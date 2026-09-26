@@ -1,0 +1,11 @@
+# Everything derived from the game's own files stays local: never commit it.
+out/
+*.exe
+*.bin
+*.map
+hook/build/
+__pycache__/
+# linker by-products
+*.lib
+*.exp
+*.obj
