@@ -1,4 +1,4 @@
-# viper-port
+# viper-racing-port
 
 A hook-based reimplementation of the 1998 racing game **Viper Racing** (MGI / Sierra), in the style of
 OpenRCT2: a DLL loads into the original game and replaces its parts one at a time with new code, so the
