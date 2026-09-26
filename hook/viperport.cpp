@@ -586,6 +586,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
              g_peak_tex, g_tex_overflows, TEX_BUCKETS);
         logf("exit: texture table entries in use at the peak %ld (stock table 250)", g_peak_table);
         renderer_report();
+        platform_report();
         if (g_pair_ticks)
             logf("exit: collisions: %.0f volume pair tests per tick on average (stock tests every pair)",
                  (double)g_pair_tests / (double)g_pair_ticks);

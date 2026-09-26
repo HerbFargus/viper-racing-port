@@ -20,6 +20,7 @@ bool jmp_hook(uint32_t v10, const uint8_t* expect, size_t n, void* to, const cha
 
 // M2 (platform.cpp): move the window and input onto SDL2 if viperport.ini says so
 void platform_install(const char* build);
+void platform_report();                       // the exit log's input line
 
 // M2 stage 2 (ddraw_gl.cpp): the game's DirectDraw/Direct3D emulated on OpenGL, via its DDRAW imports
 bool renderer_install();

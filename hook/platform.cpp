@@ -47,7 +47,8 @@ SDL_Window* g_window;
 HWND g_hwnd;
 bool g_gl;                                                       // viperport.ini renderer=gl: an OpenGL window
 struct { int x0, y0, w, h, game_w, game_h; bool set; } g_view;   // where the renderer shows the game's picture
-Uint32 g_mouse_buttons;                                          // the game's MK-style mask: 1 left, 2 right, 4 middle
+Uint32 g_mouse_buttons;
+volatile LONG g_n_keys, g_n_motion, g_n_clicks, g_n_activations;   // for the exit log: did input arrive?                                          // the game's MK-style mask: 1 left, 2 right, 4 middle
 SDL_Joystick* g_joy;
 SDL_GameController* g_pad;
 SDL_Haptic* g_haptic;
@@ -116,6 +117,7 @@ void SDLCALL raw_message(void*, void*, unsigned int msg, Uint64 wparam, Sint64 l
     // switch meets lost surfaces (DDERR_WRONGMODE) and crashes.
     if (msg == WM_ACTIVATEAPP) {
         bool active = wparam != 0;
+        if (active) g_n_activations++;
         *(uint8_t*)G.inactive = active ? 0 : 1;
         clip_cursor(active);
         if (active && g_gl && g_window) SDL_RaiseWindow(g_window);
@@ -205,6 +207,7 @@ void handle(const SDL_Event& e) {
         SDL_ShowCursor(SDL_ENABLE);
         ExitProcess(0);
     case SDL_KEYDOWN: {                                          // WM_KEYDOWN / WM_SYSKEYDOWN
+        g_n_keys++;
         const Key* k = key_for(e.key.keysym.scancode);
         if (!k) break;
         unsigned char scan = k->dik & 0x7f;
@@ -226,11 +229,13 @@ void handle(const SDL_Event& e) {
         queue_text(e.text.text);
         break;
     case SDL_MOUSEMOTION:
+        g_n_motion++;
         mouse(6, e.motion.x, e.motion.y);
         break;
     case SDL_MOUSEBUTTONDOWN:
     case SDL_MOUSEBUTTONUP: {
         bool down = e.type == SDL_MOUSEBUTTONDOWN;
+        if (down) g_n_clicks++;
         int bit = e.button.button == SDL_BUTTON_LEFT ? 1 : e.button.button == SDL_BUTTON_RIGHT ? 2
                 : e.button.button == SDL_BUTTON_MIDDLE ? 4 : 0;
         if (!bit) break;
@@ -383,6 +388,12 @@ void __cdecl sdl_joy_set_force(float a, float b, float c) {
 }
 
 }  // namespace
+
+void platform_report() {
+    if (g_window)
+        logf("exit: input: %ld key presses, %ld mouse moves, %ld clicks, %ld activations", g_n_keys, g_n_motion,
+             g_n_clicks, g_n_activations);
+}
 
 // ---- for the renderer (ddraw_gl.cpp) ------------------------------------------------------------------
 SDL_Window* platform_window() { return g_window; }
