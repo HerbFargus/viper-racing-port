@@ -38,7 +38,7 @@ U32U8_t KeyQueueChar, KeyQueueMetaChar;
 Void_t KeyClearBits, gxRestore;
 MouseQueue_t MouseQueueEvent;
 struct {
-    uint32_t hwnd, prev_foreground, inactive, hooks, title;      // win32.obj
+    uint32_t hwnd, prev_foreground, inactive, hooks, title, class_name;   // win32.obj
     uint32_t dik, shift, ctrl, alt;                              // scan.obj: DirectInput key state
 } G;
 
@@ -129,6 +129,9 @@ unsigned char __cdecl sdl_create_window(void* instance) {
     *(HWND*)G.prev_foreground = GetForegroundWindow();
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");  // DirectInput had the joystick in background mode
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
+    // the game's own window class name, so start_unique_instance's FindWindow still finds a running copy
+    const char* cls = *(const char**)G.class_name;
+    SDL_RegisterApp(cls ? cls : "Viper Racing Window", CS_HREDRAW | CS_VREDRAW, instance);
     // keep the game DPI-unaware, as it always was: DirectDraw's fullscreen and the mouse coordinates are
     // built on it (stage 2, with our own renderer, is where the game learns real pixels)
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "unaware");
@@ -167,6 +170,14 @@ unsigned char __cdecl sdl_create_window(void* instance) {
 }
 
 void __cdecl sdl_hook_keys(void) {}                              // the game's hook passed everything on anyway
+
+void __cdecl sdl_mouse_center(void) {                            // MouseCenter: the middle of the picture
+    if (!g_window) return;
+    int w = 0, h = 0;
+    SDL_GetWindowSize(g_window, &w, &h);
+    if (g_view.set) SDL_WarpMouseInWindow(g_window, g_view.x0 + g_view.w / 2, g_view.y0 + g_view.h / 2);
+    else SDL_WarpMouseInWindow(g_window, w / 2, h / 2);
+}
 
 // ---- events ------------------------------------------------------------------------------------------
 void queue_text(const char* utf8) {                              // typed text: the game's character set is ANSI
@@ -414,12 +425,13 @@ void platform_install(const char* build) {
     G.inactive = A(0x004e5ec0);
     G.hooks = A(0x00508060);
     G.title = A(0x004db440);
+    G.class_name = A(0x004db43c);
     G.dik = A(0x00508088);
     G.shift = A(0x00508185);
     G.ctrl = A(0x00508186);
     G.alt = A(0x00508187);
     if (!KeyDown || !KeyUp || !KeyQueueChar || !KeyQueueMetaChar || !KeyClearBits || !gxRestore || !MouseQueueEvent ||
-        !G.hwnd || !G.prev_foreground || !G.inactive || !G.hooks || !G.title || !G.dik || !G.shift || !G.ctrl || !G.alt) {
+        !G.hwnd || !G.prev_foreground || !G.inactive || !G.hooks || !G.title || !G.class_name || !G.dik || !G.shift || !G.ctrl || !G.alt) {
         logf("platform: NOT switching to SDL2 -- %s is missing addresses", build);
         return;
     }
@@ -429,6 +441,7 @@ void platform_install(const char* build) {
     static const uint8_t idle_pro[] = {0x83, 0xEC, 0x1C, 0x80, 0x3D, 0xC0, 0x5E, 0x4E};
     static const uint8_t scan_begin_pro[] = {0x57, 0x6A, 0x00, 0x68, 0x88, 0x81, 0x50, 0x00};
     static const uint8_t scan_update_pro[] = {0x83, 0x3D, 0x8C, 0x81, 0x50, 0x00, 0x00, 0x0F};
+    static const uint8_t mouse_center_pro[] = {0x6A, 0x00, 0xA1, 0x54, 0x86, 0x50, 0x00, 0x6A};
     static const uint8_t joy_begin_pro[] = {0x53, 0x33, 0xDB, 0x53, 0x88, 0x1D, 0x10, 0x91};
     static const uint8_t joy_pos_pro[] = {0x83, 0xEC, 0x54, 0x83, 0x3D, 0x08, 0x91, 0x50};
     static const uint8_t joy_name_pro[] = {0x83, 0x3D, 0x08, 0x91, 0x50, 0x00, 0x00, 0xB8};
@@ -443,6 +456,7 @@ void platform_install(const char* build) {
         {0x00412bf0, idle_pro, sizeof idle_pro, (void*)sdl_idle, "Win32Idle (SDL events)"},
         {0x00412f00, scan_begin_pro, sizeof scan_begin_pro, (void*)sdl_scan_begin, "ScanBegin"},
         {0x00413040, scan_update_pro, sizeof scan_update_pro, (void*)sdl_scan_update, "ScanUpdate (SDL keyboard)"},
+        {0x00414620, mouse_center_pro, sizeof mouse_center_pro, (void*)sdl_mouse_center, "MouseCenter"},
     };
     // v1.0 and v1.1 have one joystick; 1.2.x rewrote joy.obj for up to 8 (every call takes an index), so
     // its tables have none of these and its joysticks stay on DirectInput
