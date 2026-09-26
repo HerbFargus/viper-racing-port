@@ -23,11 +23,37 @@ Supported builds: v1.0 `race.exe`, v1.1 `race.bin`, and the community 1.2.4–1.
 hooks are translated per build through generated address tables (`hook/sites_*.inc`); M2's emulations
 go through the imports and need no tables.
 
+## M3: rewriting the game's code, checked bit for bit
+
+M3 replaces the game's own functions with C++, one at a time, against the v1.0 `race.exe`. The physics
+runs at x87 single precision (it sets that every tick), so a faithful rewrite can match the original bit
+for bit, and that is the bar. Two checks enforce it (`hook/port.h`, `port.cpp`, `replay.cpp`):
+
+- **Per function, `[port]`:** each rewrite is registered with `PORT_FN` and switched by its map name to
+  `new`, `original` or `shadow`. In shadow mode, a check runs the original, then restores the starting
+  state and runs the rewrite, feeding it the same random numbers and control readings, and compares
+  everything either could change byte for byte: the function's footprint, the physics and AI statics,
+  the heap tables the physics owns, the return value, and its outputs (crash sounds and replay events,
+  which are compared, then made once). The game always continues on the original's result. A mismatch is
+  logged with the first differing field, named from the recovered types. `shadow_every=N` samples.
+- **Per race, `[replay]`:** `record=1` writes each race's inputs to `replays\`: the physics ticks per
+  update, the pause flag, the random numbers the physics thread draws, the 13 control readings, and the
+  start-up seed the AI drivers' personalities are rolled from. `play=<name>` runs the race again with
+  nobody driving. Both write a per-tick hash of every physics object; a replay compares itself to the
+  recording live and logs the first tick where they part, and `tools/trace_diff.py` compares any two
+  runs, field by field at the ticks `dump_ticks` names (tick 0 is always dumped).
+
+`tools/gen_port_tables.py` generates what the DLL needs: the original instructions at every hooked
+address (for trampolines), the physics classes and their named fields, and the statics of the physics
+and AI object files, attributed by which file's code uses each address, with the input code and the
+main thread's buffers left out.
+
 ## Layout
 
-- `hook/` — the DLL: `viperport.cpp` (M1 and install), `platform.cpp` (window and input),
-  `ddraw_gl.cpp` (renderer), `dsound_sdl.cpp` (audio); `build.bat` builds it (Visual Studio Build Tools,
+- `hook/` — the DLL: `viperport.cpp` (M1 and install), `port.cpp` (M3's rewrites and shadow checks),
+  `replay.cpp` (the race recorder), `platform.cpp` (window and input), `ddraw_gl.cpp` (renderer),
+  `dsound_sdl.cpp` (audio); `build.bat` builds it (Visual Studio Build Tools,
   SDL2 2.32 in `../sdl2`).
 - `tools/` — the analysis: linker-map extraction, the function inventory, cross-build matching
   (`match_builds.py`, `propagate.py`, `port_sites.py`), type recovery for Ghidra (`recover_types.py`,
-  `type_names.py`, `names/`, `ApplyTypes.java`), and generators (`gen_com_base.py`, `gen_texture_table.py`).
+  `type_names.py`, `names/`, `ApplyTypes.java`), generators (`gen_com_base.py`, `gen_texture_table.py`, `gen_port_tables.py`), and `trace_diff.py`.

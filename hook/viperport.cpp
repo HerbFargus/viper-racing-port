@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <vector>
 #include "viperport.h"
+#include "port.h"
 
 // ---- the one export, forwarded ---------------------------------------------------------------------
 typedef HRESULT(WINAPI* DirectInputCreateA_t)(HINSTANCE, DWORD, void**, void*);
@@ -41,6 +42,7 @@ extern "C" HRESULT WINAPI DirectInputCreateA(HINSTANCE inst, DWORD version, void
 
 // ---- logging -------------------------------------------------------------------------------------------
 static FILE* g_log;
+static HMODULE g_self;
 void logf(const char* fmt, ...) {
     if (!g_log) return;
     SYSTEMTIME t; GetLocalTime(&t);
@@ -76,6 +78,8 @@ static const Xlat* xlat(uint32_t v10) {
         if (g_build->table[i].v10 == v10) return &g_build->table[i];
     return 0;
 }
+
+bool build_is_v10() { return g_build && !g_build->table; }
 
 bool have(uint32_t v10) { return !g_build->table || xlat(v10) != 0; }
 
@@ -125,6 +129,15 @@ static void __fastcall Obstacle_Update(uint8_t* self, void* /*edx*/) {
     }
     PhobDyno_Update(self, 0);
 }
+
+// M3: switched and checked through port.h. It changes its own obstacle (Perturb and PhobDyno::Update
+// included), so that's its footprint. v1.1 and 1.2.x square +238h first: the same sum, the terms the
+// other way round -- their first bytes come from the build tables.
+static void fp_obstacle_update(Footprint& f, uint8_t* self, void*) { f.object(self); }
+// push ebx; push esi; fld dword [ecx+23Ch]; fmul dword [ecx+23Ch]
+static const uint8_t k_obstacle_update_pro[] = {0x53, 0x56, 0xD9, 0x81, 0x3C, 0x02, 0x00, 0x00, 0xD8, 0x89, 0x3C, 0x02, 0x00, 0x00};
+PORT_FN_BUILDS(0x0043d2e0, "Obstacle::Update", Obstacle_Update, fp_obstacle_update, k_obstacle_update_pro,
+               sizeof k_obstacle_update_pro)
 
 // ---- hooking -------------------------------------------------------------------------------------------
 // Does the function at v1.0 address v10 start as it should? v1.0: the prologue given; another build: the
@@ -500,12 +513,14 @@ static void __cdecl collide_phobs(void) {
     g_pair_ticks++;
 }
 
-static void speed_up_collisions() {
-    // sub esp,14h; push ebx; push esi; push edi; push ebp; xor esi,esi (the race.bin builds have no
-    // profiler calls in it, so theirs starts sub esp,10h -- the loops are the same)
-    static const uint8_t pro[] = {0x83, 0xEC, 0x14, 0x53, 0x56, 0x57, 0x55, 0x33, 0xF6};
-    jmp_hook(0x00427120, pro, sizeof pro, (void*)collide_phobs, "collide_phobs (broad-phase)");
-}
+// M3: switched through port.h. Every object's volumes, impulses and contacts can change, some outside
+// the objects themselves, so it isn't shadow-checked: a replay with it on and off compares whole races.
+static void fp_collide_phobs(Footprint& f) { f.replay_only = "it can change every physics object"; }
+// sub esp,14h; push ebx; push esi; push edi; push ebp; xor esi,esi (the race.bin builds have no profiler
+// calls in it, so theirs starts sub esp,10h -- the loops are the same)
+static const uint8_t k_collide_phobs_pro[] = {0x83, 0xEC, 0x14, 0x53, 0x56, 0x57, 0x55, 0x33, 0xF6};
+PORT_FN_BUILDS(0x00427120, "collide_phobs", collide_phobs, fp_collide_phobs, k_collide_phobs_pro,
+               sizeof k_collide_phobs_pro)
 
 // the most of each seen during the session, for the exit line
 static volatile LONG g_peak_phobs, g_peak_wobs, g_peak_gobs;
@@ -556,26 +571,28 @@ static void install() {
         logf("NOT installing anything: %d addresses have no translation for %s", g_unresolved, g_build->name);
         return;
     }
-    // push ebx; push esi; fld dword [ecx+23Ch]; fmul dword [ecx+23Ch] (v1.1 and 1.2.x square +238h
-    // first: the same sum with the terms the other way round)
-    static const uint8_t update_prologue[] = {0x53, 0x56, 0xD9, 0x81, 0x3C, 0x02, 0x00, 0x00, 0xD8, 0x89, 0x3C, 0x02, 0x00, 0x00};
-    jmp_hook(0x0043d2e0, update_prologue, sizeof update_prologue, (void*)Obstacle_Update, "Obstacle::Update");
     lift_limits();
     lift_texture_limit();
     relocate_texture_table();
-    speed_up_collisions();
+    char ini[MAX_PATH];                         // viperport.ini, beside this DLL
+    GetModuleFileNameA(g_self, ini, MAX_PATH);
+    char* slash = strrchr(ini, '\\');
+    lstrcpyA(slash ? slash + 1 : ini, "viperport.ini");
+    port_install(ini);                          // M3: rewritten functions (Obstacle::Update, collide_phobs, ...)
+    replay_install(ini);                        // M3: the race recorder and replayer
     platform_install(g_build->name);            // M2: SDL2 window and input, when viperport.ini asks
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
+        g_self = inst;
         DisableThreadLibraryCalls(inst);
         char path[MAX_PATH];
         GetModuleFileNameA(inst, path, MAX_PATH);
         char* slash = strrchr(path, '\\');
         lstrcpyA(slash ? slash + 1 : path, "viperport.log");
         g_log = fopen(path, "w");
-        logf("viperport loaded (M1: object limits, texture limit + table, collision broad-phase, Obstacle::Update)");
+        logf("viperport loaded (M1: object limits, texture limit + table; M3: rewritten functions, race recorder)");
         install();
     } else if (reason == DLL_PROCESS_DETACH) {
         logf("exit: new Obstacle::Update ran %ld times, woke obstacles %ld times, put them to sleep %ld times",
@@ -585,6 +602,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         logf("exit: highest texture number drawn through the deferred buckets %ld (stock crashes past 118); %ld past %d",
              g_peak_tex, g_tex_overflows, TEX_BUCKETS);
         logf("exit: texture table entries in use at the peak %ld (stock table 250)", g_peak_table);
+        replay_report();
+        port_report();
         renderer_report();
         platform_report();
         if (g_pair_ticks)
