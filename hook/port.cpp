@@ -79,6 +79,38 @@ void* detour(uint32_t v10, void* to, const char* what) {
     return t;
 }
 
+// ---- stock fingerprints (stock.inc) --------------------------------------------------------------------------
+// A rewrite replaces only the exact stock v1.0 function it was written from: its code and every read-only
+// constant it reads. On a race.exe with vrmod's patches (engine fixes, hornball, the AI crash fix) a
+// patched function stays original, so the patch keeps working. Checked before anything is patched.
+struct StockConst { uint32_t va, width; };
+struct Stock { uint32_t v10, size, hash_code, hash, nconst; StockConst c[24]; };
+static const Stock k_stock[] = {
+#include "stock.inc"
+};
+
+static uint32_t fnv(const uint8_t* p, uint32_t n, uint32_t h) {
+    for (uint32_t i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
+void port_check_stock() {
+    if (!is_v10()) return;
+    for (PortFn* f : registry()) {
+        for (const Stock& st : k_stock) {
+            if (st.v10 != f->v10) continue;
+            uint32_t hc = fnv((const uint8_t*)st.v10, st.size, 2166136261u), h = hc;
+            for (uint32_t i = 0; i < st.nconst; i++) h = fnv((const uint8_t*)st.c[i].va, st.c[i].width, h);
+            if (h != st.hash) {
+                f->patched = true;
+                logf("port: %s stays original -- the installed race.exe has %s patched (a vrmod fix?)", f->name,
+                     hc != st.hash_code ? "its code" : "a constant it reads");
+            }
+            break;
+        }
+    }
+}
+
 // ---- classes, sizes and field names (state_layout.inc) --------------------------------------------------
 struct ClassInfo { uint32_t vtable, size; const char* name; int first, count; };
 struct FieldInfo { uint32_t off, size; const char* name; };
@@ -271,6 +303,7 @@ static __declspec(thread) uint8_t t_ret_orig[16];
 static __declspec(thread) size_t t_ret_n;
 
 bool shadow_on() { return g_shadow_on; }
+volatile unsigned long g_physics_thread_id;
 
 bool shadow_begin(PortFn* f) {
     LONG n = InterlockedIncrement(&f->calls);
@@ -344,7 +377,8 @@ void shadow_snapshot() {
     std::vector<Span>& sp = *t_spans;
     sp.clear();
     for (int i = 0; i < t_fp->n; i++) sp.push_back({(uint8_t*)t_fp->r[i].p, t_fp->r[i].n, 0, i});
-    if (!t_fp->pure) {                                  // a pure function (maths) changes no globals
+    // a pure function (maths) changes no globals; a check on another thread mustn't touch the physics'
+    if (!t_fp->pure && GetCurrentThreadId() == g_physics_thread_id) {
         for (int i = 0; i < (int)(sizeof k_globals / sizeof k_globals[0]); i++)
             sp.push_back({(uint8_t*)k_globals[i].va, k_globals[i].size, 1, i});
         for (int i = 0; i < (int)(sizeof k_heap_blocks / sizeof k_heap_blocks[0]); i++)
@@ -473,6 +507,7 @@ void port_install(const char* ini) {
         GetPrivateProfileStringA("port", f->name, "", buf, sizeof buf, ini);
         f->mode = buf[0] ? parse_mode(buf, dflt) : dflt;
         if (f->mode == PORT_ORIGINAL) { logf("port: %s -- original", f->name); continue; }
+        if (f->patched) { f->mode = PORT_ORIGINAL; continue; }             // logged by port_check_stock
         const Prologue* p = live_prologue(f->v10);
         if (p && p->rel == -2) {
             // a short branch in its first 5 bytes: it can be replaced, but there's no trampoline to run the

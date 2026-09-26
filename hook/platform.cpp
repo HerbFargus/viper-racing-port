@@ -275,7 +275,7 @@ void __cdecl sdl_scan_update(void) { scan_update(); }
 // ---- joysticks and wheels ----------------------------------------------------------------------------
 // JoyPos, as JoyGetPos fills it from DirectInput's DIJOYSTATE: axes X Y Z Rz Rx Ry in -1..1, 32 buttons,
 // then the POV hat as 0 (centred) or 1..4 (up, right, down, left).
-struct JoyPos { float axis[6]; uint8_t button[32]; float pov; };
+struct JoyPos { float axis[6]; uint8_t button[32]; int32_t pov; };   // pov: an int, as the original stores it
 
 float unit(Sint16 v) { float f = v / 32768.0f; return f < -1 ? -1 : f > 1 ? 1 : f; }
 
@@ -339,7 +339,7 @@ unsigned char __cdecl sdl_joy_get_pos(JoyPos* p) {
         bool lf = SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0;
         bool rt_ = SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0;
         int deg = up ? (rt_ ? 45 : lf ? 315 : 0) : dn ? (rt_ ? 135 : lf ? 225 : 180) : rt_ ? 90 : lf ? 270 : -1;
-        p->pov = deg < 0 ? 0.0f : (float)(deg * 100 / 9000 + 1);
+        p->pov = deg < 0 ? 0 : deg * 100 / 9000 + 1;
     } else {
         // a plain joystick or wheel: SDL's axes come in DirectInput's order X Y Z Rx Ry Rz
         static const int from[6] = {0, 1, 2, 5, 3, 4};           // JoyPos wants X Y Z Rz Rx Ry
@@ -351,7 +351,7 @@ unsigned char __cdecl sdl_joy_get_pos(JoyPos* p) {
             Uint8 h = SDL_JoystickGetHat(g_joy, 0);
             int deg = h == SDL_HAT_UP ? 0 : h == SDL_HAT_RIGHTUP ? 45 : h == SDL_HAT_RIGHT ? 90 : h == SDL_HAT_RIGHTDOWN ? 135
                     : h == SDL_HAT_DOWN ? 180 : h == SDL_HAT_LEFTDOWN ? 225 : h == SDL_HAT_LEFT ? 270 : h == SDL_HAT_LEFTUP ? 315 : -1;
-            p->pov = deg < 0 ? 0.0f : (float)(deg * 100 / 9000 + 1);
+            p->pov = deg < 0 ? 0 : deg * 100 / 9000 + 1;
         }
     }
     return 1;

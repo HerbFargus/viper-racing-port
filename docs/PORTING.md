@@ -53,6 +53,10 @@ grouping, with the same constants, on values of the same range, gets the same bi
     original computes it at run time on the x87 in single precision, and the results can differ. Where
     the original does arithmetic on two constants at run time and the result isn't exact in 24 bits, load
     them through `volatile` (or write the exact bits the original produces).
+7b. **Narrow integers can compile differently.** A 16-bit bit operation written in C
+    (`mask |= (uint16_t)(1u << n)`) can come out as `bts cx, ax`, which takes the bit number mod 16,
+    where the original's `shl ax, cl` shifts an out-of-range bit away entirely. Do the arithmetic in 32
+    bits and truncate at the end, and check the compiler's output where the original works on 8 or 16 bits.
 8. **Calls.** Call other game functions by their v1.0 address with an exact typedef; a `__thiscall` is
    called and received as `__fastcall(self, void* edx, args...)`. Virtual calls go through the object's
    vtable (`VFN(obj, byte_offset, Ret, Args...)(obj, 0, args...)`), never directly, so the callee's own
@@ -89,6 +93,11 @@ physics and AI statics (saved automatically):
 - `f.pure = true` — writes only its explicit outputs and reads nothing global (also fuzzed offline);
 - `f.replay_only = "why"` — allocates, frees, loads files, or writes what can't be bounded: checked by
   whole-race replays, not shadow checks.
+
+**Threads.** The physics runs on the game's timer thread; the input code (`DriverUpdate`,
+`ControlUpdate`, `PhysicsReadControls`) and everything else on the main thread. A shadow check only
+saves and restores the physics and AI statics when it runs on the physics thread; a function that runs
+on the main thread must list the statics it writes in its footprint (`f.add(address, bytes, "what")`).
 
 Crash sounds and the game's own replay events are outputs, captured automatically. Random numbers and
 the controls are inputs, fed to the rewrite automatically.

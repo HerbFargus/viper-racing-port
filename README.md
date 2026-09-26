@@ -48,13 +48,21 @@ code at its own address, puts the FPU in the physics thread's single precision, 
 whose footprint is pure against its original on millions of random inputs, NaN, infinity, denormals and
 overlapping arguments included.
 
-The rewrites so far (`hook/phys_*.cpp`, layouts in `hook/phys_types.h`), 167 functions:
+The rewrites so far (`hook/phys_*.cpp`, layouts in `hook/phys_types.h`), 380 functions:
 - **3.2, collisions:** the physics library's maths helpers, every collision volume (sphere, cube, sphere
   group, moveable sphere, cylinder, tube, box), the pairwise collision tests, and `collide.obj`'s crash
   reports, water and static objects.
 - **3.3, the car:** the wheel (suspension, tyre contact, brakes), the Pacejka tyre and aerodynamics, the
   drivetrain (clutch, gearbox with its automatic shifting, differentials, shafts), and the engine, its
   heat and power curve, and the hidden plane mode's propeller and wings.
+- **3.4, the objects and the race:** `Car` (its tick, set-up, damage and dents, teleport, replay
+  packets), the rigid body (`PhobDyno::Update`), ground contact, obstacles, wobbles, balls and
+  checkpoints, the player's car and the input side (driver filtering, the control mapping), and the race
+  logic (laps, positions, the start, drag races).
+
+A rewrite replaces only the exact stock v1.0 function it was written from: before anything is patched,
+the DLL fingerprints each function's code and the read-only constants it reads (`hook/stock.inc`), and
+a function a vrmod fix has patched stays original, so the fix keeps working.
 
 Each is checked in game in shadow mode, or, where the game never reaches it, offline. A race recorded
 with all of them running and replayed on the original code is identical tick for tick. How to port a

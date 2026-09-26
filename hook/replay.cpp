@@ -324,6 +324,7 @@ static void __cdecl h_PhysTaskRestart(void) {
 }
 
 static void __cdecl h_PhysTaskUpdate(void) {
+    g_physics_thread_id = GetCurrentThreadId();          // for shadow checks (port.h), race or not
     if (on_physics_thread()) {
         uint8_t paused = *PHYSICS_PAUSED;
         if (g_stream) put(K_UPDATE, &paused, 1);
@@ -450,7 +451,7 @@ void replay_install(const char* ini) {
         {0x00426850, (void*)h_PhysTaskBegin, (void**)&o_PhysTaskBegin, "PhysTaskBegin", true},
         {0x00426a80, (void*)h_PhysTaskEnd, (void**)&o_PhysTaskEnd, "PhysTaskEnd", true},
         {0x00426b20, (void*)h_PhysTaskRestart, (void**)&o_PhysTaskRestart, "PhysTaskRestart", true},
-        {0x00426b90, (void*)h_PhysTaskUpdate, (void**)&o_PhysTaskUpdate, "PhysTaskUpdate", true},
+        {0x00426b90, (void*)h_PhysTaskUpdate, (void**)&o_PhysTaskUpdate, "PhysTaskUpdate", false},
         {0x004274d0, (void*)h_update_phobs, (void**)&o_update_phobs, "update_phobs", true},
         {0x00428c30, (void*)h_GetTicks, (void**)&o_GetTicks, "TimerConditioner::GetTicks", true},
         {0x0041b6b0, (void*)h_Randomize, (void**)&o_Randomize, "Randomize", true},

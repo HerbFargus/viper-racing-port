@@ -576,6 +576,7 @@ static void install() {
         logf("NOT installing anything: %d addresses have no translation for %s", g_unresolved, g_build->name);
         return;
     }
+    port_check_stock();                         // M3: before M1 patches any code, note non-stock functions
     lift_limits();
     lift_texture_limit();
     relocate_texture_table();

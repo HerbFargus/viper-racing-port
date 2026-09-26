@@ -53,6 +53,7 @@ struct PortFn {
     PortMode mode = PORT_NEW;
     volatile long calls = 0, checks = 0, mismatches = 0;
     int budget_tick = -1, budget_used = 0;         // shadow_per_tick bookkeeping
+    bool patched = false;                          // the installed function isn't stock v1.0: left original
     PortFn(uint32_t v, const char* nm, void* r, void* s, const uint8_t* op = 0, uint8_t ol = 0);
 };
 
@@ -73,6 +74,10 @@ void shadow_abandon(PortFn* f);                // end a check without comparing 
 bool shadow_feed(uint8_t kind, void* v, size_t n);
 void shadow_saw(uint8_t kind, const void* v, size_t n);
 bool shadow_on();                              // is any function in shadow mode? (the input hooks are needed)
+// the physics thread (set by the recorder's PhysTaskUpdate hook, installed whenever shadow checks are on).
+// A check made on another thread -- the main thread's input code -- doesn't save or restore the physics
+// globals, which the physics thread is using at that moment: its footprint lists what it writes.
+extern volatile unsigned long g_physics_thread_id;
 
 // Shadow<F>::call<fn, NEW, FOOTPRINT> -- a wrapper with the rewrite's exact signature and calling
 // convention (a __thiscall arrives as __fastcall with an unused edx, as everywhere in this DLL).
@@ -126,6 +131,7 @@ VP_SHADOW_CC(__stdcall)
 #define PORT_FN(V10, NAME, NEW, FP) PORT_FN_BUILDS(V10, NAME, NEW, FP, 0, 0)
 
 // ---- the framework ----------------------------------------------------------------------------------------
+void port_check_stock();                       // before anything is patched: find non-stock functions
 void port_install(const char* ini);            // read [port], hook every registered function
 void port_report();                            // the exit log: per function, calls / checks / mismatches
 bool port_is_new(const PortFn& f);             // is the rewrite in force (new or shadow)?
