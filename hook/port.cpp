@@ -32,6 +32,7 @@ static uint8_t* g_tramp_page;
 static size_t g_tramp_used;
 
 static void* make_trampoline(const Prologue& p) {
+    if (p.rel == -2) return 0;                                    // branches in its first bytes (see below)
     if (!g_tramp_page) g_tramp_page = (uint8_t*)VirtualAlloc(0, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!g_tramp_page || g_tramp_used + 32 > 65536) return 0;
     uint8_t* t = g_tramp_page + g_tramp_used;
@@ -472,7 +473,18 @@ void port_install(const char* ini) {
         GetPrivateProfileStringA("port", f->name, "", buf, sizeof buf, ini);
         f->mode = buf[0] ? parse_mode(buf, dflt) : dflt;
         if (f->mode == PORT_ORIGINAL) { logf("port: %s -- original", f->name); continue; }
-        if (const Prologue* p = live_prologue(f->v10)) {            // v1.0: every mode
+        const Prologue* p = live_prologue(f->v10);
+        if (p && p->rel == -2) {
+            // a short branch in its first 5 bytes: it can be replaced, but there's no trampoline to run the
+            // original, so no shadow check -- a replay with it on (new) is its check
+            if (f->mode == PORT_SHADOW) {
+                logf("port: %s stays original in shadow mode (it branches in its first bytes; check it with a replay)", f->name);
+                f->mode = PORT_ORIGINAL;
+                continue;
+            }
+            write_jmp(f->v10, f->repl);
+            f->orig = (void*)1;                                     // in force; the original is never called
+        } else if (p) {                                             // v1.0: every mode
             f->orig = make_trampoline(*p);
             if (!f->orig) continue;
             write_jmp(f->v10, f->mode == PORT_SHADOW ? f->shadow : f->repl);

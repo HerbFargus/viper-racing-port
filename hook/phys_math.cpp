@@ -193,17 +193,17 @@ PORT_FN(0x004294c0, "MatrixToQuat", MatrixToQuat, fp_to_quat)
 typedef void(__cdecl* MatrixConcat_t)(M3*, const M3*, const M3*);
 static void __cdecl MatrixMakeModelRotation(M3* m, float a, float b, float c) {
     const MatrixConcat_t concat = (MatrixConcat_t)0x00403040;
-    double ca = x87_cos(a), sa = x87_sin(a);
+    float ca = x87_cos_f(a), sa = x87_sin_f(a);   // stored straight to floats
     m->m[1] = 0.0f; m->m[3] = 0.0f; m->m[4] = 1.0f; m->m[5] = 0.0f; m->m[7] = 0.0f;
-    m->m[0] = (float)ca; m->m[2] = (float)-sa; m->m[6] = (float)sa; m->m[8] = (float)ca;
+    m->m[0] = ca; m->m[2] = -sa; m->m[6] = sa; m->m[8] = ca;
     M3 r;
-    double cb = x87_cos(b), sb = x87_sin(b);
+    float cb = x87_cos_f(b), sb = x87_sin_f(b);   // stored straight to floats
     r.m[0] = 1.0f; r.m[1] = 0.0f; r.m[2] = 0.0f; r.m[3] = 0.0f; r.m[6] = 0.0f;
-    r.m[4] = (float)cb; r.m[5] = (float)sb; r.m[7] = (float)-sb; r.m[8] = (float)cb;
+    r.m[4] = cb; r.m[5] = sb; r.m[7] = -sb; r.m[8] = cb;
     concat(m, &r, m);
-    double cc = x87_cos(c), sc = x87_sin(c);
+    float cc = x87_cos_f(c), sc = x87_sin_f(c);   // stored straight to floats
     r.m[2] = 0.0f; r.m[5] = 0.0f; r.m[6] = 0.0f; r.m[7] = 0.0f; r.m[8] = 1.0f;
-    r.m[0] = (float)cc; r.m[1] = (float)sc; r.m[3] = (float)-sc; r.m[4] = (float)cc;
+    r.m[0] = cc; r.m[1] = sc; r.m[3] = -sc; r.m[4] = cc;
     concat(m, &r, m);
 }
 static void fp_model_rotation(Footprint& f, M3* m, float, float, float) PURE_OUT(m, 36)

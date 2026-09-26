@@ -5,6 +5,7 @@
 // order of operations (the grouping of each sum), the width of each constant (a double constant in a
 // multiply is not a float one), and these instructions, which only the x87 has.
 #pragma once
+#include <stdint.h>
 
 // A value the original keeps in an x87 register has the register's exponent range: single precision
 // rounds only the mantissa, so a sum of squares past 3.4e38 still has a square root, and a product below
@@ -20,20 +21,61 @@ static __forceinline double x87_sqrt(double x) {
     return r;
 }
 
-static __forceinline double x87_sin(double x) {
-    double r;
+// fsin, fcos and fpatan are NOT rounded by precision control: they return a full 64-bit mantissa, which
+// no C type holds (MSVC's long double is a double). So a transcendental result never passes through a C
+// variable: the helpers below finish what the original does with it inside the same asm block -- store
+// it to a float, or multiply it (the product IS rounded to 24 bits, so a double holds it exactly). Any
+// other sequence gets its own small asm helper where it's used (see phys_tire.cpp, phys_engine.cpp).
+static __forceinline float x87_sin_f(double x) {             // fsin; fstp dword
+    float r;
     __asm { fld x
             fsin
             fstp r }
     return r;
 }
 
-static __forceinline double x87_cos(double x) {
-    double r;
+static __forceinline float x87_cos_f(double x) {             // fcos; fstp dword
+    float r;
     __asm { fld x
             fcos
             fstp r }
     return r;
+}
+
+static __forceinline double x87_sin_mul(double x, double k) { // fsin; fmul k
+    double r;
+    __asm { fld x
+            fsin
+            fmul k
+            fstp r }
+    return r;
+}
+
+static __forceinline double x87_cos_mul(double x, double k) { // fcos; fmul k
+    double r;
+    __asm { fld x
+            fcos
+            fmul k
+            fstp r }
+    return r;
+}
+
+// __ftol (0x4cf108): fistp qword with the rounding set to chop; the low dword. Out of range or NaN gives the
+// integer indefinite 0x8000000000000000 -- so 0, where C's (int) would give 0x80000000.
+static __forceinline int32_t x87_ftol(double x) {
+    int32_t lo;
+    uint16_t cw, chop;
+    int64_t q;
+    __asm { fld x
+            fnstcw cw
+            mov ax, cw
+            or ah, 0x0c
+            mov chop, ax
+            fldcw chop
+            fistp qword ptr q
+            fldcw cw }
+    lo = (int32_t)q;
+    return lo;
 }
 
 // Comparisons. The 1998 compiler tests the FPU's condition flags directly, and each test decides what a

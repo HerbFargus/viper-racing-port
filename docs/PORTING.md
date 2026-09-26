@@ -1,0 +1,106 @@
+# Porting a game function, bit for bit
+
+How M3 rewrites the v1.0 `race.exe`'s functions so they match the originals exactly, and how each
+rewrite is checked. Read `hook/x87.h` and `hook/phys_math.cpp` (a finished example) alongside this.
+
+## Why bit for bit is possible
+
+The physics thread sets the x87 FPU to single precision every tick (`physics_thread` →
+`ExceptSinglePrecision(1)`): every operation rounds its result to a float's 24-bit mantissa, while the
+registers keep their full 15-bit exponent. This DLL is built `/arch:IA32 /fp:precise`, so its own float
+arithmetic runs on the same x87 in the same mode. A rewrite that does the same operations, in the same
+grouping, with the same constants, on values of the same range, gets the same bits.
+
+## Materials
+
+- `python tools\disasm.py 0xADDR ...` — the exact disassembly: calls named, every memory constant shown
+  with its value and **width** (float or double). The ground truth; port from it.
+- `tools\ghidra_decompile.bat 0xADDR ...` → `out\decomp_sample.c` — Ghidra's decompilation with the
+  recovered types. Good for structure; it reorders arithmetic and hides precision, so never trust its
+  order of operations.
+- `out\types.json`, `out\types.tsv` — recovered class layouts and field names
+  (`grep "^field\tWheel\t" out\types.tsv`).
+- `hook\phys_types.h` — shared layouts with `static_assert` offsets, and `VFN()` for virtual calls.
+- `out\symbols.csv` — every symbol's address, demangled signature, library and object file.
+
+## The rules
+
+1. **Same grouping.** Two-operand `+` and `*` are commutative bit for bit; `(a+b)+c` is not `a+(b+c)`.
+   Read the grouping from the `fld`/`fadd`/`faddp` sequence, not from the decompiler.
+2. **Registers versus memory.** A value the original keeps in an x87 register is a `double` in the
+   rewrite (the register's exponent range: a sum of squares past 3.4e38 still has a square root; a
+   product below 1e-38 isn't zero); a value it stores with `fstp dword` is a `float`. Cast to `double`
+   for intermediates and to `float` exactly where the original stores. A function whose original
+   returns an unrounded ST0 returns `double` (the same register to its callers). Trace the x87 stack
+   through `fxch`, `fld st(n)`, `fstp st(n)`: a value can live in a register for a long stretch.
+3. **Constants keep their width and exact value.** `fmul dword ptr [c]` is a float constant (`0.5f`),
+   `qword` a double. Write odd values from their bits (e.g. `0x3d666666` is not `0.05625f`).
+4. **Comparisons keep the original's NaN result.** The 1998 compiler tests the FPU's flags directly:
+   after `fcomp b`, `test ah,1` is "less, or unordered" → `!(a >= b)`; `test ah,0x41` → `!(a > b)`;
+   `test ah,0x40` → `!(a < b || a > b)`. An integer compare of a float's bits (`cmp dword [x], ...`) is
+   done on the bits.
+5. **`__adjust_fdiv`** (`cmp [__adjust_fdiv],0; jne` → `__adj_fdiv_r`) is the Pentium FDIV-bug
+   workaround: a plain division.
+6. **Bit copies stay bit copies.** Where the original moves a float with integer instructions (`mov`,
+   `rep movsd`, a float argument pushed straight on to a callee), copy the bits — `memcpy`, `uint32_t`,
+   or a typedef whose parameter is `uint32_t`. A copy through the FPU quietens a signalling NaN. Check
+   the compiler's output (`dumpbin /disasm` on your `.obj`) where it matters.
+7. **`call __ftol` is NOT C's `(int)x`.** The 1998 routine truncates through `fistp qword` and keeps the low
+   dword, so NaN or an out-of-range value gives 0; today's `(int)` can take an SSE path that gives
+   0x80000000. Use `x87_ftol` (x87.h).
+7a. **No compile-time folding of what the original computes at run time.** An expression of constants
+    (`900.0f * 80.0f`, `1.0f / (4180.0f * 12.8f)`) is folded by the compiler in double precision; the
+    original computes it at run time on the x87 in single precision, and the results can differ. Where
+    the original does arithmetic on two constants at run time and the result isn't exact in 24 bits, load
+    them through `volatile` (or write the exact bits the original produces).
+8. **Calls.** Call other game functions by their v1.0 address with an exact typedef; a `__thiscall` is
+   called and received as `__fastcall(self, void* edx, args...)`. Virtual calls go through the object's
+   vtable (`VFN(obj, byte_offset, Ret, Args...)(obj, 0, args...)`), never directly, so the callee's own
+   rewrite — hooked at its address — is what runs. Keep every call, in order, with the same arguments,
+   and read memory at the same points relative to calls.
+9. **x87-only instructions.** Precision control rounds `fsqrt` (so `x87_sqrt` returns a double that
+   holds it exactly) but NOT `fsin`, `fcos` or `fpatan`: they return a full 64-bit mantissa, which no C
+   type holds. So their result never passes through a C variable: `x87_sin_f`/`x87_cos_f` store it
+   straight to a float, `x87_sin_mul`/`x87_cos_mul` multiply it in the same asm block (the product is
+   rounded); any other sequence, and `fpatan`, `fyl2x`, `frndint`..., gets a small asm helper in your
+   file that does exactly what the original does with the result. The fuzzer can't catch a mistake here
+   (it changes about one result in 5e8): it has to be right by construction.
+10. **Faithful first.** Reproduce the original's bugs and quirks exactly (a 0/0, a missing bounds check,
+    dead stores that matter). Fixes come later, as their own step.
+11. **Dead branches** the original can never take (a compiler alias check comparing two of its own stack
+    locals) may be left out; say so in a comment.
+
+## Registering a rewrite
+
+```cpp
+static void __fastcall Wheel_UpdateHeat(Wheel* self, void* edx, float dt) { ... }
+static void fp_wheel_update_heat(Footprint& f, Wheel* self, void*, float) { f.add(self, sizeof(Wheel), "wheel"); }
+PORT_FN(0x0044a440, "Wheel::UpdateHeat", Wheel_UpdateHeat, fp_wheel_update_heat)
+```
+
+The name is the map's (the `viperport.ini [port]` key); overloads get a suffix, e.g. `"MatrixSet(rows)"`.
+Rewrite function names are file-local but should still be descriptive. The footprint function takes the
+rewrite's parameters after a `Footprint&` and lists everything the function may write, besides the
+physics and AI statics (saved automatically):
+
+- `f.object(ptr, "what")` — a game object with a vtable, sized by its class;
+- `f.add(ptr, bytes, "what")` — anything else (an embedded part, an output, a constructor's `this`,
+  whose vtable isn't set yet);
+- `f.pure = true` — writes only its explicit outputs and reads nothing global (also fuzzed offline);
+- `f.replay_only = "why"` — allocates, frees, loads files, or writes what can't be bounded: checked by
+  whole-race replays, not shadow checks.
+
+Crash sounds and the game's own replay events are outputs, captured automatically. Random numbers and
+the controls are inputs, fed to the rewrite automatically.
+
+## Checking
+
+1. **Compile:** `test\check_compile.bat hook\phys_x.cpp %TEMP%\somewhere` (warning-free).
+2. **Pure functions:** `test\build_fuzz.bat %TEMP%\fz hook\phys_x.cpp` then `%TEMP%\fz\fuzz.exe 1000000`.
+3. **Everything else, offline:** a world harness. Load `out\race_v10.exe` at 0x400000 the way
+   `test\fuzz.cpp` does (a child process with the range reserved before its heap exists), build real
+   objects in memory (vtables are the v1.0 addresses; `hook\state_layout.inc` lists them), patch the
+   callees you want to record with a jump to a stub, and compare the original against the rewrite on
+   random worlds — object state, outputs and the stubs' call logs. Put it in `test\world_<name>.cpp`.
+4. **In game:** shadow mode (`[port] default=shadow`) and a replay with the rewrite live
+   (`default=new`); see README.md.

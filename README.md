@@ -48,13 +48,26 @@ code at its own address, puts the FPU in the physics thread's single precision, 
 whose footprint is pure against its original on millions of random inputs, NaN, infinity, denormals and
 overlapping arguments included.
 
-The rewrites so far (`hook/phys_*.cpp`, layouts in `hook/phys_types.h`): the physics library's maths
-helpers, every collision volume (sphere, cube, sphere group, moveable sphere, cylinder, tube, box), the
-pairwise collision tests, and `collide.obj`'s collision response, water and static objects -- 73
-functions, each checked in game in shadow mode or, where the game never reaches it, offline. The rules
-that make bit-for-bit possible are in `hook/x87.h`: the same grouping of every sum; a value the original
-keeps in an x87 register is a double, one it stores is a float; each comparison keeps the original's NaN
-behaviour; each constant keeps its width.
+The rewrites so far (`hook/phys_*.cpp`, layouts in `hook/phys_types.h`), 167 functions:
+- **3.2, collisions:** the physics library's maths helpers, every collision volume (sphere, cube, sphere
+  group, moveable sphere, cylinder, tube, box), the pairwise collision tests, and `collide.obj`'s crash
+  reports, water and static objects.
+- **3.3, the car:** the wheel (suspension, tyre contact, brakes), the Pacejka tyre and aerodynamics, the
+  drivetrain (clutch, gearbox with its automatic shifting, differentials, shafts), and the engine, its
+  heat and power curve, and the hidden plane mode's propeller and wings.
+
+Each is checked in game in shadow mode, or, where the game never reaches it, offline. A race recorded
+with all of them running and replayed on the original code is identical tick for tick. How to port a
+function this way is written up in `docs/PORTING.md`. The rules that make bit for bit possible are in
+`hook/x87.h`:
+- every sum keeps the original's grouping;
+- a value the original keeps in an x87 register is a double, and one it stores is a float;
+- `fsin`, `fcos` and `fpatan`, which precision control doesn't round, never pass through a C variable;
+- comparisons keep the original's NaN behaviour;
+- constants keep their width, and aren't folded at compile time.
+
+`test/world_*.cpp` are world harnesses. Each loads the original code, builds real cars, wheels and
+drivetrains in memory, and compares the original against the rewrite on millions of random states.
 
 `tools/gen_port_tables.py` generates what the DLL needs: the original instructions at every hooked
 address (for trampolines), the physics classes and their named fields, and the statics of the physics

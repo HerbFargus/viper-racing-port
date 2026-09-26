@@ -68,8 +68,22 @@ def prologue(exe, secs, md, va: int, size: int) -> tuple[bytes, int]:
         if b[0] in (0xE8, 0xE9) and len(b) == 5:
             rel = len(code) + 1
         elif b[0] in (0xEB, 0xE3) or 0x70 <= b[0] <= 0x7F or (b[0] == 0x0F and 0x80 <= b[1] <= 0x8F):
-            raise SystemExit(f"{va:08x}: a short or conditional branch in the first 5 bytes ({ins.mnemonic} {ins.op_str})")
+            # can't be moved into a trampoline: the rewrite can replace it (new), but not be shadowed
+            print(f"  note: {va:08x} branches within its first 5 bytes ({ins.mnemonic} {ins.op_str}): new only, no shadow")
+            return bytes(exe[off:off + 5]), -2
         elif ins.mnemonic in ("ret", "retn") and len(code) + len(b) < 5:
+            # a function shorter than the jump: fine if what follows is the linker's alignment padding
+            # (int3 / nop), which nothing executes -- the trampoline copies the ret and the padding
+            end = len(code) + len(b)
+            rest = exe[off + end:off + size]           # to the next function: MSVC's padding is
+            ok = len(rest) >= 5 - end                   # int3, nop, lea esp,[esp], add eax,0
+            for pi in md.disasm(rest, va + end):
+                if not (pi.mnemonic in ("int3", "nop") or (pi.mnemonic == "lea" and pi.op_str.startswith("esp, [esp"))
+                        or (pi.mnemonic == "add" and pi.op_str == "eax, 0")):
+                    ok = False
+            if ok:
+                code += b + bytes(exe[off + end:off + 5])
+                break
             raise SystemExit(f"{va:08x}: returns within its first 5 bytes -- too short to hook")
         code += b
         if len(code) >= 5:
