@@ -403,7 +403,8 @@ static int peak_textures() {                                    // entries in us
 // don't overlap can't be touching, and the collision routines return without effect when they aren't
 // (collide_sphere_sphere: `cmp overlap, 0; jle exit`), so the result is the same, faster.
 // Bounds come from each volume's own GetExtents (vtable +0x18); a volume without one (the base class's
-// stub, 0x436080) makes its object unbounded, and an unbounded object is paired with everything.
+// stub, 0x436080) or a tube (whose GetExtents can undershoot) makes its object unbounded, and an unbounded
+// object is paired with everything.
 typedef char(__fastcall* VBool_t)(void* self, void* edx);
 typedef void(__fastcall* VVoid_t)(void* self, void* edx);
 typedef void(__fastcall* VCollide_t)(void* self, void* edx, void* other);
@@ -429,6 +430,10 @@ static bool phob_box(void* p, Box& b) {
     for (int k = 0; k < phob_nvol(p); k++) {
         void* v = phob_vol(p, k);
         if (!v || VSLOT(v, 0x18) == (void*)G.getextents_stub) { b.bounded = false; return false; }
+        // A tube's GetExtents isn't a bounding box: it takes the minimum from one end cap and the maximum
+        // from the other, which for some orientations is smaller than the tube (found porting it in M3).
+        // Tubes (tag 'TUBE') are paired with everything, as the original's all-pairs loop does.
+        if (*(uint32_t*)((uint8_t*)v + 0x14) == 0x54554245u) { b.bounded = false; return false; }
         float mn[3], mx[3];
         ((VExtents_t)VSLOT(v, 0x18))(v, 0, mn, mx);
         for (int a = 0; a < 3; a++) {

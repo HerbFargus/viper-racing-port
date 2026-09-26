@@ -6,6 +6,8 @@
 //   default=new                 ; new | original | shadow -- for every function without its own line
 //   Obstacle::Update=shadow     ; one function's own switch, by its name in the map
 //   shadow_every=1              ; shadow: check every Nth call (1 = every call)
+//   shadow_per_tick=4           ; and at most this many checks of each function per physics tick (0 = no limit),
+//                               ; so the cost stays bounded however many functions are in shadow mode
 //
 //   new       the rewrite runs in place of the original
 //   original  the original runs; the rewrite is never called
@@ -34,6 +36,7 @@ struct Footprint {
     Region r[MAX];
     int n = 0;
     const char* replay_only = 0;                            // set: no shadow check; the replay checks it
+    bool pure = false;                                      // set: touches only its footprint -- no globals
     void add(void* p, uint32_t bytes, const char* what);   // a plain block
     void object(void* obj, const char* what = "this");     // a game object, sized by its class (vtable)
 };
@@ -49,6 +52,7 @@ struct PortFn {
     void* orig = 0;                   // trampoline to the original, once installed (v1.0)
     PortMode mode = PORT_NEW;
     volatile long calls = 0, checks = 0, mismatches = 0;
+    int budget_tick = -1, budget_used = 0;         // shadow_per_tick bookkeeping
     PortFn(uint32_t v, const char* nm, void* r, void* s, const uint8_t* op = 0, uint8_t ol = 0);
 };
 
@@ -107,10 +111,18 @@ VP_SHADOW_CC(__stdcall)
 // PORT_FN_BUILDS(..., prologue, len) also names the first bytes to expect on the race.bin builds.
 #define VP_CAT2(a, b) a##b
 #define VP_CAT(a, b) VP_CAT2(a, b)
+#ifdef VP_FUZZ
+// test/fuzz.cpp: the same rewrites, compiled into a test program that runs each pure one against the
+// original on random inputs, outside the game (test/fuzz.h)
+#include "../test/fuzz.h"
 #define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
-    extern PortFn VP_CAT(port_, NEW);                                                                    \
-    PortFn VP_CAT(port_, NEW)(V10, NAME, (void*)&NEW,                                                    \
-        (void*)&Shadow<decltype(&NEW)>::call<&VP_CAT(port_, NEW), &NEW, &FP>, PRO, PROLEN);
+    static FuzzReg VP_CAT(fuzz_, NEW)(V10, NAME, &Fuzz<decltype(&NEW)>::run<&NEW, &FP>);
+#else
+#define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
+    namespace { extern PortFn VP_CAT(port_, NEW); }   /* file-local: rewrites in different files */     \
+    namespace { PortFn VP_CAT(port_, NEW)(V10, NAME, (void*)&NEW,                                                \
+        (void*)&Shadow<decltype(&NEW)>::call<&VP_CAT(port_, NEW), &NEW, &FP>, PRO, PROLEN); }
+#endif
 #define PORT_FN(V10, NAME, NEW, FP) PORT_FN_BUILDS(V10, NAME, NEW, FP, 0, 0)
 
 // ---- the framework ----------------------------------------------------------------------------------------

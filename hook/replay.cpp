@@ -23,7 +23,7 @@
 //
 //   [replay]
 //   record=1                   ; record every race (and its trace) to replays\ beside the DLL
-//   play=20260926-153012       ; instead, replay this recording in the next race
+//   play=20260926-153012       ; instead, replay this recording in the next race (just that one)
 //   label=original             ; this run's trace: replays\<play>.<label>.trace
 //   dump_ticks=1200,1201       ; also write whole objects at these ticks to <trace>.dump (tick 0 always)
 //
@@ -296,6 +296,10 @@ static void finish(const char* why) {
         logf("replay: recorded %s: %u updates, %u ticks (%s)", g_name, g_updates, g_ticks, why);
     }
     g_active = g_playing = false;
+    if (g_play[0]) {                                   // a replay drives one race; later races are the player's
+        logf("replay: done with %s -- the next races are yours (restart the game to replay it again)", g_play);
+        g_play[0] = 0;
+    }
 }
 
 static void __cdecl h_PhysTaskBegin(void* stream) {

@@ -256,7 +256,7 @@ static void install_outputs() {
 //   3. compare the rewrite's results with the original's; restore the original's; make its outputs
 // so the game always continues exactly as if only the original had run.
 struct Span { uint8_t* p; uint32_t n; int kind; int index; };   // kind 0 footprint, 1 global, 2 heap block
-static int g_shadow_every = 1;
+static int g_shadow_every = 1, g_shadow_per_tick = 4;
 static bool g_shadow_on;
 static __declspec(thread) int t_depth;
 static __declspec(thread) Footprint* t_fp;
@@ -274,6 +274,12 @@ bool shadow_on() { return g_shadow_on; }
 bool shadow_begin(PortFn* f) {
     LONG n = InterlockedIncrement(&f->calls);
     if (t_depth > 0 || (n - 1) % g_shadow_every) return false;
+    if (g_shadow_per_tick) {                           // a budget per function per physics tick
+        int tick = *(volatile int*)0x0052161c;         // physics_tick
+        if (tick != f->budget_tick) { f->budget_tick = tick; f->budget_used = 0; }
+        if (f->budget_used >= g_shadow_per_tick) return false;
+        f->budget_used++;
+    }
     if (!t_fp) {
         t_fp = new Footprint;
         t_spans = new std::vector<Span>;
@@ -285,6 +291,7 @@ bool shadow_begin(PortFn* f) {
     t_depth++;
     t_fp->n = 0;
     t_fp->replay_only = 0;
+    t_fp->pure = false;
     return true;
 }
 
@@ -336,10 +343,12 @@ void shadow_snapshot() {
     std::vector<Span>& sp = *t_spans;
     sp.clear();
     for (int i = 0; i < t_fp->n; i++) sp.push_back({(uint8_t*)t_fp->r[i].p, t_fp->r[i].n, 0, i});
-    for (int i = 0; i < (int)(sizeof k_globals / sizeof k_globals[0]); i++)
-        sp.push_back({(uint8_t*)k_globals[i].va, k_globals[i].size, 1, i});
-    for (int i = 0; i < (int)(sizeof k_heap_blocks / sizeof k_heap_blocks[0]); i++)
-        if (uint8_t* p = *(uint8_t**)k_heap_blocks[i].ptr_global) sp.push_back({p, k_heap_blocks[i].bytes, 2, i});
+    if (!t_fp->pure) {                                  // a pure function (maths) changes no globals
+        for (int i = 0; i < (int)(sizeof k_globals / sizeof k_globals[0]); i++)
+            sp.push_back({(uint8_t*)k_globals[i].va, k_globals[i].size, 1, i});
+        for (int i = 0; i < (int)(sizeof k_heap_blocks / sizeof k_heap_blocks[0]); i++)
+            if (uint8_t* p = *(uint8_t**)k_heap_blocks[i].ptr_global) sp.push_back({p, k_heap_blocks[i].bytes, 2, i});
+    }
     save(*t_before);
     t_out[OUT_NEW]->clear();
     t_out[OUT_ORIG]->clear();
@@ -456,6 +465,8 @@ void port_install(const char* ini) {
     PortMode dflt = parse_mode(buf, PORT_NEW);
     g_shadow_every = GetPrivateProfileIntA("port", "shadow_every", 1, ini);
     if (g_shadow_every < 1) g_shadow_every = 1;
+    g_shadow_per_tick = GetPrivateProfileIntA("port", "shadow_per_tick", 4, ini);
+    if (g_shadow_per_tick < 0) g_shadow_per_tick = 0;
     int on = 0;
     for (PortFn* f : registry()) {
         GetPrivateProfileStringA("port", f->name, "", buf, sizeof buf, ini);
@@ -476,7 +487,7 @@ void port_install(const char* ini) {
         }
         on++;
         logf("port: %s -- %s%s", f->name, mode_name(f->mode),
-             f->mode == PORT_SHADOW && g_shadow_every > 1 ? " (every Nth call checked, per shadow_every)" : "");
+             f->mode == PORT_SHADOW ? " (sampled: shadow_every, shadow_per_tick)" : "");
     }
     logf("port: %d of %d rewritten functions in force; shadow checks save %u bytes of physics and AI globals",
          on, (int)registry().size(), g_globals_bytes);

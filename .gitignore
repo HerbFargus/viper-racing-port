@@ -9,3 +9,4 @@ __pycache__/
 *.lib
 *.exp
 *.obj
+test/build/

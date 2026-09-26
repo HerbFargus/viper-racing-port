@@ -43,6 +43,19 @@ for bit, and that is the bar. Two checks enforce it (`hook/port.h`, `port.cpp`, 
   recording live and logs the first tick where they part, and `tools/trace_diff.py` compares any two
   runs, field by field at the ticks `dump_ticks` names (tick 0 is always dumped).
 
+A third check runs outside the game: `test/fuzz.exe` (`test/build_fuzz.bat`) loads the v1.0 `race.exe`'s
+code at its own address, puts the FPU in the physics thread's single precision, and runs every rewrite
+whose footprint is pure against its original on millions of random inputs, NaN, infinity, denormals and
+overlapping arguments included.
+
+The rewrites so far (`hook/phys_*.cpp`, layouts in `hook/phys_types.h`): the physics library's maths
+helpers, every collision volume (sphere, cube, sphere group, moveable sphere, cylinder, tube, box), the
+pairwise collision tests, and `collide.obj`'s collision response, water and static objects -- 73
+functions, each checked in game in shadow mode or, where the game never reaches it, offline. The rules
+that make bit-for-bit possible are in `hook/x87.h`: the same grouping of every sum; a value the original
+keeps in an x87 register is a double, one it stores is a float; each comparison keeps the original's NaN
+behaviour; each constant keeps its width.
+
 `tools/gen_port_tables.py` generates what the DLL needs: the original instructions at every hooked
 address (for trampolines), the physics classes and their named fields, and the statics of the physics
 and AI object files, attributed by which file's code uses each address, with the input code and the
@@ -51,9 +64,11 @@ main thread's buffers left out.
 ## Layout
 
 - `hook/` — the DLL: `viperport.cpp` (M1 and install), `port.cpp` (M3's rewrites and shadow checks),
+  `phys_*.cpp` (the rewritten physics),
   `replay.cpp` (the race recorder), `platform.cpp` (window and input), `ddraw_gl.cpp` (renderer),
   `dsound_sdl.cpp` (audio); `build.bat` builds it (Visual Studio Build Tools,
   SDL2 2.32 in `../sdl2`).
 - `tools/` — the analysis: linker-map extraction, the function inventory, cross-build matching
   (`match_builds.py`, `propagate.py`, `port_sites.py`), type recovery for Ghidra (`recover_types.py`,
-  `type_names.py`, `names/`, `ApplyTypes.java`), generators (`gen_com_base.py`, `gen_texture_table.py`, `gen_port_tables.py`), and `trace_diff.py`.
+  `type_names.py`, `names/`, `ApplyTypes.java`), generators (`gen_com_base.py`, `gen_texture_table.py`, `gen_port_tables.py`), `trace_diff.py`, and `disasm.py` (disassembly with every constant's value and width).
+- `test/` — the offline fuzzer for pure rewrites (`fuzz.cpp`, `fuzz.h`, `build_fuzz.bat`) and a per-file compile check.
