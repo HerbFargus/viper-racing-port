@@ -48,7 +48,7 @@ code at its own address, puts the FPU in the physics thread's single precision, 
 whose footprint is pure against its original on millions of random inputs, NaN, infinity, denormals and
 overlapping arguments included.
 
-The rewrites so far (`hook/phys_*.cpp`, layouts in `hook/phys_types.h`), 380 functions:
+The rewrites so far (`hook/phys_*.cpp`, layouts in `hook/phys_types.h`), 668 functions:
 - **3.2, collisions:** the physics library's maths helpers, every collision volume (sphere, cube, sphere
   group, moveable sphere, cylinder, tube, box), the pairwise collision tests, and `collide.obj`'s crash
   reports, water and static objects.
@@ -59,6 +59,11 @@ The rewrites so far (`hook/phys_*.cpp`, layouts in `hook/phys_types.h`), 380 fun
   packets), the rigid body (`PhobDyno::Update`), ground contact, obstacles, wobbles, balls and
   checkpoints, the player's car and the input side (driver filtering, the control mapping), and the race
   logic (laps, positions, the start, drag races).
+- **3.5, the AI:** the AI car (chasing its rabbit point along the racing line, lap-time rubber-banding,
+  passing, head-on panic, the stranded-car teleport, learning its driving notes), the racing line and
+  centre line, the driver personalities and the driver lounge (`drivers.res`), which cars are near which,
+  and the ghost-car viewer's logic. The known AI crash is reproduced as the original has it; the fix comes
+  as its own step.
 
 A rewrite replaces only the exact stock v1.0 function it was written from: before anything is patched,
 the DLL fingerprints each function's code and the read-only constants it reads (`hook/stock.inc`), and
@@ -75,7 +80,7 @@ function this way is written up in `docs/PORTING.md`. The rules that make bit fo
 - constants keep their width, and aren't folded at compile time.
 
 `test/world_*.cpp` are world harnesses. Each loads the original code, builds real cars, wheels and
-drivetrains in memory, and compares the original against the rewrite on millions of random states.
+drivetrains, AI cars and racing lines in memory, and compares the original against the rewrite on millions of random states.
 
 `tools/gen_port_tables.py` generates what the DLL needs: the original instructions at every hooked
 address (for trampolines), the physics classes and their named fields, and the statics of the physics

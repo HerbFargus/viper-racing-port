@@ -97,7 +97,9 @@ def prologue(exe, secs, md, va: int, size: int) -> tuple[bytes, int]:
             except ValueError:
                 continue
             if va < t < va + len(code):
-                raise SystemExit(f"{va:08x}: {ins.address:08x} jumps into the first {len(code)} bytes")
+                # a loop back into the moved bytes: the trampoline can't run it, the rewrite can replace it
+                print(f"  note: {va:08x}: {ins.address:08x} jumps into the first {len(code)} bytes: new only, no shadow")
+                return bytes(exe[off:off + 5]), -2
     return code, rel
 
 

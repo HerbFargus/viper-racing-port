@@ -643,7 +643,7 @@ static void __fastcall PhobDyno_reset(PhobDyno* self, Edx) {
     for (uint32_t o = 0x288; o <= 0x2ac; o += 4) set_bits(d + o, 0);
     self->num_external_impulses = 0;
 }
-PORT_FN(0x00444b90, "PhobDyno::reset", PhobDyno_reset, fp_dyno_self)
+PORT_FN(0x00444b90, "PhobDyno::reset(private)", PhobDyno_reset, fp_dyno_self)
 
 // PhobDyno::ApplyForce(force, point) (0x444c20): unless |force|^2 is within FLT_EPSILON of 0, the force
 // and the torque (point - pos) x force are added
