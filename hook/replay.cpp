@@ -34,6 +34,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <vector>
+#include <intrin.h>
 #include "viperport.h"
 #include "port.h"
 
@@ -75,6 +76,22 @@ static long g_races_recorded;
 
 static bool on_physics_thread() { return g_active && GetCurrentThreadId() == g_physics_thread; }
 
+// The pause flag is an input: each update's is recorded and fed back. But the game sets it from the main thread
+// (the Esc menu, the P key, the switch-away pause in platform.cpp) at any moment, even in the middle of an update,
+// which then reads it two ways (whether to run, whether to count the tick) while the stream holds the one it saw
+// on the way in. So in a recorded race a main-thread pause or unpause waits for the next update and is taken there,
+// before it's recorded (PhysicsIsPaused tells the game at once); in a replay the recording's flag stands, and the
+// game's requests are left out -- until the replay stops feeding, when the game's own last one is taken (else
+// the race is left as the recording ended it, usually paused by its Esc menu, and the game shows its pause icon).
+static volatile LONG g_pause_wanted = -1;             // a main-thread pause (1) or unpause (0) for the next update
+static LONG g_game_wanted = -1;                       // replay: the game's own last request, left out while feeding
+static unsigned g_pauses_left_out;
+
+static void take_pause_wanted() {
+    LONG w = InterlockedExchange(&g_pause_wanted, -1);
+    if (w >= 0) *PHYSICS_PAUSED = (uint8_t)w;
+}
+
 
 // ---- the stream -----------------------------------------------------------------------------------------
 static void put(Kind k, const void* p, size_t n) {
@@ -85,6 +102,7 @@ static void put(Kind k, const void* p, size_t n) {
 static void stop_playing(const char* why) {
     if (!g_playing) return;
     g_playing = false;
+    if (g_game_wanted >= 0) InterlockedExchange(&g_pause_wanted, g_game_wanted);   // taken at the next update
     logf("replay: stopped feeding %s at update %u, tick %u: %s -- the player drives from here", g_play, g_updates, g_ticks, why);
 }
 
@@ -270,6 +288,7 @@ static void begin_race() {
         _snprintf(out, sizeof out, "%s.%s", g_play, g_label);
         open_trace(out);
         g_playing = g_active = true;
+        g_game_wanted = -1;
         logf("replay: playing %s (%u bytes; its trace has %u ticks) -> %s.trace", g_play, (unsigned)g_in.size(),
              (unsigned)g_ref.size(), out);
     } else if (g_record) {
@@ -301,6 +320,8 @@ static void finish(const char* why) {
     } else {
         logf("replay: recorded %s: %u updates, %u ticks (%s)", g_name, g_updates, g_ticks, why);
     }
+    if (g_playing && g_game_wanted >= 0) g_pause_wanted = g_game_wanted;   // a replay: the game's own, as it ends
+    take_pause_wanted();                               // a pause asked for as the race ended
     g_active = g_playing = false;
     if (g_play[0]) {                                   // a replay drives one race; later races are the player's
         logf("replay: done with %s -- the next races are yours (restart the game to replay it again)", g_play);
@@ -332,12 +353,38 @@ static void __cdecl h_PhysTaskRestart(void) {
 static void __cdecl h_PhysTaskUpdate(void) {
     g_physics_thread_id = GetCurrentThreadId();          // for shadow checks (port.h), race or not
     if (on_physics_thread()) {
+        take_pause_wanted();
         uint8_t paused = *PHYSICS_PAUSED;
         if (g_stream) put(K_UPDATE, &paused, 1);
         else if (take(K_UPDATE, &paused, 1)) *PHYSICS_PAUSED = paused;
         g_updates++;
     }
     o_PhysTaskUpdate();
+}
+
+static Void_t o_PhysicsPause, o_PhysicsUnpause;
+static unsigned char(__cdecl* o_PhysicsIsPaused)(void);
+
+// true when the request is handled here (waiting for the next update, or left out of a replay)
+static bool pause_request(LONG want, void* from) {
+    if (!g_active || GetCurrentThreadId() == g_physics_thread) return false;
+    if (g_playing) {
+        g_game_wanted = want;
+        if (g_pauses_left_out++ < 8)
+            logf("replay: the game asked to %s the physics during the replay (from %p) -- the recording's pause stands",
+                 want ? "pause" : "unpause", from);
+        return true;
+    }
+    if (!g_stream) return false;                         // a replay that stopped feeding: the player's race
+    InterlockedExchange(&g_pause_wanted, want);
+    return true;
+}
+static void __cdecl h_PhysicsPause(void) { if (!pause_request(1, _ReturnAddress())) o_PhysicsPause(); }
+static void __cdecl h_PhysicsUnpause(void) { if (!pause_request(0, _ReturnAddress())) o_PhysicsUnpause(); }
+static unsigned char __cdecl h_PhysicsIsPaused(void) {
+    LONG w = g_pause_wanted;
+    if (w >= 0 && GetCurrentThreadId() != g_physics_thread) return (unsigned char)w;
+    return o_PhysicsIsPaused();
 }
 
 static void __cdecl h_update_phobs(void) {
@@ -476,6 +523,9 @@ void replay_install(const char* ini) {
         {0x004274d0, (void*)h_update_phobs, (void**)&o_update_phobs, "update_phobs", true},
         {0x00428c30, (void*)h_GetTicks, (void**)&o_GetTicks, "TimerConditioner::GetTicks", true},
         {0x0041b6b0, (void*)h_Randomize, (void**)&o_Randomize, "Randomize", true},
+        {0x0042bcc0, (void*)h_PhysicsPause, (void**)&o_PhysicsPause, "PhysicsPause", true},
+        {0x0042bcf0, (void*)h_PhysicsUnpause, (void**)&o_PhysicsUnpause, "PhysicsUnpause", true},
+        {0x0042bd20, (void*)h_PhysicsIsPaused, (void**)&o_PhysicsIsPaused, "PhysicsIsPaused", true},
         {0x0041b6e0, (void*)h_Random, (void**)&o_Random, "Random"},
         {0x0042bc80, (void*)h_PhysicsGetTime, (void**)&o_PhysicsGetTime, "PhysicsGetTime"},
         {0x00441df0, (void*)h_DriverGetSteering, (void**)&o_DriverGetSteering, "DriverGetSteering"},
@@ -501,7 +551,7 @@ void replay_install(const char* ini) {
         // detour(0x00428c30) detour(0x0041b6e0) detour(0x00441df0) detour(0x00441e60) detour(0x00441e70)
         // detour(0x00441e80) detour(0x00441ec0) detour(0x00441ed0) detour(0x00441ef0) detour(0x00441f00)
         // detour(0x00441f10) detour(0x00441f20) detour(0x00441f30) detour(0x00441f40) detour(0x00441f50)
-        // detour(0x0041b6b0) detour(0x0042bc80)
+        // detour(0x0041b6b0) detour(0x0042bc80) detour(0x0042bcc0) detour(0x0042bcf0) detour(0x0042bd20)
         *h.orig = detour_front(h.v10, h.to, h.what);     // in front of the rewrite, where there is one
         ok += *h.orig != 0;
     }

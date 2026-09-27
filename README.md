@@ -91,9 +91,13 @@ That is the whole physics and AI code, apart from the debug screens' drawing.
   bitmaps and the debug dashboards (`gx_2d`); models, lighting, the camera and the deferred surfaces
   (`gx_model`, which now carries M1's texture-bucket lift); the texture cache and texture loading
   (`gx_tex`); the DirectDraw and Direct3D layer, video modes and render state (`gx_dx`); and the world's
-  drawing (`wld_draw`). They still call DirectDraw and Direct3D, which land in the DLL's OpenGL
-  emulation; a later step has them call OpenGL directly. In a shadow check every DirectX call is recorded
-  and compared, so each frame's drawing is checked against the original's, call by call.
+  drawing (`wld_draw`). The thin wrappers the game keeps its DirectX objects in (dd.obj, `gx_dd`) call
+  the OpenGL renderer (`gl_core`) directly, and so do the draw calls in `gx_dx`. The original code, and
+  the race.bin builds, reach the same renderer through a DirectDraw / Direct3D facade (`ddraw_gl`), on
+  the same objects, so the game sees the same modes, capabilities and "16 meg card" either way. In a
+  shadow check every OpenGL call is recorded (`gl_table`) and compared, with the renderer's state, so
+  each frame's drawing is checked against the original's, call by call. `test/world_gx_dd.cpp` checks
+  the wrappers offline against the originals on the same renderer.
 
 Then a chosen set of the original's bugs is fixed, always on: the AI crash (a car losing its place on
 its racing line), degenerate racing lines, a ground-contact divide by zero, vrmod's obstacle wake, a single race on a
@@ -102,7 +106,8 @@ buffer overruns that long mod-car, driver and track names could trigger. A fix o
 where the original would crash, hang or overrun, so a race replays identically on the original code
 until one of those comes up. The AI crash is the one that comes up in ordinary racing (after the
 stranded-car teleport), so a recording can part from the original there. They are listed in
-`docs/FIXES.md`. A `race.exe` carrying vrmod's two engine fixes is recognised, and the rewrites, which
+`docs/FIXES.md`. Switching away from a single-player race (Alt-Tab) pauses it, where the original's
+physics carried on unseen; the sound goes quiet while away, as DirectSound's did. A `race.exe` carrying vrmod's two engine fixes is recognised, and the rewrites, which
 fix the same bugs, replace them.
 
 A rewrite replaces only the exact stock v1.0 function it was written from: before anything is patched,
@@ -132,7 +137,8 @@ main thread's buffers left out.
 
 - `hook/` — the DLL: `viperport.cpp` (M1 and install), `port.cpp` (M3's rewrites and shadow checks),
   `phys_*.cpp` (the rewritten physics),
-  `replay.cpp` (the race recorder), `platform.cpp` (window and input), `ddraw_gl.cpp` (renderer),
+  `replay.cpp` (the race recorder), `platform.cpp` (window and input), `gl_core.cpp` (the OpenGL
+  renderer, every GL call through `gl_table.cpp`), `ddraw_gl.cpp` (its DirectDraw / Direct3D facade),
   `dsound_sdl.cpp` (audio); `build.bat` builds it (Visual Studio Build Tools,
   SDL2 2.32 in `../sdl2`).
 - `tools/` — the analysis: linker-map extraction, the function inventory, cross-build matching

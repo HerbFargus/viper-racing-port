@@ -83,6 +83,7 @@ struct PortFn {
     volatile long raced = 0;          // differences while the physics thread dented a car's models: not counted
     int budget_tick = -1, budget_used = 0;         // shadow_per_tick bookkeeping
     bool patched = false;                          // the installed function isn't stock v1.0: left original
+    bool needs_renderer = false;                   // calls the OpenGL renderer directly (gx_dd.cpp): original without it
     PortFn(uint32_t v, const char* nm, void* r, void* s, const uint8_t* op = 0, uint8_t ol = 0);
 };
 
@@ -106,17 +107,29 @@ bool shadow_feed(uint8_t kind, void* v, size_t n);
 void shadow_saw(uint8_t kind, const void* v, size_t n);
 bool shadow_on();                              // is any function in shadow mode? (the input hooks are needed)
 
-// DirectDraw / Direct3D calls into the emulation (ddraw_gl.cpp) during a check, on this thread:
-// shadow_com_phase() is 0 outside a check's passes (or while an output runs), 1 in the original's pass
-// (calls run live), 2 in the rewrite's pass (effects are recorded, not made). shadow_com_effect records an
-// effect call -- its arguments, and the data they point at (hashed past 64 bytes) -- in the pass's output
-// log, which the check compares like its other outputs; the original's calls have already been made, so
-// they aren't made again afterwards. shadow_com_check() counts checks (the emulation keys its per-check
-// Lock snapshots to it).
+// The renderer during a check, on this thread (gl_table.h, gl_core.h): shadow_com_phase() is 0 outside a check's
+// passes (or while an output runs), 1 in the original's pass (OpenGL calls are made), 2 in the rewrite's pass
+// (they're recorded, not made). shadow_com_effect records a call -- its arguments, and the data they point at
+// (hashed past 64 bytes) -- in the pass's output log, which the check compares like its other outputs; the
+// original's calls have already been made, so they aren't made again afterwards. shadow_com_check() counts
+// checks (the recorder keys what it queues for the rewrite's pass to it).
 int shadow_com_phase();
 void shadow_com_effect(uint16_t method, const void* self, const void* args, size_t nargs, const void* data = 0,
                        size_t ndata = 0);
 unsigned shadow_com_check();
+// The renderer's own state (gl_core.cpp) is part of what a check compares: saved as a pass changes it, put back
+// between the passes, compared after them, and left as the original's pass left it.
+struct ShadowState {
+    void (*begin)();                                // a check starts
+    void (*after_original)();                       // keep the original's pass's results; put back the start
+    bool (*differs)(char* where, size_t n);         // after the rewrite's pass: does it differ? (where: what)
+    void (*end)(bool original_only);                // the check is over: the original's results stand
+    const char* (*record_name)(uint16_t method);    // an output log's call, by name (0 if not the renderer's)
+};
+void shadow_set_state(const ShadowState* s);
+// this pass did something a check can't do twice (start the renderer): in the original's pass, its result stands
+// and the rewrite isn't run (as when it allocates); in the rewrite's pass, it's a mismatch
+void shadow_keep_original(const char* what);
 // the physics thread (set by the recorder's PhysTaskUpdate hook, installed whenever shadow checks are on).
 // A check made on another thread -- the main thread's input code -- doesn't save or restore the physics
 // globals, which the physics thread is using at that moment: its footprint lists what it writes.
@@ -172,6 +185,16 @@ VP_SHADOW_CC(__stdcall)
         (void*)&Shadow<decltype(&NEW)>::call<&VP_CAT(port_, NEW), &NEW, &FP>, PRO, PROLEN); }
 #endif
 #define PORT_FN(V10, NAME, NEW, FP) PORT_FN_BUILDS(V10, NAME, NEW, FP, 0, 0)
+// PORT_FN_GL: a rewrite that calls the OpenGL renderer directly (gl_core.h); with the game's own DirectDraw it
+// stays original (port_install). A harness defines VP_PORT_NEEDS_RENDERER(NEW) as nothing.
+#ifndef VP_PORT_NEEDS_RENDERER
+#ifdef VP_FUZZ
+#define VP_PORT_NEEDS_RENDERER(NEW)
+#else
+#define VP_PORT_NEEDS_RENDERER(NEW) namespace { const bool VP_CAT(needs_gl_, NEW) = (VP_CAT(port_, NEW).needs_renderer = true); }
+#endif
+#endif
+#define PORT_FN_GL(V10, NAME, NEW, FP) PORT_FN(V10, NAME, NEW, FP) VP_PORT_NEEDS_RENDERER(NEW)
 
 // ---- the framework ----------------------------------------------------------------------------------------
 void port_check_stock();                       // before anything is patched: find non-stock functions

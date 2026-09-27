@@ -32,10 +32,15 @@ typedef void(__cdecl* U32U8_t)(unsigned, unsigned char);
 typedef void(__cdecl* Void_t)(void);
 typedef void(__cdecl* MouseQueue_t)(int type, int x, int y, int state);
 typedef unsigned char(__cdecl* MsgHook_t)(unsigned msg, int wparam, int lparam);
+typedef unsigned char(__cdecl* U8_t)(void);
 
 U32_t KeyDown, KeyUp;
 U32U8_t KeyQueueChar, KeyQueueMetaChar;
 Void_t KeyClearBits, gxRestore;
+Void_t PhysicsPause, PhysicsUnpause;                             // the race stands still while switched away (FIX)
+U8_t PhysicsIsPaused, MultiEnabled;
+uint32_t g_phys_state;                                           // physics.obj's task state: 3 while a race runs
+bool g_away_paused;                                              // we paused the race; we unpause it
 MouseQueue_t MouseQueueEvent;
 struct {
     uint32_t hwnd, prev_foreground, inactive, hooks, title, class_name;   // win32.obj
@@ -121,7 +126,25 @@ static LRESULT CALLBACK game_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
     if (msg == WM_ACTIVATEAPP) {
         bool active = wparam != 0;
         if (active) g_n_activations++;
+        // (the physics clock: the original's physics runs on its own timer, so a race carries on while away)
+        int tick = *(volatile int*)0x0052161c;
+        if (!active) logf("platform: switched away (physics tick %d)", tick);
+        else if (*(uint8_t*)G.inactive) logf("platform: switched back (physics tick %d)", tick);
         *(uint8_t*)G.inactive = active ? 0 : 1;
+        // FIX: the original's physics runs on its own timer, so a race carried on unseen while the game was away.
+        // A single-player race now pauses as the Esc menu pauses it (never a network race, which can't wait); the
+        // unpause resynchronises the physics clock, so nothing is caught up on the way back.
+        if (PhysicsPause && PhysicsUnpause && PhysicsIsPaused && MultiEnabled && g_phys_state) {
+            if (!active && !g_away_paused && *(volatile int32_t*)g_phys_state == 3 && !MultiEnabled() &&
+                !PhysicsIsPaused()) {
+                PhysicsPause();
+                g_away_paused = true;
+                logf("platform: the race is paused while the game is away");
+            } else if (active && g_away_paused) {
+                PhysicsUnpause();
+                g_away_paused = false;
+            }
+        }
         clip_cursor(active);
         if (active && g_gl && g_window) SDL_RaiseWindow(g_window);
     }
@@ -269,7 +292,10 @@ void scan_update() {                                             // ScanUpdate: 
 void __cdecl sdl_idle(void) {                                    // Win32Idle
     SDL_Event e;
     if (*(uint8_t*)G.inactive) {                                 // switched away: wait to be switched back
+        DWORD t0 = GetTickCount();
+        if (g_gl) gfx_repaint();                                 // the taskbar's preview: the race, not a menu
         while (*(uint8_t*)G.inactive && SDL_WaitEvent(&e)) handle(e);
+        logf("platform: the game loop waited %lu ms while switched away", GetTickCount() - t0);
         KeyClearBits();
         gxRestore();
     }
@@ -413,6 +439,14 @@ void platform_set_view(int x0, int y0, int w, int h, int game_w, int game_h) {
 }
 
 // ---- switching it on -------------------------------------------------------------------------------------
+bool platform_switched_away() { return G.inactive && *(volatile uint8_t*)G.inactive; }
+
+bool platform_plans_gl(const char* ini) {
+    char renderer[16];
+    GetPrivateProfileStringA("platform", "renderer", "ddraw", renderer, sizeof renderer, ini);
+    return GetPrivateProfileIntA("platform", "sdl", 0, ini) && _stricmp(renderer, "gl") == 0 && LoadLibraryA("SDL2.dll");
+}
+
 void platform_install(const char* build) {
     char ini[MAX_PATH];
     HMODULE self = 0;
@@ -439,6 +473,11 @@ void platform_install(const char* build) {
     KeyClearBits = (Void_t)A(0x00413ec0);
     gxRestore = (Void_t)A(0x0044df00);
     MouseQueueEvent = (MouseQueue_t)A(0x00414530);
+    PhysicsPause = (Void_t)A(0x0042bcc0);                        // (optional: without them a switch doesn't pause)
+    PhysicsUnpause = (Void_t)A(0x0042bcf0);
+    PhysicsIsPaused = (U8_t)A(0x0042bd20);
+    MultiEnabled = (U8_t)A(0x004a23c0);
+    g_phys_state = A(0x004ecf88);
     G.hwnd = A(0x004e5eac);
     G.prev_foreground = A(0x004e5eb0);
     G.inactive = A(0x004e5ec0);
@@ -503,6 +542,9 @@ void platform_install(const char* build) {
         logf("platform: joysticks stay on DirectInput in %s (its joystick code isn't v1.0's)", build);
     logf("platform: SDL2 window, keyboard and mouse%s", joy ? ", joystick" : "");
     if (g_gl && !renderer_install()) g_gl = false;               // M2 stage 2: OpenGL in place of DirectDraw
+    if (!g_gl && platform_plans_gl(ini))
+        logf("platform: the OpenGL renderer isn't on after all, but the dd.obj rewrites expect it: set [port] "
+             "default=original for dd.obj's functions, or fix what the log says above");
     char audio[16];
     GetPrivateProfileStringA("platform", "audio", "dsound", audio, sizeof audio, ini);
     if (_stricmp(audio, "sdl") == 0) audio_install();            // M2 stage 3: SDL audio in place of DirectSound

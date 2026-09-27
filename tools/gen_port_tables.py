@@ -51,7 +51,7 @@ def file_off(secs, va: int) -> int:
 
 # ---- prologues ------------------------------------------------------------------------------------------
 def hooked_addresses() -> list[int]:
-    pat = re.compile(r"\b(?:PORT_FN|PORT_FN_BUILDS|detour)\(\s*(0x[0-9a-fA-F]+)")
+    pat = re.compile(r"\b(?:PORT_FN|PORT_FN_GL|PORT_FN_BUILDS|detour)\(\s*(0x[0-9a-fA-F]+)")
     found = set()
     for f in sorted(HOOK.glob("*.cpp")):
         for m in pat.finditer(f.read_text(encoding="utf-8")):
@@ -119,7 +119,7 @@ def fnv(data: bytes, h: int = 2166136261) -> int:
 
 
 def port_fn_addresses() -> list[int]:
-    pat = re.compile(r"\bPORT_FN(?:_BUILDS)?\(\s*(0x[0-9a-fA-F]+)")
+    pat = re.compile(r"\bPORT_FN(?:_BUILDS|_GL)?\(\s*(0x[0-9a-fA-F]+)")
     found = set()
     for f in sorted(HOOK.glob("*.cpp")):
         for m in pat.finditer(f.read_text(encoding="utf-8")):
@@ -376,7 +376,7 @@ def check_m1_operands(sizes):
     src = "".join((HOOK / f).read_text(encoding="utf-8") for f in ("viperport.cpp", "texture_table_fields.inc", "res_table_fields.inc"))
     operands = sorted({int(at, 16) + int(off) for at, off in re.findall(r"\{\s*(0x[0-9a-fA-F]{6,8}),\s*(\d+),", src)})
     texts = {f: f.read_text(encoding="utf-8") for f in HOOK.glob("*.cpp") if f.name != "viperport.cpp"}
-    pat = re.compile(r"\bPORT_FN(?:_BUILDS)?\(\s*(0x[0-9a-fA-F]+)")
+    pat = re.compile(r"\bPORT_FN(?:_BUILDS|_GL)?\(\s*(0x[0-9a-fA-F]+)")
     missing = []
     for f, t in texts.items():
         for m in pat.finditer(t):

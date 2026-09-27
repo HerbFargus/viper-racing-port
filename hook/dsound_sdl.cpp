@@ -39,6 +39,7 @@ struct Buffer : Base_IDirectSoundBuffer {
     std::atomic<bool> playing{false};
     SDL_AudioDeviceID dev = 0;
     uint32_t lead = 0;                                           // write cursor distance ahead of play
+    bool global = false;                                         // DSBCAPS_GLOBALFOCUS: heard while switched away
 
     Buffer(bool is_primary, const WAVEFORMATEX* f) : primary(is_primary) {
         if (f) wfx = *f;
@@ -62,6 +63,9 @@ struct Buffer : Base_IDirectSoundBuffer {
             p = (p + n) % size;
         }
         b->play.store(p);
+        // DirectSound silenced an app's buffers while another app had the focus, unless a secondary asked for
+        // DSBCAPS_GLOBALFOCUS; they play on, cursors moving, unheard
+        if (!b->global && platform_switched_away()) memset(out, fill, len);
     }
 
     bool open() {
@@ -181,7 +185,9 @@ struct DirectSound : Base_IDirectSound {
         // the game passes the DirectX 5 DSBUFFERDESC (0x14 bytes, no 3D algorithm GUID)
         bool primary = (d->dwFlags & DSBCAPS_PRIMARYBUFFER) != 0;
         if (!primary && d->lpwfxFormat && d->lpwfxFormat->wFormatTag != WAVE_FORMAT_PCM) return DSERR_BADFORMAT;
-        *out = new Buffer(primary, primary ? 0 : d->lpwfxFormat);
+        Buffer* b = new Buffer(primary, primary ? 0 : d->lpwfxFormat);
+        b->global = !primary && (d->dwFlags & DSBCAPS_GLOBALFOCUS);
+        *out = b;
         return DS_OK;
     }
 };

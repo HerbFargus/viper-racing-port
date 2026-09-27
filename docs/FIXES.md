@@ -133,6 +133,19 @@ dozen places and the game dies.
 - `CarObject::DrawWheel`: a wheel detail level above 2 in a car's `L.tab` draws the lowest-detail wheel
   instead of a garbage model handle.
 
+## Switching away
+
+- Alt-Tab during a race: the original stops drawing and reading keys while it's away, but its physics
+  runs on its own timer thread, so the race carried on unseen and the player came back to a crashed or
+  beaten car. A single-player race now pauses as the Esc menu pauses it (`PhysicsPause`), and unpauses
+  on the way back; the unpause resynchronises the physics clock, so nothing is caught up in a burst. A
+  network race still runs on, as it must. (`platform.cpp`, `WM_ACTIVATEAPP`.)
+- The sound going quiet while away is not a fix: DirectSound silenced an app's buffers while another app
+  had the focus, and the emulation does the same.
+- The taskbar's preview showed the last menu instead of the race: a full-screen window's frames bypass
+  the desktop's compositor, so it kept whatever it last composited. The race's picture is shown once more
+  when the game starts waiting, by which time the window is composited. (Cosmetic; `gfx::repaint`.)
+
 ## Limits lifted
 
 Like M1's limits, these move a table into the DLL for the original code and the rewrites alike, so

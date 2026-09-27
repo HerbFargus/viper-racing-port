@@ -363,7 +363,14 @@ typedef void(__cdecl* MemFree_t)(void*);
 static MemAlloc_t o_mem_alloc;
 static MemFree_t o_mem_free;
 static __declspec(thread) uint8_t t_heap;             // 1: the original's pass allocated or freed; 2: the rewrite's
+static __declspec(thread) const char* t_keep_what;    // what the rewrite's pass did that it can't (shadow_keep_original)
 static void note_heap() { t_heap |= t_out_phase == OUT_ORIG ? 1 : t_out_phase == OUT_NEW ? 2 : 0; }
+static const ShadowState* g_state;
+void shadow_set_state(const ShadowState* s) { g_state = s; }
+void shadow_keep_original(const char* what) {
+    if (t_out_phase == OUT_NEW && !t_keep_what) t_keep_what = what;
+    note_heap();
+}
 static void* __cdecl heap_alloc(int n) { note_heap(); return o_mem_alloc(n); }
 static void __cdecl heap_free(void* p) { note_heap(); o_mem_free(p); }
 
@@ -519,7 +526,9 @@ void shadow_snapshot() {
     t_input_problem = 0;
     t_com_checks++;
     t_heap = 0;
+    t_keep_what = 0;
     t_dents_at = g_dents;
+    if (g_state) g_state->begin();
     t_out_phase = OUT_ORIG;
 }
 
@@ -527,11 +536,13 @@ bool shadow_after_original(PortFn* f, const void* ret, size_t n) {
     t_out_phase = OUT_OFF;
     if (t_heap & 1) {
         InterlockedIncrement(&f->heap_skips);
+        if (g_state) g_state->end(true);
         run_outputs(*t_out[OUT_ORIG]);                 // its sounds and events, made once
         t_depth--;
         return false;
     }
     save(*t_after_orig);
+    if (g_state) g_state->after_original();
     t_ret_n = n < sizeof t_ret_orig ? n : sizeof t_ret_orig;
     if (ret) memcpy(t_ret_orig, ret, t_ret_n);
     restore(*t_before);
@@ -594,18 +605,39 @@ void shadow_finish(PortFn* f, const void* ret, size_t n) {
         differs = true;
     }
     if (!differs && (t_heap & 2)) {
-        _snprintf(where, sizeof where, "the heap: the rewrite allocated or freed memory, the original didn't");
+        if (t_keep_what) _snprintf(where, sizeof where, "the rewrite %s, the original didn't", t_keep_what);
+        else _snprintf(where, sizeof where, "the heap: the rewrite allocated or freed memory, the original didn't");
+        where[sizeof where - 1] = 0;
         differs = true;
     }
     if (!differs && *t_out[OUT_NEW] != *t_out[OUT_ORIG]) {
         std::vector<uint8_t>&a = *t_out[OUT_ORIG], &b = *t_out[OUT_NEW];
         size_t k = 0;
         while (k < a.size() && k < b.size() && a[k] == b[k]) k++;
-        _snprintf(where, sizeof where, "its outputs (sounds, replay events, DirectX calls): %u bytes of calls vs %u, first differing at byte %u",
-                  (unsigned)a.size(), (unsigned)b.size(), (unsigned)k);
+        // the call it falls in: records are [id][self: 4][bytes: u16][payload]; a renderer call's payload starts
+        // with its method
+        char call[80] = "";
+        const std::vector<uint8_t>& r = k < a.size() ? a : b;
+        for (size_t at = 0, nth = 0; at + 7 <= r.size(); nth++) {
+            uint16_t len;
+            memcpy(&len, &r[at + 5], 2);
+            if (k < at + 7 + len) {
+                uint16_t m = 0;
+                if (r[at] == OUT_COM && len >= 2) memcpy(&m, &r[at + 7], 2);
+                const char* nm = r[at] == OUT_COM && g_state && g_state->record_name ? g_state->record_name(m) : 0;
+                if (!nm) nm = r[at] == OUT_ADD_EVENT ? "a replay event" : r[at] == OUT_COM ? "a renderer call" : "a crash sound";
+                _snprintf(call, sizeof call, ", in output %u (%s)", (unsigned)nth, nm);
+                call[sizeof call - 1] = 0;
+                break;
+            }
+            at += 7 + len;
+        }
+        _snprintf(where, sizeof where, "its outputs (sounds, replay events, OpenGL calls): %u bytes of calls vs %u, first differing at byte %u%s",
+                  (unsigned)a.size(), (unsigned)b.size(), (unsigned)k, call);
         where[sizeof where - 1] = 0;
         differs = true;
     }
+    if (!differs && g_state && g_state->differs(where, sizeof where)) differs = true;
     if (differs && GetCurrentThreadId() != g_physics_thread_id && g_dents != t_dents_at) {
         InterlockedIncrement(&f->raced);             // a dent landed during the check: the passes saw different models
         differs = false;
@@ -620,6 +652,7 @@ void shadow_finish(PortFn* f, const void* ret, size_t n) {
         }
     }
     restore(*t_after_orig);                            // the game continues on the original's result
+    if (g_state) g_state->end(false);                  // and the renderer as the original's pass left it
     run_outputs(*t_out[OUT_ORIG]);                     // and its sounds and events, made once
     t_depth--;
 }
@@ -657,9 +690,13 @@ void port_install(const char* ini) {
     // 120 buckets, so they are always new, whatever the ini says (the rewrites read the bucket array from the
     // operands M1 patches, so without the lift they are the original exactly)
     static const char* const k_always_new[] = {"add_deferred_surf", "end_deferred_surfs", "draw_alpha_deferred_surfs"};
+    // the dd.obj rewrites work on the OpenGL renderer's objects: with the game's own DirectDraw they stay original
+    const bool gl = platform_plans_gl(ini);
+    int kept_for_ddraw = 0;
     for (PortFn* f : registry()) {
         GetPrivateProfileStringA("port", f->name, "", buf, sizeof buf, ini);
         f->mode = buf[0] ? parse_mode(buf, dflt) : dflt;
+        if (f->needs_renderer && !gl && f->mode != PORT_ORIGINAL) { f->mode = PORT_ORIGINAL; kept_for_ddraw++; continue; }
         for (const char* n : k_always_new)
             if (!strcmp(f->name, n) && f->mode != PORT_NEW) {
                 logf("port: %s stays new (it carries M1's texture lift)", f->name);
@@ -701,6 +738,9 @@ void port_install(const char* ini) {
     }
     logf("port: %d of %d rewritten functions in force; shadow checks save %u bytes of physics and AI globals",
          on, (int)registry().size(), g_globals_bytes);
+    if (kept_for_ddraw)
+        logf("port: %d dd.obj rewrites stay original: they need the OpenGL renderer ([platform] sdl=1, renderer=gl)",
+             kept_for_ddraw);
     for (PortFn* f : registry())
         if (f->mode == PORT_SHADOW && f->orig) { g_shadow_on = true; install_outputs(); break; }
 }

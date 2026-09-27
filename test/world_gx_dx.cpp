@@ -1,10 +1,17 @@
-// world_gx_dx.cpp -- group G1d (hook/gx_dx.cpp: vid.obj, dx.obj, dxstate.obj, dd.obj) against the originals, outside
-// the game (docs/PORTING.md, checking step 3).
+// world_gx_dx.cpp -- group G1d (hook/gx_dx.cpp: vid.obj, dx.obj, dxstate.obj) against the originals, outside the game
+// (docs/PORTING.md, checking step 3). dd.obj's wrappers, which step G2 put on the OpenGL renderer (hook/gx_dd.cpp),
+// are checked by test/world_gx_dd.cpp; here their ORIGINALS run wherever vid / dx call them (by address), on the
+// recording fakes below, as they always did.
 //
 //   build (x86 tools, e.g. after vcvarsall.bat x86), from the repository root:
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_gx_dx.cpp
 //        /Fo%TEMP%\g1dw\ /Fe%TEMP%\g1dw\world_gx_dx.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_gx_dx.exe [rounds] [seed] [isolated|chain|both]      (from the repository root: out\race_v10.exe)
+//
+// The five draw wrappers (dxDPDraw, dxDrawTriangle(s), dxDrawIndexTriangles, dxDrawScreenIndexTriangles) call the
+// renderer's gfx_draw_triangles (hook/gx_gl.h) since G2, where the originals call the device's DrawPrimitive /
+// DrawIndexedPrimitive. This harness's gfx_draw_triangles makes exactly that device call (below), so the fake device
+// logs the rewrite's draw as it logs the original's, and the two are still compared call for call.
 //
 // Loads out\race_v10.exe at 0x400000 in a child process (the range reserved before its heap exists), resolves
 // KERNEL32's imports into the game's own import slots, and points the DDRAW ones (DirectDrawCreate,
@@ -51,6 +58,7 @@
 #include <vector>
 #include <type_traits>
 #define VP_FAITHFUL
+#define VP_PORT_NEEDS_RENDERER(NEW)      // PORT_FN_GL: no PortFn to mark here (the registry below replaces PORT_FN)
 #include "../hook/port.h"
 
 // ---- the registry: every PORT_FN, with a uniform caller (every argument is one stack dword) ----------------------------
@@ -100,6 +108,22 @@ void Footprint::add(void* p, uint32_t bytes, const char* what) {
 void Footprint::object(void* obj, const char* what) { add(obj, 4, what); }
 
 #include "../hook/gx_dx.cpp"
+
+// The renderer's draw (gx_gl.h), as this harness has it: what the original draw wrappers do with the same arguments --
+// the d3d's device (read at the call, as they read it) gets DrawIndexedPrimitive (vtable 0x78) when there are indices,
+// DrawPrimitive (0x74) otherwise, a triangle list (4) with D3DDP_DONOTUPDATEEXTENTS (8). So the fake device logs the
+// rewrite's call exactly as it logs the original's (the same object, arguments and vertex / index content), answers
+// from the same random stream, and faults the same way on a missing d3d or device.
+int32_t gfx_draw_triangles(uint32_t vtype, const void* v, uint32_t nv, const uint16_t* idx, uint32_t ni) {
+    void* dev = ((volatile D3D*)PV(X_D3D))->dev;
+    void* slot = *(void**)(*(uint8_t* const*)dev + (idx ? 0x78 : 0x74));
+    if (idx) {
+        typedef int32_t(__stdcall* Dip)(void*, uint32_t, uint32_t, const void*, uint32_t, const uint16_t*, uint32_t, uint32_t);
+        return ((Dip)slot)(dev, 4u, vtype, v, nv, idx, ni, 8u);
+    }
+    typedef int32_t(__stdcall* Dp)(void*, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
+    return ((Dp)slot)(dev, 4u, vtype, v, nv, 8u);
+}
 
 namespace hx {
 // ---- random values ------------------------------------------------------------------------------------------------
@@ -924,27 +948,6 @@ static uint8_t __cdecl st_tex_alpha(int t) {
     lg((uint32_t)t);
     return frnd() & 1;
 }
-// the harness's own callbacks (for the enumerators called directly)
-static int32_t __stdcall h_texfmt_cb(void* desc, void* ctx) {
-    lg(K_TEXFMT_CB);
-    lg(safe_hash(desc, 0x6c));
-    lg(aoff(ctx));
-    return frnd() % 5 != 0;
-}
-static int32_t __stdcall h_modes_cb(void* desc, void* ctx) {
-    lg(K_MODES_CB);
-    lg(safe_hash(desc, 0x6c));
-    lg(aoff(ctx));
-    return frnd() % 5 != 0;
-}
-static int32_t __stdcall h_ddenum_cb(void* guid, char* d, char* n, void* ctx) {
-    lg(K_DDENUM_CB);
-    lg(guid ? safe_hash(guid, 16) : 0);
-    lg(safe_hash_str(d));
-    lg(safe_hash_str(n));
-    lg(aoff(ctx));
-    return frnd() % 3 != 0;
-}
 static void install_stubs() {
     patch_jmp(0x00411150, (void*)&st_log_report);
     patch_jmp(0x004112b0, (void*)&st_log_panic);
@@ -1272,7 +1275,6 @@ static uint32_t wrap1(uint32_t obj) {
 }
 static uint32_t pick(const std::vector<uint32_t>& v) { return v.empty() ? 0 : v[rnd() % v.size()]; }
 static uint32_t pick_surf() { return chance(2) ? 0 : pick(W.surfs); }
-static uint32_t pick_tex() { return chance(2) ? 0 : pick(W.texs); }
 static uint32_t rbit() { return rnd() & 1; }
 static uint32_t rbyte() { return chance(80) ? rbit() : rnd() & 0xff; }
 static uint32_t rfloat() {
@@ -1419,25 +1421,6 @@ static void heal() {
 
 // ---- the calls: every function, with arguments from the world --------------------------------------------------------
 static uint32_t rmode() { return chance(90) ? (uint32_t)ri(1, 4) : (uint32_t)ri(-1, 7); }
-static uint32_t rdesc() {                                // a surface description for CreateSurface
-    uint32_t* d = (uint32_t*)wbuf(0x6c);
-    d[0] = 0x6c;
-    d[1] = rnd() & 0x1fff;
-    if (chance(50)) d[0x68 / 4] |= 0x1000;
-    else d[0x68 / 4] &= ~0x1000u;
-    return U(d);
-}
-static uint32_t rxform() {                               // a D3DTRANSFORMDATA over world buffers
-    uint32_t* x = (uint32_t*)wbuf(0x34);
-    x[0] = 0x34;
-    x[1] = U(wbuf(0x20));
-    x[2] = 0x20;
-    x[3] = chance(95) ? U(wbuf(0x20)) : 0;
-    x[4] = 0x20;
-    x[5] = chance(90) ? U(wbuf(0x10)) : 0;
-    x[6] = 0x3f;
-    return U(x);
-}
 static uint32_t rverts(uint32_t n) { return U(wbuf(n * 32)); }
 static uint32_t ridx(uint32_t n) { return U(wbuf(n * 2)); }
 static const uint32_t k_msgs[] = {0x4f3b28, 0x4f3be4, 0x4f3d28, 0x4f1f54, 0x4f3d50};   // (none with a %: LogReport(msg) has no arguments)
@@ -1550,89 +1533,6 @@ static void call(uint32_t at) {
     case 0x0045e700: ck(at, {rfloat()}); break;
     case 0x0045e460: ck(at, {(uint32_t)ri(0, 4), rbyte(), rbyte()}); break;
     case 0x0045e600: case 0x0045e630: ck(at, {(uint32_t)ri(0, 10), (uint32_t)ri(0, 10)}); break;
-    // dd.obj
-    case 0x0045e940: ck(at, {chance(50) ? 0x00454ac0u : (uint32_t)(uintptr_t)&h_ddenum_cb}); break;
-    case 0x0045e950: ck(at, {chance(30) ? 0 : U(wbuf(16))}); break;
-    case 0x0045ea20: ck(at, {chance(10) ? 0 : wrap1(W.fake_d2)}); break;
-    case 0x0045ea40: ck(at, {U(wbuf(8, 0xa3)), 0, W.fake_d3, U(wbuf(0x50))}); break;   // dmaterial::dmaterial
-    case 0x0045eaf0: {
-        uint32_t* m = (uint32_t*)wbuf(8);
-        m[0] = U(new_obj(KMAT));
-        ww_sync();
-        ck(at, {U(m), 0});
-        break;
-    }
-    case 0x0045eb10: ck(at, {W.mat, 0, U(wbuf(0x50))}); break;
-    case 0x0045eb40: ck(at, {U(wbuf(4, 0xa3)), 0, W.fake_d3, W.mat}); break;   // dviewport::dviewport
-    case 0x0045ebf0: ck(at, {wrap1(U(new_obj(KVP))), 0}); break;
-    case 0x0045ec20: ck(at, {W.vp, 0, (uint32_t)ri(0, 640), (uint32_t)ri(0, 480), chance(3) ? 0 : (uint32_t)ri(1, 1024), (uint32_t)ri(0, 768)}); break;
-    case 0x0045ece0: ck(at, {W.vp, 0, (uint32_t)ri(0, 640), (uint32_t)ri(0, 480), (uint32_t)ri(0, 640), (uint32_t)ri(0, 480), rbyte()}); break;
-    case 0x0045ed50: ck(at, {W.vp, 0, 1, rxform(), (uint32_t)ri(1, 2), chance(95) ? U(wbuf(4)) : 0}); break;
-    case 0x0045ed90: ck(at, {U(wbuf(8, 0xa3)), 0, W.dd}); break;
-    case 0x0045edb0: case 0x0045ee00: {
-        uint32_t* d = (uint32_t*)wbuf(8);
-        d[0] = U(new_obj(KD3));
-        d[1] = U(new_obj(KDEV));
-        ck(at, {U(d), 0});
-        break;
-    }
-    case 0x0045edd0: case 0x0045ee70: ck(at, {W.d3d, 0, pick_surf()}); break;
-    case 0x0045ee20: ck(at, {W.d3d, 0, W.dd}); break;
-    case 0x0045ef20: ck(at, {W.d3d, 0, U(wbuf(0x50))}); break;
-    case 0x0045ef50: {
-        uint32_t* m = (uint32_t*)wbuf(8);
-        m[0] = U(new_obj(KMAT));
-        ck(at, {W.d3d, 0, chance(15) ? 0 : U(m)});
-        break;
-    }
-    case 0x0045ef70: ck(at, {W.d3d, 0, W.mat}); break;
-    case 0x0045efa0: ck(at, {W.d3d, 0, chance(15) ? 0 : wrap1(U(new_obj(KVP)))}); break;
-    case 0x0045efc0: ck(at, {W.d3d, 0, U(wbuf(0xcc)), U(wbuf(0xcc))}); break;
-    case 0x0045f000: ck(at, {W.d3d, 0, U(wbuf(0x18))}); break;
-    case 0x0045f040: case 0x0045f070: ck(at, {W.d3d, 0}); break;
-    case 0x0045f0a0: case 0x0045f0d0: ck(at, {W.d3d, 0, (uint32_t)ri(0, 50), rnd()}); break;
-    case 0x0045f100: ck(at, {W.d3d, 0, (uint32_t)ri(1, 3), U(wbuf(0x40))}); break;
-    case 0x0045f130: ck(at, {W.d3d, 0, (uint32_t)(uintptr_t)&h_texfmt_cb, U(wbuf(4))}); break;
-    case 0x0045f160: ck(at, {U(wbuf(4, 0xa3)), 0, W.fake_d2}); break;
-    case 0x0045f170: ck(at, {wrap1(W.fake_d2), 0}); break;
-    case 0x0045f190: ck(at, {W.dd, 0, U(wbuf(0x16c)), U(wbuf(0x16c))}); break;
-    case 0x0045f1c0: ck(at, {W.dd, 0, U(wbuf(4)), U(wbuf(4)), U(wbuf(4))}); break;
-    case 0x0045f200: case 0x0045f2c0: ck(at, {W.dd, 0}); break;
-    case 0x0045f240: ck(at, {W.dd, 0, U(wbuf(0x6c)), chance(50) ? 0x00455330u : (uint32_t)(uintptr_t)&h_modes_cb}); break;
-    case 0x0045f270: ck(at, {W.dd, 0, (uint32_t)ri(320, 1024), (uint32_t)ri(200, 768), chance(80) ? 16u : 32u}); break;
-    case 0x0045f2d0: case 0x0045f3a0: case 0x0045f400: ck(at, {W.dd, 0, rdesc()}); break;
-    case 0x0045f3e0: ck(at, {W.dd, 0, chance(15) ? 0 : wrap1(U(new_obj(KS)))}); break;
-    case 0x0045f440: {
-        uint32_t* t = (uint32_t*)wbuf(16);
-        t[0] = U(new_obj(KS));
-        t[1] = U(new_obj(KTEX));
-        ck(at, {W.dd, 0, chance(15) ? 0 : U(t)});
-        break;
-    }
-    case 0x0045f460: ck(at, {U(wbuf(4, 0xa3)), 0, pick(W.fakes_s)}); break;
-    case 0x0045f470: ck(at, {wrap1(U(new_obj(KS))), 0}); break;
-    case 0x0045f490: case 0x0045f5a0: ck(at, {pick_surf(), 0, U(wbuf(0x6c))}); break;
-    case 0x0045f510: case 0x0045f520: case 0x0045f580: case 0x0045f670: ck(at, {pick_surf(), 0}); break;
-    case 0x0045f5d0: {
-        uint32_t* c = (uint32_t*)wbuf(4);
-        c[0] = chance(70) ? 4 : rnd();
-        ck(at, {pick_surf(), 0, U(c)});
-        break;
-    }
-    case 0x0045f640: case 0x0045f690: ck(at, {pick_surf(), 0, pick_surf()}); break;
-    case 0x0045f6d0: ck(at, {pick_surf(), 0, pick_surf(), (uint32_t)ri(0, 256), (uint32_t)ri(0, 256), chance(30) ? 0 : U(wbuf(16))}); break;
-    case 0x0045f710: ck(at, {pick_surf(), 0, rnd() & 0xffff}); break;
-    case 0x0045f750: ck(at, {U(wbuf(16, 0xa3)), 0, pick(W.fakes_s)}); break;
-    case 0x0045f7c0: {
-        uint32_t* t = (uint32_t*)wbuf(16);
-        t[0] = U(new_obj(KS));
-        t[1] = U(new_obj(KTEX));
-        ck(at, {U(t), 0});
-        break;
-    }
-    case 0x0045f7e0: ck(at, {pick_tex(), 0, pick_tex()}); break;
-    case 0x0045f870: case 0x0045f930: case 0x0045f940: case 0x0045f9a0: ck(at, {pick_tex(), 0}); break;
-    case 0x0045f8a0: ck(at, {pick_tex(), 0, rbyte(), rbyte()}); break;
     default:
         printf("no generator for %08x\n", at);
         ExitProcess(2);
@@ -1689,10 +1589,10 @@ static void round_setup(int r) {
 // the functions with thresholds and arithmetic, many times each, on a healed world
 static void round_focus(int r) {
     reset_world(r);
-    static const uint32_t fns[] = {0x00455130, 0x00454910, 0x00454670, 0x00454b50, 0x004585b0, 0x0045ec20, 0x00458800,
-                                   0x004582b0, 0x00459630, 0x0045dfd0, 0x0045df00, 0x00458990, 0x00458aa0, 0x00455330,
-                                   0x0045f490, 0x0045f520, 0x0045f940, 0x00454ca0, 0x00454f50, 0x0045f2d0, 0x0045f0a0,
-                                   0x0045f8a0, 0x0045ea40, 0x0045eb40, 0x00454740, 0x00454880};
+    // (dd.obj's are in world_gx_dd.cpp)
+    static const uint32_t fns[] = {0x00455130, 0x00454910, 0x00454670, 0x00454b50, 0x004585b0, 0x00458800, 0x004582b0,
+                                   0x00459630, 0x0045dfd0, 0x0045df00, 0x00458990, 0x00458aa0, 0x00455330, 0x00454ca0,
+                                   0x00454f50, 0x00454740, 0x00454880};
     for (uint32_t at : fns)
         for (int i = 0; i < 12; i++) {
             heal();

@@ -35,6 +35,9 @@ void platform_report();                       // the exit log's input line
 
 // M2 stage 2 (ddraw_gl.cpp): the game's DirectDraw/Direct3D emulated on OpenGL, via its DDRAW imports
 bool renderer_install();
+bool platform_plans_gl(const char* ini);
+bool platform_switched_away();
+void gfx_repaint();              // the OpenGL renderer shows its picture again (gl_core.cpp)   // the game's inactive flag (win32.obj): DirectSound goes quiet while it's set   // will platform_install switch to the OpenGL renderer?
 void renderer_report();
 
 // point race.exe's import of dll!name at `to` (M2's emulations; build-agnostic)
