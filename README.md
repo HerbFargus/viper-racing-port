@@ -48,7 +48,7 @@ code at its own address, puts the FPU in the physics thread's single precision, 
 whose footprint is pure against its original on millions of random inputs, NaN, infinity, denormals and
 overlapping arguments included.
 
-The rewrites so far, 1,155 functions (the physics and AI, 881 of them, in `hook/phys_*.cpp`, layouts in
+The rewrites so far, 2,186 functions (the physics and AI, 881 of them, in `hook/phys_*.cpp`, layouts in
 `hook/phys_types.h`):
 - **3.2, collisions:** the physics library's maths helpers, every collision volume (sphere, cube, sphere
   group, moveable sphere, cylinder, tube, box), the pairwise collision tests, and `collide.obj`'s crash
@@ -87,6 +87,13 @@ That is the whole physics and AI code, apart from the debug screens' drawing.
   calls as the original, through the game's own import table, and call its C runtime by address, so
   they change nothing yet about what the game runs on. The 3-byte `rdtsc` routine is too short to hook
   and stays original in the game.
+- **The graphics** (`hook/gx_*.cpp`, `hook/wld_draw.cpp`, 586 more): the 2D canvas, fonts, palettes,
+  bitmaps and the debug dashboards (`gx_2d`); models, lighting, the camera and the deferred surfaces
+  (`gx_model`, which now carries M1's texture-bucket lift); the texture cache and texture loading
+  (`gx_tex`); the DirectDraw and Direct3D layer, video modes and render state (`gx_dx`); and the world's
+  drawing (`wld_draw`). They still call DirectDraw and Direct3D, which land in the DLL's OpenGL
+  emulation; a later step has them call OpenGL directly. In a shadow check every DirectX call is recorded
+  and compared, so each frame's drawing is checked against the original's, call by call.
 
 Then a chosen set of the original's bugs is fixed, always on: the AI crash (a car losing its place on
 its racing line), degenerate racing lines, a ground-contact divide by zero, vrmod's obstacle wake, a single race on a

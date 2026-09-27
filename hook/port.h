@@ -56,13 +56,16 @@ enum PortMode { PORT_ORIGINAL, PORT_NEW, PORT_SHADOW };
 // ---- footprints: the memory a function may change, besides the physics and AI globals ----------------
 struct Footprint {
     enum { MAX = 8192 };
-    struct Region { void* p; uint32_t n; const char* what; };
+    struct Region { void* p; uint32_t n; const char* what; bool stack = false; };
     Region r[MAX];
     int n = 0;
     const char* replay_only = 0;                            // set: no shadow check; the replay checks it
     bool pure = false;                                      // set: touches only its footprint -- no globals
     void add(void* p, uint32_t bytes, const char* what);   // a plain block
     void object(void* obj, const char* what = "this");     // a game object, sized by its class (vtable)
+    // a pointer the function may leave aimed at its own stack frame (a local made current and never unset): the
+    // two passes' frames differ, so it matches when both leave the same value or both an address on this stack
+    void stack_ptr(void* p, const char* what);
 };
 
 // ---- a rewritten function ------------------------------------------------------------------------------
@@ -76,6 +79,8 @@ struct PortFn {
     void* orig = 0;                   // trampoline to the original, once installed (v1.0)
     PortMode mode = PORT_NEW;
     volatile long calls = 0, checks = 0, mismatches = 0;
+    volatile long heap_skips = 0;     // checks whose original allocated or freed: its result stands, unchecked
+    volatile long raced = 0;          // differences while the physics thread dented a car's models: not counted
     int budget_tick = -1, budget_used = 0;         // shadow_per_tick bookkeeping
     bool patched = false;                          // the installed function isn't stock v1.0: left original
     PortFn(uint32_t v, const char* nm, void* r, void* s, const uint8_t* op = 0, uint8_t ol = 0);
@@ -87,7 +92,9 @@ struct PortFn {
 bool shadow_begin(PortFn* f);                  // should this call be checked? (not nested, sampled)
 Footprint& shadow_footprint();                 // the current check's footprint, to fill
 void shadow_snapshot();                        // save the footprint and the globals; the original's pass
-void shadow_after_original(const void* ret, size_t n);   // keep its results, restore; the rewrite's pass
+// keep its results, restore; the rewrite's pass. false: the original allocated or freed memory, so the rewrite
+// isn't run (it would allocate or free again) -- the original's result stands and the check is over
+bool shadow_after_original(PortFn* f, const void* ret, size_t n);
 void shadow_finish(PortFn* f, const void* ret, size_t n);   // compare, log, restore the original's result
 void shadow_abandon(PortFn* f);                // end a check without comparing (replay_only)
 
@@ -98,6 +105,18 @@ void shadow_abandon(PortFn* f);                // end a check without comparing 
 bool shadow_feed(uint8_t kind, void* v, size_t n);
 void shadow_saw(uint8_t kind, const void* v, size_t n);
 bool shadow_on();                              // is any function in shadow mode? (the input hooks are needed)
+
+// DirectDraw / Direct3D calls into the emulation (ddraw_gl.cpp) during a check, on this thread:
+// shadow_com_phase() is 0 outside a check's passes (or while an output runs), 1 in the original's pass
+// (calls run live), 2 in the rewrite's pass (effects are recorded, not made). shadow_com_effect records an
+// effect call -- its arguments, and the data they point at (hashed past 64 bytes) -- in the pass's output
+// log, which the check compares like its other outputs; the original's calls have already been made, so
+// they aren't made again afterwards. shadow_com_check() counts checks (the emulation keys its per-check
+// Lock snapshots to it).
+int shadow_com_phase();
+void shadow_com_effect(uint16_t method, const void* self, const void* args, size_t nargs, const void* data = 0,
+                       size_t ndata = 0);
+unsigned shadow_com_check();
 // the physics thread (set by the recorder's PhysTaskUpdate hook, installed whenever shadow checks are on).
 // A check made on another thread -- the main thread's input code -- doesn't save or restore the physics
 // globals, which the physics thread is using at that moment: its footprint lists what it writes.
@@ -117,12 +136,12 @@ template <typename F> struct Shadow;
             shadow_snapshot();                                                                         \
             if constexpr (std::is_void_v<R>) {                                                           \
                 ((Fn)P->orig)(a...);                                                                     \
-                shadow_after_original(0, 0);                                                             \
+                if (!shadow_after_original(P, 0, 0)) return;                                             \
                 NEW(a...);                                                                               \
                 shadow_finish(P, 0, 0);                                                                  \
             } else {                                                                                     \
                 R ro = ((Fn)P->orig)(a...);                                                              \
-                shadow_after_original(&ro, sizeof ro);                                                   \
+                if (!shadow_after_original(P, &ro, sizeof ro)) return ro;                               \
                 R rn = NEW(a...);                                                                        \
                 shadow_finish(P, &rn, sizeof rn);                                                        \
                 return ro;                                                                               \

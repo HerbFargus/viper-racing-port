@@ -111,10 +111,13 @@ void clip_cursor(bool on) {                                      // restrict_cur
     SDL_SetWindowMouseRect(g_window, on ? &r : 0);
 }
 
-void SDLCALL raw_message(void*, void*, unsigned int msg, Uint64 wparam, Sint64 lparam) {
-    // Switching away and back: the game pauses on exactly WM_ACTIVATEAPP, as win32_event did. SDL's own
-    // focus events don't line up with it while DirectDraw holds the screen, and drawing on after the
-    // switch meets lost surfaces (DDERR_WRONGMODE) and crashes.
+// Switching away and back: the game pauses on exactly WM_ACTIVATEAPP, as win32_event did. SDL's own
+// focus events don't line up with it while DirectDraw holds the screen, and drawing on after the
+// switch meets lost surfaces (DDERR_WRONGMODE) and crashes. WM_ACTIVATEAPP is sent, not posted, so it
+// never passes SDL's message hook (which sees only what its loop takes from the queue): the window
+// procedure is subclassed for it.
+static WNDPROC g_sdl_wndproc;
+static LRESULT CALLBACK game_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == WM_ACTIVATEAPP) {
         bool active = wparam != 0;
         if (active) g_n_activations++;
@@ -122,6 +125,10 @@ void SDLCALL raw_message(void*, void*, unsigned int msg, Uint64 wparam, Sint64 l
         clip_cursor(active);
         if (active && g_gl && g_window) SDL_RaiseWindow(g_window);
     }
+    return CallWindowProcA(g_sdl_wndproc, hwnd, msg, wparam, lparam);
+}
+
+void SDLCALL raw_message(void*, void*, unsigned int msg, Uint64 wparam, Sint64 lparam) {
     MsgHook_t* hooks = (MsgHook_t*)G.hooks;                      // Win32RegisterMessageHook's two slots
     for (int i = 0; i < 2; i++)
         if (hooks[i]) hooks[i](msg, (int)wparam, (int)lparam);
@@ -142,7 +149,7 @@ unsigned char __cdecl sdl_create_window(void* instance) {
         logf("SDL: can't start: %s", SDL_GetError());
         return 0;
     }
-    SDL_SetWindowsMessageHook(raw_message, 0);                   // before the window: its first activation counts
+    SDL_SetWindowsMessageHook(raw_message, 0);
     const char* title = *(const char**)G.title;
     int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
     g_window = SDL_CreateWindow(title ? title : "Viper Racing", 0, 0, w, h,
@@ -158,6 +165,7 @@ unsigned char __cdecl sdl_create_window(void* instance) {
     SDL_VERSION(&info.version);
     SDL_GetWindowWMInfo(g_window, &info);
     g_hwnd = info.info.win.window;
+    g_sdl_wndproc = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)game_wndproc);
     HICON icon = LoadIconA((HINSTANCE)instance, MAKEINTRESOURCEA(1));
     if (icon) {
         SendMessageA(g_hwnd, WM_SETICON, ICON_BIG, (LPARAM)icon);

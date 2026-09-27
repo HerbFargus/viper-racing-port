@@ -259,84 +259,37 @@ static void lift_limits() {
 // texture number into a 120-entry array at 0x522b40 -- bucket id+1, bucket 0 for untextured -- and
 // nothing checks the number: add_deferred_surf writes past the end for texture 119 and up, straight
 // into the model list head and the pool pointers that follow. The two drawing loops only visit
-// buckets 0..118 (a 3-byte `cmp reg, 0x77`, too small to widen in place), so these three functions
-// are rewritten here with a 1,024-bucket array; begin_deferred's clear is repointed at it. A texture
-// number that still wouldn't fit is drawn untextured instead of corrupting memory. Behaviour is
-// otherwise identical: same buckets, same order, same two passes (opaque, then alpha).
+// buckets 0..118 (a 3-byte `cmp reg, 0x77`, too small to widen in place). M1 repoints begin_deferred's
+// clear at a 1,024-bucket array here, and the three functions -- add_deferred_surf, end_deferred_surfs,
+// draw_alpha_deferred_surfs -- are M3's rewrites (gx_model.cpp, PORT_FN_BUILDS on every build, as M1's
+// own hooks were): they take the array and its size from begin_deferred's operands, so with M1's they
+// use all 1,024 buckets, and a texture number that still wouldn't fit is drawn untextured instead of
+// corrupting memory (vp_deferred_bucket_ok, below). Behaviour is otherwise identical: same buckets,
+// same order, same two passes (opaque, then alpha). They must stay `new` for the lift: left original
+// (or in shadow mode, which runs the original) they are the stock 120-bucket code.
 enum { TEX_BUCKETS = 1024 };
-struct DeferredEntry { void* surf_info; void* surface; void* model_info; DeferredEntry* next; };
-static DeferredEntry* g_buckets[TEX_BUCKETS];
+static void* g_buckets[TEX_BUCKETS];
 static volatile LONG g_tex_overflows, g_peak_tex, g_peak_table;
 static int peak_textures();
-
-typedef void*(__fastcall* PoolAlloc_t)(void* pool, void* edx);
-typedef void(__fastcall* PoolFree_t)(void* pool, void* edx, void* p);
-typedef void(__cdecl* Void_t)(void);
-typedef void(__cdecl* IntArg_t)(int);
-typedef unsigned char(__cdecl* HasAlpha_t)(int);
-typedef void(__cdecl* PreLit_t)(void* surface, void* vertices, void* lit);
-typedef void(__cdecl* DPDraw_t)(const void* verts, int nverts, const uint16_t* idx, int nidx);
-static PoolAlloc_t PoolBase_alloc;
-static PoolFree_t PoolBase_free;
-static Void_t dxStateFlush;
-static IntArg_t dxDPBegin;
-static Void_t dxDPEnd;
-static HasAlpha_t TextureHasAlpha;
-static PreLit_t LightSurfacePreLit;
-static DPDraw_t dxDPDraw;
 static struct {                                                   // globals, resolved for the build
-    uint32_t deferred_pool, deferred_flag, prelit_buffer;       // the texture limit
     uint32_t phobs, nphobs, collisions, walls, getextents_stub; // collisions
     uint32_t nwobs, ngobs;                                      // the exit log's peaks
 } G;
-#define DEFERRED_POOL (*(void**)G.deferred_pool)
-#define PRELIT_BUFFER (*(void**)G.prelit_buffer)
 
-static void __cdecl add_deferred_surf(void* model_info, void* surface, void* surf_info) {
-    int id = *(int*)((uint8_t*)surf_info + 0x14);
-    DeferredEntry* e = (DeferredEntry*)PoolBase_alloc(DEFERRED_POOL, 0);
-    e->surf_info = surf_info;
-    e->surface = surface;
-    e->model_info = model_info;
+// add_deferred_surf's rewrite asks here whether texture `id` has a bucket among `buckets` (M1's
+// lifted count): no -> logged once, and it draws it untextured (bucket 0); yes -> the exit line's peaks
+bool vp_deferred_bucket_ok(int id, int buckets) {
     int b = id + 1;
-    if (b < 0 || b >= TEX_BUCKETS) {
-        if (InterlockedIncrement(&g_tex_overflows) == 1) logf("texture %d is past %d buckets: drawn untextured", id, TEX_BUCKETS);
-        b = 0;
-    } else if (id > g_peak_tex) {
+    if (b < 0 || b >= buckets) {
+        if (InterlockedIncrement(&g_tex_overflows) == 1) logf("texture %d is past %d buckets: drawn untextured", id, buckets);
+        return false;
+    }
+    if (id > g_peak_tex) {
         g_peak_tex = id;
         LONG used = peak_textures();
         if (used > g_peak_table) g_peak_table = used;
     }
-    e->next = g_buckets[b];
-    g_buckets[b] = e;
-}
-
-static void draw_bucket(int b) {
-    dxDPBegin(b - 1);
-    for (DeferredEntry* e = g_buckets[b]; e;) {
-        LightSurfacePreLit(e->surface, *(void**)((uint8_t*)e->model_info + 4), PRELIT_BUFFER);
-        uint8_t* si = (uint8_t*)e->surf_info;
-        dxDPDraw(*(void**)(si + 0x20), *(int*)(si + 0x24), *(uint16_t**)(si + 0x18), *(int*)(si + 0x1c));
-        DeferredEntry* next = e->next;
-        PoolBase_free(DEFERRED_POOL, 0, e);
-        e = next;
-    }
-    dxDPEnd();
-    g_buckets[b] = 0;
-}
-
-static void __cdecl draw_alpha_deferred_surfs(void) {           // everything still queued
-    dxStateFlush();
-    for (int b = 0; b < TEX_BUCKETS; b++)
-        if (g_buckets[b]) draw_bucket(b);
-}
-
-static void __cdecl end_deferred_surfs(void) {                  // opaque buckets first, then the rest
-    *(uint8_t*)G.deferred_flag = 0;                              // a BYTE (mov byte ptr [522d84h], bl)
-    dxStateFlush();
-    for (int b = 0; b < TEX_BUCKETS; b++)
-        if (g_buckets[b] && !TextureHasAlpha(b - 1)) draw_bucket(b);
-    draw_alpha_deferred_surfs();
+    return true;
 }
 
 static void lift_texture_limit() {
@@ -355,11 +308,8 @@ static void lift_texture_limit() {
         logf("NOT lifting the texture limit: the deferred-draw functions aren't the code %s should have", g_build->name);
         return;
     }
-    if (!patch_fields(fields, sizeof fields / sizeof fields[0], "the texture buckets and texture pools"))
-        return;
-    jmp_hook(0x4573d0, add_pro, sizeof add_pro, (void*)add_deferred_surf, "add_deferred_surf");
-    jmp_hook(0x457290, end_pro, sizeof end_pro, (void*)end_deferred_surfs, "end_deferred_surfs");
-    jmp_hook(0x457340, alpha_pro, sizeof alpha_pro, (void*)draw_alpha_deferred_surfs, "draw_alpha_deferred_surfs");
+    patch_fields(fields, sizeof fields / sizeof fields[0], "the texture buckets and texture pools");
+    // (the three deferred-draw functions are hooked by port_install: M3's rewrites in gx_model.cpp)
 }
 
 // ---- M1: the texture table --------------------------------------------------------------------------
@@ -589,18 +539,11 @@ static void resolve() {
     PhysicsGetTime = (PhysicsGetTime_t)A(0x0042bc80);
     Obstacle_Perturb = (Method0_t)A(0x0043d3e0);
     PhobDyno_Update = (Method0_t)A(0x00445210);
-    PoolBase_alloc = (PoolAlloc_t)A(0x0041bb20);
-    PoolBase_free = (PoolFree_t)A(0x0041bb60);
-    dxStateFlush = (Void_t)A(0x0045dfd0);
-    dxDPBegin = (IntArg_t)A(0x00458990);
-    dxDPEnd = (Void_t)A(0x00458a90);
-    TextureHasAlpha = (HasAlpha_t)A(0x0045a590);
-    LightSurfacePreLit = (PreLit_t)A(0x0045c250);
-    dxDPDraw = (DPDraw_t)A(0x00458a60);
+    // what the deferred-draw rewrites (gx_model.cpp) resolve on first use: every build must have it
+    static const uint32_t k_deferred_uses[] = {0x0041bb20, 0x0041bb60, 0x0045dfd0, 0x00458990, 0x00458a90, 0x0045a590,
+                                               0x0045c250, 0x00458a60, 0x00457340, 0x00522d80, 0x00522d84, 0x004f2198};
+    for (uint32_t a : k_deferred_uses) A(a);
     collide_object = (CollideObject_t)A(0x00427350);
-    G.deferred_pool = A(0x00522d80);
-    G.deferred_flag = A(0x00522d84);
-    G.prelit_buffer = A(0x004f2198);
     G.phobs = A(0x00520bb4);
     G.nphobs = A(0x00521090);
     G.collisions = A(0x004ecce4);

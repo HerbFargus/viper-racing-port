@@ -113,6 +113,21 @@ physics and AI statics (saved automatically):
 saves and restores the physics and AI statics when it runs on the physics thread; a function that runs
 on the main thread must list the statics it writes in its footprint (`f.add(address, bytes, "what")`).
 
+**DirectDraw and Direct3D.** Graphics code calls DirectX through the game's interface pointers, which land
+in the DLL's emulation (`hook/ddraw_gl.cpp`). During a check, every such call is recorded and the two
+passes' records compared like any other output. The original's pass runs the calls live and queues what
+each hands back (return values, out-parameters, new objects, and the pixels a `Lock` exposes); the
+rewrite's pass makes no call at all and is handed the queued results in order, so it sees exactly what the
+original saw and nothing is drawn twice. A footprint lists memory only. The pixels of a surface a function
+locks itself need no footprint: both passes' Locks hand out the same pixels, and each Unlock's record
+carries the pixels as that pass left them. Arguments that point at the caller's structures are recorded by
+what they hold, never by address (the two passes' stack frames differ), and a draw's vertices are recorded
+without what Direct3D never reads (an `LVERTEX`'s reserved dword; u/v with no texture bound), which the game
+leaves as stack garbage. A function that leaves a global aimed at its own dead stack frame (a local canvas
+made current and never unset) lists it with `f.stack_ptr(address, "what")`: it matches when both passes
+leave the same value or both an address on the stack. Enumerations call back into the game, so a function
+that enumerates is `replay_only`.
+
 Crash sounds and the game's own replay events are outputs, captured automatically. Random numbers and
 the controls are inputs, fed to the rewrite automatically, and so is the physics clock (`PhysicsGetTime`)
 for a check on the main thread, where the physics can tick between the two passes.

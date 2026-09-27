@@ -31,6 +31,7 @@
 #include "SDL.h"
 #include "SDL_opengl.h"
 #include "viperport.h"
+#include "port.h"
 
 // ---- from the platform layer (platform.cpp) ----------------------------------------------------------
 SDL_Window* platform_window();
@@ -436,6 +437,114 @@ Format format_of(const DDPIXELFORMAT& pf) {
     return pf.dwGBitMask == 0x03E0 ? F555 : F565;
 }
 
+// ---- shadow checks (port.h) -----------------------------------------------------------------------------------
+// A shadow check runs a graphics function twice -- the original, then the rewrite -- and every call either
+// makes into these objects is recorded (shadow_com_effect) and compared. The original's pass runs live, and
+// what each call hands back (out-parameters, return values, new objects, a Lock's pixels) is queued. The
+// rewrite's pass makes no call at all: it's handed the queued results in order, so it sees exactly what the
+// original saw, and nothing is drawn twice. A rewrite that calls differently shows up as differing outputs.
+enum ComId : uint16_t {
+    C_QI = 1, C_ADDREF, C_RELEASE,
+    C_T_HANDLE, C_T_LOAD, C_T_PALCHANGED,
+    C_S_DESC, C_S_PIXFMT, C_S_CAPS, C_S_ISLOST, C_S_RESTORE, C_S_FLIPSTATUS, C_S_BLTSTATUS, C_S_ADDATT, C_S_DELATT,
+    C_S_GETATT, C_S_SETKEY, C_S_GETKEY, C_S_LOCK, C_S_UNLOCK, C_S_FLIP, C_S_BLT, C_S_BLTFAST,
+    C_M_SET, C_M_GET, C_M_HANDLE,
+    C_V_SET, C_V_GET, C_V_BACKGROUND, C_V_CLEAR, C_V_TRANSFORM,
+    C_D_CAPS, C_D_STATS, C_D_ADDVP, C_D_DELVP, C_D_SETVP, C_D_GETVP, C_D_BEGIN, C_D_END, C_D_ENUMTEX, C_D_SETRS,
+    C_D_GETRS, C_D_SETLS, C_D_SETXF, C_D_GETXF, C_D_DRAW, C_D_DRAWIDX, C_D_DRAWIDX_I,
+    C_3_MATERIAL, C_3_VIEWPORT, C_3_DEVICE,
+    C_DD_CAPS, C_DD_VIDMEM, C_DD_COOP, C_DD_ENUMMODES, C_DD_SETMODE, C_DD_RESTOREMODE, C_DD_GETMODE, C_DD_VBLANK,
+    C_DD_SURFACE,
+};
+
+// tex: the texture handle this pass has bound (its own SetRenderState calls; the emulation's state has already
+// moved on to the original's by the rewrite's pass), from tex0, the handle when the check began
+struct ComFeed { unsigned check = ~0u; int ph = 0; std::vector<uint8_t> q; size_t at = 0; DWORD tex0 = 0, tex = 0; };
+static __declspec(thread) ComFeed* t_feed;
+static void feed_sync(int ph) {
+    if (!t_feed) t_feed = new ComFeed;
+    unsigned c = shadow_com_check();
+    if (t_feed->check != c) {
+        t_feed->check = c; t_feed->q.clear(); t_feed->at = 0; t_feed->ph = ph;
+        t_feed->tex = t_feed->tex0 = g.rs[D3DRENDERSTATE_TEXTUREHANDLE];
+    } else if (t_feed->ph != ph) { t_feed->ph = ph; t_feed->tex = t_feed->tex0; }
+}
+
+// 0 outside a check, 1 the original's pass (run live, queue the results), 2 the rewrite's (take them)
+int com_begin(ComId id, const void* self, const void* args, size_t nargs, const void* data = 0, size_t ndata = 0) {
+    int ph = shadow_com_phase();
+    if (!ph) return 0;
+    feed_sync(ph);
+    shadow_com_effect(id, self, args, nargs, data, ndata);
+    return ph;
+}
+// the vertices as a check records them: without what Direct3D never reads -- an LVERTEX's reserved dword, and u/v
+// with no texture bound -- which the game leaves as stack garbage (its triangles are built in locals)
+static const void* draw_record(D3DVERTEXTYPE vt, const void* v, DWORD n, std::vector<uint8_t>& buf) {
+    int ph = shadow_com_phase();
+    if (!ph || !v) return v;
+    feed_sync(ph);
+    bool lv = vt == D3DVT_LVERTEX, notex = t_feed->tex == 0;
+    if (!lv && !notex) return v;
+    buf.assign((const uint8_t*)v, (const uint8_t*)v + (size_t)n * 32);
+    for (size_t i = 0; i < n; i++) {
+        uint8_t* p = &buf[i * 32];
+        if (lv) memset(p + 12, 0, 4);
+        if (notex) memset(p + 24, 0, 8);
+    }
+    return buf.data();
+}
+void com_save(const void* p, size_t n) {
+    uint32_t k = p ? (uint32_t)n : 0;
+    std::vector<uint8_t>& q = t_feed->q;
+    q.insert(q.end(), (const uint8_t*)&k, (const uint8_t*)&k + 4);
+    if (k) q.insert(q.end(), (const uint8_t*)p, (const uint8_t*)p + k);
+}
+void com_take(void* p, size_t n) {
+    std::vector<uint8_t>& q = t_feed->q;
+    uint32_t k = 0;
+    if (t_feed->at + 4 <= q.size()) { memcpy(&k, &q[t_feed->at], 4); t_feed->at += 4; }
+    if (t_feed->at + k > q.size()) k = 0;
+    if (p && n) {
+        size_t m = k < n ? k : n;
+        memcpy(p, &q[t_feed->at], m);
+        if (m < n) memset((uint8_t*)p + m, 0, n - m);
+    }
+    t_feed->at += k;
+}
+// an effect: live once; the rewrite's pass is handed the original's return value
+template <class R, class F> R effect(int ph, F live) {
+    R r = R();
+    if (ph == 2) { com_take(&r, sizeof r); return r; }
+    r = live();
+    if (ph == 1) com_save(&r, sizeof r);
+    return r;
+}
+// a query: live once; what it wrote (the listed out-parameters) is handed to the rewrite's pass too
+struct Out { void* p; size_t n; };
+template <class F> HRESULT query(int ph, std::initializer_list<Out> outs, F live) {
+    HRESULT r = DD_OK;
+    if (ph == 2) {
+        com_take(&r, sizeof r);
+        for (const Out& o : outs) com_take(o.p, o.p ? o.n : 0);
+        return r;
+    }
+    r = live();
+    if (ph == 1) {
+        com_save(&r, sizeof r);
+        for (const Out& o : outs) com_save(o.p, o.n);
+    }
+    return r;
+}
+struct A1 { uint32_t a; };
+struct A2 { uint32_t a, b; };
+struct A3 { uint32_t a, b, c; };
+struct A4 { uint32_t a, b, c, d; };
+struct A5 { uint32_t a, b, c, d, e; };
+#define U(x) ((uint32_t)(uintptr_t)(x))
+
+void present();                                        // Flip (below)
+
 struct Surface;
 struct Texture2 : Base_IDirect3DTexture2 {
     Surface* s;
@@ -444,7 +553,11 @@ struct Texture2 : Base_IDirect3DTexture2 {
     ULONG STDMETHODCALLTYPE Release() override;
     HRESULT STDMETHODCALLTYPE GetHandle(LPDIRECT3DDEVICE2, LPD3DTEXTUREHANDLE h) override;
     HRESULT STDMETHODCALLTYPE Load(LPDIRECT3DTEXTURE2 src) override;
-    HRESULT STDMETHODCALLTYPE PaletteChanged(DWORD, DWORD) override { return DD_OK; }
+    HRESULT load(LPDIRECT3DTEXTURE2 src);
+    HRESULT STDMETHODCALLTYPE PaletteChanged(DWORD a, DWORD b) override {
+        A2 x = {a, b};
+        return effect<HRESULT>(com_begin(C_T_PALCHANGED, this, &x, sizeof x), [&] { return (HRESULT)DD_OK; });
+    }
 };
 
 struct Surface : Base_IDirectDrawSurface3 {
@@ -474,18 +587,23 @@ struct Surface : Base_IDirectDrawSurface3 {
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* out) override {
-        if (riid == IID_IDirect3DTexture2) { *out = &t2; AddRef(); return DD_OK; }
-        if (riid == IID_IDirectDrawSurface || riid == IID_IDirectDrawSurface2 || riid == IID_IDirectDrawSurface3 ||
-            riid == IID_IUnknown) { *out = this; AddRef(); return DD_OK; }
-        *out = 0;
-        return E_NOINTERFACE;
+        return query(com_begin(C_QI, this, &riid, sizeof riid), {{out, sizeof *out}}, [&] {
+            if (riid == IID_IDirect3DTexture2) { *out = &t2; add_ref(); return (HRESULT)DD_OK; }
+            if (riid == IID_IDirectDrawSurface || riid == IID_IDirectDrawSurface2 || riid == IID_IDirectDrawSurface3 ||
+                riid == IID_IUnknown) { *out = this; add_ref(); return (HRESULT)DD_OK; }
+            *out = 0;
+            return (HRESULT)E_NOINTERFACE;
+        });
     }
-    ULONG STDMETHODCALLTYPE AddRef() override { return root && root != this ? 1 : InterlockedIncrement(&refs); }
+    ULONG add_ref() { return root && root != this ? 1 : InterlockedIncrement(&refs); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return effect<ULONG>(com_begin(C_ADDREF, this, 0, 0), [&] { return add_ref(); }); }
     ULONG STDMETHODCALLTYPE Release() override {
-        if (root && root != this) return 1;                       // levels live as long as their root
-        LONG n = InterlockedDecrement(&refs);
-        if (n == 0) delete this;
-        return n;
+        return effect<ULONG>(com_begin(C_RELEASE, this, 0, 0), [&]() -> ULONG {
+            if (root && root != this) return 1;                   // levels live as long as their root
+            LONG n = InterlockedDecrement(&refs);
+            if (n == 0) delete this;
+            return (ULONG)n;
+        });
     }
 
     void describe(LPDDSURFACEDESC d) {
@@ -507,40 +625,88 @@ struct Surface : Base_IDirectDrawSurface3 {
         if (keyed) d->dwFlags |= DDSD_CKSRCBLT, d->ddckCKSrcBlt.dwColorSpaceLowValue = d->ddckCKSrcBlt.dwColorSpaceHighValue = key;
     }
 
-    HRESULT STDMETHODCALLTYPE GetSurfaceDesc(LPDDSURFACEDESC d) override { describe(d); return DD_OK; }
-    HRESULT STDMETHODCALLTYPE GetPixelFormat(LPDDPIXELFORMAT pf) override { pixel_format(fmt, *pf); return DD_OK; }
-    HRESULT STDMETHODCALLTYPE GetCaps(LPDDSCAPS c) override { *c = caps; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE IsLost() override { return DD_OK; }
-    HRESULT STDMETHODCALLTYPE Restore() override { return DD_OK; }
-    HRESULT STDMETHODCALLTYPE GetFlipStatus(DWORD) override { return DD_OK; }
-    HRESULT STDMETHODCALLTYPE GetBltStatus(DWORD) override { return DD_OK; }
-    HRESULT STDMETHODCALLTYPE AddAttachedSurface(LPDIRECTDRAWSURFACE3) override { return DD_OK; }   // the z-buffer
-    HRESULT STDMETHODCALLTYPE DeleteAttachedSurface(DWORD, LPDIRECTDRAWSURFACE3) override { return DD_OK; }
+    HRESULT STDMETHODCALLTYPE GetSurfaceDesc(LPDDSURFACEDESC d) override {
+        DWORD size = d->dwSize ? d->dwSize : sizeof(DDSURFACEDESC);
+        return query(com_begin(C_S_DESC, this, &size, 4), {{d, size}}, [&] { describe(d); return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE GetPixelFormat(LPDDPIXELFORMAT pf) override {
+        return query(com_begin(C_S_PIXFMT, this, 0, 0), {{pf, sizeof *pf}}, [&] { pixel_format(fmt, *pf); return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE GetCaps(LPDDSCAPS c) override {
+        return query(com_begin(C_S_CAPS, this, 0, 0), {{c, sizeof *c}}, [&] { *c = caps; return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE IsLost() override { return query(com_begin(C_S_ISLOST, this, 0, 0), {}, [] { return (HRESULT)DD_OK; }); }
+    HRESULT STDMETHODCALLTYPE Restore() override { return effect<HRESULT>(com_begin(C_S_RESTORE, this, 0, 0), [] { return (HRESULT)DD_OK; }); }
+    HRESULT STDMETHODCALLTYPE GetFlipStatus(DWORD f) override {
+        return query(com_begin(C_S_FLIPSTATUS, this, &f, 4), {}, [] { return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE GetBltStatus(DWORD f) override {
+        return query(com_begin(C_S_BLTSTATUS, this, &f, 4), {}, [] { return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE AddAttachedSurface(LPDIRECTDRAWSURFACE3 a) override {   // the z-buffer
+        A1 x = {U(a)};
+        return effect<HRESULT>(com_begin(C_S_ADDATT, this, &x, sizeof x), [] { return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE DeleteAttachedSurface(DWORD f, LPDIRECTDRAWSURFACE3 a) override {
+        A2 x = {f, U(a)};
+        return effect<HRESULT>(com_begin(C_S_DELATT, this, &x, sizeof x), [] { return (HRESULT)DD_OK; });
+    }
 
     HRESULT STDMETHODCALLTYPE GetAttachedSurface(LPDDSCAPS c, LPDIRECTDRAWSURFACE3* out) override {
-        if ((c->dwCaps & DDSCAPS_BACKBUFFER) && back) { *out = back; back->AddRef(); return DD_OK; }
-        if ((c->dwCaps & DDSCAPS_MIPMAP) && next_mip) { *out = next_mip; return DD_OK; }
-        *out = 0;
-        return DDERR_NOTFOUND;
+        return query(com_begin(C_S_GETATT, this, c, sizeof *c), {{out, sizeof *out}}, [&] {
+            if ((c->dwCaps & DDSCAPS_BACKBUFFER) && back) { *out = back; back->add_ref(); return (HRESULT)DD_OK; }
+            if ((c->dwCaps & DDSCAPS_MIPMAP) && next_mip) { *out = next_mip; return (HRESULT)DD_OK; }
+            *out = 0;
+            return (HRESULT)DDERR_NOTFOUND;
+        });
     }
 
-    HRESULT STDMETHODCALLTYPE SetColorKey(DWORD, LPDDCOLORKEY k) override {
-        keyed = k != 0;
-        key = k ? (uint16_t)k->dwColorSpaceLowValue : 0;
-        gen++;
-        return DD_OK;
+    HRESULT STDMETHODCALLTYPE SetColorKey(DWORD f, LPDDCOLORKEY k) override {
+        A2 x = {f, k ? (uint32_t)k->dwColorSpaceLowValue : 0xFFFFFFFFu};
+        return effect<HRESULT>(com_begin(C_S_SETKEY, this, &x, sizeof x), [&] {
+            keyed = k != 0;
+            key = k ? (uint16_t)k->dwColorSpaceLowValue : 0;
+            gen++;
+            return (HRESULT)DD_OK;
+        });
     }
-    HRESULT STDMETHODCALLTYPE GetColorKey(DWORD, LPDDCOLORKEY k) override {
-        if (!keyed) return DDERR_NOCOLORKEY;
-        k->dwColorSpaceLowValue = k->dwColorSpaceHighValue = key;
-        return DD_OK;
+    HRESULT STDMETHODCALLTYPE GetColorKey(DWORD f, LPDDCOLORKEY k) override {
+        return query(com_begin(C_S_GETKEY, this, &f, 4), {{k, sizeof *k}}, [&] {
+            if (!keyed) return (HRESULT)DDERR_NOCOLORKEY;
+            k->dwColorSpaceLowValue = k->dwColorSpaceHighValue = key;
+            return (HRESULT)DD_OK;
+        });
     }
 
-    HRESULT STDMETHODCALLTYPE Lock(LPRECT, LPDDSURFACEDESC d, DWORD, HANDLE) override;
-    HRESULT STDMETHODCALLTYPE Unlock(LPVOID) override;
-    HRESULT STDMETHODCALLTYPE Flip(LPDIRECTDRAWSURFACE3, DWORD) override;
-    HRESULT STDMETHODCALLTYPE Blt(LPRECT dst, LPDIRECTDRAWSURFACE3 src, LPRECT srcr, DWORD, LPDDBLTFX) override;
-    HRESULT STDMETHODCALLTYPE BltFast(DWORD x, DWORD y, LPDIRECTDRAWSURFACE3 src, LPRECT srcr, DWORD) override;
+    HRESULT STDMETHODCALLTYPE Lock(LPRECT r, LPDDSURFACEDESC d, DWORD f, HANDLE e) override;
+    // a check compares the pixels as each pass leaves them at the Unlock (its Lock handed both passes the same ones)
+    const void* lk_p = 0;
+    size_t lk_n = 0;
+    HRESULT STDMETHODCALLTYPE Unlock(LPVOID p) override {
+        A1 x = {U(p)};
+        int ph = shadow_com_phase();
+        return effect<HRESULT>(com_begin(C_S_UNLOCK, this, &x, sizeof x, ph ? lk_p : 0, ph ? lk_n : 0),
+                               [&] { return unlock(); });
+    }
+    HRESULT STDMETHODCALLTYPE Flip(LPDIRECTDRAWSURFACE3 t, DWORD f) override {
+        A2 x = {U(t), f};
+        return effect<HRESULT>(com_begin(C_S_FLIP, this, &x, sizeof x), [&] { present(); return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE Blt(LPRECT dst, LPDIRECTDRAWSURFACE3 src, LPRECT srcr, DWORD f, LPDDBLTFX fx) override {
+        // (pointers to the caller's structures are recorded by what they hold: the two passes' stacks differ)
+        struct { RECT d, s; uint32_t src, f, has; } x = {dst ? *dst : RECT{}, srcr ? *srcr : RECT{}, U(src), f,
+                                                         (dst ? 1u : 0u) | (srcr ? 2u : 0u) | (fx ? 4u : 0u)};
+        return effect<HRESULT>(com_begin(C_S_BLT, this, &x, sizeof x, fx, fx ? fx->dwSize : 0),
+                               [&] { return blt(dst, src, srcr); });
+    }
+    HRESULT STDMETHODCALLTYPE BltFast(DWORD x, DWORD y, LPDIRECTDRAWSURFACE3 src, LPRECT srcr, DWORD f) override {
+        struct { RECT s; uint32_t x, y, src, f, has; } a = {srcr ? *srcr : RECT{}, x, y, U(src), f, srcr ? 1u : 0u};
+        return effect<HRESULT>(com_begin(C_S_BLTFAST, this, &a, sizeof a), [&] { return blt_fast(x, y, src, srcr); });
+    }
+    HRESULT lock(LPDDSURFACEDESC d);
+    HRESULT unlock();
+    HRESULT blt(LPRECT dst, LPDIRECTDRAWSURFACE3 src, LPRECT srcr);
+    HRESULT blt_fast(DWORD x, DWORD y, LPDIRECTDRAWSURFACE3 src, LPRECT srcr);
 
     void copy_from(Surface* s, int sx, int sy, int dx, int dy, int cw, int ch) {
         for (int y = 0; y < ch; y++) {
@@ -558,12 +724,19 @@ struct Surface : Base_IDirectDrawSurface3 {
 HRESULT STDMETHODCALLTYPE Texture2::QueryInterface(REFIID riid, LPVOID* out) { return s->QueryInterface(riid, out); }
 ULONG STDMETHODCALLTYPE Texture2::AddRef() { return s->AddRef(); }
 ULONG STDMETHODCALLTYPE Texture2::Release() { return s->Release(); }
-HRESULT STDMETHODCALLTYPE Texture2::GetHandle(LPDIRECT3DDEVICE2, LPD3DTEXTUREHANDLE h) {
-    *h = (D3DTEXTUREHANDLE)(uintptr_t)s;
-    g.textures.insert(s);
-    return DD_OK;
+HRESULT STDMETHODCALLTYPE Texture2::GetHandle(LPDIRECT3DDEVICE2 dev, LPD3DTEXTUREHANDLE h) {
+    A1 x = {U(dev)};
+    return query(com_begin(C_T_HANDLE, this, &x, sizeof x), {{h, sizeof *h}}, [&] {
+        *h = (D3DTEXTUREHANDLE)(uintptr_t)s;
+        g.textures.insert(s);
+        return (HRESULT)DD_OK;
+    });
 }
-HRESULT STDMETHODCALLTYPE Texture2::Load(LPDIRECT3DTEXTURE2 src) {    // copy every level, as D3D does
+HRESULT STDMETHODCALLTYPE Texture2::Load(LPDIRECT3DTEXTURE2 src) {
+    A1 x = {U(src)};
+    return effect<HRESULT>(com_begin(C_T_LOAD, this, &x, sizeof x), [&] { return load(src); });
+}
+HRESULT Texture2::load(LPDIRECT3DTEXTURE2 src) {    // copy every level, as D3D does
     Surface* from = ((Texture2*)src)->s;
     for (Surface* d = s; d && from; d = d->next_mip, from = from->next_mip)
         if (d->w == from->w && d->h == from->h) d->pixels = from->pixels, d->gen++;
@@ -639,7 +812,32 @@ void present() {
     state_dirty();
 }
 
-HRESULT STDMETHODCALLTYPE Surface::Lock(LPRECT, LPDDSURFACEDESC d, DWORD, HANDLE) {
+// Lock hands out pixels: the rewrite's pass gets the same pointer, and the pixels the original's pass got
+HRESULT STDMETHODCALLTYPE Surface::Lock(LPRECT r, LPDDSURFACEDESC d, DWORD f, HANDLE e) {
+    struct { RECT r; uint32_t f, e, has; } x = {r ? *r : RECT{}, f, U(e), r ? 1u : 0u};
+    int ph = com_begin(C_S_LOCK, this, &x, sizeof x);
+    DWORD size = d->dwSize ? d->dwSize : sizeof(DDSURFACEDESC);
+    if (ph == 2) {
+        HRESULT hr = DD_OK;
+        com_take(&hr, sizeof hr);
+        com_take(d, size);
+        size_t n = d->lpSurface ? (size_t)d->lPitch * d->dwHeight : 0;
+        com_take(n ? d->lpSurface : 0, n);
+        lk_p = d->lpSurface, lk_n = n;
+        return hr;
+    }
+    HRESULT hr = lock(d);
+    if (ph == 1) {
+        size_t n = d->lpSurface ? (size_t)d->lPitch * d->dwHeight : 0;
+        com_save(&hr, sizeof hr);
+        com_save(d, size);
+        com_save(d->lpSurface, n);
+        lk_p = d->lpSurface, lk_n = n;
+    }
+    return hr;
+}
+
+HRESULT Surface::lock(LPDDSURFACEDESC d) {
     describe(d);
     if (is_back) {
         read_page();
@@ -654,7 +852,7 @@ HRESULT STDMETHODCALLTYPE Surface::Lock(LPRECT, LPDDSURFACEDESC d, DWORD, HANDLE
     return DD_OK;
 }
 
-HRESULT STDMETHODCALLTYPE Surface::Unlock(LPVOID) {
+HRESULT Surface::unlock() {
     if (is_back && g.page_locked) {
         g.page_locked = false;
         draw_page();
@@ -664,9 +862,7 @@ HRESULT STDMETHODCALLTYPE Surface::Unlock(LPVOID) {
     return DD_OK;
 }
 
-HRESULT STDMETHODCALLTYPE Surface::Flip(LPDIRECTDRAWSURFACE3, DWORD) { present(); return DD_OK; }
-
-HRESULT STDMETHODCALLTYPE Surface::Blt(LPRECT dst, LPDIRECTDRAWSURFACE3 src, LPRECT srcr, DWORD, LPDDBLTFX) {
+HRESULT Surface::blt(LPRECT dst, LPDIRECTDRAWSURFACE3 src, LPRECT srcr) {
     Surface* s = (Surface*)src;
     if (!s) { com_unsupported("IDirectDrawSurface3::Blt (colour fill)"); return DD_OK; }
     RECT d = dst ? *dst : RECT{0, 0, w, h}, r = srcr ? *srcr : RECT{0, 0, s->w, s->h};
@@ -685,7 +881,7 @@ HRESULT STDMETHODCALLTYPE Surface::Blt(LPRECT dst, LPDIRECTDRAWSURFACE3 src, LPR
     return DD_OK;
 }
 
-HRESULT STDMETHODCALLTYPE Surface::BltFast(DWORD x, DWORD y, LPDIRECTDRAWSURFACE3 src, LPRECT srcr, DWORD) {
+HRESULT Surface::blt_fast(DWORD x, DWORD y, LPDIRECTDRAWSURFACE3 src, LPRECT srcr) {
     Surface* s = (Surface*)src;
     RECT r = srcr ? *srcr : RECT{0, 0, s->w, s->h};
     copy_from(s, r.left, r.top, (int)x, (int)y, r.right - r.left, r.bottom - r.top);
@@ -866,24 +1062,66 @@ void draw(D3DVERTEXTYPE vtype, const void* verts, DWORD nverts, const WORD* idx,
 struct Material : Base_IDirect3DMaterial2 {
     LONG refs = 1;
     D3DMATERIAL m = {};
-    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
-    ULONG STDMETHODCALLTYPE Release() override { LONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE SetMaterial(LPD3DMATERIAL p) override { m = *p; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE GetMaterial(LPD3DMATERIAL p) override { *p = m; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE GetHandle(LPDIRECT3DDEVICE2, LPD3DMATERIALHANDLE h) override { *h = (D3DMATERIALHANDLE)(uintptr_t)this; return DD_OK; }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return effect<ULONG>(com_begin(C_ADDREF, this, 0, 0), [&] { return (ULONG)InterlockedIncrement(&refs); });
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        return effect<ULONG>(com_begin(C_RELEASE, this, 0, 0), [&] {
+            LONG n = InterlockedDecrement(&refs);
+            if (!n) delete this;
+            return (ULONG)n;
+        });
+    }
+    HRESULT STDMETHODCALLTYPE SetMaterial(LPD3DMATERIAL p) override {
+        return effect<HRESULT>(com_begin(C_M_SET, this, 0, 0, p, sizeof *p), [&] { m = *p; return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE GetMaterial(LPD3DMATERIAL p) override {
+        return query(com_begin(C_M_GET, this, 0, 0), {{p, sizeof *p}}, [&] { *p = m; return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE GetHandle(LPDIRECT3DDEVICE2 dev, LPD3DMATERIALHANDLE h) override {
+        A1 x = {U(dev)};
+        return query(com_begin(C_M_HANDLE, this, &x, sizeof x), {{h, sizeof *h}}, [&] {
+            *h = (D3DMATERIALHANDLE)(uintptr_t)this;
+            return (HRESULT)DD_OK;
+        });
+    }
 };
 
 struct Viewport : Base_IDirect3DViewport2 {
     LONG refs = 1;
     D3DVIEWPORT2 vp = {};
     Material* background = 0;
-    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
-    ULONG STDMETHODCALLTYPE Release() override { LONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE SetViewport2(LPD3DVIEWPORT2 v) override { vp = *v; g.vp = vp; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE GetViewport2(LPD3DVIEWPORT2 v) override { *v = vp; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE SetBackground(D3DMATERIALHANDLE h) override { background = (Material*)(uintptr_t)h; return DD_OK; }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return effect<ULONG>(com_begin(C_ADDREF, this, 0, 0), [&] { return (ULONG)InterlockedIncrement(&refs); });
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        return effect<ULONG>(com_begin(C_RELEASE, this, 0, 0), [&] {
+            LONG n = InterlockedDecrement(&refs);
+            if (!n) delete this;
+            return (ULONG)n;
+        });
+    }
+    HRESULT STDMETHODCALLTYPE SetViewport2(LPD3DVIEWPORT2 v) override {
+        return effect<HRESULT>(com_begin(C_V_SET, this, 0, 0, v, sizeof *v), [&] { vp = *v; g.vp = vp; return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE GetViewport2(LPD3DVIEWPORT2 v) override {
+        DWORD size = v->dwSize ? v->dwSize : sizeof *v;
+        return query(com_begin(C_V_GET, this, &size, 4), {{v, sizeof *v}}, [&] { *v = vp; return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE SetBackground(D3DMATERIALHANDLE h) override {
+        A1 x = {(uint32_t)h};
+        return effect<HRESULT>(com_begin(C_V_BACKGROUND, this, &x, sizeof x), [&] {
+            background = (Material*)(uintptr_t)h;
+            return (HRESULT)DD_OK;
+        });
+    }
 
     HRESULT STDMETHODCALLTYPE Clear(DWORD n, LPD3DRECT rects, DWORD flags) override {
+        A2 x = {n, flags};
+        return effect<HRESULT>(com_begin(C_V_CLEAR, this, &x, sizeof x, rects, rects ? n * sizeof *rects : 0),
+                               [&] { return clear(n, rects, flags); });
+    }
+    HRESULT clear(DWORD n, LPD3DRECT rects, DWORD flags) {
         if (!on_gl_thread()) return DD_OK;
         p_glBindFramebuffer(GL_FRAMEBUFFER, g.fbo);
         glEnable(GL_SCISSOR_TEST);
@@ -904,7 +1142,16 @@ struct Viewport : Base_IDirect3DViewport2 {
         return DD_OK;
     }
 
+    // what it computes depends on the transforms and viewport the calls before it set: queued like any result
     HRESULT STDMETHODCALLTYPE TransformVertices(DWORD n, LPD3DTRANSFORMDATA d, DWORD flags, LPDWORD offscreen) override {
+        struct { uint32_t n, flags, in_size, out_size, has_h, has_off; } x = {n, flags, d->dwInSize, d->dwOutSize,
+                                                                             d->lpHOut ? 1u : 0u, offscreen ? 1u : 0u};
+        int ph = com_begin(C_V_TRANSFORM, this, &x, sizeof x, d->lpIn, (size_t)n * d->dwInSize);
+        return query(ph, {{d->lpOut, (size_t)n * d->dwOutSize}, {d->lpHOut, (size_t)n * sizeof(D3DHVERTEX)},
+                          {&d->dwClipIntersection, 4}, {&d->dwClipUnion, 4}, {offscreen, 4}},
+                     [&] { return transform(n, d, flags, offscreen); });
+    }
+    HRESULT transform(DWORD n, LPD3DTRANSFORMDATA d, DWORD flags, LPDWORD offscreen) {
         // on the CPU, as D3D did: W x V x P, then the viewport mapping; clip codes for anything outside
         float m[16], wv[16];
         D3DMATRIX t;
@@ -948,10 +1195,22 @@ struct Viewport : Base_IDirect3DViewport2 {
 struct Device : Base_IDirect3DDevice2 {
     LONG refs = 1;
     Viewport* current = 0;
-    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
-    ULONG STDMETHODCALLTYPE Release() override { LONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return effect<ULONG>(com_begin(C_ADDREF, this, 0, 0), [&] { return (ULONG)InterlockedIncrement(&refs); });
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        return effect<ULONG>(com_begin(C_RELEASE, this, 0, 0), [&] {
+            LONG n = InterlockedDecrement(&refs);
+            if (!n) delete this;
+            return (ULONG)n;
+        });
+    }
 
     HRESULT STDMETHODCALLTYPE GetCaps(LPD3DDEVICEDESC hal, LPD3DDEVICEDESC hel) override {
+        A2 x = {hal ? (uint32_t)hal->dwSize : 0, hel ? (uint32_t)hel->dwSize : 0};
+        return query(com_begin(C_D_CAPS, this, &x, sizeof x), {{hal, x.a}, {hel, x.b}}, [&] { return caps(hal, hel); });
+    }
+    HRESULT caps(LPD3DDEVICEDESC hal, LPD3DDEVICEDESC hel) {
         for (LPD3DDEVICEDESC d : {hal, hel}) {
             if (!d) continue;
             DWORD size = d->dwSize;
@@ -989,15 +1248,39 @@ struct Device : Base_IDirect3DDevice2 {
         }
         return DD_OK;
     }
-    HRESULT STDMETHODCALLTYPE GetStats(LPD3DSTATS s) override { DWORD n = s->dwSize; memset(s, 0, n); s->dwSize = n; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE AddViewport(LPDIRECT3DVIEWPORT2) override { return DD_OK; }
-    HRESULT STDMETHODCALLTYPE DeleteViewport(LPDIRECT3DVIEWPORT2 v) override { if ((Viewport*)v == current) current = 0; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE SetCurrentViewport(LPDIRECT3DVIEWPORT2 v) override { current = (Viewport*)v; if (current) g.vp = current->vp; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE GetCurrentViewport(LPDIRECT3DVIEWPORT2* v) override { *v = current; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE BeginScene() override { return DD_OK; }
-    HRESULT STDMETHODCALLTYPE EndScene() override { return DD_OK; }
+    HRESULT STDMETHODCALLTYPE GetStats(LPD3DSTATS s) override {
+        DWORD n = s->dwSize;
+        return query(com_begin(C_D_STATS, this, &n, 4), {{s, n}}, [&] { memset(s, 0, n); s->dwSize = n; return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE AddViewport(LPDIRECT3DVIEWPORT2 v) override {
+        A1 x = {U(v)};
+        return effect<HRESULT>(com_begin(C_D_ADDVP, this, &x, sizeof x), [] { return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE DeleteViewport(LPDIRECT3DVIEWPORT2 v) override {
+        A1 x = {U(v)};
+        return effect<HRESULT>(com_begin(C_D_DELVP, this, &x, sizeof x), [&] {
+            if ((Viewport*)v == current) current = 0;
+            return (HRESULT)DD_OK;
+        });
+    }
+    HRESULT STDMETHODCALLTYPE SetCurrentViewport(LPDIRECT3DVIEWPORT2 v) override {
+        A1 x = {U(v)};
+        return effect<HRESULT>(com_begin(C_D_SETVP, this, &x, sizeof x), [&] {
+            current = (Viewport*)v;
+            if (current) g.vp = current->vp;
+            return (HRESULT)DD_OK;
+        });
+    }
+    HRESULT STDMETHODCALLTYPE GetCurrentViewport(LPDIRECT3DVIEWPORT2* v) override {
+        return query(com_begin(C_D_GETVP, this, 0, 0), {{v, sizeof *v}}, [&] { *v = current; return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE BeginScene() override { return effect<HRESULT>(com_begin(C_D_BEGIN, this, 0, 0), [] { return (HRESULT)DD_OK; }); }
+    HRESULT STDMETHODCALLTYPE EndScene() override { return effect<HRESULT>(com_begin(C_D_END, this, 0, 0), [] { return (HRESULT)DD_OK; }); }
 
+    // (a callback into the game for each format: run in both passes, as the data never changes)
     HRESULT STDMETHODCALLTYPE EnumTextureFormats(LPD3DENUMTEXTUREFORMATSCALLBACK cb, LPVOID ctx) override {
+        A1 x = {U(cb)};                                // (not ctx: the caller's stack)
+        com_begin(C_D_ENUMTEX, this, &x, sizeof x);
         for (Format f : {F565, F1555, F4444}) {
             DDSURFACEDESC d = {};
             d.dwSize = sizeof d;
@@ -1010,47 +1293,91 @@ struct Device : Base_IDirect3DDevice2 {
     }
 
     HRESULT STDMETHODCALLTYPE SetRenderState(D3DRENDERSTATETYPE s, DWORD v) override {
-        if ((DWORD)s < 64) {
-            g.rs[s] = v;
-            if (s == D3DRENDERSTATE_TEXTUREADDRESS) g.rs[D3DRENDERSTATE_TEXTUREADDRESSU] = g.rs[D3DRENDERSTATE_TEXTUREADDRESSV] = v;
-        }
-        return DD_OK;
+        A2 x = {(uint32_t)s, v};
+        int ph = com_begin(C_D_SETRS, this, &x, sizeof x);
+        if (ph && s == D3DRENDERSTATE_TEXTUREHANDLE) t_feed->tex = v;
+        return effect<HRESULT>(ph, [&] {
+            if ((DWORD)s < 64) {
+                g.rs[s] = v;
+                if (s == D3DRENDERSTATE_TEXTUREADDRESS) g.rs[D3DRENDERSTATE_TEXTUREADDRESSU] = g.rs[D3DRENDERSTATE_TEXTUREADDRESSV] = v;
+            }
+            return (HRESULT)DD_OK;
+        });
     }
-    HRESULT STDMETHODCALLTYPE GetRenderState(D3DRENDERSTATETYPE s, LPDWORD v) override { *v = (DWORD)s < 64 ? g.rs[s] : 0; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE SetLightState(D3DLIGHTSTATETYPE, DWORD) override { return DD_OK; }
+    HRESULT STDMETHODCALLTYPE GetRenderState(D3DRENDERSTATETYPE s, LPDWORD v) override {
+        A1 x = {(uint32_t)s};
+        return query(com_begin(C_D_GETRS, this, &x, sizeof x), {{v, 4}}, [&] { *v = (DWORD)s < 64 ? g.rs[s] : 0; return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE SetLightState(D3DLIGHTSTATETYPE s, DWORD v) override {
+        A2 x = {(uint32_t)s, v};
+        return effect<HRESULT>(com_begin(C_D_SETLS, this, &x, sizeof x), [] { return (HRESULT)DD_OK; });
+    }
     HRESULT STDMETHODCALLTYPE SetTransform(D3DTRANSFORMSTATETYPE t, LPD3DMATRIX m) override {
-        if (t == D3DTRANSFORMSTATE_WORLD) g.world = *m;
-        else if (t == D3DTRANSFORMSTATE_VIEW) g.view = *m;
-        else if (t == D3DTRANSFORMSTATE_PROJECTION) g.proj = *m;
-        return DD_OK;
+        A1 x = {(uint32_t)t};
+        return effect<HRESULT>(com_begin(C_D_SETXF, this, &x, sizeof x, m, sizeof *m), [&] {
+            if (t == D3DTRANSFORMSTATE_WORLD) g.world = *m;
+            else if (t == D3DTRANSFORMSTATE_VIEW) g.view = *m;
+            else if (t == D3DTRANSFORMSTATE_PROJECTION) g.proj = *m;
+            return (HRESULT)DD_OK;
+        });
     }
     HRESULT STDMETHODCALLTYPE GetTransform(D3DTRANSFORMSTATETYPE t, LPD3DMATRIX m) override {
-        *m = t == D3DTRANSFORMSTATE_WORLD ? g.world : t == D3DTRANSFORMSTATE_VIEW ? g.view : g.proj;
-        return DD_OK;
+        A1 x = {(uint32_t)t};
+        return query(com_begin(C_D_GETXF, this, &x, sizeof x), {{m, sizeof *m}}, [&] {
+            *m = t == D3DTRANSFORMSTATE_WORLD ? g.world : t == D3DTRANSFORMSTATE_VIEW ? g.view : g.proj;
+            return (HRESULT)DD_OK;
+        });
     }
-    HRESULT STDMETHODCALLTYPE DrawPrimitive(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vt, LPVOID v, DWORD n, DWORD) override {
-        if (pt != D3DPT_TRIANGLELIST) { com_unsupported("DrawPrimitive (not a triangle list)"); return DD_OK; }
-        draw(vt, v, n, 0, 0);
-        return DD_OK;
+    // every vertex type the game draws is 32 bytes (D3DVERTEX, D3DLVERTEX, D3DTLVERTEX)
+    HRESULT STDMETHODCALLTYPE DrawPrimitive(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vt, LPVOID v, DWORD n, DWORD f) override {
+        A4 x = {(uint32_t)pt, (uint32_t)vt, n, f};
+        std::vector<uint8_t> buf;
+        return effect<HRESULT>(com_begin(C_D_DRAW, this, &x, sizeof x, draw_record(vt, v, n, buf), (size_t)n * 32), [&] {
+            if (pt != D3DPT_TRIANGLELIST) { com_unsupported("DrawPrimitive (not a triangle list)"); return (HRESULT)DD_OK; }
+            draw(vt, v, n, 0, 0);
+            return (HRESULT)DD_OK;
+        });
     }
-    HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vt, LPVOID v, DWORD n, LPWORD idx, DWORD ni, DWORD) override {
-        if (pt != D3DPT_TRIANGLELIST) { com_unsupported("DrawIndexedPrimitive (not a triangle list)"); return DD_OK; }
-        draw(vt, v, n, idx, ni);
-        return DD_OK;
+    HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vt, LPVOID v, DWORD n, LPWORD idx, DWORD ni, DWORD f) override {
+        A5 x = {(uint32_t)pt, (uint32_t)vt, n, ni, f};
+        std::vector<uint8_t> buf;
+        int ph = com_begin(C_D_DRAWIDX, this, &x, sizeof x, draw_record(vt, v, n, buf), (size_t)n * 32);
+        if (ph) shadow_com_effect(C_D_DRAWIDX_I, this, 0, 0, idx, (size_t)ni * 2);
+        return effect<HRESULT>(ph, [&] {
+            if (pt != D3DPT_TRIANGLELIST) { com_unsupported("DrawIndexedPrimitive (not a triangle list)"); return (HRESULT)DD_OK; }
+            draw(vt, v, n, idx, ni);
+            return (HRESULT)DD_OK;
+        });
     }
 };
 
 struct Direct3D : Base_IDirect3D2 {
     LONG refs = 1;
-    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
-    ULONG STDMETHODCALLTYPE Release() override { LONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE CreateMaterial(LPDIRECT3DMATERIAL2* out, IUnknown*) override { *out = new Material; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE CreateViewport(LPDIRECT3DVIEWPORT2* out, IUnknown*) override { *out = new Viewport; return DD_OK; }
-    HRESULT STDMETHODCALLTYPE CreateDevice(REFCLSID, LPDIRECTDRAWSURFACE, LPDIRECT3DDEVICE2* out) override {
-        if (!gl_start()) return DDERR_GENERIC;
-        set_defaults();
-        *out = new Device;
-        return DD_OK;
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return effect<ULONG>(com_begin(C_ADDREF, this, 0, 0), [&] { return (ULONG)InterlockedIncrement(&refs); });
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        return effect<ULONG>(com_begin(C_RELEASE, this, 0, 0), [&] {
+            LONG n = InterlockedDecrement(&refs);
+            if (!n) delete this;
+            return (ULONG)n;
+        });
+    }
+    // a new object, like any result: the rewrite's pass is handed the one the original's pass made
+    HRESULT STDMETHODCALLTYPE CreateMaterial(LPDIRECT3DMATERIAL2* out, IUnknown*) override {
+        return query(com_begin(C_3_MATERIAL, this, 0, 0), {{out, sizeof *out}}, [&] { *out = new Material; return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE CreateViewport(LPDIRECT3DVIEWPORT2* out, IUnknown*) override {
+        return query(com_begin(C_3_VIEWPORT, this, 0, 0), {{out, sizeof *out}}, [&] { *out = new Viewport; return (HRESULT)DD_OK; });
+    }
+    HRESULT STDMETHODCALLTYPE CreateDevice(REFCLSID c, LPDIRECTDRAWSURFACE sf, LPDIRECT3DDEVICE2* out) override {
+        struct { GUID c; uint32_t sf; } x = {c, U(sf)};
+        return query(com_begin(C_3_DEVICE, this, &x, sizeof x), {{out, sizeof *out}}, [&] {
+            if (!gl_start()) return (HRESULT)DDERR_GENERIC;
+            set_defaults();
+            *out = new Device;
+            return (HRESULT)DD_OK;
+        });
     }
 };
 
@@ -1058,15 +1385,29 @@ struct Direct3D : Base_IDirect3D2 {
 struct DirectDraw2 : Base_IDirectDraw2 {
     LONG refs = 1;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* out) override {
-        if (riid == IID_IDirect3D2) { *out = new Direct3D; return DD_OK; }
-        if (riid == IID_IDirectDraw2 || riid == IID_IUnknown) { *out = this; AddRef(); return DD_OK; }
-        *out = 0;
-        return E_NOINTERFACE;
+        return query(com_begin(C_QI, this, &riid, sizeof riid), {{out, sizeof *out}}, [&] {
+            if (riid == IID_IDirect3D2) { *out = new Direct3D; return (HRESULT)DD_OK; }
+            if (riid == IID_IDirectDraw2 || riid == IID_IUnknown) { *out = this; InterlockedIncrement(&refs); return (HRESULT)DD_OK; }
+            *out = 0;
+            return (HRESULT)E_NOINTERFACE;
+        });
     }
-    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
-    ULONG STDMETHODCALLTYPE Release() override { LONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return effect<ULONG>(com_begin(C_ADDREF, this, 0, 0), [&] { return (ULONG)InterlockedIncrement(&refs); });
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        return effect<ULONG>(com_begin(C_RELEASE, this, 0, 0), [&] {
+            LONG n = InterlockedDecrement(&refs);
+            if (!n) delete this;
+            return (ULONG)n;
+        });
+    }
 
     HRESULT STDMETHODCALLTYPE GetCaps(LPDDCAPS hal, LPDDCAPS hel) override {
+        A2 x = {hal ? (uint32_t)hal->dwSize : 0, hel ? (uint32_t)hel->dwSize : 0};
+        return query(com_begin(C_DD_CAPS, this, &x, sizeof x), {{hal, x.a}, {hel, x.b}}, [&] { return caps(hal, hel); });
+    }
+    HRESULT caps(LPDDCAPS hal, LPDDCAPS hel) {
         for (LPDDCAPS c : {hal, hel}) {
             if (!c) continue;
             DWORD size = c->dwSize;
@@ -1082,14 +1423,23 @@ struct DirectDraw2 : Base_IDirectDraw2 {
         return DD_OK;
     }
     HRESULT STDMETHODCALLTYPE GetAvailableVidMem(LPDDSCAPS caps, LPDWORD total, LPDWORD free) override {
-        // 64 MB of card memory and no AGP: the top tier, and far from the 4 GB wrap that crashed v1.1
-        DWORD mem = caps && (caps->dwCaps & DDSCAPS_NONLOCALVIDMEM) ? 0 : 64u << 20;
-        if (total) *total = mem;
-        if (free) *free = mem;
-        return DD_OK;
+        A1 x = {caps ? (uint32_t)caps->dwCaps : 0xFFFFFFFFu};
+        return query(com_begin(C_DD_VIDMEM, this, &x, sizeof x), {{total, 4}, {free, 4}}, [&] {
+            // 64 MB of card memory and no AGP: the top tier, and far from the 4 GB wrap that crashed v1.1
+            DWORD mem = caps && (caps->dwCaps & DDSCAPS_NONLOCALVIDMEM) ? 0 : 64u << 20;
+            if (total) *total = mem;
+            if (free) *free = mem;
+            return (HRESULT)DD_OK;
+        });
     }
-    HRESULT STDMETHODCALLTYPE SetCooperativeLevel(HWND, DWORD) override { return gl_start() ? DD_OK : DDERR_GENERIC; }
-    HRESULT STDMETHODCALLTYPE EnumDisplayModes(DWORD, LPDDSURFACEDESC, LPVOID ctx, LPDDENUMMODESCALLBACK cb) override {
+    HRESULT STDMETHODCALLTYPE SetCooperativeLevel(HWND w, DWORD f) override {
+        A2 x = {U(w), f};
+        return effect<HRESULT>(com_begin(C_DD_COOP, this, &x, sizeof x), [] { return gl_start() ? (HRESULT)DD_OK : (HRESULT)DDERR_GENERIC; });
+    }
+    // (a callback into the game for each mode: run in both passes, as the data never changes)
+    HRESULT STDMETHODCALLTYPE EnumDisplayModes(DWORD f, LPDDSURFACEDESC, LPVOID ctx, LPDDENUMMODESCALLBACK cb) override {
+        A2 x = {f, U(cb)};                             // (not ctx: the caller's stack)
+        com_begin(C_DD_ENUMMODES, this, &x, sizeof x);
         static const int modes[][2] = {{512, 384}, {640, 480}, {800, 600}, {1024, 768}};
         for (auto& m : modes) {
             DDSURFACEDESC d = {};
@@ -1102,12 +1452,18 @@ struct DirectDraw2 : Base_IDirectDraw2 {
         }
         return DD_OK;
     }
-    HRESULT STDMETHODCALLTYPE SetDisplayMode(DWORD w, DWORD h, DWORD, DWORD, DWORD) override {
-        resize_target((int)w, (int)h);
-        return DD_OK;
+    HRESULT STDMETHODCALLTYPE SetDisplayMode(DWORD w, DWORD h, DWORD bpp, DWORD rate, DWORD f) override {
+        A5 x = {w, h, bpp, rate, f};
+        return effect<HRESULT>(com_begin(C_DD_SETMODE, this, &x, sizeof x), [&] { resize_target((int)w, (int)h); return (HRESULT)DD_OK; });
     }
-    HRESULT STDMETHODCALLTYPE RestoreDisplayMode() override { return DD_OK; }
+    HRESULT STDMETHODCALLTYPE RestoreDisplayMode() override {
+        return effect<HRESULT>(com_begin(C_DD_RESTOREMODE, this, 0, 0), [] { return (HRESULT)DD_OK; });
+    }
     HRESULT STDMETHODCALLTYPE GetDisplayMode(LPDDSURFACEDESC d) override {
+        DWORD size = d->dwSize ? d->dwSize : sizeof *d;
+        return query(com_begin(C_DD_GETMODE, this, &size, 4), {{d, size}}, [&] { return display_mode(d); });
+    }
+    HRESULT display_mode(LPDDSURFACEDESC d) {
         DWORD size = d->dwSize ? d->dwSize : sizeof *d;
         memset(d, 0, size);
         d->dwSize = size;
@@ -1116,9 +1472,16 @@ struct DirectDraw2 : Base_IDirectDraw2 {
         pixel_format(F565, d->ddpfPixelFormat);
         return DD_OK;
     }
-    HRESULT STDMETHODCALLTYPE WaitForVerticalBlank(DWORD, HANDLE) override { return DD_OK; }
+    HRESULT STDMETHODCALLTYPE WaitForVerticalBlank(DWORD f, HANDLE e) override {
+        A2 x = {f, U(e)};
+        return effect<HRESULT>(com_begin(C_DD_VBLANK, this, &x, sizeof x), [] { return (HRESULT)DD_OK; });
+    }
 
     HRESULT STDMETHODCALLTYPE CreateSurface(LPDDSURFACEDESC d, LPDIRECTDRAWSURFACE* out, IUnknown*) override {
+        DWORD size = d->dwSize ? d->dwSize : sizeof *d;
+        return query(com_begin(C_DD_SURFACE, this, 0, 0, d, size), {{out, sizeof *out}}, [&] { return create_surface(d, out); });
+    }
+    HRESULT create_surface(LPDDSURFACEDESC d, LPDIRECTDRAWSURFACE* out) {
         DWORD caps = d->ddsCaps.dwCaps;
         Surface* s = new Surface;
         s->caps = d->ddsCaps;
@@ -1163,13 +1526,23 @@ struct DirectDraw2 : Base_IDirectDraw2 {
 struct DirectDraw1 : Base_IDirectDraw {                   // what DirectDrawCreate returns; the game QIs it at once
     LONG refs = 1;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* out) override {
-        if (riid == IID_IDirectDraw2) { *out = new DirectDraw2; return DD_OK; }
-        if (riid == IID_IDirectDraw || riid == IID_IUnknown) { *out = this; AddRef(); return DD_OK; }
-        *out = 0;
-        return E_NOINTERFACE;
+        return query(com_begin(C_QI, this, &riid, sizeof riid), {{out, sizeof *out}}, [&] {
+            if (riid == IID_IDirectDraw2) { *out = new DirectDraw2; return (HRESULT)DD_OK; }
+            if (riid == IID_IDirectDraw || riid == IID_IUnknown) { *out = this; InterlockedIncrement(&refs); return (HRESULT)DD_OK; }
+            *out = 0;
+            return (HRESULT)E_NOINTERFACE;
+        });
     }
-    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
-    ULONG STDMETHODCALLTYPE Release() override { LONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return effect<ULONG>(com_begin(C_ADDREF, this, 0, 0), [&] { return (ULONG)InterlockedIncrement(&refs); });
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        return effect<ULONG>(com_begin(C_RELEASE, this, 0, 0), [&] {
+            LONG n = InterlockedDecrement(&refs);
+            if (!n) delete this;
+            return (ULONG)n;
+        });
+    }
 };
 
 HRESULT WINAPI emu_DirectDrawCreate(GUID*, LPDIRECTDRAW* out, IUnknown*) {
