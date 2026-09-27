@@ -101,7 +101,10 @@ physics and AI statics (saved automatically):
 - `f.object(ptr, "what")` — a game object with a vtable, sized by its class;
 - `f.add(ptr, bytes, "what")` — anything else (an embedded part, an output, a constructor's `this`,
   whose vtable isn't set yet);
-- `f.pure = true` — writes only its explicit outputs and reads nothing global (also fuzzed offline);
+- `f.pure = true` — reads and writes no globals (also fuzzed offline). It doesn't cover the object: a
+  member function that writes `this` still lists it, or the check runs the rewrite on the original's
+  result and never compares it. A setter that steps a value (`Car::SetSteering` moves at most 0.08 a
+  tick) then steps twice, and the race parts from the original in shadow mode alone;
 - `f.replay_only = "why"` — allocates, frees, loads files, or writes what can't be bounded: checked by
   whole-race replays, not shadow checks.
 
@@ -124,15 +127,18 @@ for a check on the main thread, where the physics can tick between the two passe
    callees you want to record with a jump to a stub, and compare the original against the rewrite on
    random worlds — object state, outputs and the stubs' call logs. Put it in `test\world_<name>.cpp`.
 4. **In game:** shadow mode (`[port] default=shadow`) and a replay with the rewrite live
-   (`default=new`); see README.md.
+   (`default=new`); see README.md. A shadow-mode replay runs the original, so its trace must match the
+   same recording replayed with `default=original`, tick for tick; if it doesn't, a check leaks (a
+   footprint misses something its function writes), and `dump_ticks` at the first differing tick names
+   the field.
 
 ## Fixes
 
 Faithful first: every function is ported and verified with the original's bugs intact. Then a chosen
 set of bugs is fixed, always on for players and never a switch. A fix departs from the original only
 where the original would crash, hang, overrun a buffer or turn a degenerate case into NaN, so every
-other input still gives the original's bits and a recorded race still replays identically on the
-original code.
+other input still gives the original's bits, and a recorded race replays identically on the original
+code until one of those cases comes up (docs/FIXES.md).
 
 - Mark each one `// FIX: what and why`, and write it `if (VP_FIX && bad case) { ... }` (or
   `VP_FIX ? fixed : original`). `VP_FIX` is 1 in the DLL; a harness that defines `VP_FAITHFUL` before

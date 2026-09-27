@@ -387,13 +387,13 @@ PORT_FN(0x00437660, "Car::ApplySuspensionForce", Car_ApplySuspensionForce, fp_su
 static void __fastcall Car_SetTractionControl(Car* self, Edx, int mode) {
     for (int i = 0; i < 4; i++) self->wheels[i].traction_control = mode;
 }
-static void fp_set_tc(Footprint& f, Car*, Edx, int) { f.pure = true; }
+static void fp_set_tc(Footprint& f, Car* self, Edx, int) { f.add(self, sizeof(Car), "car"); f.pure = true; }
 PORT_FN(0x004395e0, "Car::SetTractionControl", Car_SetTractionControl, fp_set_tc)
 
 static void __fastcall Car_SetABSBraking(Car* self, Edx, int mode) {
     for (int i = 0; i < 4; i++) self->wheels[i].abs_mode = mode;
 }
-static void fp_set_abs(Footprint& f, Car*, Edx, int) { f.pure = true; }
+static void fp_set_abs(Footprint& f, Car* self, Edx, int) { f.add(self, sizeof(Car), "car"); f.pure = true; }
 PORT_FN(0x00439600, "Car::SetABSBraking", Car_SetABSBraking, fp_set_abs)
 
 // SetSteering (0x439620): the change is limited to 0.08 a step, the result to -1..1, then the steered pair's
@@ -417,24 +417,24 @@ static void __fastcall Car_SetSteering(Car* self, Edx, float s) {
     }
     COPY4(self->steering, nsf);
 }
-static void fp_set_steering(Footprint& f, Car*, Edx, float) { f.pure = true; }
+static void fp_set_steering(Footprint& f, Car* self, Edx, float) { f.add(self, sizeof(Car), "car"); f.pure = true; }
 PORT_FN(0x00439620, "Car::SetSteering", Car_SetSteering, fp_set_steering)
 
 // the plain stores (each an integer move of the float's bits)
 static void __fastcall Car_SetThrottle(Car* self, Edx, uint32_t v) { memcpy(&self->throttle, &v, 4); }
-static void fp_set_throttle(Footprint& f, Car*, Edx, uint32_t) { f.pure = true; }
+static void fp_set_throttle(Footprint& f, Car* self, Edx, uint32_t) { f.add(self, sizeof(Car), "car"); f.pure = true; }
 PORT_FN(0x004396d0, "Car::SetThrottle", Car_SetThrottle, fp_set_throttle)
 static void __fastcall Car_SetBraking(Car* self, Edx, uint32_t v) { memcpy(&self->braking, &v, 4); }
-static void fp_set_braking(Footprint& f, Car*, Edx, uint32_t) { f.pure = true; }
+static void fp_set_braking(Footprint& f, Car* self, Edx, uint32_t) { f.add(self, sizeof(Car), "car"); f.pure = true; }
 PORT_FN(0x004396e0, "Car::SetBraking", Car_SetBraking, fp_set_braking)
 static void __fastcall Car_SetClutch(Car* self, Edx, uint32_t v) { memcpy(&self->clutch, &v, 4); }
-static void fp_set_clutch(Footprint& f, Car*, Edx, uint32_t) { f.pure = true; }
+static void fp_set_clutch(Footprint& f, Car* self, Edx, uint32_t) { f.add(self, sizeof(Car), "car"); f.pure = true; }
 PORT_FN(0x004396f0, "Car::SetClutch", Car_SetClutch, fp_set_clutch)
 static void __fastcall Car_SetEBrake(Car* self, Edx, uint32_t v) { memcpy(&self->ebrake, &v, 4); }
-static void fp_set_ebrake(Footprint& f, Car*, Edx, uint32_t) { f.pure = true; }
+static void fp_set_ebrake(Footprint& f, Car* self, Edx, uint32_t) { f.add(self, sizeof(Car), "car"); f.pure = true; }
 PORT_FN(0x00439700, "Car::SetEBrake", Car_SetEBrake, fp_set_ebrake)
 static void __fastcall Car_SetPitch(Car* self, Edx, uint32_t v) { memcpy(&self->pitch, &v, 4); }
-static void fp_set_pitch(Footprint& f, Car*, Edx, uint32_t) { f.pure = true; }
+static void fp_set_pitch(Footprint& f, Car* self, Edx, uint32_t) { f.add(self, sizeof(Car), "car"); f.pure = true; }
 PORT_FN(0x0043b050, "Car::SetPitch", Car_SetPitch, fp_set_pitch)
 
 // the gear setters go through the Transmission (by address) and mirror its requested gear

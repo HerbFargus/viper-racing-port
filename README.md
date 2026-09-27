@@ -79,21 +79,32 @@ That is the whole physics and AI code, apart from the debug screens' drawing.
   the renderer draws (models, textures, smoke, dust, skids), and the effects (shadows, smoke puffs,
   reflections, crash debris, sparks, splashes). The drawing itself is left for the graphics stage. The
   world runs every frame on the main thread, so it is checked by shadow-mode races and by replays.
+- **The kernel and utilities** (`hook/krn_*.cpp`, 437 more): start-up, memory, threads, the physics
+  timer, locks, the crash handler and FPU modes, timing and profiling (`krn_core`); files, the log, the
+  rest of `win32.obj`, message pipes and shared memory (`krn_file`); the keyboard and mouse queues,
+  random numbers, pools, bags, memory streams, string tables and base64 (`krn_util`); and the resource
+  archives, languages and units, the options file and telemetry (`krn_res`). They make the same Windows
+  calls as the original, through the game's own import table, and call its C runtime by address, so
+  they change nothing yet about what the game runs on. The 3-byte `rdtsc` routine is too short to hook
+  and stays original in the game.
 
 Then a chosen set of the original's bugs is fixed, always on: the AI crash (a car losing its place on
 its racing line), degenerate racing lines, a ground-contact divide by zero, vrmod's obstacle wake, a single race on a
 track with no AI racing line (it runs without AI cars instead of crashing), and
 buffer overruns that long mod-car, driver and track names could trigger. A fix only changes what happens
-where the original would crash, hang or overrun, so an ordinary race still replays identically on the
-original code. They are listed in `docs/FIXES.md`. A `race.exe` carrying vrmod's two engine fixes is
-recognised, and the rewrites, which carry the same fixes, replace them.
+where the original would crash, hang or overrun, so a race replays identically on the original code
+until one of those comes up. The AI crash is the one that comes up in ordinary racing (after the
+stranded-car teleport), so a recording can part from the original there. They are listed in
+`docs/FIXES.md`. A `race.exe` carrying vrmod's two engine fixes is recognised, and the rewrites, which
+fix the same bugs, replace them.
 
 A rewrite replaces only the exact stock v1.0 function it was written from: before anything is patched,
 the DLL fingerprints each function's code and the read-only constants it reads (`hook/stock.inc`), and
 a function a vrmod fix has patched stays original, so the fix keeps working.
 
 Each is checked in game in shadow mode, or, where the game never reaches it, offline. A race recorded
-with all of them running and replayed on the original code is identical tick for tick. How to port a
+with all of them running and replayed on the original code is identical tick for tick, up to a fix
+(above), and the same replay in shadow mode matches the original's. How to port a
 function this way is written up in `docs/PORTING.md`. The rules that make bit for bit possible are in
 `hook/x87.h`:
 - every sum keeps the original's grouping;

@@ -2,8 +2,16 @@
 
 The rewrites reproduce the v1.0 `race.exe` bit for bit, bugs included, and then fix a chosen set of
 those bugs. The fixes are always on. Each one changes only what happens where the original would crash,
-hang, overrun a buffer or turn a degenerate case into NaN, so an ordinary race is identical to the
-original's, tick for tick. In the code each is marked `// FIX:` (see docs/PORTING.md, "Fixes").
+hang, overrun a buffer or turn a degenerate case into NaN, so a race is identical to the original's, tick
+for tick, until one of those cases comes up. In the code each is marked `// FIX:` (see docs/PORTING.md,
+"Fixes").
+
+The AI crash below is the one that comes up in ordinary racing: an AI car teleported back onto the track
+can lose its place on its racing line (it did within a minute on the Coliseum). On a stock `race.exe`
+the original then crashes. On one with vrmod's patch it survives, but puts the car's place at the head of
+the line, where the fix puts it at the nearest point. So a race recorded with the rewrites parts from the
+original there, in that car's steering target, and a shadow check of `IdealLine::reset_bead_position`
+reports it as a mismatch. That is the fix, not a porting error.
 
 ## The AI crash
 
@@ -18,7 +26,7 @@ dozen places and the game dies.
   `CenterLine::update`, `update_2d_data`, `get_car_dlong_meters`, `get_car_dlong_cookie`,
   `time_between`, `AICar::check_for_too_fast` and `init_rt_lat`.
 - vrmod's AI bead guard (back to the head of the line, in `advance_bead`) is recognised, and replaced by
-  this fix.
+  this fix, which puts the car at the nearest point of its line instead of the head.
 
 ## Racing lines
 

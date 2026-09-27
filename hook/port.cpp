@@ -122,7 +122,7 @@ void port_check_stock() {
             for (uint32_t i = st.first; i < st.first + st.nconst; i++)
                 h = fnv((const uint8_t*)k_stock_consts[i].va, k_stock_consts[i].width, h);
             if (st.vrmod && h == st.vrmod) {
-                logf("port: %s has vrmod's engine fix; the rewrite, which carries the same fix, replaces it", f->name);
+                logf("port: %s has vrmod's engine fix; the rewrite fixes the same bug and replaces it (docs/FIXES.md)", f->name);
             } else if (h != st.hash) {
                 f->patched = true;
                 logf("port: %s stays original -- the installed race.exe has %s patched (a vrmod fix?)", f->name,

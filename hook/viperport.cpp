@@ -562,6 +562,60 @@ static void resolve() {
     G.ngobs = A(0x00553368);
 }
 
+// ---- diagnostics: the game's own log, and crashes --------------------------------------------------------
+// The game writes its log to c:\log.log and its crash report to c:\except.log, which an ordinary user can't
+// create today, so both are lost. Its log is mirrored here (a hook of its own, LogInstallHook), and a vectored
+// exception handler notes each fault as it happens: the code, where, and the code addresses on the stack
+// (hook\build\dinput.map names the DLL's; out\symbols.csv the game's). First chance: some are handled.
+static void __cdecl game_log_hook(const char* msg) { logf("game: %s", msg); }
+static volatile long g_faults;
+static LONG CALLBACK fault_logger(EXCEPTION_POINTERS* e) {
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION: case EXCEPTION_INT_DIVIDE_BY_ZERO: case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+    case EXCEPTION_FLT_OVERFLOW: case EXCEPTION_FLT_INVALID_OPERATION: case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION: case EXCEPTION_STACK_OVERFLOW: case EXCEPTION_FLT_STACK_CHECK:
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (InterlockedIncrement(&g_faults) > 20) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t at = (uintptr_t)e->ExceptionRecord->ExceptionAddress;
+    const uintptr_t self = (uintptr_t)g_self;
+    char where[48];
+    if (at >= 0x400000 && at < 0x600000) wsprintfA(where, "race.exe %08lx", (unsigned long)at);
+    else wsprintfA(where, "dinput.dll+%05lx", (unsigned long)(at - self));
+    char stack[16 * 22] = "";
+    const uint32_t* sp = (const uint32_t*)(uintptr_t)e->ContextRecord->Esp;
+    int n = 0;
+    for (int i = 0; i < 256 && n < 16 && !IsBadReadPtr(sp + i, 4); i++) {
+        const uint32_t v = sp[i];
+        char one[24];
+        if (v >= 0x401000 && v < 0x4d0000) wsprintfA(one, " %08lx", (unsigned long)v);
+        else if (v >= self + 0x1000 && v < self + 0x400000) wsprintfA(one, " dll+%05lx", (unsigned long)(v - self));
+        else continue;
+        lstrcatA(stack, one);
+        n++;
+    }
+    const ULONG_PTR* info = e->ExceptionRecord->ExceptionInformation;
+    logf("FAULT %08lx at %s (thread %lu%s)%s%08lx; code on the stack:%s", code, where, GetCurrentThreadId(),
+         GetCurrentThreadId() == g_physics_thread_id ? ", physics" : "",
+         code == EXCEPTION_ACCESS_VIOLATION ? (info[0] ? ", writing " : ", reading ") : ", ",
+         code == EXCEPTION_ACCESS_VIOLATION ? (unsigned long)info[1] : (unsigned long)e->ContextRecord->Eip, stack);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+// LogBegin clears the hook table, so the hook goes in just after it (detour(0x00410d10), for gen_port_tables.py)
+static uint8_t(__cdecl* o_LogBegin)();
+static uint8_t __cdecl h_LogBegin() {
+    const uint8_t r = o_LogBegin();
+    ((void(__cdecl*)(void*))0x00411120)((void*)game_log_hook);                                 // LogInstallHook
+    return r;
+}
+static void install_diagnostics() {
+    AddVectoredExceptionHandler(0, fault_logger);
+    if (g_build == &k_builds[0]) *(void**)&o_LogBegin = detour_front(0x00410d10, (void*)h_LogBegin, "LogBegin (the game's log, mirrored)");
+}
+
 static void install() {
     uint8_t* base = (uint8_t*)GetModuleHandleA(NULL);
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
@@ -588,6 +642,7 @@ static void install() {
     port_install(ini);                          // M3: rewritten functions (Obstacle::Update, collide_phobs, ...)
     replay_install(ini);                        // M3: the race recorder and replayer
     platform_install(g_build->name);            // M2: SDL2 window and input, when viperport.ini asks
+    install_diagnostics();
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
