@@ -285,8 +285,21 @@ PORT_FN(0x0042b630, "RecordFile::bartag::bartag", bartag_ctor, fp_bartag_ctor)
 static void __fastcall RecordMgr_init_baserecord(RecordMgr* self, Edx, RaceRecord* rec, int car) {
     stosd0(rec, 0x12);
     const uint8_t* info = CarMgrGetInfo(car);
-    str_copy(rec->car_name, (const char*)info + 5);
-    str_copy(rec->driver_name, (const char*)info + 0x12);
+    const char* car_name = (const char*)info + 5;
+    const char* driver_name = (const char*)info + 0x12;
+    // FIX: the original strcpys both names whole: a car name of 13 characters or more ran into driver_name (and
+    // past it, for a long one), a driver name of 33 or more over index, flags, car, stage, lap, race_type and on into
+    // the next record. Each is cut to what its field holds (12 and 32 characters).
+    if (VP_FIX && strlen(car_name) > sizeof rec->car_name - 1) {
+        memcpy(rec->car_name, car_name, sizeof rec->car_name - 1);
+        rec->car_name[sizeof rec->car_name - 1] = 0;
+    } else
+        str_copy(rec->car_name, car_name);
+    if (VP_FIX && strlen(driver_name) > sizeof rec->driver_name - 1) {
+        memcpy(rec->driver_name, driver_name, sizeof rec->driver_name - 1);
+        rec->driver_name[sizeof rec->driver_name - 1] = 0;
+    } else
+        str_copy(rec->driver_name, driver_name);
     const int8_t c = (int8_t)rec->driver_name[0];                      // cmp al, 'a'; jl (signed)
     if (c >= 0x61 && c <= 0x7a) rec->driver_name[0] = (char)(c & 0xdf);
     memcpy(rec->date, P<void>(S_DATE), 4);
@@ -448,9 +461,7 @@ static void fp_set_racetime(Footprint& f, int, uint32_t) {
 PORT_FN(0x0042a4d0, "set_racetime_for_car", set_racetime_for_car, fp_set_racetime)
 
 // set_best_stages: per car and stage (a table of 16 x 3 on the stack, indexed car*3 + stage - 1 with the car
-// signed), the fastest stage record (the first of equals; a NaN never replaces one) gets flag 2. An index
-// outside the table writes the original's own stack (saved registers, the return address): not reproduced --
-// those records are left alone here (the footprint makes such a call replay_only).
+// signed), the fastest stage record (the first of equals; a NaN never replaces one) gets flag 2.
 static void __cdecl set_best_stages(void) {
     struct Slot { int32_t idx; uint32_t time; };
     Slot tab[48];
@@ -458,7 +469,11 @@ static void __cdecl set_best_stages(void) {
     for (int32_t i = 0; stages()->count > i; i++) {
         const uint8_t* r = rec_at(stages(), i);
         const int32_t k = (int32_t)(int8_t)r[0x41] * 3 + (int32_t)r[0x42] - 1;
-        if ((uint32_t)k >= 48) continue;                                // (the original's stack)
+        // FIX: an index outside the 48 slots (a negative car byte, a stage of 0, car*3 + stage past 48) wrote the
+        // record's index and time over the original's own stack -- its saved registers, or at 48 the return
+        // address. Such a record is skipped. (There is no faithful form: the original's stack isn't the
+        // rewrite's to write, so VP_FAITHFUL skips it too, and the footprint makes such a call replay_only.)
+        if ((uint32_t)k >= 48) continue;
         Slot& s = tab[k];
         if (s.idx == -1 || D(Fb(s.time)) > D(at<float>((void*)r, 4))) {
             s.idx = i;
@@ -673,6 +688,26 @@ static void __fastcall RecordFile_clear_record_bits(RecordFile* self, Edx) {
 static void fp_clear_record_bits(Footprint& f, RecordFile* self, Edx) { f.add(self, sizeof *self, "RecordFile"); }
 PORT_FN(0x0042a9d0, "RecordFile::clear_record_bits", RecordFile_clear_record_bits, fp_clear_record_bits)
 
+// <user dir><records file name>, as the constructor and save build it: strcpy / strcat into 0x100 bytes of the
+// original's stack. Returns the path: `path` (0x100 bytes), or `big` (0x400) for the FIX.
+static const char* record_path(char* path, char* big, const char* dir, const char* fn) {
+    const size_t nd = strlen(dir), nf = strlen(fn);
+    // FIX: a user directory and name of 0x100 characters or more together overran the original's buffer (into its
+    // return address). Such a path is built in a bigger buffer instead (cut at 0x3ff characters, which no file
+    // call would open anyway), so a long user directory still finds its records file.
+    if (VP_FIX && nd + nf + 1 > 0x100) {
+        const size_t kd = nd < 0x3ff ? nd : 0x3ff;
+        const size_t kf = nf < 0x3ff - kd ? nf : 0x3ff - kd;
+        memcpy(big, dir, kd);
+        memcpy(big + kd, fn, kf);
+        big[kd + kf] = 0;
+        return big;
+    }
+    str_copy(path, dir);
+    str_cat(path, fn);
+    return path;
+}
+
 // the constructor: an empty file (the six bartags constructed, then all of it zeroed and the header set);
 // the name, its 3-letter extension stripped, + ".sco" (strcpy / strcat into 15 bytes, unbounded); load
 // <user dir><name>; a missing, short or foreign file is removed and recreated empty (and saved)
@@ -689,12 +724,27 @@ static RecordMgr* __fastcall RecordMgr_ctor(RecordMgr* self, Edx, const char* na
         self->file = file;
     } else self->file = 0;
     char* fn = (char*)self + 1;
-    str_copy(fn, name);
-    if (fn[(int32_t)strlen(fn) - 4] == '.') fn[(int32_t)strlen(fn) - 4] = 0;   // (len < 4: reads before it, as the original)
-    memcpy(fn + strlen(fn), P<void>(STR_SCO), 5);                       // ".sco" (a dword and a byte)
-    char path[0x100];
-    str_copy(path, Win32GetUserDirectory());
-    str_cat(path, fn);
+    const size_t len = strlen(name);
+    const bool ext = len >= 4 && name[len - 4] == '.';
+    // FIX: the name has 15 bytes (+0x01; the RecordFile pointer, already set, follows at +0x10), and the original
+    // copies the whole track name in, then puts ".sco" in place of a 3-letter extension, or after the name if it
+    // has none: a name of more than 14 characters, or of more than 10 without an extension, overran onto the file
+    // pointer, and the load or the recreated file went through the broken pointer. The stem is cut to 10
+    // characters instead: the file is "<the stem's first 10 characters>.sco".
+    if (VP_FIX && (len > 14 || (!ext && len > 10))) {
+        const size_t stem = (ext ? len - 4 : len) < 10 ? (ext ? len - 4 : len) : 10;
+        memcpy(fn, name, stem);
+        memcpy(fn + stem, P<void>(STR_SCO), 5);
+        logf("records: the track name \"%s\" doesn't fit the records file name; using %s", name, fn);
+    } else {
+        str_copy(fn, name);
+        // FIX: a name under 4 characters has no extension, but the original tests the byte 4 before its end -- for
+        // under 3, a byte before the RecordMgr -- and clears it if it is a '.'. Not tested here.
+        if (!(VP_FIX && len < 4) && fn[(int32_t)strlen(fn) - 4] == '.') fn[(int32_t)strlen(fn) - 4] = 0;
+        memcpy(fn + strlen(fn), P<void>(STR_SCO), 5);                   // ".sco" (a dword and a byte)
+    }
+    char path_buf[0x100], path_big[0x400];
+    const char* path = record_path(path_buf, path_big, Win32GetUserDirectory(), fn);
     int fd = FileOpen(path);
     int size = FILE_SIZE;
     if (fd && FileRead(fd, self->file, &size) && self->file->size == FILE_SIZE && self->file->version == FILE_VERSION) {
@@ -724,9 +774,9 @@ static void __fastcall RecordMgr_save(RecordMgr* self, Edx) {
     if (!self->dirty) return;
     clear_record_bitsA(self->file, 0);
     self->dirty = 0;
-    char path[0x100];
-    str_copy(path, Win32GetUserDirectory());
-    str_cat(path, (const char*)self + 1);                              // (an overlong name runs on into +0x10)
+    char path_buf[0x100], path_big[0x400];
+    const char* path = record_path(path_buf, path_big, Win32GetUserDirectory(),
+                                   (const char*)self + 1);             // (an overlong name runs on into +0x10)
     int fd = FileCreate(path);
     if (fd) {
         FileWrite(fd, self->file, FILE_SIZE);

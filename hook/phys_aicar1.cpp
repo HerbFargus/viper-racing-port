@@ -15,10 +15,12 @@
 //   Skipped: the 34 $E static initialisers (0x42e3a0..0x42e5b0, the msg colours) and AICar::show_msg
 //   (0x42fb70), a bare `ret` (called here by address all the same).
 //
-// Faithful first: the known AI crash is kept. A stranded car's teleport (teleport_to_track ->
-// IdealLine::update_car_info / reset_bead_position) can leave the line's bead segment NULL; get_ilpos then
-// hands out a NULL segment, and check_for_too_fast reads seg->next through it (the crash), as the original
-// does. update_segment_info checks for NULL; the other reader (init_rt_lat) is the second half's.
+// Fixes (port.h: VP_FIX; VP_FAITHFUL builds the original's behaviour): the known AI crash. A stranded car's teleport
+// (teleport_to_track -> IdealLine::update_car_info / reset_bead_position) or a NaN position could leave the line's
+// bead segment NULL; get_ilpos then handed out a NULL segment, and check_for_too_fast read seg->next through it.
+// reset_bead_position (phys_ideal.cpp) now puts a lost bead back at the nearest point of the line itself, and
+// check_for_too_fast asks it to before reading. update_segment_info checks for NULL; the other reader
+// (init_rt_lat) is the second half's. And stuff_event's text is bounded to its 32-byte buffer.
 //
 // Written from the v1.0 disassembly: register values as double, stored values as float, the same grouping,
 // integer compares of float bits done on the bits, float copies made with integer moves kept as bit copies,
@@ -453,16 +455,23 @@ PORT_FN(0x0042e5c0, "AICar::repl_handler", AICar_repl_handler, fp_repl_handler)
 
 // =============================================================================================================
 // AICar::stuff_event (0x42e5f0; nothing calls it): replay event 4 {kind, car, value, text}, and its handler. The
-// text is strcpy'd into a 32-byte stack buffer, as the original's: no bound, and the bytes after its terminator
-// are whatever the stack held (the event carries them). So a shorter text's event can't match the original's
-// byte for byte -- a 31-character one does.
+// text is strcpy'd into a 32-byte stack buffer, as the original's, and the bytes after its terminator are whatever
+// the stack held (the event carries them). So a shorter text's event can't match the original's byte for byte --
+// a 31-character one does.
 // =============================================================================================================
 static void __fastcall AICar_stuff_event(AICar* self, Edx, int32_t kind, int32_t value, const char* text) {
     AIEvent ev;
     ev.kind = kind;
     ev.value = value;
     ev.car = self->car_index;
-    memcpy(ev.text, text, strlen(text) + 1);        // repne scasb; rep movsd; rep movsb
+    const size_t len = strlen(text);
+    // FIX: the original's strcpy has no bound: a text of 32 characters or more ran off the event's 32 bytes and
+    // over its stack frame. Cut to 31 characters (nothing calls it; bounded all the same).
+    if (VP_FIX && len >= sizeof ev.text) {
+        memcpy(ev.text, text, sizeof ev.text - 1);
+        ev.text[sizeof ev.text - 1] = 0;
+    } else
+        memcpy(ev.text, text, len + 1);             // repne scasb; rep movsd; rep movsb
     PhysReplayAddEvent(4, &ev, 0x2c);
     call_repl_handler(&ev, 0);
 }
@@ -1105,7 +1114,8 @@ PORT_FN(0x0042f620, "AICar::check_for_stranded", AICar_check_for_stranded, fp_st
 // AICar::check_for_too_fast (0x42f730, every 16 ticks): above 22.2 m/s, racing, after lap 0: the schedule error (the
 // lap clock against the line's cumulative time at the bead x pace); ahead of the schedule, away from the lap's first
 // and last 3 segments, too_fast = 5 x (the share of the remaining time it's ahead, plus the error's growth), 0..1,
-// and the throttle cap from it (1 .. 0.6). The bead segment is read unguarded: NULL there is the known AI crash.
+// and the throttle cap from it (1 .. 0.6). The original reads the bead segment unguarded: NULL there is the known AI
+// crash (fixed below).
 // =============================================================================================================
 static void __fastcall AICar_check_for_too_fast(AICar* self, Edx) {
     if (I(self->speed) <= 0x41b1c71c || self->finished || self->lap == 0) {
@@ -1114,6 +1124,18 @@ static void __fastcall AICar_check_for_too_fast(AICar* self, Edx) {
     }
     ILinePos ilp;
     call_get_ilpos(self, 0, &ilp);
+    // FIX: a lost (NULL) bead -- a stranded car's teleport, a NaN position -- was read (seg->next) and crashed: the
+    // line puts it back at the point nearest the car (reset_bead_position) and it's read again; with no bead even
+    // then, as the early out: not too fast. (A car with no line at all -- a track without one -- is left as the
+    // original has it.)
+    if (VP_FIX && !ilp.seg && self->line) {
+        IdealLine_reset_bead_position(self->line, 0);
+        call_get_ilpos(self, 0, &ilp);
+        if (!ilp.seg) {
+            self->too_fast = 0.0f;
+            return;
+        }
+    }
     const double old_error = self->schedule_error;
     const float* clock = self->lap_clock;
     const ILSeg* seg = ilp.seg;
@@ -1139,7 +1161,12 @@ static void __fastcall AICar_check_for_too_fast(AICar* self, Edx) {
     else if (I(*tf) > 0x3f800000) SETB(self->throttle_cap, 0x3f19999au);
     else self->throttle_cap = (float)((D(K_ONE) - *tf) + D(*tf) * K_0_6);
 }
-PORT_FN(0x0042f730, "AICar::check_for_too_fast", AICar_check_for_too_fast, fp_self)
+// the car; the line (a lost bead is found again: reset_bead_position)
+static void fp_too_fast(Footprint& f, AICar* self, Edx) {
+    f.object(self, "AICar");
+    fp_line(f, self);
+}
+PORT_FN(0x0042f730, "AICar::check_for_too_fast", AICar_check_for_too_fast, fp_too_fast)
 
 // =============================================================================================================
 // AICar::check_for_damage (0x42f8b0, every 64 ticks): a broken wheel freezes the driving (brake on, throttle and
@@ -1234,9 +1261,11 @@ static void __fastcall AICar_init_rtinfo(AICar* self, Edx) {
         SETB(self->recover_side, I(self->center_lat) > 0 ? B_ONE : B_MINUS_ONE);
     }
 }
-// the car; init_rt_lat's: the car and (at most) the deity's race record with its centre line, as Car::Update lists it
+// the car; init_rt_lat's: the car, its line (a lost bead found again) and (at most) the deity's race record with its
+// centre line, as Car::Update lists it
 static void fp_init_rtinfo(Footprint& f, AICar* self, Edx) {
     f.object(self, "AICar");
+    fp_line(f, self);
     uint8_t* deity = (uint8_t*)g_deity;
     if (!deity || *(uint32_t*)deity != VT_RaceDeity) return;
     f.add(deity, 2012, "deity");

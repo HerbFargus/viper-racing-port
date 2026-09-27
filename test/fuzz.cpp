@@ -1,6 +1,6 @@
 // fuzz.cpp -- run the pure rewrites against the originals, outside the game, on random inputs.
 //
-//   test\build_fuzz.bat && test\build\fuzz.exe [iterations] [name-filter]
+//   test\build_fuzz.bat && test\build\fuzz.exe [iterations] [name-filter, or - for all] [seed]
 //
 // Loads out\race_v10.exe's sections at its own base, 0x400000 (this program is linked elsewhere, so the
 // address is free), with no imports resolved: pure functions -- maths -- call nothing outside the image.
@@ -144,7 +144,8 @@ int main(int argc, char** argv) {
     if (!GetEnvironmentVariableA("VP_FUZZ_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);                // a crash mustn't lose what was already printed
     int iterations = argc > 1 ? atoi(argv[1]) : 1000000;
-    const char* filter = argc > 2 ? argv[2] : 0;
+    const char* filter = argc > 2 && strcmp(argv[2], "-") ? argv[2] : 0;   // "-": no filter
+    if (argc > 3) g_state = (uint32_t)strtoul(argv[3], 0, 0) | 1;              // a seed
     char exe[MAX_PATH];
     strcpy(exe, __FILE__);                        // ...\test\fuzz.cpp (built /FC) -> ...\out\race_v10.exe
     char* s = strstr(exe, "\\test\\fuzz.cpp");

@@ -1296,8 +1296,13 @@ PORT_FN(0x0043d390, "Obstacle::ApplyExternalForce", Obstacle_ApplyExternalForce,
 static void __fastcall Obstacle_Reset(Obstacle* self, Edx) {
     movsd(&self->frame, &self->spawn_frame, 12);
     PhobDynoReset(self, 0);
+    // FIX: the sleep state survives a reset and the physics clock runs on across a restart, so an obstacle
+    // that had settled was reset ASLEEP and hung at its spawn (4 m up) until something hit it. vrmod's engine
+    // fix NOPs this function's `ret`, which sits right before Obstacle::Perturb, so every reset falls through
+    // into it with ecx still the obstacle (PhobDyno::Reset never touches ecx): the same call here.
+    if (VP_FIX) ObstaclePerturb(self, 0);
 }
-static void fp_obstacle_self(Footprint& f, Obstacle* self, Edx) { f.object(self); }
+static void fp_obstacle_self(Footprint& f, Obstacle* self, Edx) { f.object(self); }   // (Perturb's writes too)
 PORT_FN(0x0043d3c0, "Obstacle::Reset", Obstacle_Reset, fp_obstacle_self)
 
 // Obstacle::Perturb (0x43d3e0): awake, from now

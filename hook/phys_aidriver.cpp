@@ -308,17 +308,21 @@ static bool counts_ok(const int32_t* first, uint32_t stride, int n) {  // every 
 // AIDriverLounge
 // =================================================================================================================
 
-// copy_res: point each strength's table at the loaded resource's drivers, and copy the counts. No bounds check:
-// a count past 16 runs on into the next table (and past the last one, into `offset` and beyond).
+// copy_res: point each strength's table at the loaded resource's drivers, and copy the counts. The original has no
+// bounds check: a count past 16 runs on into the next table (and past the last one, into `offset` and beyond).
 static void __fastcall Lounge_copy_res(AIDriverLounge* self, Edx) {
     for (uint32_t off = 0, t = 8; off < 0x11020; off += 0x2204, t += 0x44) {
-        for (int32_t j = 0; at<int32_t>(self->res, off + 0x2200) > j; j++)     // the resource pointer re-read each time
+        // FIX: a bucket of more than 16 drivers (the resource's own count) wrote its pointers over this table's count,
+        // the next strengths' tables and past the lounge, and kept a count Get then indexed the table with: at most
+        // the 16 there are
+        const bool clamp = VP_FIX && at<int32_t>(self->res, off + 0x2200) > 16;
+        for (int32_t j = 0; (clamp ? 16 : at<int32_t>(self->res, off + 0x2200)) > j; j++)   // the resource pointer re-read each time
             at<uint32_t>(self, t + 4 * j) = (uint32_t)(uintptr_t)(self->res + off + 0x220 * j);
-        at<int32_t>(self, t + 0x40) = at<int32_t>(self->res, off + 0x2200);
+        at<int32_t>(self, t + 0x40) = clamp ? 16 : at<int32_t>(self->res, off + 0x2200);
     }
 }
 static void fp_lounge_tables(Footprint& f, AIDriverLounge* self, Edx) {
-    if (!self->res || !counts_ok((const int32_t*)(self->res + 0x2200), 0x2204, 8)) {
+    if (!self->res || (!VP_FIX && !counts_ok((const int32_t*)(self->res + 0x2200), 0x2204, 8))) {   // (fixed: bounded)
         f.replay_only = "a resource count outside 0..16 writes past the lounge's tables";
         return;
     }
@@ -327,9 +331,9 @@ static void fp_lounge_tables(Footprint& f, AIDriverLounge* self, Edx) {
 PORT_FN(0x0041d600, "AIDriverLounge::copy_res", Lounge_copy_res, fp_lounge_tables)
 
 // fixup_res: a "development" resource's drivers get their names from a table of 128 strings (8 strengths x 16:
-// "E-1".. at 0x4eba44..0x4ebdd0), which the original builds on its stack. A count past 16 takes the next
-// strength's names -- and past the last one (index 128 and up) the original reads its own stack (saved
-// registers, the return address): not reproduced (0 here).
+// "E-1".. at 0x4eba44..0x4ebdd0), which the original builds on its stack. In the original a count past 16 takes the
+// next strength's names and writes into the next bucket -- and past the last one (index 128 and up) reads its own
+// stack (saved registers, the return address: not reproduced, 0 here) and writes past the resource. Fixed below.
 static const uint32_t k_driver_names[128] = {
     0x4eba44, 0x4eba48, 0x4eba4c, 0x4eba50, 0x4eba54, 0x4eba58, 0x4eba5c, 0x4eba60,
     0x4eba64, 0x4eba68, 0x4eba70, 0x4eba78, 0x4eba80, 0x4eba88, 0x4eba90, 0x4eba98,
@@ -350,13 +354,15 @@ static const uint32_t k_driver_names[128] = {
 };
 static void __fastcall Lounge_fixup_res(AIDriverLounge* self, Edx) {
     for (uint32_t off = 0, k = 0; off < 0x11020; off += 0x2204, k += 16)
-        for (int32_t j = 0; at<int32_t>(self->res, off + 0x2200) > j; j++) {
+        // FIX: a bucket of more than 16 drivers named the next strength's drivers, read the stack past the table
+        // and wrote past the resource: at most the 16 there are
+        for (int32_t j = 0; ((VP_FIX && at<int32_t>(self->res, off + 0x2200) > 16) ? 16 : at<int32_t>(self->res, off + 0x2200)) > j; j++) {
             uint32_t idx = k + (uint32_t)j;
             at<uint32_t>(self->res, off + 0x220 * j + 0x210) = idx < 128 ? k_driver_names[idx] : 0;
         }
 }
 static void fp_lounge_fixup_res(Footprint& f, AIDriverLounge* self, Edx) {
-    if (!self->res || !counts_ok((const int32_t*)(self->res + 0x2200), 0x2204, 8)) {
+    if (!self->res || (!VP_FIX && !counts_ok((const int32_t*)(self->res + 0x2200), 0x2204, 8))) {   // (fixed: bounded)
         f.replay_only = "a resource count outside 0..16 writes past its bucket";
         return;
     }

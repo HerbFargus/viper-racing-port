@@ -297,7 +297,13 @@ static void __fastcall SphereVolume_CollideGround(SphereVolume* self, Edx) {
             float mag = (float)x87_sqrt((D(T.y) * T.y + D(T.z) * T.z) + D(T.x) * T.x);
             double lim = A * self->default_b;
             float limf = (float)lim;
-            if (!(lim >= mag)) {                            // fcom; test ah,1: less, or a NaN
+            // FIX: the depth d is never tested here: TerrainGetSphereIntersection hits when |s| < r, s the centre's
+            // height over the terrain plane along N, and gives P = C - sN, so d = r - (C - P).N is r - s|N|^2 plus
+            // the rounding of P -- a little below 0 when the ball barely touches (s within a few ulps of r, or |N|
+            // a hair over 1). Then lim < 0, and with no tangential velocity (a ball at rest, or moving straight
+            // along N: mag == 0) the original divided lim by 0: a zero-divide fault on the physics thread, which
+            // unmasks it (ExceptDiv0Crashes(1)). No tangential velocity: no friction, T stays 0.
+            if (!(lim >= mag) && !(VP_FIX && mag == 0.0f)) {   // fcom; test ah,1: less, or a NaN
                 double k = D(limf) / mag;                   // from the stored limit
                 T.x = (float)(D(T.x) * k);
                 T.y = (float)(D(T.y) * k);
@@ -424,6 +430,9 @@ static void __fastcall CubeVolume_CollideGround(CubeVolume* self, Edx) {
                 float mag = (float)x87_sqrt((D(T.y) * T.y + D(T.z) * T.z) + D(T.x) * T.x);
                 double lim = D(self->default_b) * Af;
                 float limf = (float)lim;
+                // (No fix needed for the zero divide below, unlike SphereVolume::CollideGround's: a corner gets here
+                // only with dd > 0, so d >= 0 (a positive dd can't round below +0), Af = default_a * d >= 0 and lim
+                // >= 0 for the volumes' non-negative default_a / default_b; then mag == 0 fails the test, lim >= 0.)
                 if (!(lim >= mag)) {                        // fcom; test ah,1
                     double kk = D(limf) / mag;
                     T.x = (float)(D(T.x) * kk);

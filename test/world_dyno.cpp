@@ -5,6 +5,8 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_dyno.cpp
 //        /Fe:world_dyno.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:    world_dyno.exe [worlds] [seed]
+//   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS (or /DVP_TEST_FIXES) -- the rewrites as the game builds them,
+//   against the original with vrmod's obstacle-wake patch (Obstacle::Reset's `ret` NOPed into Perturb)
 //
 // Like test/fuzz.cpp it loads out\race_v10.exe's sections at 0x400000 in a child process that reserved the
 // range before its heap existed. Each world is one block of memory holding a physics object of a random
@@ -34,6 +36,12 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
+#define VP_TEST_FIXES           // (the flag the other harnesses use)
+#endif
+#ifndef VP_TEST_FIXES
+#define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+#endif
 #include "../hook/port.h"
 
 // the rewrites, compiled in: each PORT_FN just names the original's address and the footprint function
@@ -567,7 +575,7 @@ template <typename Run, typename Fp> static void check(const char* name, Run run
 // ---- coverage ------------------------------------------------------------------------------------------------
 static long c_update_weight, c_update_ext, c_update_vcap, c_update_wcap, c_update_tiny, c_update_ground,
     c_corner_water, c_corner_first, c_throw_plane, c_throw_other, c_wobble_clamp, c_msg_alias, c_vel_alias,
-    c_arm_alias, c_ctor_type[4];
+    c_arm_alias, c_ctor_type[4], c_reset_asleep, c_reset_woke;
 
 typedef void*(__fastcall* Ctor2_t)(void*, int, const uint8_t*, void*);
 static void prebuild_obj2(int which) {                        // an object for the destructors, by the originals
@@ -691,7 +699,12 @@ static void run_world() {
             if (g_class == 1) {
                 Obstacle* ob = (Obstacle*)d;
                 switch (rnd() % 3) {
-                case 0: CHECK(Obstacle_Reset, ob, 0); break;
+                case 0: {
+                    bool asleep = !ob->awake;
+                    CHECK(Obstacle_Reset, ob, 0);
+                    if (asleep) { c_reset_asleep++; if (ob->awake) c_reset_woke++; }   // (the original's result)
+                    break;
+                }
                 case 1: CHECK(Obstacle_Perturb, ob, 0); break;
                 default: CHECK(Obstacle_ApplyExternalForce, ob, 0, p3(0), p3(1), surf); break;
                 }
@@ -819,6 +832,13 @@ int main(int argc, char** argv) {
     patch_jmp(0x00426d80, (void*)&stub_find_static);
     patch_jmp(0x0040d5a0, (void*)&stub_car_index);
     patch_jmp(0x00406910, (void*)&stub_car_name);
+#ifdef VP_TEST_FIXES
+    // vrmod's obstacle wake: Obstacle::Reset's `ret; mov edi, edi` NOPed, so it falls through into Perturb
+    static const uint8_t k_stock[3] = {0xc3, 0x8b, 0xff}, k_nops[3] = {0x90, 0x90, 0x90};
+    if (memcmp((void*)0x0043d3dd, k_stock, 3)) { printf("Obstacle::Reset isn't stock\n"); return 2; }
+    memcpy((void*)0x0043d3dd, k_nops, 3);
+    printf("fix build: against the original with vrmod's obstacle-wake patch\n");
+#endif
     for (int i = 0; i < 16; i++) g_deity_vt[i] = (void*)&stub_deity;
     for (int c = 0; c < 4; c++) {
         memcpy(g_vt_copy[c], (void*)(uintptr_t)k_vt_orig[c], 15 * 4);
@@ -843,6 +863,12 @@ int main(int argc, char** argv) {
            c_update_weight, c_update_ext, c_update_vcap, c_update_wcap, c_update_tiny, c_update_ground, c_corner_first,
            c_corner_water, c_throw_plane, c_throw_other, c_wobble_clamp, c_msg_alias, c_vel_alias, c_arm_alias,
            c_ctor_type[0], c_ctor_type[1], c_ctor_type[2], c_ctor_type[3]);
+    printf("  Obstacle::Reset of a sleeping obstacle: %ld, awake after it: %ld\n", c_reset_asleep, c_reset_woke);
+#ifdef VP_TEST_FIXES
+    if (c_reset_woke != c_reset_asleep || !c_reset_asleep) { printf("FIX: a reset left an obstacle asleep\n"); failed++; }
+#else
+    if (c_reset_woke) { printf("FAITHFUL: a reset woke an obstacle\n"); failed++; }
+#endif
     printf("%d worlds, %ld checks; %d of %d functions differ; %d unknown footprint classes\n", worlds, total, failed,
            g_nstats, g_fp_unknown);
     return failed || g_fp_unknown ? 1 : 0;

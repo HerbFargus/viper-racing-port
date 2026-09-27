@@ -1258,7 +1258,17 @@ PORT_FN(0x00439fd0, "Car::reset(private)", Car_reset, fp_car_reset)   // (the in
 static void __fastcall Car_Setup(Car* self, Edx, const CarData* cd) {
     uint8_t pc[24];                                              // the PowerCurve Engine::Setup copies
     char buf[56];
-    memcpy(self->name, cd->name, strlen(cd->name) + 1);          // (inline repne scasb / rep movs)
+    const size_t name_len = strlen(cd->name);
+    // FIX: the car's name has 32 bytes, and the original copies the data's name whole: a name of 32 characters or
+    // more (unterminated in CarData's own name[32], so it runs on into lod_models) overran the Car's fields after
+    // it. It is cut to 31 characters -- which also bounds the sprintf into buf[56] below ("%s.car/cockpit.tab":
+    // 31 + 18 + 1 = 50 bytes) and the constructor's horn name; Wheel::Setup then sees the 31-character name.
+    if (VP_FIX && name_len > 31) {
+        memcpy(self->name, cd->name, 31);
+        self->name[31] = 0;
+        logf("Car::Setup: the car name \"%.31s...\" is %u characters; cut to 31", cd->name, (unsigned)name_len);
+    } else
+        memcpy(self->name, cd->name, name_len + 1);              // (inline repne scasb / rep movs)
     memcpy(&self->start_frame, &cd->start_frame, 48);
     COPY4(self->fuel_capacity, cd->fuel_capacity);
     COPY4(self->fuel_consumption, cd->fuel_consumption);

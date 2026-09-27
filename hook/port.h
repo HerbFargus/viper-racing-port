@@ -27,6 +27,17 @@
 #include <stdint.h>
 #include <type_traits>
 
+// Fixes (docs/PORTING.md, "Fixes"): a rewrite departs from the original only where the original would
+// crash, hang or overrun a buffer, each place marked `// FIX:` and written `if (VP_FIX && ...)`, so every
+// other input still gives the original's bits. Always on in the game. The test harnesses define
+// VP_FAITHFUL to build the original behaviour and check it against the original bit for bit, and test
+// the fixes separately on the inputs that used to fail.
+#ifdef VP_FAITHFUL
+#define VP_FIX 0
+#else
+#define VP_FIX 1
+#endif
+
 enum PortMode { PORT_ORIGINAL, PORT_NEW, PORT_SHADOW };
 
 // ---- footprints: the memory a function may change, besides the physics and AI globals ----------------

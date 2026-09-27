@@ -5,6 +5,8 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_camera.cpp
 //        /Fo<dir>\ /Fe<dir>\world_camera.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_camera.exe [worlds] [seed]
+//   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS (or /DVP_TEST_FIXES) -- the rewrites as the game builds them; then
+//   load_tv_cameras on a camera.tab of more than 32 rows, against the original on its first 32.
 //
 // Loads out\race_v10.exe at 0x400000 the way test/fuzz.cpp does and includes the rewrite file itself. A world is a
 // small arena -- four cars (Car's vtable and the fields the camera reads: frame, velocity, the focus offset at +0x28,
@@ -36,6 +38,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
+#define VP_TEST_FIXES           // (the flag the other harnesses use)
+#endif
+#ifndef VP_TEST_FIXES
+#define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+#endif
 #include "../hook/port.h"
 #undef PORT_FN_BUILDS
 #define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
@@ -44,7 +52,8 @@
 
 void Footprint::add(void* p, uint32_t bytes, const char* what) { if (n < MAX) r[n++] = {p, bytes, what}; }
 void Footprint::object(void* obj, const char* what) { printf("footprint: object() not expected (%s)\n", what); add(obj, 4, what); }
-void logf(const char* fmt, ...) { va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); putchar('\n'); }
+static int g_logf_quiet, g_logf_count;           // the fix test counts the rewrite's log lines instead of printing them
+void logf(const char* fmt, ...) { g_logf_count++; if (g_logf_quiet) return; va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); putchar('\n'); }
 
 #include "../hook/phys_camera.cpp"
 
@@ -791,5 +800,53 @@ int main(int argc, char** argv) {
            c_notv, c_tv_near, c_tv0, c_tvtype[0], c_tvtype[1], c_tvtype[2], c_tvtype[3], c_tvtype[4], c_identity, c_fallback, c_loaded);
     printf("others: camera_look turned %d / left %d, load_tv_cameras unknown types %d, crash sound without a Sound3D %d, volume changed %d, graph new best %d\n",
            c_look_ok, c_look_early, c_load_panic, c_play_nosnd, c_play_vol, c_q_best);
+#ifdef VP_TEST_FIXES
+    // load_tv_cameras' FIX: a camera.tab of 33..40 rows must load exactly as the original loads its first 32 rows
+    // (the stub calls included: the rows past 32 are never read), the count 32 and nothing past the table written.
+    // The original on the long table, for the record, overruns (the TimerConditioner at 0x521038, or a fault).
+    int fix_bad = 0, orig_overran = 0;
+    g_logf_quiet = 1;
+    g_logf_count = 0;
+    const int fix_runs = 2000;
+    for (int it = 0; it < fix_runs; it++) {
+        memset(g_arena, 0, ARENA_BYTES);
+        random_statics();
+        g_script.res_exists = 1;
+        for (int r = 0; r < 40; r++) {
+            strcpy(g_script.cells[r][0], k_types[rnd() % 6]);
+            for (int c = 1; c < 7; c++) sprintf(g_script.cells[r][c], "%.3f", range(-500.0f, 500.0f));
+        }
+        const int rows = 33 + (int)(rnd() % 8);
+        g_pc = _PC_24;
+        memcpy(g_arena_snap, g_arena, ARENA_BYTES);
+        memcpy(g_data_snap, DATA, DATA_BYTES);
+        uint32_t ro = 0, rn = 0;
+        g_script.rows = 32;
+        int fo = run_guarded(K_LOAD, false, &ro);
+        memcpy(g_arena_after, g_arena, ARENA_BYTES);
+        memcpy(g_data_after, DATA, DATA_BYTES);
+        g_log_orig = g_log;
+        memcpy(g_arena, g_arena_snap, ARENA_BYTES);
+        memcpy(DATA, g_data_snap, DATA_BYTES);
+        g_script.rows = rows;
+        int fn = run_guarded(K_LOAD, true, &rn);
+        bool ok = !fo && !fn && *(int32_t*)S_NUM_TV == 32 && !memcmp(g_arena_after, g_arena, ARENA_BYTES) &&
+                  !memcmp(g_data_after, DATA, DATA_BYTES) && g_log.n == g_log_orig.n &&
+                  !memcmp(g_log.w, g_log_orig.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)) &&
+                  !memcmp(DATA + (0x00521038 - 0x4e1000), g_data_snap + (0x00521038 - 0x4e1000), 0x521084 - 0x521038);
+        if (!ok && fix_bad++ < 4) printf("  FIX load_tv_cameras (%d rows, run %d): differs from the original's first 32 rows\n", rows, it);
+        if (it < 20) {                                          // the original on the long table
+            memcpy(g_arena, g_arena_snap, ARENA_BYTES);
+            memcpy(DATA, g_data_snap, DATA_BYTES);
+            int f = run_guarded(K_LOAD, false, &ro);
+            if (f || memcmp(DATA + (0x00521038 - 0x4e1000), g_data_snap + (0x00521038 - 0x4e1000), 28)) orig_overran++;
+        }
+        memcpy(g_arena, g_arena_snap, ARENA_BYTES);
+        memcpy(DATA, g_data_snap, DATA_BYTES);
+    }
+    printf("fix build: load_tv_cameras on a camera.tab of 33..40 rows %d times: %d differ from the original on the first 32"
+           " (the original itself overran %d of 20); %d log lines\n", fix_runs, fix_bad, orig_overran, g_logf_count);
+    if (fix_bad || orig_overran != 20 || g_logf_count != fix_runs) differ++;
+#endif
     return differ || fp_bad ? 1 : 0;
 }

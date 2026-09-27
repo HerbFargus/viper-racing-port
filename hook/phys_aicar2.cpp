@@ -22,10 +22,14 @@
 // deity -- is called by address or through its vtable (or the AICar's own member-function pointers,
 // drive_fn / interact_fn), never inlined, so whichever version is hooked there is what runs.
 //
-// Faithful first: the known AI crash is kept. A stranded-car teleport (periodics -> check_for_stranded /
-// check_for_damage / the wall heat -> teleport_to_track -> IdealLine::reset_bead_position) can leave the line's
-// bead NULL; init_rt_lat (the ILinePos from get_ilpos) and passer / obey_speed_limit / fast_drive (the segment
-// pointers) dereference what they're given unchecked, exactly as the original does.
+// Fixes (port.h: VP_FIX; VP_FAITHFUL builds the original's behaviour):
+//  * the known AI crash: a stranded-car teleport (periodics -> check_for_stranded / check_for_damage / the wall
+//    heat -> teleport_to_track -> IdealLine::reset_bead_position) or a NaN position could leave the line's bead
+//    NULL, and init_rt_lat read it (the ILinePos from get_ilpos) unchecked. reset_bead_position (phys_ideal.cpp)
+//    now puts a lost bead back at the nearest point of the line, and init_rt_lat asks it to before reading.
+//    (passer / obey_speed_limit / fast_drive read the segment info's segments, never NULL, not the bead; in_path
+//    hands get_nearest_bead one of those.)
+//  * begin_race's 32-byte buffer for the driver's name (AIGetDriverNameByCar's unbounded strcpy): cut to 31.
 //
 // In the comments, [+0xNN] is a local's offset in the original's frame (after its register pushes).
 #include <stdint.h>
@@ -398,6 +402,8 @@ typedef double(__fastcall* DlongMeters_t)(CenterLine*, Edx);             // retu
 typedef ILinePos*(__fastcall* MetersToIlpos_t)(CenterLine*, Edx, ILinePos*, uint32_t);
 typedef double(__fastcall* NearestBead_t)(IdealLine*, Edx, const Point2D*, ILinePos*, uint32_t);   // returns ST0
 typedef void(__fastcall* GetMyD_t)(const ProxerDelta*, Edx, int, Point2D*);
+typedef void(__fastcall* LineVoid_t)(IdealLine*, Edx);
+typedef int(__cdecl* IntInt_t)(int);
 typedef void(__cdecl* ProfVoid_t)();
 typedef int(__cdecl* ProfStart_t)(const char*);
 typedef void(__cdecl* ProfStop_t)(int);
@@ -469,6 +475,9 @@ static const QuickTan_t ILSeg_QuickTan = (QuickTan_t)0x00426150;
 static const DlongMeters_t CenterLine_get_car_dlong_meters = (DlongMeters_t)0x004225e0;
 static const MetersToIlpos_t CenterLine_convert_meters_to_ilpos = (MetersToIlpos_t)0x00422710;
 static const NearestBead_t IdealLine_get_nearest_bead = (NearestBead_t)0x004216f0;
+static const LineVoid_t IdealLine_reset_bead_position = (LineVoid_t)0x00421520;
+static const IntInt_t AIGetDriverForCar = (IntInt_t)0x00420ce0;
+static const Int_t AIGetStrength = (Int_t)0x0041d310;
 static const GetMyD_t ProxerDelta_GetMyDL = (GetMyD_t)0x00423430;
 static const GetMyD_t ProxerDelta_GetMyDV = (GetMyD_t)0x00423470;
 typedef int(__cdecl* GameState_t)();
@@ -482,6 +491,7 @@ static const Time_t PhysicsGetTime = (Time_t)0x0042bc80;
 #define g_physics_tick (*(volatile int32_t*)0x0052161c)
 #define g_game_state ((void*)0x004e4e3c)
 #define g_splash_sound (*(uint8_t**)0x00521f7c)
+#define g_lounge (*(void**)0x004eb8b0)                   // the AI driver lounge (AIDriverLounge*)
 // the profiler's hooks: pointers the original calls through
 #define i_pr_overhead_begin (*(ProfVoid_t*)0x004e642c)
 #define i_pr_overhead_end (*(ProfVoid_t*)0x004e6430)
@@ -537,11 +547,32 @@ static __forceinline double atan2_div(double y, double x, float m) {
     return r;
 }
 
+// the name AIGetDriverNameByCar copies for a car: the lounge's driver for it (AIGetDriverForCar) at the current
+// strength, its name pointer (+0x210) -- found the same way, by the same calls (the fix below)
+static const char* driver_name_of(int car) {
+    const int d = AIGetDriverForCar(car);
+    const int s = AIGetStrength();
+    void* l = g_lounge;
+    const uint8_t* p = VFN(l, 4, const uint8_t*, int, int)(l, 0, s, d);   // AIDriverLounge::Get(strength, driver)
+    return *(const char* const*)(p + 0x210);
+}
+
 // ==== AICar::begin_race (0x430250): the clocks start; the grid lane is remembered ================================
 static void __fastcall AICar_begin_race(AICar* self, Edx) {
     if (!PhysReplayPlayMode()) {
         char name[32];                                  // [+4] (the name isn't used)
-        AIGetDriverNameByCar(name, self->car_index);
+        const char* n;
+        // FIX: AIGetDriverNameByCar strcpy's the driver's name, however long, into this 32-byte buffer: a name of 32
+        // characters or more ran over the stack frame (and a NULL name faulted). Such a name is cut to 31
+        // characters here instead (the name is looked up the same way first; an ordinary one is fetched as before).
+        if (VP_FIX && (!(n = driver_name_of(self->car_index)) || strlen(n) >= sizeof name)) {
+            name[0] = 0;
+            if (n) {
+                memcpy(name, n, sizeof name - 1);
+                name[sizeof name - 1] = 0;
+            }
+        } else
+            AIGetDriverNameByCar(name, self->car_index);
     }
     const double c = D(self->now) - self->skill->aftershock_time;
     COPY4(self->progress_time, self->now);
@@ -729,6 +760,7 @@ static bool fp_teleport_possible(const AICar* self, double now) {
 }
 static void fp_periodics(Footprint& f, AICar* self, Edx) {
     f.object(self, "car");
+    if (self->line) f.add(self->line, sizeof(IdealLine), "ideal line");   // (check_for_too_fast: a lost bead found)
     if (fp_teleport_possible(self, self->now)) f.replay_only = "a teleport_to_track may fire (the deity's TeleportToLine)";
 }
 PORT_FN(0x004306f0, "AICar::periodics", AICar_periodics, fp_periodics)
@@ -774,9 +806,18 @@ static void __fastcall AICar_init_rt_lat(AICar* self, Edx) {
     self->side_edge_offset.z = (float)(D(self->center_right.z) * e);
     self->edge_offset.x = (float)(D(tan.z) * half5);
     self->edge_offset.z = (float)(D(self->center_right.z) * half5);
-    // the car against its racing line, at its bead (a NULL bead is dereferenced, as in the original)
+    // the car against its racing line, at its bead
     ILinePos b;                                         // [+8]
     const ILinePos* bp = AICar_get_ilpos(self, 0, &b);
+    // FIX: a lost (NULL) bead -- a stranded car's teleport, a NaN position -- was read (seg->next) and crashed: the
+    // line puts it back at the point nearest the car (reset_bead_position) and it's read again; with no bead even
+    // then, the racing-line offset stays as it was. (A car with no line at all -- a track without one -- is left as
+    // the original has it.)
+    if (VP_FIX && !bp->seg && self->line) {
+        IdealLine_reset_bead_position(self->line, 0);
+        bp = AICar_get_ilpos(self, 0, &b);
+        if (!bp->seg) return;
+    }
     ILSeg* bs = bp->seg;                                // [+0x1c]
     const uint32_t bt = Ub(bp->t);                      // [+0x20]
     ILSeg* bn = bs->next;
@@ -791,8 +832,14 @@ static void __fastcall AICar_init_rt_lat(AICar* self, Edx) {
     const double dz = D(line->car_pos.z) - pt.z;        // fst [+0x28]; the register goes on
     self->line_lat = (float)(dz * r.z + D(r.x) * dx);
 }
-// the car (the CenterLine, the line and its segments are only read; __CIfmod sets a CRT byte of its own)
-static void fp_init_rt_lat(Footprint& f, AICar* self, Edx) { f.object(self, "car"); }
+// the car; its line and its centre line (only read, unless a lost bead is found again: reset_bead_position,
+// get_car_dlong_meters); __CIfmod sets a CRT byte of its own
+static void fp_init_rt_lat(Footprint& f, AICar* self, Edx) {
+    f.object(self, "car");
+    if (self->line) f.add(self->line, sizeof(IdealLine), "ideal line");
+    if (g_race_deity_global)
+        if (CenterLine* cl = *(CenterLine**)(race_record(self) + 0xa4)) f.add(cl, sizeof(CenterLine), "centre line");
+}
 PORT_FN(0x004307e0, "AICar::init_rt_lat", AICar_init_rt_lat, fp_init_rt_lat)
 
 // ==== HermiteEval (0x430a70): the cubic Hermite point between a and b with tangents c and d at t =================

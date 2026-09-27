@@ -90,12 +90,22 @@ void* detour_front(uint32_t v10, void* to, const char* what) {
 
 // ---- stock fingerprints (stock.inc) --------------------------------------------------------------------------
 // A rewrite replaces only the exact stock v1.0 function it was written from: its code and every read-only
-// constant it reads. On a race.exe with vrmod's patches (engine fixes, hornball, the AI crash fix) a
-// patched function stays original, so the patch keeps working. Checked before anything is patched.
+// constant it reads. On a race.exe with vrmod's patches (the hornball, say) a patched function stays
+// original, so the patch keeps working. vrmod's two engine fixes (obstacle wake, the AI bead guard) are
+// the exception: the rewrites carry those fixes themselves, so a function patched with exactly vrmod's fix
+// (`vrmod`, the fingerprint of stock + that patch) is replaced like a stock one. Checked before anything
+// is patched.
 struct StockConst { uint32_t va, width; };
-struct Stock { uint32_t v10, size, hash_code, hash, nconst; StockConst c[24]; };
-static const Stock k_stock[] = {
+static const StockConst k_stock_consts[] = {
+#define VP_STOCK_CONSTS
 #include "stock.inc"
+#undef VP_STOCK_CONSTS
+};
+struct Stock { uint32_t v10, size, hash_code, hash, first, nconst, vrmod; };
+static const Stock k_stock[] = {
+#define VP_STOCK
+#include "stock.inc"
+#undef VP_STOCK
 };
 
 static uint32_t fnv(const uint8_t* p, uint32_t n, uint32_t h) {
@@ -109,8 +119,11 @@ void port_check_stock() {
         for (const Stock& st : k_stock) {
             if (st.v10 != f->v10) continue;
             uint32_t hc = fnv((const uint8_t*)st.v10, st.size, 2166136261u), h = hc;
-            for (uint32_t i = 0; i < st.nconst; i++) h = fnv((const uint8_t*)st.c[i].va, st.c[i].width, h);
-            if (h != st.hash) {
+            for (uint32_t i = st.first; i < st.first + st.nconst; i++)
+                h = fnv((const uint8_t*)k_stock_consts[i].va, k_stock_consts[i].width, h);
+            if (st.vrmod && h == st.vrmod) {
+                logf("port: %s has vrmod's engine fix; the rewrite, which carries the same fix, replaces it", f->name);
+            } else if (h != st.hash) {
                 f->patched = true;
                 logf("port: %s stays original -- the installed race.exe has %s patched (a vrmod fix?)", f->name,
                      hc != st.hash_code ? "its code" : "a constant it reads");

@@ -31,6 +31,7 @@
 #include <string.h>
 
 // the rewrite, compiled into this program: PORT_FN only records its function
+#define VP_FAITHFUL                 // the rewrite exactly as the original, bugs included (docs/PORTING.md, "Fixes")
 #include "../hook/port.h"
 #undef PORT_FN
 #define PORT_FN(V10, NAME, NEW, FP) \

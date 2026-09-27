@@ -113,3 +113,21 @@ the controls are inputs, fed to the rewrite automatically.
    random worlds — object state, outputs and the stubs' call logs. Put it in `test\world_<name>.cpp`.
 4. **In game:** shadow mode (`[port] default=shadow`) and a replay with the rewrite live
    (`default=new`); see README.md.
+
+## Fixes
+
+Faithful first: every function is ported and verified with the original's bugs intact. Then a chosen
+set of bugs is fixed, always on for players and never a switch. A fix departs from the original only
+where the original would crash, hang, overrun a buffer or turn a degenerate case into NaN, so every
+other input still gives the original's bits and a recorded race still replays identically on the
+original code.
+
+- Mark each one `// FIX: what and why`, and write it `if (VP_FIX && bad case) { ... }` (or
+  `VP_FIX ? fixed : original`). `VP_FIX` is 1 in the DLL; a harness that defines `VP_FAITHFUL` before
+  including the rewrite gets 0, and checks the original behaviour bit for bit as before.
+- Test each fix separately, without `VP_FAITHFUL`: the input that used to fail no longer does, and
+  ordinary inputs still match the original.
+- The footprint covers what the fixed code writes.
+- vrmod's two engine fixes (obstacle wake, the AI bead guard) are carried by the rewrites, so the stock
+  check (`tools/gen_port_tables.py`, `VRMOD_FIXES`) also accepts exactly those two patched functions and
+  replaces them; any other patched function (the hornball) stays original.

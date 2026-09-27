@@ -4,7 +4,11 @@
 //   build (x86 tools, from the repo root):
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC /DVP_FUZZ test\world_wheel2.cpp
 //        /Fo<outdir>\ /Fe<outdir>\world_wheel2.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
-//   run:   world_wheel2.exe [iterations] [name-filter]
+//   run:   world_wheel2.exe [iterations] [name-filter] [seed]
+//   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS (or /DVP_TEST_FIXES) -- the rewrites as the game builds them.
+//   Wheel::Setup with a 31-character car name then must match the original on everything but the tyre width
+//   passed to TireCreate, which must be the one the original computes before its name buffer overruns it (the
+//   original's width with the name one character shorter).
 //
 // Loads out\race_v10.exe at 0x400000 the way test/fuzz.cpp does, and includes the rewrite file itself so its
 // static functions can be called directly. A World (a Car with its four Wheels, a CarData, a hub vertex, a
@@ -21,6 +25,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
+#define VP_TEST_FIXES           // (the flag the other harnesses use)
+#endif
+#ifndef VP_TEST_FIXES
+#define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+#endif
 #include "../hook/phys_wheel.cpp"
 
 // ---- what the rewrites link against, standing in for the DLL and test/fuzz.cpp -------------------------
@@ -315,6 +325,40 @@ typedef void(__fastcall* WPacket_t)(const Wheel*, Edx, WheelReplayPacket*);
 typedef void(__fastcall* WTorque_t)(Wheel*, Edx, uint32_t);
 typedef float(__fastcall* WRpm_t)(const Wheel*, Edx);
 
+#ifdef VP_TEST_FIXES
+// Wheel::Setup's FIX, for a 31-character car name: the original has just run (g_after, g_log_orig) and the rewrite
+// (g_world, g_log). The original put its terminator on the tyre width's low byte; so the width it passed to
+// TireCreate is replaced with the one it passes for the same world with the name a character shorter (which it
+// computes the same way, but doesn't overrun), and then everything must match -- the file names included.
+static long c_long_names, c_long_width_clobbered;
+static World g_rw;
+static int tire_width_at(const CallLog& l) {
+    for (uint32_t i = 0; i + 1 < l.n; i++)
+        if (l.w[i] == 'TIRE') return (int)i + 1;
+    return -1;
+}
+static bool check_long_name_setup(Wheel* w, const CarData* cd, int index, const P3* hub) {
+    c_long_names++;
+    const int po = tire_width_at(g_log_orig), pn = tire_width_at(g_log);
+    if (po < 0 || pn < 0 || po != pn) { printf("  Wheel::Setup iteration %d: no TireCreate to compare\n", g_iter); return false; }
+    memcpy(&g_rw, &g_world, sizeof(World));                 // the rewrite's result and log, kept
+    CallLog rw_log = g_log;
+    memcpy(&g_world, &g_snap, sizeof(World));
+    *g_temperature = g_temp_snap;
+    g_world.car.name[30] = 0;
+    g_log.n = 0;
+    ((void(__fastcall*)(Wheel*, Edx, const CarData*, Car*, int, const P3*))0x00448140)(w, 0, cd, &g_world.car, index, hub);
+    const int p30 = tire_width_at(g_log);
+    if (p30 != po) { printf("  Wheel::Setup iteration %d: the shorter name's calls differ\n", g_iter); return false; }
+    const uint32_t w30 = g_log.w[p30];
+    if (g_log_orig.w[po] != w30) c_long_width_clobbered++;
+    g_log_orig.w[po] = w30;
+    memcpy(&g_world, &g_rw, sizeof(World));
+    g_log = rw_log;
+    return finish();
+}
+#endif
+
 static int run_one(int which, int it) {
     random_world();
     Car& car = g_world.car;
@@ -347,6 +391,9 @@ static int run_one(int which, int it) {
         const P3* hub = &g_world.hub;
         const CarData* cd = (const CarData*)g_world.cd;
         begin(); ((WSetup_t)0x00448140)(w, 0, cd, &car, index, hub); mid(); Wheel_Setup(w, 0, cd, &car, index, hub);
+#ifdef VP_TEST_FIXES
+        if (strlen(car.name) == 31) return check_long_name_setup(w, cd, index, hub) ? 0 : 1;
+#endif
         break;
     }
     case 4: {
@@ -409,7 +456,8 @@ int main(int argc, char** argv) {
     if (!GetEnvironmentVariableA("VP_FUZZ_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
     int iterations = argc > 1 ? atoi(argv[1]) : 100000;
-    const char* filter = argc > 2 ? argv[2] : 0;
+    const char* filter = argc > 2 && strcmp(argv[2], "-") ? argv[2] : 0;
+    if (argc > 3) g_state = (uint32_t)strtoul(argv[3], 0, 0) | 1;
     char exe[MAX_PATH];
     strcpy(exe, __FILE__);                        // ...\test\world_wheel2.cpp (built /FC) -> ...\out\race_v10.exe
     char* s = strstr(exe, "\\test\\world_wheel2.cpp");
@@ -429,6 +477,11 @@ int main(int argc, char** argv) {
         printf("  %-30s %s\n", k_names[which], bad ? "DIFFERS (above)" : "identical to the original");
         if (bad) failed++;
     }
+#ifdef VP_TEST_FIXES
+    printf("fix build: Wheel::Setup with a 31-character car name %ld times (the original's width clobbered %ld)\n",
+           c_long_names, c_long_width_clobbered);
+    if (!filter && !c_long_names) failed++;
+#endif
     printf("%d of 12 differ (%d random worlds each)\n", failed, iterations);
     return failed ? 1 : 0;
 }

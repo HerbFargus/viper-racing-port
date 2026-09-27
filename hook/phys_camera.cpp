@@ -683,7 +683,7 @@ static void fp_blimp_to_tv(Footprint& f) {             // (the main thread)
 PORT_FN(0x004267b0, "blimp_to_tv", blimp_to_tv, fp_blimp_to_tv)
 
 // ==== load_tv_cameras (0x428db0) =============================================================================
-// camera.tab: one row a camera -- type, x, y, z, a, b, c (no bound on the rows: the table holds 32)
+// camera.tab: one row a camera -- type, x, y, z, a, b, c (no bound on the rows in the original: the table holds 32)
 static void __cdecl load_tv_cameras() {
     int32_t* num = P<int32_t>(S_NUM_TV);
     if (!ResourceExists((const char*)0x004ecc50)) {    // "camera.tab"
@@ -693,6 +693,13 @@ static void __cdecl load_tv_cameras() {
     void* st = StringTableGet((const char*)0x004ecc5c);
     int row = 0;
     *num = StringTableNumRows(st);
+    // FIX: the table holds 32 cameras and the original loads every row: the 33rd overwrote the TimerConditioner
+    // (0x521038), the next ones blimp_frame and then the count itself (0x521084, in the 35th), which the loop
+    // re-reads; and every reader of the count indexed past the table. The rows past 32 are ignored, the count 32.
+    if (VP_FIX && *num > 32) {
+        logf("camera.tab has %d rows; the TV camera table holds 32: the rest are ignored", *num);
+        *num = 32;
+    }
     if (*num > row) {
         TVCamera* c = P<TVCamera>(S_TV);
         do {

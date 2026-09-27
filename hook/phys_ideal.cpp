@@ -32,12 +32,19 @@
 // (they draw with gxCircle / gxRect: replay_only). Loading a line (ILineTry, load_res, the loads, the
 // constructors that load) and the MutableIdealLine's pool (alloc / free) are replay_only.
 //
-// Faithful first: advance_bead reads bead_seg->next unchecked, so a bead left NULL (reset_bead_position after
-// a teleport far from the line: get_nearest_bead gives up) faults exactly as the original does -- vrmod's AI
-// crash fix patches the installed function, and a patched function is left original by the DLL anyway.
+// Fixes (port.h: VP_FIX; the harness builds VP_FAITHFUL for the original's behaviour, bit for bit):
+//  * the lost bead (the stock AI crash): reset_bead_position leaves the bead NULL when get_nearest_bead finds
+//    nothing (a NaN car position, a teleport, a point alongside no segment), and advance_bead, CenterLine::update,
+//    update_2d_data, time_between and get_car_dlong_meters/cookie read it unchecked. Now the bead is put back on
+//    the line where it's lost -- at the point of the line nearest the car (fix_find_bead) -- and every reader
+//    here does the same before it reads. (This replaces vrmod's race.exe patch of advance_bead: head, t = 0.)
+//  * a t that can't be stepped down a segment at a time (infinite or >= 2^24: a zero or near-zero segment
+//    length) hung advance_bead, get_rabbit_position and get_nearest_bead: it now moves on one node, t = 0.
+//  * QuickTan's 0/0 (zero tangents: a two-node line's) gives the chord's direction instead of NaN.
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include "viperport.h"
 #include "port.h"
 #include "x87.h"
@@ -299,6 +306,102 @@ static void fp_centerline(Footprint& f, CenterLine* c) {
     if (c->res && c->times && c->res->count > 0) f.add(c->times, (uint32_t)c->res->count * 4, "CenterLine times");
 }
 
+// ---- the fixes' helpers (VP_FIX; only ever reached on the inputs the original crashes or hangs on) --------------
+enum { FIX_MAX_NODES = 0x10000 };                     // a bound on any walk round a loop (the Pool has 512 nodes)
+static __forceinline bool fix_finite(float x) { return (Ub(x) & 0x7f800000u) != 0x7f800000u; }
+
+// is s one of the line's nodes?
+static bool fix_in_loop(const IdealLine* l, const ILSeg* s) {
+    const ILSeg* h = l->head;
+    const ILSeg* q = h;
+    for (int n = 0; q && n < FIX_MAX_NODES; n++) {
+        if (q == s) return true;
+        q = q->next;
+        if (q == h) break;
+    }
+    return false;
+}
+
+// The point of the line nearest pt, measured the way the line's own nearest-search steps (get_nearest_bead's
+// QuickEval): along each segment's chord, the foot of the perpendicular clamped to its ends. False if no node
+// gives a distance (all of them non-finite).
+static bool fix_nearest_on_line(const IdealLine* l, const Point2D* pt, ILinePos* out) {
+    const ILSeg* h = l->head;
+    const ILSeg* s = h;
+    bool found = false;
+    double best = 0.0;
+    for (int n = 0; s && n < FIX_MAX_NODES; n++) {
+        const ILSeg* nx = s->next;
+        if (!nx) break;
+        const double ax = s->p.x, az = s->p.z;
+        const double dx = D(nx->p.x) - ax, dz = D(nx->p.z) - az;
+        const double qx = D(pt->x) - ax, qz = D(pt->z) - az;
+        const double ll = dx * dx + dz * dz;
+        double t = 0.0;
+        if (ll > 0.0 && ll <= DBL_MAX) {
+            t = (qx * dx + qz * dz) / ll;
+            if (!(t > 0.0)) t = 0.0;
+            else if (t > 1.0) t = 1.0;
+        }
+        const double ex = qx - t * dx, ez = qz - t * dz;
+        const double d = ex * ex + ez * ez;
+        if (d == d && (!found || d < best)) {
+            best = d;
+            out->seg = (ILSeg*)s;
+            out->t = (float)t;
+            found = true;
+        }
+        s = nx;
+        if (s == h) break;
+    }
+    return found;
+}
+
+// Put a lost (NULL) bead back on the line, so the car carries on from where it is: at the point nearest pt; with
+// no point to go by (pt not finite), on the segment it was on before (prev, if it's this line's; its t if that's
+// in 0..1, else 0), or else at the head, t = 0. Nothing without a head (no line).
+static void fix_find_bead(IdealLine* l, const Point2D* pt, ILSeg* prev, uint32_t prev_t) {
+    if (!l->head) return;
+    ILinePos p;
+    if (fix_finite(pt->x) && fix_finite(pt->z) && fix_nearest_on_line(l, pt, &p)) {
+        l->bead_seg = p.seg;
+        l->bead_t = p.t;
+        return;
+    }
+    if (prev && fix_in_loop(l, prev)) {
+        float t = Fb(prev_t);
+        if (!(t >= 0.0f && t <= 1.0f)) t = 0.0f;
+        l->bead_seg = prev;
+        l->bead_t = t;
+        return;
+    }
+    l->bead_seg = l->head;
+    l->bead_t = 0.0f;
+}
+
+// QuickTan's degenerate case (the blended tangent has no length): the direction of the chord to the next node --
+// the curve's own direction when both tangents are zero (a two-node line's); across coincident nodes, the next
+// chord that has a length; (0, 1) if no two nodes differ
+static void fix_chord_tan(const ILSeg* self, Point2D* out) {
+    const ILSeg* a = self;
+    for (int n = 0; a && n < FIX_MAX_NODES; n++) {
+        const ILSeg* b = a->next;
+        if (!b) break;
+        const float dx = (float)(D(b->p.x) - a->p.x);
+        const float dz = (float)(D(b->p.z) - a->p.z);
+        const double l = x87_sqrt(D(dz) * dz + D(dx) * dx);
+        if (l > 0.0 && l <= DBL_MAX) {
+            out->x = (float)(D(dx) / l);
+            out->z = (float)(D(dz) / l);
+            return;
+        }
+        a = b;
+        if (a == self) break;
+    }
+    out->x = 0.0f;
+    out->z = 1.0f;
+}
+
 // ===================================================================================================================
 // ideal.obj
 // ===================================================================================================================
@@ -520,8 +623,14 @@ PORT_FN(0x00421510, "IdealLine::reset_to_head", IdealLine_reset_to_head, fp_rese
 
 // IdealLine::reset_bead_position (0x421520): find the bead afresh near the car (within 10 km)
 static void __fastcall IdealLine_reset_bead_position(IdealLine* self, Edx) {
+    ILSeg* prev = self->bead_seg;
+    const uint32_t prev_t = Ub(self->bead_t);
     self->bead_seg = 0;
     IdealLine_get_nearest_bead_o(self, 0, &self->car_pos, (ILinePos*)&self->bead_seg, k_far);   // fstp st(0)
+    // FIX: get_nearest_bead found nothing (the car's position NaN, a teleport alongside no segment, a Newton walk
+    // past 10 km) and the original leaves the bead NULL, for advance_bead and the AI to crash on: put it back at
+    // the point of the line nearest the car (NaN: where it was, or the head).
+    if (VP_FIX && !self->bead_seg) fix_find_bead(self, &self->car_pos, prev, prev_t);
 }
 static void fp_reset_bead_position(Footprint& f, IdealLine* self, Edx) { f.add(self, sizeof(IdealLine), "IdealLine"); }
 PORT_FN(0x00421520, "IdealLine::reset_bead_position", IdealLine_reset_bead_position, fp_reset_bead_position)
@@ -618,7 +727,16 @@ static float __fastcall IdealLine_get_nearest_bead(IdealLine* self, Edx, const P
                     goto done;
                 }
                 pos->seg = s->next;
-                pos->t = pos->t - 1.0f;
+                const float tm = pos->t - 1.0f;
+                // FIX: a t that 1 can't be taken from (infinite or >= 2^24: a zero or near-zero segment length; or
+                // NaN) looped forever where the lengths don't reach max_dist (zero, or max_dist NaN): on at the
+                // next node's start
+                if (VP_FIX && !(tm < pos->t)) {
+                    const uint32_t zero = 0;
+                    cp4(&pos->t, &zero);
+                    break;
+                }
+                pos->t = tm;
             } while (I(pos->t) > 0x3f800000);
         }
         if (Ub(pos->t) > 0x80000000u) {                   // below -0
@@ -637,14 +755,21 @@ PORT_FN(0x004216f0, "IdealLine::get_nearest_bead", IdealLine_get_nearest_bead, f
 
 // IdealLine::advance_bead (0x421840): follow the car along the line -- up to 10 Newton steps of the bead's t
 // on the tangent, moving on to the next node past t = 1 and back one node below 0 (once; 0 at the head).
-// Off the line (the car > 150 m from the bead, or no way back) clears bead_on_line. The bead must not be
-// NULL: it's read unchecked (the stock AI crash, kept).
+// Off the line (the car > 150 m from the bead, or no way back) clears bead_on_line. The original reads the bead
+// unchecked: NULL is the stock AI crash (fixed below).
 static void __fastcall IdealLine_advance_bead(IdealLine* self, Edx) {
     (*i_pr_overhead_begin)();
     int prof = (*i_prof_start)((const char*)0x004ec388);     // "adv_bead"
     (*i_pr_overhead_end)();
     ILSeg* prev = 0;
     ILSeg* s = self->bead_seg;
+    // FIX: the lost bead (NULL: reset_bead_position after a NaN position or a teleport) is the stock AI crash,
+    // s->next read unchecked: put it back at the point of the line nearest the car first. (A line with no nodes at
+    // all is left as the original has it; update_car_info never calls this for one.)
+    if (VP_FIX && !s && self->head) {
+        fix_find_bead(self, &self->car_pos, 0, 0);
+        s = self->bead_seg;
+    }
     float t;
     cp4(&t, &self->bead_t);
     uint8_t off = 0;
@@ -669,9 +794,16 @@ static void __fastcall IdealLine_advance_bead(IdealLine* self, Edx) {
         t = (float)r;
         if (r > 1.0f) {
             do {
-                t = t - 1.0f;
+                const float tm = t - 1.0f;
                 prev = s;
                 s = s->next;
+                // FIX: a t that 1 can't be taken from (infinite or >= 2^24: a zero-length node's dot / 0) looped
+                // forever: on at the next node's start (the bead passes a zero-length node)
+                if (VP_FIX && !(tm < t)) {
+                    t = 0.0f;
+                    break;
+                }
+                t = tm;
             } while (t > 1.0f);
         }
         if (Ub(t) > 0x80000000u) {                        // below -0: back one node
@@ -717,8 +849,15 @@ static void __fastcall IdealLine_get_rabbit_position(IdealLine* self, Edx, Point
     float t = (float)r;
     if (r > 1.0f) {
         do {
-            t = t - 1.0f;
+            const float tm = t - 1.0f;
             s = s->next;
+            // FIX: a t that 1 can't be taken from (infinite or >= 2^24: dist over a zero-length node) looped
+            // forever: the rabbit goes to the next node's start
+            if (VP_FIX && !(tm < t)) {
+                t = 0.0f;
+                break;
+            }
+            t = tm;
         } while (t > 1.0f);
     }
     H4 h = hermite(t);
@@ -1209,11 +1348,15 @@ static void fp_cl_reset(Footprint& f, CenterLine* self, Edx) { fp_centerline(f, 
 PORT_FN(0x004224c0, "CenterLine::reset", CenterLine_reset, fp_cl_reset)
 
 // CenterLine::update (0x422510): move the bead after the car, stamp the nodes it passed, the lateral offset;
-// returns whether the bead changed checkpoint. (bead_seg is read unchecked here too.)
+// returns whether the bead changed checkpoint. (The original reads bead_seg unchecked, before and after.)
 static uint8_t __fastcall CenterLine_update(CenterLine* self, Edx, const Point2D* pos, int car_index) {
     self->car_index = car_index;
     if (!self->head) return 0;
     float now = (float)PhysicsGetTime();
+    // FIX: a lost (NULL) bead -- CenterLine::reset from a position alongside no segment (a line that doesn't claim
+    // the origin at the grid), a NaN position -- was read here (the checkpoint) and crashed: put it back at the
+    // point of the line nearest the car first
+    if (VP_FIX && !self->bead_seg) fix_find_bead(self, pos, 0, 0);
     uint32_t cp0 = self->bead_seg->checkpoint;
     Point2D zero;
     const uint32_t z = 0;
@@ -1221,6 +1364,11 @@ static uint8_t __fastcall CenterLine_update(CenterLine* self, Edx, const Point2D
     cp4(&zero.z, &z);
     IdealLine_update_car_info_o(self, 0, pos, &zero);
     ILSeg* b = self->bead_seg;
+    // FIX: the same after update_car_info (its reset_bead_position, were that left to the original)
+    if (VP_FIX && !b) {
+        fix_find_bead(self, pos, 0, 0);
+        b = self->bead_seg;
+    }
     uint8_t changed = (uint32_t)b->checkpoint != cp0 ? 1 : 0;
     if (!self->started) {
         if (self->head == b) {
@@ -1247,21 +1395,29 @@ PORT_FN(0x00422510, "CenterLine::update", CenterLine_update, fp_cl_update)
 
 // CenterLine::get_car_dlong_meters (0x4225e0) / get_car_dlong_cookie (0x422600): the bead's
 static double __fastcall CenterLine_get_car_dlong_meters(CenterLine* self, Edx) {
+    // FIX: a lost (NULL) bead crashed convert_ilpos_to_meters (seg->length): put it back at the point of the line
+    // nearest the car. (No line at all is left as the original has it.)
+    if (VP_FIX && !self->bead_seg && self->head) fix_find_bead(self, &self->car_pos, 0, 0);
     ILinePos p;
     p.seg = self->bead_seg;
     cp4(&p.t, &self->bead_t);
     return CenterLine_convert_ilpos_to_meters_o(self, 0, &p);
 }
 static void fp_cl_read(Footprint&, CenterLine*, Edx) {}
-PORT_FN(0x004225e0, "CenterLine::get_car_dlong_meters", CenterLine_get_car_dlong_meters, fp_cl_read)
+static void fp_cl_read_bead(Footprint& f, CenterLine* self, Edx) { f.add(self, sizeof(IdealLine), "IdealLine (a lost bead found)"); }
+PORT_FN(0x004225e0, "CenterLine::get_car_dlong_meters", CenterLine_get_car_dlong_meters, fp_cl_read_bead)
 
 static uint32_t __fastcall CenterLine_get_car_dlong_cookie(CenterLine* self, Edx) {
+    // FIX: a lost (NULL) bead gave a cookie from a garbage node index (the NULL's offset from the resource), which
+    // the deity turns back into a node pointer: put it back at the point of the line nearest the car. (No line at
+    // all is left as the original has it.)
+    if (VP_FIX && !self->bead_seg && self->head) fix_find_bead(self, &self->car_pos, 0, 0);
     ILinePos p;
     p.seg = self->bead_seg;
     cp4(&p.t, &self->bead_t);
     return CenterLine_convert_ilpos_to_cookie_o(self, 0, &p);
 }
-PORT_FN(0x00422600, "CenterLine::get_car_dlong_cookie", CenterLine_get_car_dlong_cookie, fp_cl_read)
+PORT_FN(0x00422600, "CenterLine::get_car_dlong_cookie", CenterLine_get_car_dlong_cookie, fp_cl_read_bead)
 
 // CenterLine::convert_cookie_to_ilpos (0x422620)
 static ILinePos* __fastcall CenterLine_convert_cookie_to_ilpos(CenterLine* self, Edx, ILinePos* ret, uint32_t cookie) {
@@ -1356,6 +1512,10 @@ PORT_FN(0x00422800, "CenterLine::get_ilpos_at_point", CenterLine_get_ilpos_at_po
 static double __fastcall CenterLine_time_between(CenterLine* self, Edx, const CenterLine* other) {
     IdealLineRes* r = self->res;
     if (!r) return 0.0f;
+    // FIX: either car's lost (NULL) bead was read (its index) and crashed: put it back at the point of that car's
+    // line nearest it. (A line with no nodes at all is left as the original has it.)
+    if (VP_FIX && !self->bead_seg && self->head) fix_find_bead(self, &self->car_pos, 0, 0);
+    if (VP_FIX && !other->bead_seg && other->head) fix_find_bead((CenterLine*)other, &other->car_pos, 0, 0);
     int32_t a = self->bead_seg->index - 1;
     int32_t b = other->bead_seg->index - 1;
     if (a < 0) a = r->count - 1;
@@ -1368,7 +1528,10 @@ static double __fastcall CenterLine_time_between(CenterLine* self, Edx, const Ce
     double interp = w + D(ot[k]) * self->bead_t;
     return now - interp;
 }
-static void fp_cl_time_between(Footprint&, CenterLine*, Edx, const CenterLine*) {}
+static void fp_cl_time_between(Footprint& f, CenterLine* self, Edx, const CenterLine* other) {
+    f.add(self, sizeof(IdealLine), "IdealLine (a lost bead found)");
+    f.add((void*)other, sizeof(IdealLine), "other IdealLine (a lost bead found)");
+}
 PORT_FN(0x00422840, "CenterLine::time_between", CenterLine_time_between, fp_cl_time_between)
 
 // CenterLine::wrong_way (0x4228d0): moving faster than 2.2 m/s against the line's tangent at the bead
@@ -1398,6 +1561,13 @@ static void __fastcall CenterLine_update_2d_data(CenterLine* self, Edx) {
     ILinePos p;
     IdealLine_get_actual_bead_position_o(self, 0, &p);
     ILSeg* s = p.seg;
+    // FIX: a lost (NULL) bead was read (s->next) and crashed: put it back at the point of the line nearest the
+    // car. (No line at all is left as the original has it.)
+    if (VP_FIX && !s && self->head) {
+        fix_find_bead(self, &self->car_pos, 0, 0);
+        s = p.seg = self->bead_seg;
+        cp4(&p.t, &self->bead_t);
+    }
     H4 h = hermite(p.t);
     ILSeg* n = s->next;
     self->pos.x = (float)(((D(s->p.x) * h.h00 + D(s->v.x) * h.h10) + D(n->v.x) * h.h11) + D(n->p.x) * h.h01);
@@ -1504,6 +1674,13 @@ static void __fastcall ILSeg_QuickTan(const ILSeg* self, Edx, Point2D* out, floa
     n = self->next;
     out->z = (float)((D(n->v.z) - self->v.z) * t + self->v.z);
     double len = x87_sqrt(D(out->z) * out->z + D(out->x) * out->x);
+    // FIX: a tangent with no length (both nodes' tangents zero -- a two-node line's, when a tangent is made from the
+    // next node minus the previous, the same node -- or blending to zero) was 0/0: NaN, which the AI steers by. The
+    // chord's direction instead (the zero-tangent curve's own); likewise for a NaN or infinite length.
+    if (VP_FIX && !(len > 0.0 && len <= DBL_MAX)) {
+        fix_chord_tan(self, out);
+        return;
+    }
     out->x = (float)(D(out->x) / len);
     out->z = (float)(D(out->z) / len);
 }

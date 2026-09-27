@@ -376,7 +376,7 @@ static void __fastcall Wheel_Setup(Wheel* self, Edx, const CarData* cd, Car* car
     const float side = (index == 0 || index == 2) ? -1.0f : 1.0f;
 
     // the original's stack frame from the tyre-file name on: a 36-byte buffer, then the tyre width in metres,
-    // which a 31-character car name overwrites (sprintf's terminator) before TireCreate reads it back
+    // which a 31-character car name overwrites (sprintf's terminator) before TireCreate reads it back (see FIX below)
     uint8_t frame[40];
     char* tire_file = (char*)frame;
 
@@ -468,7 +468,16 @@ static void __fastcall Wheel_Setup(Wheel* self, Edx, const CarData* cd, Car* car
     self->roll_resist_static = (float)((D(cd->static_rolling_resistance) / corner_load) * 1.1125f);
 
     // the tyre: <car name>f.tir / r.tir, else the default
-    game_sprintf(tire_file, "%s%s.tir", car->name, front ? "f" : "r");
+    // FIX: the original's name buffer is 36 bytes with the tyre width right after it, so a 31-character car name
+    // ("<name>f.tir", 36 characters) put sprintf's terminator on the width's low byte and the tyre was made
+    // narrower; a longer (unterminated) name ran on up the stack. Here the name has a buffer of its own and takes
+    // at most 31 characters of the car name, so a 31-character car still finds "<name>f.tir" / "<name>r.tir" (the
+    // file the original looked for) with its width intact; anything past 31 characters is left off.
+    char tire_file_fixed[40];
+    if (VP_FIX) {
+        tire_file = tire_file_fixed;
+        game_sprintf(tire_file, "%.31s%s.tir", car->name, front ? "f" : "r");
+    } else game_sprintf(tire_file, "%s%s.tir", car->name, front ? "f" : "r");
     if (!ResourceExists(tire_file)) memcpy(tire_file, "def_tire.tir", 13);   // strcpy, inlined
     float width_now;
     memcpy(&width_now, frame + 36, 4);

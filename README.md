@@ -72,6 +72,13 @@ The rewrites so far (`hook/phys_*.cpp`, layouts in `hook/phys_types.h`), 881 fun
 
 That is the whole physics and AI code, apart from the debug screens' drawing.
 
+Then a chosen set of the original's bugs is fixed, always on: the AI crash (a car losing its place on
+its racing line), degenerate racing lines, a ground-contact divide by zero, vrmod's obstacle wake, and
+buffer overruns that long mod-car, driver and track names could trigger. A fix only changes what happens
+where the original would crash, hang or overrun, so an ordinary race still replays identically on the
+original code. They are listed in `docs/FIXES.md`. A `race.exe` carrying vrmod's two engine fixes is
+recognised, and the rewrites, which carry the same fixes, replace them.
+
 A rewrite replaces only the exact stock v1.0 function it was written from: before anything is patched,
 the DLL fingerprints each function's code and the read-only constants it reads (`hook/stock.inc`), and
 a function a vrmod fix has patched stays original, so the fix keeps working.

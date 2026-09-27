@@ -28,6 +28,13 @@
 // restored, the rewrite runs, and every block, the return value and the logs are compared. The bytes the
 // original changed must also lie inside the rewrite's footprint. A share of the worlds ("wild") has floats
 // replaced by extreme values.
+//
+// The fixes (port.h: VP_FIX): the plain build defines VP_FAITHFUL and checks the rewrites against the originals as
+// above. Built with /DFIX_TESTS it compiles the fixed rewrites: every world must still equal the original, except
+// check_for_too_fast on a lost (NULL) bead, where the original faults and the fixed one must run (and every byte it
+// changes must be in its footprint); then the fixes on their own: check_for_too_fast on a NULL bead that
+// reset_bead_position finds (the same result as the original's on that bead) or doesn't (not too fast), and
+// stuff_event's long texts (cut to 31 characters).
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -36,6 +43,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef FIX_TESTS
+#define VP_FAITHFUL                                 // the original's behaviour, bit for bit (the fixes: /DFIX_TESTS)
+#endif
 #include "../hook/port.h"
 #undef PORT_FN_BUILDS
 #define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
@@ -985,6 +995,99 @@ static void coverage(Kind k, const State& s, const State& o) {
     }
 }
 
+#ifdef FIX_TESTS
+// ==== the fix tests ================================================================================================
+static int g_fix_fail;
+#define FIXCHECK(cond, ...)                                                                                     \
+    do {                                                                                                        \
+        if (!(cond)) {                                                                                          \
+            if (g_fix_fail++ < 30) { printf("FIX FAIL: "); printf(__VA_ARGS__); printf("\n"); }                 \
+        }                                                                                                       \
+    } while (0)
+// a world where check_for_too_fast gets past its early out, with a line
+static void too_fast_world() {
+    for (;;) {
+        randomize_world();
+        randomize_args();
+        AICar* c = car();
+        if (!c->line) continue;
+        c->speed = range(22.3f, 80.0f);
+        c->finished = 0;
+        if (!c->lap) c->lap = 1;
+        return;
+    }
+}
+static void run_fix_tests() {
+    static State a, b, ra;
+    long same = 0, not_found = 0, orig_faults = 0;
+    // check_for_too_fast on a lost bead: the fixed one asks reset_bead_position to find it (the stub puts it at a
+    // scripted segment) and goes on as the original does on a bead already there
+    for (int it = 0; it < 20000; it++) {
+        too_fast_world();
+        AICar* c = car();
+        const int k = (int)(rnd() % g_nsegs);
+        const float t = uni();
+        g_script.bead_after_reset = chance(15) ? -1 : k;
+        g_script.bead_t_after = t;
+        line()->bead_seg = 0;
+        save(a);
+        uint64_t r;
+        const int fn = run_guarded(K_TOOFAST, true, &r);
+        save(ra);
+        ra.log = g_log;
+        FIXCHECK(!fn, "check_for_too_fast faulted on a NULL bead (world %d)", it);
+        FIXCHECK(log_has(ra.log, 0xbead0000u), "check_for_too_fast didn't ask for the bead (world %d)", it);
+        load(a);
+        const int fo = run_guarded(K_TOOFAST, false, &r);
+        if (fo) orig_faults++;
+        if (g_script.bead_after_reset < 0) {
+            not_found++;
+            FIXCHECK(fbits(((AICar*)ra.car)->too_fast) == 0, "no bead: too_fast isn't 0");
+            continue;
+        }
+        // the original, on the bead where reset_bead_position put it
+        load(a);
+        line()->bead_seg = &g_segs[k];
+        line()->bead_t = t;
+        save(b);
+        const int fb = run_guarded(K_TOOFAST, false, &r);
+        save(b);
+        if (fb) continue;
+        same++;
+        FIXCHECK(!memcmp(ra.car, b.car, CAR_BUF) && !memcmp(ra.line, b.line, sizeof ra.line),
+                 "check_for_too_fast: the found bead's result differs from the original's on it (world %d)", it);
+        (void)c;
+    }
+    printf("check_for_too_fast, NULL bead: the original faulted %ld times; the fixed one found it (%ld as the original's on "
+           "it) or not (%ld, not too fast)\n", orig_faults, same, not_found);
+    FIXCHECK(orig_faults > 10000, "the original didn't fault on NULL beads");
+    // stuff_event: texts of 32 characters and more, cut to 31 (the original would run over its stack: not run)
+    static char text[4096];
+    long cut = 0;
+    for (int it = 0; it < 4000; it++) {
+        randomize_world();
+        randomize_args();
+        const int len = it % 4 == 0 ? 31 + (int)(rnd() % 3) : 32 + (int)(rnd() % 4000);
+        for (int i = 0; i < len; i++) text[i] = (char)('A' + rnd() % 26);
+        text[len] = 0;
+        reset_run();
+        unsigned cw;
+        _controlfp_s(&cw, _PC_24, _MCW_PC);
+        bool fault = false;
+        __try { AICar_stuff_event(car(), 0, g_args.ev_kind & 1, g_args.ev_value, text); } __except (EXCEPTION_EXECUTE_HANDLER) { fault = true; }
+        FIXCHECK(!fault, "stuff_event faulted on a %d-character text", len);
+        // the event as the replay got it: {kind, car, value, text[32]} after the stub's (0xadde0000, type, size)
+        FIXCHECK(g_log.n >= 3 + 11 && g_log.e[0] == 0xadde0000u && g_log.e[2] == 0x2c, "stuff_event: no event");
+        char got[32];
+        memcpy(got, &g_log.e[3 + 3], 32);
+        const int want = len < 31 ? len : 31;
+        FIXCHECK(!memcmp(got, text, want) && got[want] == 0, "stuff_event: a %d-character text isn't cut to %d", len, want);
+        if (len >= 32) cut++;
+    }
+    printf("stuff_event: %ld texts of 32 characters or more cut to 31, none faulted\n", cut);
+}
+#endif
+
 int main(int argc, char** argv) {
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
@@ -1043,6 +1146,7 @@ int main(int argc, char** argv) {
     int differ = 0, faults = 0, fault_mismatch = 0, wild_runs = 0, wild_differ = 0, fp_bad = 0, replay_only = 0, fp_faults = 0;
     int per_kind[N_KINDS] = {0}, per_kind_bad[N_KINDS] = {0}, per_kind_fault[N_KINDS] = {0};
     int same_fault_addr = 0;
+    int fixed = 0;                                    // (FIX_TESTS: the original faulted, the fixed one ran)
     int total_w = 0;
     for (int i = 0; i < N_KINDS; i++) total_w += kind_weight[i];
     for (int it = 0; it < iterations; it++) {
@@ -1068,6 +1172,13 @@ int main(int argc, char** argv) {
         save(rew);
         rew.log = g_log;
         per_kind[kind]++;
+#ifdef FIX_TESTS
+        {   // the fixed rewrite: its changes inside its footprint; a lost bead in check_for_too_fast is the fix
+            fp_bad += check_footprint(start, rew, fp, it, kind);
+            const AICar* sc = (const AICar*)start.car;
+            if (fo && !fn && kind == K_TOOFAST && sc->line && !((IdealLine*)start.line)->bead_seg) { fixed++; per_kind[kind]++; continue; }
+        }
+#endif
         if (fo || fn) {
             if (fo != fn) {
                 printf("  world %d (%s): original %s, rewrite %s (fault %08x at %08x, address %08x)\n", it, kind_names[kind], fo ? "faulted" : "ran",
@@ -1098,6 +1209,14 @@ int main(int argc, char** argv) {
            iterations, wild_runs, differ, wild_differ, fault_mismatch, faults, same_fault_addr, fp_bad, replay_only, fp_faults);
     printf("per function (worlds / differing / both faulted):\n");
     for (int i = 0; i < N_KINDS; i++) printf("  %-26s %6d / %d / %d\n", kind_names[i], per_kind[i], per_kind_bad[i], per_kind_fault[i]);
+#ifdef FIX_TESTS
+    printf("fixed: %d worlds where the original faulted on a NULL bead and the fixed one ran\n", fixed);
+    run_fix_tests();
+    printf("fix tests: %d failures\n", g_fix_fail);
+    if (g_fix_fail) differ++;
+#else
+    (void)fixed;
+#endif
     printf("coverage:\n");
     for (int i = 0; i < N_COV; i++) printf("  %-28s %d\n", cov_names[i], g_cov[i]);
     return differ || fp_bad ? 1 : 0;

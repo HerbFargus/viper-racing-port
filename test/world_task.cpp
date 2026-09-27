@@ -5,6 +5,9 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_task.cpp
 //        /Fo%TEMP%\wt\ /Fe%TEMP%\wt\world_task.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_task.exe [worlds] [seed]
+//   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS (or /DVP_TEST_FIXES) -- the rewrites as the game builds them (the
+//   random streams' records fit create_phob's buffer, so they must still match); then create_phob on records bigger
+//   than its buffer, or of a negative size.
 //
 // Loads out\race_v10.exe at 0x400000 the way test/fuzz.cpp does. A world is one tracked arena holding:
 //   * a phob list of up to 12 physics objects of the real classes (PlayCar, Ball, Obstacle, CheckPoint,
@@ -39,6 +42,12 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
+#define VP_TEST_FIXES           // (the flag the other harnesses use)
+#endif
+#ifndef VP_TEST_FIXES
+#define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+#endif
 #include "../hook/port.h"
 
 #undef PORT_FN_BUILDS
@@ -47,7 +56,10 @@
     static const char* const VP_CAT(name_, NEW) = NAME;                                                   \
     static constexpr auto VP_CAT(fpof_, NEW) = &FP;
 
+static int g_logf_quiet, g_logf_count;              // the fix test counts the rewrite's log lines instead
 void logf(const char* fmt, ...) {
+    g_logf_count++;
+    if (g_logf_quiet) return;
     va_list ap;
     va_start(ap, fmt);
     vprintf(fmt, ap);
@@ -1160,6 +1172,74 @@ static void run_begin_world() {
     MAIN(CHECK0(PhysicsEnd_rw));
 }
 
+#ifdef VP_TEST_FIXES
+// create_phob's FIX: a stream of [a record of 0x1e5..0x1000 bytes, or of a negative size (its 8-byte header alone)],
+// [an ordinary record], -1. The first must be read as its first 0x1e4 bytes (or its header) and the stream moved to
+// the second, which must come out whole; then the end. Checked on the rewrite's calls: the reads' sizes, the stream
+// positions, the constructors' FourCCs.
+static int fix_create_phob() {
+    int bad = 0;
+    const int runs = 3000;
+    g_logf_quiet = 1;
+    g_logf_count = 0;
+    for (int it = 0; it < runs; it++) {
+        setup_world();
+        FakeStream* s = stream();
+        s->len = 0;
+        s->cap = STREAM_CAP;
+        const int32_t big = chance(25) ? -ri(1, 0x7fffffff) : ri(0x1e5, 0x1000);
+        const uint32_t t1 = k_types[rnd() % 9], t2 = k_types[rnd() % 9];
+        const int32_t size2 = ri(8, 0x60);
+        auto put = [&](const void* p, int n) { memcpy(s->data + s->len, p, (size_t)n); s->len += n; };
+        int32_t msg = ri(0, 0x1000);
+        put(&msg, 4);
+        PhobData d1 = {t1, big};
+        put(&d1, 8);
+        for (int k = 8; k < big; k++) s->data[s->len++] = (uint8_t)rnd();
+        const int32_t second = s->len;
+        msg = ri(0, 0x1000);
+        put(&msg, 4);
+        PhobData d2 = {t2, size2};
+        put(&d2, 8);
+        for (int k = 8; k < size2; k++) s->data[s->len++] = (uint8_t)rnd();
+        const int32_t end = s->len;
+        msg = -1;
+        put(&msg, 4);
+        FakeSPtr* p = (FakeSPtr*)(g_arena + OFF_SPTR);
+        p->s = s;
+        p->pos = 0;
+        PhobRoot** out = (PhobRoot**)(g_arena + OFF_EVT);
+        for (int i = 0; i < 64; i++) g_script[i] = rnd() | 1;        // (odd: no MemAlloc fails)
+        g_pass = 1; g_nlog[1] = 0; g_si = 0;
+        uint8_t r[3] = {9, 9, 9};
+        int32_t pos[3] = {0, 0, 0};
+        bool ran = true;
+        __try {
+            for (int k = 0; k < 3; k++) { r[k] = create_phob_rw((void*)p, out); pos[k] = p->pos; }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { ran = false; }
+        // the reads and the constructions, in order
+        uint32_t reads[8], types[4];
+        int nr = 0, nt = 0;
+        for (int i = 0; i < g_nlog[1] && i < LOGN; i++) {
+            const LogEntry& e = g_log[1][i];
+            if (e.kind == L_MS_GET_DATA && nr < 8) reads[nr++] = e.a[1];
+            if (e.kind == L_CTOR && nt < 4) types[nt++] = e.a[2];
+        }
+        const uint32_t first = big > 0 ? 0x1e4u : 8u;
+        const bool ok = ran && r[0] == 1 && r[1] == 1 && r[2] == 0 && pos[0] == second && pos[1] == end &&
+                        nr == 4 && reads[0] == 8 && reads[1] == first && reads[2] == 8 && reads[3] == (uint32_t)size2 &&
+                        nt == 2 && types[0] == t1 && types[1] == t2;
+        if (!ok && bad++ < 4)
+            printf("  FIX create_phob (run %d, a record of %d bytes): returns %d %d %d, positions %d %d (want %d %d), %d reads, %d phobs\n",
+                   it, big, r[0], r[1], r[2], pos[0], pos[1], second, end, nr, nt);
+    }
+    g_logf_quiet = 0;
+    printf("fix build: create_phob on %d records past its buffer (or of a negative size): %d wrong, %d log lines\n", runs, bad,
+           g_logf_count);
+    return bad || g_logf_count != runs;
+}
+#endif
+
 int main(int argc, char** argv) {
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
@@ -1194,5 +1274,8 @@ int main(int argc, char** argv) {
     printf("covered:");
     for (int i = 0; i < NCOV; i++) printf("%s %s %d", i ? "," : "", k_cov_names[i], g_cov[i]);
     printf("\n");
+#ifdef VP_TEST_FIXES
+    failed += fix_create_phob();
+#endif
     return failed ? 1 : 0;
 }

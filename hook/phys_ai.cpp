@@ -53,6 +53,13 @@ static __forceinline void s_copy(char* d, const char* s) {
     memcpy(d, s, n);
 }
 static __forceinline void s_cat(char* d, const char* s) { s_copy(d + strlen(d), s); }
+// FIX helper: the string cut to fit an n-byte field (n - 1 characters and the terminator)
+static __forceinline void s_copy_max(char* d, const char* s, size_t n) {
+    size_t l = strlen(s);
+    if (l >= n) l = n - 1;
+    memcpy(d, s, l);
+    d[l] = 0;
+}
 
 // ---- layouts -----------------------------------------------------------------------------------------------------
 namespace {
@@ -1261,7 +1268,9 @@ PORT_FN(0x00424560, "get_ili_info", get_ili_info, fp_ili_info)
 
 // generate_notes_for (0x4246a0): a whole race in learn mode, one car (the driver, in its own car) on the track, the
 // notes it records then written to notes\ with their header. The header's unused bytes (after the car name) are
-// uninitialised stack in the original; zero here.
+// uninitialised stack in the original; zero here. The World's first car-list entry (+0x28, 0xc8 bytes) holds the
+// driver's name at +4 (13 bytes, as GenerateCarList's OptionsGet fills it) and the car's at +0x11 (35 bytes, up to
+// the setup data at +0x34); the header's car name is 32 bytes.
 static void __cdecl generate_notes_for(int driver, int strength, int track, const char* car) {
     alignas(4) uint8_t world[0xcd4];
     int args[1] = {driver};                            // AISetDriverMap's `int* const`: the original's argument slot
@@ -1272,8 +1281,14 @@ static void __cdecl generate_notes_for(int driver, int strength, int track, cons
     Iat(world, 0xca8) = 1;
     Iat(world, 0x28) = 1;
     const uint8_t* d = VFN(lounge, 4, const uint8_t*, int, int)(lounge, 0, strength, driver);
-    s_copy((char*)world + 0x2c, *(const char* const*)(d + 0x210));
-    s_copy((char*)world + 0x39, car);
+    // FIX: the original strcpy's the driver's and the car's names into the World unbounded: a driver's name of 13
+    // characters or more ran into the car's field, a car's of 35 or more into the car's setup data and on through
+    // the World on the stack. Each is cut to its field.
+    const char* dname = *(const char* const*)(d + 0x210);
+    if (VP_FIX && strlen(dname) >= 13) s_copy_max((char*)world + 0x2c, dname, 13);
+    else s_copy((char*)world + 0x2c, dname);
+    if (VP_FIX && strlen(car) >= 35) s_copy_max((char*)world + 0x39, car, 35);
+    else s_copy((char*)world + 0x39, car);
     Iat(world, 0xcac) = 2;
     Iat(world, 0xcb0) = 1;
     Iat(world, 0xcb4) = 0;
@@ -1303,7 +1318,10 @@ static void __cdecl generate_notes_for(int driver, int strength, int track, cons
     h.version = 7;
     h.size = 0x40;
     h.strength = strength;
-    s_copy(h.car, car);
+    // FIX: the header's car name (32 bytes) takes the car's name unbounded in the original: 32 characters or more ran
+    // over the header's other fields and, from 44 on, past the header on the stack. Cut to the field.
+    if (VP_FIX && strlen(car) >= sizeof h.car) s_copy_max(h.car, car, sizeof h.car);
+    else s_copy(h.car, car);
     uint64_t ili = get_ili_info_o(track, args[0], strength, car);
     uint16_t crc = calc_driver_crc_o(args[0], strength);
     h.driver_crc = crc;
@@ -1371,7 +1389,7 @@ PORT_FN(0x00424a90, "hex2int", hex2int, fp_hex2int)
 // car's four characters + ext
 static void __cdecl GetUniqueDSTCFname(char* out, const char* dir, const char* ext, int driver, int strength, int track,
                                        const char* car) {
-    char munge[64];                                    // (the original's is 16 bytes)
+    char munge[64];                                    // (the original's is 16 bytes: at most 3 x 8 + 4 + 1 used now)
     GetUniqueDSTCMunge_o(munge, driver, strength, track, car);
     crt_sprintf(out, k_fmt_sss, dir, munge, ext);
 }
@@ -1381,11 +1399,13 @@ static void fp_dstc_fname(Footprint& f, char* out, const char*, const char*, int
 PORT_FN(0x00424ae0, "GetUniqueDSTCFname", GetUniqueDSTCFname, fp_dstc_fname)
 
 static void __cdecl GetUniqueDSTCMunge(char* out, int driver, int strength, int track, const char* car) {
-    char car4[32];
-    // munge_carname_to_4char strncpy's four characters of any car but viper/vipergt, unterminated: the original's
-    // name then runs on into its uninitialised stack. Zeroed here (the four characters).
-    memset(car4, 0, sizeof car4);
+    char car4[32];                                     // (uninitialised, as the original's)
     munge_carname_to_4char(car4, car);
+    // FIX: munge_carname_to_4char strncpy's four characters of any car but viper / vipergt, unterminated (a mod car's
+    // name of 4 or more characters): the name then ran on into the uninitialised stack, making the ghost and notes
+    // file names from garbage and overrunning GetUniqueDSTCFname's 16-byte buffer. Terminated after the four.
+    // (Every other car's code is already terminated by then: the same name.)
+    if (VP_FIX) car4[4] = 0;
     crt_sprintf(out, k_fmt_dstc, driver, strength, track, car4);
 }
 static void fp_dstc_munge(Footprint& f, char* out, int, int, int, const char*) { f.add(out, 0x40, "name"); }

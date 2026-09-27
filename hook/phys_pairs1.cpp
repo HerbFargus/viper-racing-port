@@ -56,7 +56,8 @@ static void fp_volume(Footprint& f, CollisionVolume* v, const char* what, const 
 // and replay events, naming ca/cb if given (the compound volumes the spheres belong to) or else a/b.
 //
 // Faithful quirks: n is divided out by the distance BEFORE the tests (coincident centres give 0/0 = NaN,
-// then leave at the distance test); the overlap test is an integer test of the stored float's bits
+// then leave at the distance test -- so no fix is needed: the NaN never leaves, and 0/0 is an invalid operation,
+// which the physics thread keeps masked; it unmasks only zero-divide and overflow, ExceptDiv0Crashes(1)); the overlap test is an integer test of the stored float's bits
 // (overlap <= 0 as an int: +0, any negative, a negative NaN -- a positive NaN goes on); the impulse is
 // queued on a with b's surface type and on b with a's, as are the forces.
 static uint8_t __cdecl collide_sphere_sphere_rw(SphereVolume* a, SphereVolume* b, CollisionVolume* ca,

@@ -747,7 +747,7 @@ PORT_FN(0x004274d0, "update_phobs", update_phobs_rw, fp_replay_tick)
 
 // ==== create_phob (0x4289c0), make_phob (0x428a70) ===============================================================
 // A creation record in the stream: the phob's message offset (int; negative ends the list), then its PhobData
-// (FourCC, size, ...), read whole into a 0x1e4-byte buffer on the stack (unchecked, as the original).
+// (FourCC, size, ...), read whole into a 0x1e4-byte buffer on the stack (unchecked in the original: see FIX).
 static uint8_t __cdecl create_phob_rw(void* s, PhobRoot** out) {
     struct { int32_t msg; uint8_t data[0x1e4]; } rec;
     MemStreamGetInt(s, &rec.msg);
@@ -755,7 +755,23 @@ static uint8_t __cdecl create_phob_rw(void* s, PhobRoot** out) {
     int pos = MemStreamGetPos(s);
     MemStreamGetData(s, rec.data, 8);
     MemStreamSeekPos(s, pos);
-    MemStreamGetData(s, rec.data, ((PhobData*)rec.data)->size);
+    const int32_t size = ((PhobData*)rec.data)->size;
+    // FIX: a record bigger than the buffer overran the original's stack (and a negative size copied ~4 GB). An
+    // oversized record is read truncated to the buffer -- its first 0x1e4 bytes, which hold every field a phob
+    // constructor reads -- and the stream is moved on past the rest of it, so the records after it still line up
+    // (past the stream's end if it is cut short: the next read fails, as the original's own read would have). A
+    // negative size is read as the 8-byte header alone.
+    if (VP_FIX && (size < 0 || size > (int32_t)sizeof rec.data)) {
+        logf("create_phob: a %08x record of %d bytes; the buffer holds %u", ((PhobData*)rec.data)->type, size,
+             (unsigned)sizeof rec.data);
+        if (size < 0) {
+            MemStreamGetData(s, rec.data, 8);
+        } else {
+            MemStreamGetData(s, rec.data, (int)sizeof rec.data);
+            MemStreamSeekPos(s, (int)((uint32_t)pos + (uint32_t)size));
+        }
+    } else
+        MemStreamGetData(s, rec.data, size);
     PhobRoot* p = make_phob_o((PhobData*)rec.data, rec.msg);
     void** vt = p->vtable;
     if (((uint8_t(__fastcall*)(void*, Edx))vt[0x2c / 4])(p, 0)) PhysReplayRegisterPhob(p);   // IsDynamic

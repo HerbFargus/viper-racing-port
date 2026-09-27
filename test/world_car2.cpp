@@ -4,7 +4,10 @@
 //   build (x86 tools, from the repo root):
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC /DVP_FUZZ test\world_car2.cpp
 //        /Fo<outdir>\ /Fe<outdir>\world_car2.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
-//   run:   world_car2.exe [iterations] [name-filter]
+//   run:   world_car2.exe [iterations] [name-filter, or -] [seed]
+//   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS (or /DVP_TEST_FIXES) -- the rewrites as the game
+//   builds them; Car::Setup then also gets CarData names of 32 characters and more (unterminated), which must come out
+//   as the original's result for the name cut to 31.
 //
 // Loads out\race_v10.exe at 0x400000 the way test/fuzz.cpp does and includes the rewrite file itself. Every
 // iteration builds a whole world in a bump arena: a CarData (PhobData) with random but plausible numbers, five
@@ -28,6 +31,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
+#define VP_TEST_FIXES
+#endif
+#ifndef VP_TEST_FIXES
+#define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+#endif
 #include "../hook/phys_car.cpp"
 
 // ---- what the rewrites link against, standing in for the DLL and test/fuzz.cpp -------------------------
@@ -618,6 +627,7 @@ static void cover(int which) {
     }
 }
 
+static long g_long_names;
 static int run_one(int which, int it) {
     g_iter = it;
     g_name = k_names[which];
@@ -744,6 +754,21 @@ static int run_one(int which, int it) {
         random_cardata(W.cd);                                    // (keeps the models: they're past +0x1b8)
         *(uint8_t*)0x00521d48 = (uint8_t)(fuzz_rand() & 3);
         *g_damage_on = chance(80);
+#ifdef VP_TEST_FIXES
+        if (chance(25)) {                                        // FIX: a name of 32 characters or more
+            char* nm = ((CarData*)W.cd)->name;
+            for (int i = 0; i < 32; i++) nm[i] = "abcdefghijklmnopqrstuvwxyz"[fuzz_rand() % 26];
+            begin();
+            const char c31 = nm[31];
+            nm[31] = 0;                                          // the original, on the name cut to 31
+            ((CSetup_t)0x0043a130)(c, 0, W.cd);
+            nm[31] = c31;
+            mid();
+            Car_Setup(c, 0, W.cd);                               // the rewrite, on the long one
+            g_long_names++;
+            break;
+        }
+#endif
         begin(); ((CSetup_t)0x0043a130)(c, 0, W.cd); mid(); Car_Setup(c, 0, W.cd);
         break;
     }
@@ -770,7 +795,8 @@ int main(int argc, char** argv) {
     if (!GetEnvironmentVariableA("VP_FUZZ_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
     int iterations = argc > 1 ? atoi(argv[1]) : 2000;
-    const char* filter = argc > 2 ? argv[2] : 0;
+    const char* filter = argc > 2 && strcmp(argv[2], "-") ? argv[2] : 0;
+    if (argc > 3) g_state = (uint32_t)strtoul(argv[3], 0, 0) | 1;
     char exe[MAX_PATH];
     strcpy(exe, __FILE__);                        // ...\test\world_car2.cpp (built /FC) -> ...\out\race_v10.exe
     char* s = strstr(exe, "\\test\\world_car2.cpp");
@@ -821,6 +847,10 @@ int main(int argc, char** argv) {
         if (bad) failed++;
         ran++;
     }
+#ifdef VP_TEST_FIXES
+    printf("fix build: Car::Setup with a CarData name of 32+ characters %ld times (checked in Car::Setup above)\n", g_long_names);
+    if ((!filter || strstr("Car::Setup", filter)) && !g_long_names) failed++;
+#endif
     printf("%d of %d differ (%d random worlds each)\n", failed, ran, iterations);
     return failed ? 1 : 0;
 }

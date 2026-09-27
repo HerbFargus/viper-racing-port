@@ -20,6 +20,12 @@
 // heap top, globals) and the log are kept, the world restored, the rewrite runs, and the world, return value, log
 // and any fault are compared; every byte the original changed must lie inside the rewrite's footprint (or an AI
 // static, for the physics-thread functions) unless it's replay_only. The world continues from the original's result.
+//
+// The fixes (port.h: VP_FIX): the plain build defines VP_FAITHFUL and checks the rewrites against the originals as
+// above. Built with /DFIX_TESTS it compiles the fixed rewrites and runs the same worlds (every one must still equal
+// the original), then runs GetUniqueDSTCMunge / GetUniqueDSTCFname with the game's own munge_carname_to_4char on
+// mod car names over a stack full of junk: the original's name runs on into the junk, the fixed one stops at the
+// four characters (and the stock names and short ones come out as the original's).
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -30,6 +36,9 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#ifndef FIX_TESTS
+#define VP_FAITHFUL                                 // the original's behaviour, bit for bit (the fixes: /DFIX_TESTS)
+#endif
 #include "../hook/port.h"
 
 #undef PORT_FN_BUILDS
@@ -350,9 +359,15 @@ static const void* __cdecl stub_restry(const char* name, uint32_t type, uint32_t
 }
 static uint8_t __cdecl stub_resforget(const void* p) { logn(L_RESFORGET, pv(p)); return 1; }
 static void __cdecl stub_reswrite(int fd, uint32_t type, uint32_t ver) { logn(L_RESWRITE, (uint32_t)fd, type, ver); }
+#ifdef FIX_TESTS
+static bool g_ilinetry_always;                         // (the fix test: every line found -- no line is another crash)
+#endif
 static void* __cdecl stub_ilinetry(const char* name, uint32_t rev) {
     uint32_t s = script();
     logn(L_ILINETRY, hs(name), rev & 0xff, s % 3 != 0);
+#ifdef FIX_TESTS
+    if (g_ilinetry_always) return g_arena + OFF_LINE;
+#endif
     return s % 3 ? g_arena + OFF_LINE : 0;
 }
 static void __cdecl stub_munge(char* out, const char* name) {
@@ -362,7 +377,15 @@ static void __cdecl stub_munge(char* out, const char* name) {
     out[i] = 0;
 }
 static int __cdecl stub_filecreate(const char* name) { uint32_t s = script(); logn(L_FILECREATE, hs(name)); return s % 4 ? 0x100 + (int)(s % 7) : 0; }
+#ifdef FIX_TESTS
+static uint8_t g_cap_world[0xcd4], g_cap_hdr[0x40];     // (the fix test: the World LoadRace got, the notes header)
+static uint32_t g_cap_world_seed;
+static int g_cap_n;
+#endif
 static uint8_t __cdecl stub_filewrite(int fd, const void* data, int n) {
+#ifdef FIX_TESTS
+    if (n == 0x40) { memcpy(g_cap_hdr, data, 0x40); g_cap_n++; }
+#endif
     uint32_t h;
     if (n == 0x40 && pv(data) == 0x5eac0000u) {                    // the notes header: its defined bytes
         const uint8_t* b = (const uint8_t*)data;
@@ -380,9 +403,17 @@ static void* __fastcall stub_world_ctor(uint8_t* w, int) {
     uint32_t s = script();
     logn(L_WORLDCTOR, pv(w));
     fill_script(w, 0xcd4, s);
+#ifdef FIX_TESTS
+    g_cap_world_seed = s;
+#endif
     return w;
 }
-static void __cdecl stub_loadrace(const uint8_t* w) { logn(L_LOADRACE, hash_bytes(w, 0xcd4)); }
+static void __cdecl stub_loadrace(const uint8_t* w) {
+    logn(L_LOADRACE, hash_bytes(w, 0xcd4));
+#ifdef FIX_TESTS
+    memcpy(g_cap_world, w, 0xcd4);
+#endif
+}
 static bool g_dorace_aborts;
 static void __cdecl stub_dorace(const uint8_t* w, void* r, void* cb) {
     uint32_t s = script();
@@ -1084,6 +1115,110 @@ static void test_gcv() {
     g_main_thread = false;
 }
 
+#ifdef FIX_TESTS
+// ==== the fix test: a mod car's four-character code ================================================================
+static int g_fix_fail;
+#define FIXCHECK(cond, ...)                                                                                     \
+    do {                                                                                                        \
+        if (!(cond)) {                                                                                          \
+            if (g_fix_fail++ < 30) { printf("FIX FAIL: "); printf(__VA_ARGS__); printf("\n"); }                 \
+        }                                                                                                       \
+    } while (0)
+static uint8_t g_munge_code[5];                        // munge_carname_to_4char's first bytes (the stub's jump replaces them)
+static __declspec(noinline) void junk_stack() {
+    volatile char junk[1024];
+    for (int i = 0; i < 1023; i++) junk[i] = 'Z';
+    junk[1023] = 0;
+}
+typedef void(__cdecl* Munge5_t)(char*, int, int, int, const char*);
+static __declspec(noinline) void munge_on_junk(Munge5_t f, char* out, int d, int s, int t, const char* car) {
+    junk_stack();
+    f(out, d, s, t, car);
+}
+static void run_fix_tests() {
+    memcpy((void*)0x0040dc70, g_munge_code, 5);          // the game's munge_carname_to_4char
+    static char a[4096], b[4096];
+    static const char* const cars[] = {"jeep", "jeepster", "willys", "indyjeep", "Burninator", "vw", "abc", "viper", "vipergt", "VIPER"};
+    long garbage = 0, runs = 0;
+    for (int it = 0; it < 2000; it++) {
+        const char* car = cars[it % 10];
+        const int d = ri(0, 15), st = ri(0, 7), tr = ri(0, 15);
+        memset(a, 0, sizeof a);
+        memset(b, 0, sizeof b);
+        munge_on_junk((Munge5_t)0x00424b30, a, d, st, tr, car);
+        munge_on_junk(&GetUniqueDSTCMunge, b, d, st, tr, car);
+        char want[64];
+        char code[5] = {0};
+        if (!_stricmp(car, "viper")) strcpy(code, "vipr");
+        else if (!_stricmp(car, "vipergt")) strcpy(code, "vgt");
+        else strncpy(code, car, 4);
+        sprintf(want, "%x%x%x%s", d, st, tr, code);
+        runs++;
+        FIXCHECK(!strcmp(b, want), "GetUniqueDSTCMunge(%s): \"%.40s\", not \"%s\"", car, b, want);
+        if (strlen(car) < 4 || !_stricmp(car, "viper") || !_stricmp(car, "vipergt"))
+            FIXCHECK(!strcmp(a, b), "GetUniqueDSTCMunge(%s): the original's \"%.40s\", the fixed \"%s\"", car, a, b);
+        else if (strcmp(a, b)) garbage++;
+    }
+    printf("GetUniqueDSTCMunge: %ld names; the original ran a mod car's code on into the stack %ld times, the fixed one "
+           "never (stock and short names as the original's)\n", runs, garbage);
+    FIXCHECK(garbage > 500, "the original never read the junk");
+    // GetUniqueDSTCFname through the fixed munge (hooked, as in the game): dir + code + ext
+    patch_jmp(0x00424b30, (void*)&GetUniqueDSTCMunge);
+    for (int it = 0; it < 500; it++) {
+        const char* car = cars[it % 5];
+        const int d = ri(0, 15), st = ri(0, 7), tr = ri(0, 15);
+        junk_stack();
+        GetUniqueDSTCFname(a, "notes\\", ".dnt", d, st, tr, car);
+        char want[128];
+        char code[5] = {0};
+        strncpy(code, car, 4);
+        sprintf(want, "notes\\%x%x%x%s.dnt", d, st, tr, code);
+        FIXCHECK(!strcmp(a, want), "GetUniqueDSTCFname(%s): \"%.60s\", not \"%s\"", car, a, want);
+    }
+    // generate_notes_for with over-long driver and car names: each cut to its field in the World (driver 13 bytes at
+    // +0x2c, car 35 at +0x39) and the notes header (car 32 at +0x14); nothing else in the World changed by them
+    static char dname[512], cname[512];
+    long cut = 0;
+    g_ilinetry_always = true;
+    for (int it = 0; it < 3000; it++) {
+        build_world();
+        const int dl = it % 3 ? ri(13, 500) : ri(0, 12), cl = it % 4 ? ri(32, 500) : ri(1, 31);
+        for (int i = 0; i < dl; i++) dname[i] = (char)('A' + rnd() % 26);
+        dname[dl] = 0;
+        for (int i = 0; i < cl; i++) cname[i] = (char)('a' + rnd() % 26);
+        cname[cl] = 0;
+        for (int i = 0; i < 16; i++) *(char**)(driver_rec(i) + 0x210) = dname;
+        for (int i = 0; i < 64; i++) g_script[i] = rnd();
+        g_si = 0;
+        g_pass = 0;
+        g_nlog[0] = 0;
+        g_cap_n = 0;
+        memset(g_cap_world, 0, sizeof g_cap_world);
+        unsigned cw;
+        _controlfp_s(&cw, _PC_53, _MCW_PC);
+        bool fault = false;
+        __try { generate_notes_for(ri(0, 3), ri(0, 3), ri(0, 15), cname); } __except (EXCEPTION_EXECUTE_HANDLER) { fault = true; }
+        FIXCHECK(!fault, "generate_notes_for faulted (driver %d, car %d characters)", dl, cl);
+        const int dw = dl < 12 ? dl : 12, cw2 = cl < 34 ? cl : 34;
+        FIXCHECK(!memcmp(g_cap_world + 0x2c, dname, dw) && g_cap_world[0x2c + dw] == 0, "the World's driver name (%d characters)", dl);
+        FIXCHECK(!memcmp(g_cap_world + 0x39, cname, cw2) && g_cap_world[0x39 + cw2] == 0, "the World's car name (%d characters)", cl);
+        // the rest of the World as the constructor made it, but for the fields generate_notes_for sets
+        uint8_t want[0xcd4];
+        fill_script(want, 0xcd4, g_cap_world_seed);
+        FIXCHECK(!memcmp(g_cap_world + 0x5c, want + 0x5c, 0xca8 - 0x5c), "the car's setup data in the World changed (car %d characters)", cl);
+        if (g_cap_n) {
+            const int hw = cl < 31 ? cl : 31;
+            FIXCHECK(!memcmp(g_cap_hdr + 0x14, cname, hw) && g_cap_hdr[0x14 + hw] == 0, "the header's car name (%d characters)", cl);
+        }
+        if (dl >= 13 || cl >= 32) cut++;
+    }
+    printf("generate_notes_for: %ld runs with a driver's name of 13+ or a car's of 32+ characters, cut to their fields, none "
+           "faulted or wrote past them\n", cut);
+    g_ilinetry_always = false;
+    // GetUniqueDSTCFname through the fixed munge (hooked, as in the game): dir + code + ext
+}
+#endif
+
 int main(int argc, char** argv) {
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
@@ -1094,6 +1229,9 @@ int main(int argc, char** argv) {
     char* s = strstr(exe, "\\test\\world_ai.cpp");
     if (s) strcpy(s, "\\out\\race_v10.exe");
     if (!load_race_exe(exe)) return 2;
+#ifdef FIX_TESTS
+    memcpy(g_munge_code, (void*)0x0040dc70, 5);
+#endif
     install_stubs();
     g_arena = (uint8_t*)VirtualAlloc(0, ARENA_SIZE, MEM_COMMIT, PAGE_READWRITE);
     if (!g_arena) return 2;
@@ -1126,5 +1264,10 @@ int main(int argc, char** argv) {
     }
     printf("%d worlds, %ld calls; %d of %d functions differ or escape their footprint; %d unknown footprint classes\n",
            worlds, calls, failed, g_nstats, g_fp_unknown);
+#ifdef FIX_TESTS
+    run_fix_tests();
+    printf("fix tests: %d failures\n", g_fix_fail);
+    if (g_fix_fail) failed++;
+#endif
     return failed ? 1 : 0;
 }

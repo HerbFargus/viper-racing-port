@@ -5,6 +5,9 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_record.cpp
 //        /Fo%TEMP%\wr\ /Fe%TEMP%\wr\world_record.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_record.exe [worlds] [seed]
+//   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS (or /DVP_TEST_FIXES) -- the rewrites as the game builds them, on
+//   worlds whose names fit (so they must still match the originals), then the inputs that used to overrun: long track
+//   names, a long user directory, stage records outside set_best_stages' table, a short name after a '.'.
 //
 // Loads out\race_v10.exe at 0x400000 the way test/fuzz.cpp does. Each world starts from the pristine .data and
 // builds, in an arena: 16 CarMgrInfos (a flag byte, names of random lengths, now and then a lower-case or high
@@ -38,6 +41,12 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
+#define VP_TEST_FIXES           // (the flag the other harnesses use)
+#endif
+#ifndef VP_TEST_FIXES
+#define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+#endif
 #include "../hook/port.h"
 
 #undef PORT_FN_BUILDS
@@ -47,7 +56,10 @@
     static constexpr auto VP_CAT(fpof_, NEW) = &FP;
 
 // ---- what the rewrites link against, standing in for the DLL ------------------------------------------
+static int g_logf_quiet, g_logf_count;              // the fix tests count the rewrites' log lines instead
 void logf(const char* fmt, ...) {
+    g_logf_count++;
+    if (g_logf_quiet) return;
     va_list ap;
     va_start(ap, fmt);
     vprintf(fmt, ap);
@@ -255,7 +267,8 @@ template <uint32_t TAG> static void __cdecl st_log(const char* fmt, ...) {
     lg_varargs(fmt, ap);
     va_end(ap);
 }
-static const char* __cdecl st_UserDir(void) { lg('UDIR'); return (const char*)g_arena + A_STR; }
+static const char* g_user_dir;                          // the arena's (A_STR), or a fix test's long one
+static const char* __cdecl st_UserDir(void) { lg('UDIR'); return g_user_dir ? g_user_dir : (const char*)g_arena + A_STR; }
 static int __cdecl st_FileOpen(const char* path) { lg('FOPN'); lg_str(path); return script() % 5 ? 5 : 0; }
 static uint8_t __cdecl st_FileRead(int fd, void* buf, int* n) {
     lg('FRED'); lg((uint32_t)fd); lg((uint32_t)(uintptr_t)buf); lg((uint32_t)*n);
@@ -305,6 +318,17 @@ static void random_name(char* s, int maxlen) {
     for (int k = 0; k < n; k++) s[k] = (char)(k == 0 && rnd() % 5 == 0 ? (rnd() % 2 ? 0xe9 : '1') : 'a' + rnd() % 26);
     if (n && rnd() % 2) s[0] = (char)(s[0] & 0xdf);
     s[n] = 0;
+}
+// a track name that takes one of RecordMgr::RecordMgr's FIX paths (it wouldn't fit the 15-byte name) is cut to
+// one that doesn't in the fix build, so the random worlds stay inputs the fixed rewrites must still match on
+static void fit_name(char* s) {
+#ifdef VP_TEST_FIXES
+    size_t n = strlen(s);
+    bool ext = n >= 4 && s[n - 4] == '.';
+    if (n > 14 || (!ext && n > 10)) s[10] = 0;
+#else
+    (void)s;
+#endif
 }
 static float g_pool[8];                                // recent times: ties
 static float a_time(float lo, float hi) {
@@ -394,6 +418,7 @@ static void build_world() {
         char* name = (char*)w + 8;
         random_name(name, 10);
         if (rnd() % 3) strcat(name, rnd() % 4 ? ".trk" : ".t");
+        fit_name(name);
         at<int32_t>(w, 0xca8) = g_ncars;
         at<int32_t>(w, 0xcc0) = g_nlaps;
         at<int32_t>(w, 0xcac) = ri(0, 2);
@@ -642,6 +667,7 @@ static void main_step() {
         char* name = (char*)g_arena + A_STR + 0x100;
         random_name(name, 10);
         if (rnd() % 2) strcat(name, ".trk");
+        fit_name(name);
         uint32_t mark = g_heap_mark;
         CHECK(RecordMgrCreate, name);
         g_alloc_fails = false;
@@ -658,6 +684,7 @@ static void main_step() {
         char* name = (char*)g_arena + A_STR + 0x100;
         random_name(name, 10);
         if (rnd() % 2) strcat(name, rnd() % 2 ? ".trk" : ".x");
+        fit_name(name);
         g_ret_is_self = true;
         CHECK(RecordMgr_ctor, m2, 0, (const char*)name);
         if (!g_crashed && m2->file) CHECK(RecordMgr_dtor, m2, 0);
@@ -682,6 +709,219 @@ static void run_world() {
     if (g_crashed) return;
     if (rnd() % 2) CHECK0(RecordEnd);
 }
+
+#ifdef VP_TEST_FIXES
+// ---- the fixes, on the inputs that used to overrun ------------------------------------------------------------------
+// the first `tag` entry in the rewrite's log carries exactly the string `expect` (lg_str)
+static bool logged_str(uint32_t tag, const char* expect) {
+    const uint32_t* L = g_log[1];
+    for (int i = 0; i + 1 < g_nlog[1]; i++) {
+        if (L[i] != tag) continue;
+        const uint32_t n = L[i + 1];
+        if (n != strlen(expect)) return false;
+        for (uint32_t k = 0; k < n; k += 4) {
+            uint32_t w = 0;
+            memcpy(&w, expect + k, n - k < 4 ? n - k : 4);
+            if (L[i + 2 + k / 4] != w) return false;
+        }
+        return true;
+    }
+    return false;
+}
+static void rewrite_pass() { g_pass = 1; g_nlog[1] = 0; g_script = rnd() | 1; g_heap_next = g_heap_mark; }
+template <typename F> static bool no_fault(F f) {
+    __try { f(); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return true;
+}
+typedef RecordMgr*(__fastcall* OrigMgrCtor_t)(RecordMgr*, Edx, const char*);
+typedef void(__cdecl* Void0_t)(void);
+
+static int fix_tests() {
+    int failed = 0;
+    static char expect[0x1000], path[0x1000], dir[0x900];
+    RecordMgr* m2 = (RecordMgr*)(g_arena + A_MGR2);
+    char* name = (char*)g_arena + A_STR + 0x100;
+
+    g_logf_quiet = 1;
+    g_logf_count = 0;
+    // 1. RecordMgr::RecordMgr, a track name too long for the 15-byte name: "<its stem's first 10>.sco", the RecordFile
+    //    pointer after the name intact, and that file name in the path it opens
+    int bad = 0;
+    for (int it = 0; it < 2000; it++) {
+        build_world();
+        const int len = ri(11, 60);
+        for (int k = 0; k < len; k++) name[k] = (char)('a' + rnd() % 26);
+        name[len] = 0;
+        const bool ext = len > 14 && rnd() % 2;
+        if (ext) memcpy(name + len - 4, ".trk", 4);
+        const int stem = (ext ? len - 4 : len) < 10 ? (ext ? len - 4 : len) : 10;
+        memcpy(expect, name, stem);
+        strcpy(expect + stem, ".sco");
+        strcpy(path, (const char*)g_arena + A_STR);
+        strcat(path, expect);
+        rewrite_pass();
+        const bool ran = no_fault([&] { RecordMgr_ctor(m2, 0, name); });
+        const bool ok = ran && !strcmp(m2->filename, expect) && (uint8_t*)m2->file == g_arena + A_HEAP && logged_str('FOPN', path);
+        if (!ok && bad++ < 4) printf("  FIX RecordMgr::RecordMgr(\"%s\"): name \"%.15s\", file %p, path %s\n", name, m2->filename,
+                                     (void*)m2->file, logged_str('FOPN', path) ? "ok" : "wrong");
+    }
+    printf("fix: RecordMgr::RecordMgr on 2000 track names of 11..60 characters: %d wrong\n", bad);
+    failed += bad != 0 || g_logf_count != 2000;             // one log line each
+
+    // 2. a user directory of 245..0x800 characters: the constructor opens and save() creates <dir><name> (cut at 0x3ff).
+    //    The constructor's own save (a recreated file) goes to the rewrite, as it does in the game (the original's
+    //    would overrun its stack here).
+    bad = 0;
+    uint8_t save_entry[5];
+    memcpy(save_entry, (void*)0x0042ac20, 5);
+    patch_jump(0x0042ac20, (void*)&RecordMgr_save);
+    for (int it = 0; it < 1000; it++) {
+        build_world();
+        const int dl = it % 4 ? ri(245, 0x3f0) : ri(0x3f0, 0x800);
+        strcpy(dir, "C:\\");
+        for (int k = 3; k < dl - 1; k++) dir[k] = (char)('a' + rnd() % 26);
+        dir[dl - 1] = '\\';
+        dir[dl] = 0;
+        g_user_dir = dir;
+        strcpy(name, "bemidji.trk");
+        strcpy(path, dir);
+        strcat(path, "bemidji.sco");
+        path[0x3ff] = 0;
+        rewrite_pass();
+        bool ok = no_fault([&] { RecordMgr_ctor(m2, 0, name); }) && logged_str('FOPN', path) && !strcmp(m2->filename, "bemidji.sco");
+        m2->dirty = 1;
+        rewrite_pass();
+        ok = ok && no_fault([&] { RecordMgr_save(m2, 0); }) && logged_str('FCRT', path);
+        g_user_dir = 0;
+        if (!ok && bad++ < 4) printf("  FIX a user directory of %d characters: the records path is wrong\n", dl);
+    }
+    memcpy((void*)0x0042ac20, save_entry, 5);
+    printf("fix: RecordMgr::RecordMgr and save with a user directory of 245..2048 characters, 1000 times: %d wrong\n", bad);
+    failed += bad != 0;
+
+    // 3. set_best_stages with stage records outside its table: they're skipped, and every other record comes out as
+    //    the original leaves it when those records are moved to table slots nobody else uses (and put back after)
+    bad = 0;
+    int runs = 0, spoiled = 0;
+    for (int it = 0; it < 3000; it++) {
+        build_world();
+        RecordList* l = stages();
+        if (l->cap < 4) continue;
+        l->count = ri(2, l->cap);
+        for (int i = 0; i < l->count; i++) random_list_record(rec_at(l, i), 2);
+        for (int b = ri(1, 4); b > 0; b--) {
+            uint8_t* r = rec_at(l, ri(0, l->count - 1));
+            switch (rnd() % 3) {
+            case 0: r[0x41] = (uint8_t)(0x80 | rnd()); break;                    // a negative car
+            case 1: r[0x41] = 0; r[0x42] = 0; break;                              // slot -1
+            default: r[0x41] = 15; r[0x42] = (uint8_t)ri(4, 255); break;          // past slot 47
+            }
+        }
+        auto slot = [](const uint8_t* r) { return (int32_t)(int8_t)r[0x41] * 3 + (int32_t)r[0x42] - 1; };
+        bool used[48] = {};
+        int nb = 0, outs[384];
+        for (int i = 0; i < l->count; i++) {
+            const int32_t k = slot(rec_at(l, i));
+            if ((uint32_t)k < 48) used[k] = true;
+            else outs[nb++] = i;
+        }
+        int nfree = 0, free_slots[48];
+        for (int k = 0; k < 48; k++) if (!used[k]) free_slots[nfree++] = k;
+        if (nb == 0 || nfree < nb) continue;
+        runs++;
+        spoiled += nb;
+        const uint32_t bytes = (uint32_t)l->count * 0x48;
+        static uint8_t start[384 * 0x48], fixed[384 * 0x48];
+        memcpy(start, l->recs, bytes);
+        rewrite_pass();
+        bool ok = no_fault([&] { set_best_stages(); });
+        memcpy(fixed, l->recs, bytes);
+        memcpy(l->recs, start, bytes);
+        for (int j = 0; j < nb; j++) {
+            uint8_t* r = rec_at(l, outs[j]);
+            r[0x41] = (uint8_t)(free_slots[j] / 3);
+            r[0x42] = (uint8_t)(free_slots[j] % 3 + 1);
+        }
+        g_pass = 0;
+        ok = ok && no_fault([&] { ((Void0_t)0x0042a510)(); });
+        for (int j = 0; j < nb; j++) memcpy(rec_at(l, outs[j]), start + outs[j] * 0x48, 0x48);
+        ok = ok && !memcmp(l->recs, fixed, bytes);
+        if (!ok && bad++ < 4) printf("  FIX set_best_stages (world %d, %d records, %d outside the table) differs\n", it, l->count, nb);
+    }
+    printf("fix: set_best_stages with %d records outside its table in %d lists: %d differ\n", spoiled, runs, bad);
+    failed += bad != 0 || runs == 0;
+
+    // 5. init_baserecord with a car name filling its 13 bytes (no terminator: it runs on into the driver name) and a
+    //    driver name of 0..60 characters: the record must be what the original makes from the names cut to 12 and 32
+    bad = 0;
+    int orig_spilled = 0;
+    for (int it = 0; it < 2000; it++) {
+        build_world();
+        const int car = ri(0, 7);
+        uint8_t* info = g_arena + A_INFO + car * 0x40;
+        char* cn = (char*)info + 5;
+        char* dn = (char*)info + 0x12;
+        const bool long_car = rnd() % 4 != 0;
+        const int dlen = ri(0, 60);
+        if (long_car) for (int k = 0; k < 13; k++) cn[k] = (char)('a' + rnd() % 26);
+        for (int k = 0; k < dlen; k++) dn[k] = (char)('a' + rnd() % 26);
+        dn[dlen] = 0;
+        if (!long_car && dlen <= 32) continue;                     // nothing to cut
+        uint8_t* rec = g_arena + A_SCRATCH + 0x48 * ri(0, 8);
+        static uint8_t start[0x48 * 3], fixed[0x48 * 3], cut[0x48 * 3];
+        memcpy(start, rec, sizeof start);
+        rewrite_pass();
+        bool ok = no_fault([&] { RecordMgr_init_baserecord(mgr(), 0, (RaceRecord*)rec, car); });
+        memcpy(fixed, rec, sizeof fixed);
+        memcpy(rec, start, sizeof start);
+        // the original on the cut names (restored after)
+        const char c12 = cn[12], d32 = dn[32];
+        cn[12] = 0;
+        if (dlen > 32) dn[32] = 0;
+        g_pass = 0;
+        ok = ok && no_fault([&] { ((void(__fastcall*)(RecordMgr*, Edx, RaceRecord*, int))0x00429f80)(mgr(), 0, (RaceRecord*)rec, car); });
+        cn[12] = c12;
+        dn[32] = d32;
+        memcpy(cut, rec, sizeof cut);
+        ok = ok && !memcmp(cut, fixed, sizeof cut);
+        if (!ok && bad++ < 4) printf("  FIX init_baserecord (car name %s, driver name %d): differs\n", long_car ? "13+" : "short", dlen);
+        // the original on the long names, for the record: does it write past the driver name's field?
+        memcpy(rec, start, sizeof start);
+        g_pass = 0;
+        no_fault([&] { ((void(__fastcall*)(RecordMgr*, Edx, RaceRecord*, int))0x00429f80)(mgr(), 0, (RaceRecord*)rec, car); });
+        if (dlen > 32 && memcmp(rec + 0x3e, cut + 0x3e, sizeof cut - 0x3e)) orig_spilled++;
+        memcpy(rec, start, sizeof start);
+    }
+    printf("fix: init_baserecord with names past their fields: %d wrong (the original wrote past driver_name %d times)\n", bad, orig_spilled);
+    failed += bad != 0 || orig_spilled == 0;
+
+    // 4. RecordMgr::RecordMgr with a name under 3 characters: the '.'s before the RecordMgr stay (the original clears one)
+    bad = 0;
+    int orig_cleared = 0;
+    for (int it = 0; it < 300; it++) {
+        build_world();
+        const int len = it % 3;
+        for (int k = 0; k < len; k++) name[k] = (char)('a' + rnd() % 26);
+        name[len] = 0;
+        strcpy(expect, name);
+        strcat(expect, ".sco");
+        memset((uint8_t*)m2 - 4, '.', 4);
+        rewrite_pass();
+        bool ok = no_fault([&] { RecordMgr_ctor(m2, 0, name); });
+        ok = ok && !memcmp((uint8_t*)m2 - 4, "....", 4) && !strcmp(m2->filename, expect);
+        if (!ok && bad++ < 4) printf("  FIX RecordMgr::RecordMgr(\"%s\") wrote before the RecordMgr\n", name);
+        build_world();
+        memset((uint8_t*)m2 - 4, '.', 4);
+        g_pass = 0;
+        g_heap_next = g_heap_mark;
+        if (no_fault([&] { ((OrigMgrCtor_t)0x0042aa30)(m2, 0, name); }) && memcmp((uint8_t*)m2 - 4, "....", 4)) orig_cleared++;
+    }
+    printf("fix: RecordMgr::RecordMgr with names of 0..2 characters after a '.', 300 times: %d wrong (the original cleared one %d times)\n",
+           bad, orig_cleared);
+    failed += bad != 0 || orig_cleared != 300;
+    return failed;
+}
+#endif
 
 int main(int argc, char** argv) {
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
@@ -719,5 +959,8 @@ int main(int argc, char** argv) {
         failed += st.fails || st.fp_fails;
     }
     printf("%d worlds; %d of %d functions differ or miss their footprint\n", worlds, failed, g_nstats);
+#ifdef VP_TEST_FIXES
+    failed += fix_tests();
+#endif
     return failed ? 1 : 0;
 }

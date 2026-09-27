@@ -28,6 +28,24 @@
 // plus the globals) and the log are kept, the world restored, the rewrite runs, and the world, the return
 // value, the log and any fault are compared; every byte the original changed must lie inside the rewrite's
 // footprint unless it's replay_only. The world continues from the original's result.
+//
+// The fixes (port.h: VP_FIX). The plain build defines VP_FAITHFUL: the rewrites as the original, checked bit for
+// bit as above. Built with /DFIX_TESTS it compiles the fixed rewrites (as the game runs them) and checks them:
+//  * ordinary worlds (the track worlds without NaNs, infinities or lines under 3 nodes): every call must still
+//    equal the original, except where the original crashed (the fixed one mustn't) or left a line's bead NULL
+//    (the fixed one must have put it at the brute-force nearest point of the line, for reset_bead_position and
+//    CenterLine::reset);
+//  * the lost bead, against the originals: reset_bead_position on points near, far and on the nodes (where the
+//    original finds a bead the fixed one finds the same; where it leaves it NULL the fixed one is at the nearest
+//    point), NaN positions (the bead stays where it was, or goes to the head), and every reader of a NULL bead
+//    (the original faults, the fixed one doesn't);
+//  * two-node lines (QuickTan: the original NaN, the fixed one the chord), and then -- with every rewrite hooked
+//    in the image, as the game runs them -- cars driven round two-node lines, lines with a zero-length node,
+//    the editor's zero-length lines and NaN positions: nothing faults, hangs (the watchdog) or goes NaN, and the
+//    bead gets round the loop.
+#ifndef FIX_TESTS
+#define VP_FAITHFUL                                 // the original's behaviour, bit for bit
+#endif
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -39,12 +57,18 @@
 #include <type_traits>
 #include "../hook/port.h"
 
-// the rewrites, compiled in: each PORT_FN just names the original's address and the footprint function
+// the rewrites, compiled in: each PORT_FN just names the original's address and the footprint function (and
+// registers the pair, for the fix tests that hook every rewrite in the image as the game does)
+struct PortReg { uint32_t at; void* fn; };
+static PortReg g_regs[128];
+static int g_nregs;
+struct PortRegAdd { PortRegAdd(uint32_t a, void* f) { g_regs[g_nregs++] = {a, f}; } };
 #undef PORT_FN_BUILDS
 #define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                      \
     static const uint32_t VP_CAT(addr_, NEW) = V10;                                                        \
     static const char* const VP_CAT(name_, NEW) = NAME;                                                   \
-    static constexpr auto VP_CAT(fpof_, NEW) = &FP;
+    static constexpr auto VP_CAT(fpof_, NEW) = &FP;                                                         \
+    static PortRegAdd VP_CAT(reg_, NEW)(V10, (void*)&NEW);
 
 // ---- what the rewrites link against, standing in for the DLL ------------------------------------------
 void logf(const char* fmt, ...) {
@@ -312,13 +336,13 @@ template <typename F, typename... A> static uint64_t invoke(F f, A... a) {
     }
 }
 
-struct Stat { const char* name; long calls, changed, fails, fp_fails, faults, replay_only; };
+struct Stat { const char* name; long calls, changed, fails, fp_fails, faults, replay_only, fixed; };
 static Stat g_stats[96];
 static int g_nstats;
 static Stat& stat(const char* name) {
     for (int i = 0; i < g_nstats; i++)
         if (!strcmp(g_stats[i].name, name)) return g_stats[i];
-    g_stats[g_nstats] = {name, 0, 0, 0, 0, 0, 0};
+    g_stats[g_nstats] = {name, 0, 0, 0, 0, 0, 0, 0};
     return g_stats[g_nstats++];
 }
 
@@ -369,6 +393,102 @@ static const char* region_of(uint32_t off, uint32_t* rel) {
     *rel = off - rs[k].at;
     return rs[k].name;
 }
+#ifdef FIX_TESTS
+// ---- the fix checks' helpers -------------------------------------------------------------------------------------
+static int g_fix_fail;
+static long g_fix_nearest, g_fix_found;
+#define FIXCHECK(cond, ...)                                                                             \
+    do {                                                                                                \
+        if (!(cond)) {                                                                                  \
+            if (g_fix_fail++ < 40) { printf("FIX FAIL (world %d): ", g_world); printf(__VA_ARGS__); printf("\n"); } \
+        }                                                                                               \
+    } while (0)
+static bool ffin(float x) { return (ubits(x) & 0x7f800000u) != 0x7f800000u; }
+// the world's lines, by offset in the arena
+static const uint32_t g_line_offs[] = {OFF_CL, OFF_CL + CL_STRIDE, OFF_CL + 2 * CL_STRIDE, OFF_CL + 3 * CL_STRIDE, OFF_CIL,
+                                       OFF_MIL, OFF_RLINE, OFF_FCL, OFF_FCL + 0x80};
+static bool on_loop(const IdealLine* l, const ILSeg* s) {
+    const ILSeg* h = l->head;
+    const ILSeg* q = h;
+    for (int n = 0; q && n < 10000; n++) {
+        if (q == s) return true;
+        q = q->next;
+        if (q == h) break;
+    }
+    return false;
+}
+// brute force, at 53 bits: the squared distance from pt to the nearest of 4001 points along each chord of the line,
+// and to the bead's point on its chord
+static unsigned pc53_begin() { unsigned cw, x; _controlfp_s(&cw, 0, 0); _controlfp_s(&x, _PC_53, _MCW_PC); return cw; }
+static void pc_end(unsigned cw) { unsigned x; _controlfp_s(&x, cw & _MCW_PC, _MCW_PC); }
+static double brute_nearest(const IdealLine* l, const Point2D* pt) {
+    unsigned cw = pc53_begin();
+    const ILSeg* h = l->head;
+    const ILSeg* s = h;
+    double best = 1e300;
+    for (int n = 0; s && n < 10000; n++) {
+        const ILSeg* nx = s->next;
+        for (int k = 0; k <= 4000; k++) {
+            double t = k / 4000.0;
+            double x = s->p.x + t * ((double)nx->p.x - s->p.x) - pt->x, z = s->p.z + t * ((double)nx->p.z - s->p.z) - pt->z;
+            double d = x * x + z * z;
+            if (d < best) best = d;
+        }
+        s = nx;
+        if (s == h) break;
+    }
+    pc_end(cw);
+    return sqrt(best);
+}
+static double bead_dist(const IdealLine* l, const Point2D* pt) {
+    unsigned cw = pc53_begin();
+    const ILSeg* s = l->bead_seg;
+    const ILSeg* nx = s->next;
+    double t = l->bead_t;
+    double x = s->p.x + t * ((double)nx->p.x - s->p.x) - pt->x, z = s->p.z + t * ((double)nx->p.z - s->p.z) - pt->z;
+    double d = sqrt(x * x + z * z);
+    pc_end(cw);
+    return d;
+}
+// the bead of a line the fixed code put back: on the line, t in 0..1, at the nearest point of the line to pt
+static void check_found_bead(const IdealLine* l, const Point2D* pt, const char* what) {
+    FIXCHECK(l->bead_seg && on_loop(l, l->bead_seg), "%s: the bead isn't on the line", what);
+    if (!l->bead_seg || !on_loop(l, l->bead_seg)) return;
+    FIXCHECK(l->bead_t >= 0.0f && l->bead_t <= 1.0f, "%s: bead t %g", what, l->bead_t);
+    if (ffin(pt->x) && ffin(pt->z)) {
+        double b = brute_nearest(l, pt), d = bead_dist(l, pt);
+        FIXCHECK(d <= b + 1e-4 * (1.0 + b) + 1e-3, "%s: the bead is %.6f m from the car, the nearest point of the line %.6f m", what, d, b);
+        g_fix_nearest++;
+    }
+}
+// did the original leave some line's bead NULL (a line with a head) that the fixed one filled?
+static bool fix_lost_bead_found() {
+    bool found = false;
+    for (uint32_t off : g_line_offs) {
+        const IdealLine* o = (const IdealLine*)(g_after.arena + off);
+        const IdealLine* n = (const IdealLine*)(g_arena + off);
+        if (o->head && !o->bead_seg && n->bead_seg) found = true;
+    }
+    return found;
+}
+// after a call the original crashed on or left a bead NULL on: every line whose bead the fixed one put back is on
+// the line (and, for the resets, at the point nearest the car)
+static void fix_validate(const char* name, Stat&) {
+    bool nearest = !strcmp(name, "IdealLine::reset_bead_position") || !strcmp(name, "CenterLine::reset");
+    for (uint32_t off : g_line_offs) {
+        const IdealLine* s = (const IdealLine*)(g_start.arena + off);
+        const IdealLine* o = (const IdealLine*)(g_after.arena + off);
+        const IdealLine* n = (const IdealLine*)(g_arena + off);
+        if (!n->head || n->bead_seg == o->bead_seg) continue;
+        if (o->bead_seg && s->bead_seg) continue;                 // (not a bead the original lost)
+        g_fix_found++;
+        char what[96];
+        sprintf(what, "%s (line +0x%x)", name, off);
+        if (nearest) check_found_bead(n, &n->car_pos, what);
+        else FIXCHECK(n->bead_seg && on_loop(n, n->bead_seg) && ffin(n->bead_t), "%s: the bead isn't on the line", what);
+    }
+}
+#endif
 static void fpu_reset() {
     __asm fninit
     unsigned cw;
@@ -403,6 +523,28 @@ template <typename Run, typename Fp> static void check(const char* name, Run run
     fpu_reset();
     g_last_fault = fo != 0;
     g_last_ret = ro;
+#ifdef FIX_TESTS
+    // the fixed rewrite: never a fault, and every byte it changed inside its footprint
+    if (fn && !fo) {
+        if (st.fails++ < 4) printf("FIXED REWRITE FAULTED %s (world %d, %s): the original ran\n", name, g_world, g_phase);
+        load(g_after);
+        return;
+    }
+    if (!fn && !g_fp.replay_only)
+        for (uint32_t i = 0; i < ARENA_SIZE; i++) {
+            if (g_arena[i] == g_start.arena[i] || in_footprint(g_arena + i)) continue;
+            uint32_t rel;
+            const char* r = region_of(i, &rel);
+            if (st.fp_fails++ < 3) printf("FOOTPRINT (fixed) %s (world %d, %s): %s+0x%x changed outside it\n", name, g_world, g_phase, r, rel);
+            break;
+        }
+    if (fo && !fn) {                                              // the original crashed; the fixed one ran
+        st.fixed++;
+        fix_validate(name, st);
+        load(g_after);
+        return;
+    }
+#endif
     if (fo || fn) {
         st.faults++;
         if (fo != fn && st.fails++ < 4) printf("MISMATCH %s (world %d, %s): original %s, rewrite %s\n", name, g_world, g_phase,
@@ -415,6 +557,13 @@ template <typename Run, typename Fp> static void check(const char* name, Run run
     int nlog0 = g_nlog[0] < LOGN ? g_nlog[0] : LOGN;
     bool bad = ro != rn || memcmp(g_after.arena, g_arena, ARENA_SIZE) || memcmp(g_after.globals, now_globals, GLOBALS_BYTES) ||
                g_after.heap_top != g_heap_top || g_nlog[0] != g_nlog[1] || memcmp(g_log[0], g_log[1], sizeof(LogEntry) * nlog0);
+#ifdef FIX_TESTS
+    if (bad && fix_lost_bead_found()) {                           // the original left a bead NULL; the fixed one found it
+        st.fixed++;
+        fix_validate(name, st);
+        bad = false;
+    }
+#endif
     if (bad && st.fails++ < 4) {
         printf("MISMATCH %s (world %d, %s, PC %d)\n", name, g_world, g_phase, g_pc53 ? 53 : 24);
         if (ro != rn) printf("  return: original %016llx, rewrite %016llx\n", ro, rn);
@@ -643,6 +792,10 @@ static void run_track_world() {
     memset(g_arena, 0, ARENA_SIZE);
     int n = chance(10) ? ri(1, 3) : ri(4, MAXSEG);
     g_special_pct = chance(65) ? 0 : chance(70) ? 1 : 4;          // NaNs etc. in the nodes and arguments
+#ifdef FIX_TESTS
+    n = ri(3, MAXSEG);                                             // ordinary inputs: a line of 3 or more nodes,
+    g_special_pct = 0;                                             // no NaNs or infinities
+#endif
     build_resource(n);
     g_ild_missing_pct = chance(30) ? (chance(50) ? 100 : 30) : 0;
     g_ili_missing_pct = chance(10) ? 100 : 0;
@@ -784,7 +937,11 @@ static void run_track_world() {
             case 5: CHECK(IdealLine_reset_to_head, l, 0); break;
             case 6: CHECK(IdealLine_segloop_count, l, 0); CHECK(IdealLine_get_actual_bead_position, l, 0, pslot(15)); break;
             case 7: CHECK(CenterLine_get_car_dlong_meters, c, 0); break;
+#ifdef FIX_TESTS
+            case 8: if (c->res) CHECK(CenterLine_get_car_dlong_cookie, c, 0); break;       // (a NULL bead too)
+#else
             case 8: if (c->res && c->bead_seg) CHECK(CenterLine_get_car_dlong_cookie, c, 0); break;
+#endif
             case 9: if (c->res && c->res->count > 0) {
                 uint32_t k = (uint32_t)ri(0, c->res->count - 1) << 16 | (rnd() & 0xffff);
                 CHECK(CenterLine_convert_cookie_to_ilpos, c, 0, pslot(16), k);
@@ -807,7 +964,11 @@ static void run_track_world() {
             case 12: CHECK(CenterLine_get_ilpos_at_point, c, 0, pslot(19), (const Point2D*)pt); break;
             case 13: {
                 CenterLine* o = cl(ri(0, g_ncl - 1));
+#ifdef FIX_TESTS
+                if (c->res && o->res && o->times && c->times && c->res->count > 0) CHECK(CenterLine_time_between, c, 0, (const CenterLine*)o);
+#else
                 if (c->res && c->bead_seg && o->bead_seg && o->times && c->times && c->res->count > 0) CHECK(CenterLine_time_between, c, 0, (const CenterLine*)o);
+#endif
                 break;
             }
             case 14: {
@@ -1087,6 +1248,597 @@ static DWORD WINAPI watchdog(void*) {
     }
 }
 
+#ifdef FIX_TESTS
+// ==== the fix tests ================================================================================================
+template <typename F> static bool ran(F f) {
+    __try {
+        f();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+static void busy(const char* what) {
+    g_busy_name = what;
+    InterlockedIncrement(&g_busy);
+}
+static float qnan() { return fbits(0x7fc00000u); }
+
+// a fresh world: the arena cleared, the stubs' resource served, the FPU as the physics thread has it
+static void fresh_world() {
+    g_heap_top = g_arena + OFF_HEAP;
+    memset(g_arena, 0, ARENA_SIZE);
+    g_ild_missing_pct = 0;
+    g_ili_missing_pct = 0;
+    g_special_pct = 0;
+    g_pc53 = false;
+    fpu_reset();
+}
+// the served resource loaded as centre lines 0 and 1 and the AI's ConstIdealLine
+static void load_lines() {
+    CenterLine_ctor(cl(0), 0, 0);
+    CenterLine_ctor(cl(1), 0, 0);
+    ConstIdealLine_ctor(cil(), 0);
+    ConstIdealLine_load(cil(), 0, k_name_ili, 0);
+}
+// a line resource of our own: nodes, tangents and lengths as given
+static void build_custom(int n, const double* x, const double* z, const double* vx, const double* vz, const float* len) {
+    uint8_t* src = g_arena + OFF_SRC;
+    memset(src, 0, 0xc + MAXSEG * 0x44);
+    IdealLineRes* r = (IdealLineRes*)src;
+    r->magic = -2;
+    r->seg_size = 0x44;
+    r->count = n;
+    g_res_version = 3;
+    g_res_size = 0xc + n * 0x44;
+    float dist = 0;
+    g_path.n = n;
+    for (int i = 0; i < n; i++) {
+        ILSeg* s = res_seg(r, i);
+        s->p.x = (float)x[i];
+        s->p.z = (float)z[i];
+        s->v.x = (float)vx[i];
+        s->v.z = (float)vz[i];
+        s->width = 12.0f;
+        s->speed = 30.0f;
+        s->length = len[i];
+        s->dist = dist;
+        dist += len[i];
+        s->index = (int16_t)i;
+        s->checkpoint = (uint8_t)(1 + i * 3 / n);
+        g_path.x[i] = x[i];
+        g_path.z[i] = z[i];
+        g_path.vx[i] = vx[i];
+        g_path.vz[i] = vz[i];
+        g_path.len[i] = len[i];
+    }
+}
+// a closed loop of n nodes round an ellipse, Catmull-Rom tangents, chord lengths; node `dup` (if >= 0) is moved onto
+// the next one (a zero-length node), with its tangent zeroed too if zero_tan
+static void build_ellipse(int n, int dup, bool zero_tan) {
+    double x[MAXSEG], z[MAXSEG], vx[MAXSEG], vz[MAXSEG];
+    float len[MAXSEG];
+    for (int i = 0; i < n; i++) {
+        double th = 6.2831853 * i / n;
+        x[i] = 400 + 220 * cos(th);
+        z[i] = -300 + 130 * sin(th);
+    }
+    if (dup >= 0) { x[dup] = x[(dup + 1) % n]; z[dup] = z[(dup + 1) % n]; }
+    for (int i = 0; i < n; i++) {
+        int a = (i + n - 1) % n, b = (i + 1) % n;
+        vx[i] = (x[b] - x[a]) * 0.5;
+        vz[i] = (z[b] - z[a]) * 0.5;
+        double dx = x[b] - x[i], dz = z[b] - z[i];
+        len[i] = (float)sqrt(dx * dx + dz * dz);
+    }
+    if (dup >= 0 && zero_tan) { vx[dup] = 0; vz[dup] = 0; }
+    build_custom(n, x, z, vx, vz, len);
+}
+// a point s metres along the loop of chords from node 0, lat metres to the side
+static Point2D drive_point(double s, double lat) {
+    const Path& p = g_path;
+    double total = 0;
+    for (int i = 0; i < p.n; i++) {
+        int j = (i + 1) % p.n;
+        total += sqrt((p.x[j] - p.x[i]) * (p.x[j] - p.x[i]) + (p.z[j] - p.z[i]) * (p.z[j] - p.z[i]));
+    }
+    s = fmod(s, total);
+    if (s < 0) s += total;
+    Point2D r = {(float)p.x[0], (float)p.z[0]};
+    for (int i = 0; i < p.n; i++) {
+        int j = (i + 1) % p.n;
+        double dx = p.x[j] - p.x[i], dz = p.z[j] - p.z[i], c = sqrt(dx * dx + dz * dz);
+        if (c > 0 && s <= c) {
+            double t = s / c;
+            r.x = (float)(p.x[i] + t * dx - dz / c * lat);
+            r.z = (float)(p.z[i] + t * dz + dx / c * lat);
+            return r;
+        }
+        s -= c;
+    }
+    return r;
+}
+static int node_of(const ConstIdealLine* l, const ILSeg* s) { return (int)(((const uint8_t*)s - (const uint8_t*)l->res - 12) / 0x44); }
+static void set_bead(IdealLine* l, ILSeg* s, float t) { l->bead_seg = s; l->bead_t = t; }
+
+// ---- against the originals (nothing hooked yet) --------------------------------------------------------------------
+
+// reset_bead_position: where the original finds the bead the fixed one finds the same; where it leaves it NULL the
+// fixed one puts it at the nearest point of the line
+static void test_reset_vs_original() {
+    auto orig = (decltype(&IdealLine_reset_bead_position))(uintptr_t)addr_IdealLine_reset_bead_position;
+    long same = 0, lost = 0, kinds[5] = {0, 0, 0, 0, 0};
+    for (int w = 0; w < 80; w++) {
+        busy("reset_bead_position vs the original");
+        fresh_world();
+        build_resource(ri(3, MAXSEG));
+        load_lines();
+        IdealLine* lines[2] = {cl(0), cil()};
+        for (int k = 0; k < 250; k++) {
+            IdealLine* l = lines[k & 1];
+            if (!l->head) continue;
+            Point2D pt;
+            int kind = ri(0, 4);
+            switch (kind) {
+            case 0: path_point(rf(0, (float)g_path.n), rf(-80, 80), &pt.x, &pt.z); break;       // near the line
+            case 1: pt.x = rf(-12000, 12000); pt.z = rf(-12000, 12000); break;                // far
+            case 2: pt = seg_of(l, ri(0, loop_len(l) - 1))->p; break;                         // on a node (a teleport)
+            case 3: pt.x = rf(-1e7f, 1e7f); pt.z = rf(-1e7f, 1e7f); break;                    // very far
+            default: pt = seg_of(l, ri(0, loop_len(l) - 1))->p; pt.x += rf(-0.01f, 0.01f); pt.z += rf(-0.01f, 0.01f); break;
+            }
+            l->car_pos = pt;
+            set_bead(l, chance(50) ? 0 : seg_of(l, ri(0, loop_len(l) - 1)), rf(0, 1));
+            save(g_start);
+            fpu_reset();
+            bool fo = !ran([&] { orig(l, 0); });
+            ILSeg* os = l->bead_seg;
+            uint32_t ot = ubits(l->bead_t);
+            load(g_start);
+            fpu_reset();
+            bool fn = !ran([&] { IdealLine_reset_bead_position(l, 0); });
+            fpu_reset();
+            FIXCHECK(!fo && !fn, "reset_bead_position faulted (original %d, fixed %d)", fo, fn);
+            if (os) {
+                same++;
+                FIXCHECK(l->bead_seg == os && ubits(l->bead_t) == ot, "reset_bead_position: the original found the bead, the fixed one differs");
+            } else {
+                lost++;
+                kinds[kind]++;
+                check_found_bead(l, &pt, "reset_bead_position (the original left it NULL)");
+            }
+        }
+    }
+    printf("reset_bead_position: %ld beads as the original's, %ld the original lost (near %ld, far %ld, on a node %ld, very far %ld, "
+           "by a node %ld) put at the nearest point\n", same, lost, kinds[0], kinds[1], kinds[2], kinds[3], kinds[4]);
+    FIXCHECK(lost > 100, "only %ld points made the original lose the bead", lost);
+}
+
+// a NaN position: the bead stays where it was (on this line), or goes to the head
+static void test_nan_position() {
+    auto orig = (decltype(&IdealLine_reset_bead_position))(uintptr_t)addr_IdealLine_reset_bead_position;
+    auto orig_adv = (decltype(&IdealLine_advance_bead))(uintptr_t)addr_IdealLine_advance_bead;
+    long lost = 0, n = 0;
+    for (int w = 0; w < 40; w++) {
+        busy("NaN positions");
+        fresh_world();
+        build_resource(ri(3, MAXSEG));
+        load_lines();
+        IdealLine* l = chance(50) ? (IdealLine*)cl(0) : (IdealLine*)cil();
+        if (!l->head) continue;
+        for (int k = 0; k < 40; k++) {
+            n++;
+            l->car_pos.x = chance(50) ? qnan() : rf(-100, 100);
+            l->car_pos.z = chance(50) || !ffin(l->car_pos.x) ? fbits(chance(50) ? 0x7fc00000u : 0xff800000u) : qnan();
+            int mode = ri(0, 3);
+            ILSeg* prev = mode == 0 ? (ILSeg*)0 : mode == 3 ? cl(1)->head : seg_of(l, ri(0, loop_len(l) - 1));   // (3: another line's node)
+            float pt = mode == 2 ? qnan() : rf(0, 1);
+            set_bead(l, prev, pt);
+            save(g_start);
+            fpu_reset();
+            ran([&] { orig(l, 0); });
+            ILSeg* os = l->bead_seg;
+            uint32_t ot = ubits(l->bead_t);
+            load(g_start);
+            fpu_reset();
+            bool fn = !ran([&] { IdealLine_reset_bead_position(l, 0); });
+            fpu_reset();
+            FIXCHECK(!fn, "reset_bead_position faulted on a NaN position");
+            if (os) FIXCHECK(l->bead_seg == os && ubits(l->bead_t) == ot, "NaN position: the original found a bead, the fixed one differs");
+            else {
+                lost++;
+                if (mode == 1) FIXCHECK(l->bead_seg == prev && l->bead_t == pt, "NaN position: the bead didn't stay where it was");
+                else if (mode == 2) FIXCHECK(l->bead_seg == prev && ubits(l->bead_t) == 0, "NaN position: the bead didn't stay (t 0)");
+                else FIXCHECK(l->bead_seg == l->head && ubits(l->bead_t) == 0, "NaN position: the bead isn't at the head");
+            }
+            // advance_bead on a NULL bead with a NaN position: the original faults, the fixed one goes to the head
+            set_bead(l, 0, 0.5f);
+            save(g_start);
+            bool fo = !ran([&] { orig_adv(l, 0); });
+            load(g_start);
+            fn = !ran([&] { IdealLine_advance_bead(l, 0); });
+            fpu_reset();
+            FIXCHECK(fo, "the original advance_bead didn't fault on a NULL bead");
+            FIXCHECK(!fn && l->bead_seg == l->head && ubits(l->bead_t) == 0, "advance_bead, NULL bead, NaN position: not at the head");
+        }
+    }
+    printf("NaN positions: %ld resets (%ld beads the original left NULL): kept where they were, or at the head\n", n, lost);
+}
+
+// every reader of a NULL bead: the original faults (or, the cookie, makes one from a garbage index), the fixed one
+// puts the bead at the nearest point of the line and runs
+static void test_null_readers() {
+    long faults[8] = {0}, runs = 0;
+    for (int w = 0; w < 60; w++) {
+        busy("NULL bead readers");
+        fresh_world();
+        build_resource(ri(3, MAXSEG));
+        load_lines();
+        if (!cl(0)->head || !cl(1)->head || !cil()->head) continue;
+        for (int k = 0; k < 20; k++) {
+            runs++;
+            Point2D pt;
+            path_point(rf(0, (float)g_path.n), rf(-40, 40), &pt.x, &pt.z);
+            if (chance(20)) { pt.x = rf(-12000, 12000); pt.z = rf(-12000, 12000); }
+            CenterLine* c = cl(0);
+            CenterLine* o = cl(1);
+            int which = ri(0, 6);
+            *g_tick += 3;
+            c->car_pos = pt;
+            o->car_pos = pt;
+            o->car_pos.x += rf(-30, 30);
+            set_bead(c, 0, 0);
+            if (which == 5) set_bead(o, 0, 0);
+            if (which == 6) { set_bead(c, c->head, 0.25f); set_bead(o, 0, 0); }
+            IdealLine* checked = which == 6 ? (IdealLine*)o : (IdealLine*)c;
+            Point2D* cp = &checked->car_pos;
+            Point2D at = *cp;
+            c->reset_pending = (uint8_t)chance(30);
+            IdealLine* a = cil();
+            a->car_pos = pt;
+            set_bead(a, 0, 0);
+            Point2D* pos = slot(0);
+            *pos = pt;
+            uint64_t ro = 0, rn = 0;
+            auto both = [&](auto of, auto nf) {
+                save(g_start);
+                fpu_reset();
+                bool fo = !ran([&] { ro = of(); });
+                load(g_start);
+                fpu_reset();
+                bool fn = !ran([&] { rn = nf(); });
+                fpu_reset();
+                if (fo) faults[which]++;
+                FIXCHECK(!fn, "reader %d faulted on a NULL bead", which);
+                return fo;
+            };
+            switch (which) {
+            case 0: {
+                bool fo = both([&] { ((decltype(&IdealLine_advance_bead))(uintptr_t)addr_IdealLine_advance_bead)(a, 0); return 0ull; },
+                               [&] { IdealLine_advance_bead(a, 0); return 0ull; });
+                FIXCHECK(fo, "the original advance_bead didn't fault");
+                FIXCHECK(a->bead_seg && on_loop(a, a->bead_seg) && ffin(a->bead_t), "advance_bead: no bead after");
+                break;
+            }
+            case 1: {
+                bool fo = both([&] { return (uint64_t)((decltype(&CenterLine_update))(uintptr_t)addr_CenterLine_update)(c, 0, pos, 0); },
+                               [&] { return (uint64_t)CenterLine_update(c, 0, pos, 0); });
+                FIXCHECK(fo, "the original CenterLine::update didn't fault");
+                FIXCHECK(c->bead_seg && on_loop(c, c->bead_seg) && ffin(c->pos.x) && ffin(c->tan.x) && ffin(c->lat),
+                         "CenterLine::update: no bead, or NaN, after");
+                break;
+            }
+            case 2: {
+                bool fo = both([&] { double d = ((decltype(&CenterLine_get_car_dlong_meters))(uintptr_t)addr_CenterLine_get_car_dlong_meters)(c, 0); uint64_t u; memcpy(&u, &d, 8); return u; },
+                               [&] { double d = CenterLine_get_car_dlong_meters(c, 0); uint64_t u; memcpy(&u, &d, 8); return u; });
+                FIXCHECK(fo, "the original get_car_dlong_meters didn't fault");
+                check_found_bead(c, &at, "get_car_dlong_meters");
+                double d;
+                memcpy(&d, &rn, 8);
+                FIXCHECK(d == d && d >= 0 && d <= c->total + 1, "get_car_dlong_meters: %g", d);
+                break;
+            }
+            case 3: {
+                both([&] { return (uint64_t)((decltype(&CenterLine_get_car_dlong_cookie))(uintptr_t)addr_CenterLine_get_car_dlong_cookie)(c, 0); },
+                     [&] { return (uint64_t)CenterLine_get_car_dlong_cookie(c, 0); });
+                check_found_bead(c, &at, "get_car_dlong_cookie");
+                FIXCHECK((int32_t)(rn >> 16 & 0xffff) < c->res->count, "get_car_dlong_cookie: node %d of %d", (int)(rn >> 16), c->res->count);
+                break;
+            }
+            case 4: {
+                bool fo = both([&] { ((decltype(&CenterLine_update_2d_data))(uintptr_t)addr_CenterLine_update_2d_data)(c, 0); return 0ull; },
+                               [&] { CenterLine_update_2d_data(c, 0); return 0ull; });
+                FIXCHECK(fo, "the original update_2d_data didn't fault");
+                check_found_bead(c, &at, "update_2d_data");
+                FIXCHECK(ffin(c->pos.x) && ffin(c->pos.z) && ffin(c->tan.x) && ffin(c->normal.z), "update_2d_data: NaN");
+                break;
+            }
+            default: {
+                bool fo = both([&] { double d = ((decltype(&CenterLine_time_between))(uintptr_t)addr_CenterLine_time_between)(c, 0, o); uint64_t u; memcpy(&u, &d, 8); return u; },
+                               [&] { double d = CenterLine_time_between(c, 0, o); uint64_t u; memcpy(&u, &d, 8); return u; });
+                FIXCHECK(fo, "the original time_between didn't fault");
+                check_found_bead(checked, &at, "time_between");
+                if (which == 5) check_found_bead(o, &o->car_pos, "time_between (the other car)");
+                break;
+            }
+            }
+        }
+    }
+    printf("NULL-bead readers: %ld calls; the original faulted in advance_bead %ld, CenterLine::update %ld, get_car_dlong_meters %ld, "
+           "update_2d_data %ld, time_between %ld (the cookie: garbage, no fault); the fixed ones never\n",
+           runs, faults[0], faults[1], faults[2], faults[4], faults[5] + faults[6]);
+}
+
+// QuickTan on a two-node line (zero tangents): the original NaN, the fixed one the chord's direction
+static void test_two_node_tan() {
+    auto orig = (decltype(&ILSeg_QuickTan))(uintptr_t)addr_ILSeg_QuickTan;
+    long nan_orig = 0, same = 0;
+    for (int w = 0; w < 400; w++) {
+        busy("QuickTan");
+        fresh_world();
+        double x[2] = {rf(-2000, 2000), rf(-2000, 2000)}, z[2] = {rf(-2000, 2000), rf(-2000, 2000)};
+        double vx[2] = {0, 0}, vz[2] = {0, 0};
+        int k = ri(0, 2);
+        if (k == 1) { vx[0] = rf(-50, 50); vz[0] = rf(-50, 50); vx[1] = -vx[0]; vz[1] = -vz[0]; }   // zero at t = 0.5
+        if (k == 2) { vx[0] = rf(-50, 50); vz[0] = rf(-50, 50); vx[1] = rf(-50, 50); vz[1] = rf(-50, 50); }   // ordinary
+        float len[2];
+        len[0] = len[1] = (float)sqrt((x[1] - x[0]) * (x[1] - x[0]) + (z[1] - z[0]) * (z[1] - z[0]));
+        build_custom(2, x, z, vx, vz, len);
+        load_lines();
+        IdealLine* l = cil();
+        for (int i = 0; i < 2; i++) {
+            ILSeg* s = seg_of(l, i);
+            float t = k == 1 ? 0.5f : rf(0, 1);
+            Point2D a, b;
+            orig(s, 0, &a, t);
+            ILSeg_QuickTan(s, 0, &b, t);
+            fpu_reset();
+            if (k == 2 || (ffin(a.x) && ffin(a.z) && !(a.x == 0 && a.z == 0))) {
+                // an ordinary tangent: the same bits
+                if (ffin(a.x) && ffin(a.z)) { same++; FIXCHECK(!memcmp(&a, &b, 8), "QuickTan: an ordinary tangent differs"); }
+                continue;
+            }
+            nan_orig++;
+            double cx = s->next->p.x - (double)s->p.x, cz = s->next->p.z - (double)s->p.z, cl2 = sqrt(cx * cx + cz * cz);
+            FIXCHECK(ffin(b.x) && ffin(b.z) && fabs(b.x - cx / cl2) < 1e-5 && fabs(b.z - cz / cl2) < 1e-5,
+                     "QuickTan: (%g, %g), the chord's direction is (%g, %g)", b.x, b.z, cx / cl2, cz / cl2);
+        }
+    }
+    printf("QuickTan: %ld zero tangents (the original NaN) give the chord's direction; %ld ordinary ones the same bits\n", nan_orig, same);
+    FIXCHECK(nan_orig > 100, "QuickTan: only %ld degenerate tangents", nan_orig);
+}
+
+// the original's loops on a zero-length node never end: shown in a thread given two seconds
+static HANDLE g_hang_thread;
+static volatile LONG g_hang_done;
+static DWORD WINAPI hang_worker(void* p) {
+    (*(void (*)())p)();
+    InterlockedExchange(&g_hang_done, 1);
+    return 0;
+}
+static void (*g_hang_fn)();
+static bool original_hangs(void (*fn)()) {
+    g_hang_done = 0;
+    HANDLE h = CreateThread(0, 0, hang_worker, (void*)fn, 0, 0);
+    DWORD r = WaitForSingleObject(h, 2000);
+    if (r == WAIT_TIMEOUT) {
+        TerminateThread(h, 0);
+        CloseHandle(h);
+        return true;
+    }
+    CloseHandle(h);
+    return false;
+}
+static void hang_adv() {
+    unsigned x; _controlfp_s(&x, _PC_24, _MCW_PC);
+    ((decltype(&IdealLine_advance_bead))(uintptr_t)addr_IdealLine_advance_bead)(cil(), 0);
+}
+static void hang_rabbit() {
+    unsigned x; _controlfp_s(&x, _PC_24, _MCW_PC);
+    ((decltype(&IdealLine_get_rabbit_position))(uintptr_t)addr_IdealLine_get_rabbit_position)(cil(), 0, slot(1), slot(2), 25.0f, pslot(3));
+}
+static void hang_nearest() {
+    unsigned x; _controlfp_s(&x, _PC_24, _MCW_PC);
+    ((decltype(&IdealLine_get_nearest_bead))(uintptr_t)addr_IdealLine_get_nearest_bead)(cil(), 0, slot(4), pslot(5), qnan());
+}
+static void setup_zero_node(int* dup_out) {
+    fresh_world();
+    int dup = 4;
+    build_ellipse(10, dup, false);
+    load_lines();
+    *dup_out = dup;
+    IdealLine* l = cil();
+    ILSeg* z = seg_of(l, dup);                                    // the zero-length node
+    set_bead(l, z, 0.0f);
+    Point2D a1 = seg_of(l, dup + 1)->p, a2 = seg_of(l, dup + 2)->p;   // the car past it, within 150 m
+    Point2D ahead = {(a1.x + a2.x) * 0.5f, (a1.z + a2.z) * 0.5f};
+    l->car_pos = ahead;
+    *slot(4) = ahead;
+    pslot(5)->seg = z;
+    pslot(5)->t = 0.0f;
+}
+static void test_zero_node_hangs_vs_original() {
+    int dup;
+    setup_zero_node(&dup);
+    save(g_start);
+    bool h1 = original_hangs(hang_adv);
+    load(g_start);
+    bool h2 = original_hangs(hang_rabbit);
+    load(g_start);
+    bool h3 = original_hangs(hang_nearest);
+    load(g_start);
+    printf("a zero-length node: the original advance_bead %s, get_rabbit_position %s, get_nearest_bead (max_dist NaN) %s\n",
+           h1 ? "hangs" : "returns", h2 ? "hangs" : "returns", h3 ? "hangs" : "returns");
+    FIXCHECK(h1 && h2 && h3, "the originals didn't all hang on a zero-length node");
+    // the fixed ones, the same inputs
+    fpu_reset();
+    busy("zero-length node (fixed)");
+    IdealLine* l = cil();
+    bool ok = ran([&] { IdealLine_advance_bead(l, 0); });
+    FIXCHECK(ok && l->bead_seg && node_of(cil(), l->bead_seg) != dup && ffin(l->bead_t), "advance_bead: stuck at the zero-length node");
+    load(g_start);
+    fpu_reset();
+    ok = ran([&] { IdealLine_get_rabbit_position(l, 0, slot(1), slot(2), 25.0f, pslot(3)); });
+    FIXCHECK(ok && pslot(3)->seg == seg_of(l, dup + 1) && pslot(3)->t == 0.0f && ffin(slot(1)->x) && ffin(slot(2)->x),
+             "get_rabbit_position: not at the next node");
+    load(g_start);
+    fpu_reset();
+    ok = ran([&] { IdealLine_get_nearest_bead(l, 0, slot(4), pslot(5), qnan()); });
+    FIXCHECK(ok && pslot(5)->seg && ffin(pslot(5)->t), "get_nearest_bead: gave up");
+    fpu_reset();
+}
+
+// ---- with every rewrite hooked in the image, as the game runs them ------------------------------------------------
+static void hook_all() {
+    for (int i = 0; i < g_nregs; i++) patch_jmp(g_regs[i].at, g_regs[i].fn);
+}
+
+// drive a car round the line for `laps`: CenterLine 0's update, the AI line's update_car_info and rabbit, the
+// deity's queries; NaN positions every nan_every ticks, far teleports (with the AI's reset) every tele_every.
+// Nothing may fault or go NaN, no bead NULL; with no NaNs or teleports the beads must get round every lap and
+// stamp every node.
+static int g_seq[400], g_nseq;
+static void drive(const char* what, IdealLine* ai, double laps, int nan_every, int tele_every, bool zero_lengths) {
+    g_nseq = 0;
+    CenterLine* c = cl(0);
+    const Path& p = g_path;
+    double total = 0;
+    for (int i = 0; i < p.n; i++) {
+        int j = (i + 1) % p.n;
+        total += sqrt((p.x[j] - p.x[i]) * (p.x[j] - p.x[i]) + (p.z[j] - p.z[i]) * (p.z[j] - p.z[i]));
+    }
+    double s = 0, lat = 0;
+    int ticks = (int)(laps * total / 1.5), wraps = 0, last_node = -1;
+    bool seen[MAXSEG] = {false};
+    for (int k = 0; k < ticks; k++) {
+        busy(what);
+        *g_tick += 1;
+        s += 1.5;                                                 // 1.5 m a tick
+        lat = lat * 0.95 + rf(-0.3f, 0.3f);
+        Point2D* pos = slot(0);
+        Point2D* dir = slot(1);
+        *pos = drive_point(s, lat);
+        Point2D ahead = drive_point(s + 1, lat);
+        dir->x = ahead.x - pos->x;
+        dir->z = ahead.z - pos->z;
+        bool nan = nan_every && k % nan_every == nan_every - 1;
+        bool tele = tele_every && k % tele_every == tele_every - 1;
+        if (nan) pos->x = qnan();
+        if (tele) { pos->x = rf(-12000, 12000); pos->z = rf(-12000, 12000); }
+        double m = 0;
+        uint32_t cookie = 0;
+        bool ok = ran([&] {
+            CenterLine_update(c, 0, pos, 0);
+            IdealLine_update_car_info(ai, 0, pos, dir);
+            if (tele) {                                           // AICar::teleport_to_track
+                Point2D zero = {0, 0};
+                IdealLine_update_car_info(ai, 0, pos, &zero);
+                IdealLine_reset_bead_position(ai, 0);
+            }
+            IdealLine_get_rabbit_position(ai, 0, slot(2), slot(3), 25.0f, pslot(4));
+            m = CenterLine_get_car_dlong_meters(c, 0);
+            cookie = CenterLine_get_car_dlong_cookie(c, 0);
+            CenterLine_time_between(c, 0, cl(1));
+        });
+        fpu_reset();
+        FIXCHECK(ok, "%s: faulted at tick %d", what, k);
+        if (!ok) return;
+        FIXCHECK(c->bead_seg && ai->bead_seg && on_loop(c, c->bead_seg) && on_loop(ai, ai->bead_seg), "%s: a bead is NULL (tick %d)", what, k);
+        FIXCHECK(ffin(c->bead_t) && ffin(ai->bead_t) && ffin(slot(2)->x) && ffin(slot(2)->z) && ffin(slot(3)->x) && ffin(slot(3)->z) && m == m,
+                 "%s: NaN at tick %d", what, k);
+        if (!nan) FIXCHECK(ffin(c->pos.x) && ffin(c->tan.x) && ffin(c->tan.z) && ffin(c->lat), "%s: the centre line's point NaN at tick %d", what, k);
+        if (!zero_lengths || !ai->bead_seg) continue;
+        int nd = node_of(cil(), ai->bead_seg);
+        if (nd >= 0 && nd < MAXSEG) seen[nd] = true;
+        if (last_node >= p.n - 2 && nd <= 1 && nd < last_node) wraps++;
+        if (nd != last_node && g_nseq < 400) g_seq[g_nseq++] = nd;
+        last_node = nd;
+    }
+    if (zero_lengths) {
+        int unseen = 0;
+        for (int i = 0; i < p.n; i++)
+            if (!seen[i] && p.len[i] > 0) unseen++;
+        FIXCHECK(unseen == 0, "%s: the AI's bead never reached %d nodes", what, unseen);
+        FIXCHECK(wraps >= (int)laps - 1, "%s: the AI's bead went round %d times in %g laps", what, wraps, laps);
+        if (wraps < (int)laps - 1) {
+            printf("  %d nodes, lengths:", p.n);
+            for (int i = 0; i < p.n; i++) printf(" %.1f", p.len[i]);
+            printf("\n  the AI's bead:");
+            for (int i = 0; i < g_nseq; i++) printf(" %d", g_seq[i]);
+            printf("\n");
+        }
+        int stale = 0;
+        const float now = (float)(*g_tick * 0.016);
+        for (int i = 0; i < c->res->count; i++)
+            if (c->times[i] > now + 100.0f) stale++;              // (reset stamps now + 1000; a pass, now)
+        FIXCHECK(c->started && stale == 0, "%s: the centre line never stamped %d nodes", what, stale);
+        if (stale) {
+            printf("  %d nodes, stale:", p.n);
+            for (int i = 0; i < c->res->count; i++)
+                if (c->times[i] > now + 100.0f) printf(" %d (length %.1f)", i, p.len[i]);
+            printf("; its bead %d %.3f, time_seg %d\n", node_of(c, c->bead_seg), c->bead_t, node_of(c, c->time_seg));
+        }
+    }
+}
+
+static void test_drives() {
+    // two-node lines (zero tangents), a car driven round and round
+    for (int w = 0; w < 20; w++) {
+        fresh_world();
+        double x[2] = {rf(-500, 500), rf(-500, 500)}, z[2] = {rf(-500, 500), rf(-500, 500)}, v[2] = {0, 0};
+        float len[2];
+        len[0] = len[1] = (float)sqrt((x[1] - x[0]) * (x[1] - x[0]) + (z[1] - z[0]) * (z[1] - z[0]));
+        build_custom(2, x, z, v, v, len);
+        load_lines();
+        // (no progress to check: both segments are the same chord, one each way, so the bead slides to and fro on
+        // the first as the car goes out and back -- the original's NaN is what's fixed)
+        drive("a two-node line", cil(), 4, 0, 0, false);
+        drive("a two-node line, NaN positions and teleports", cil(), 2, 9, 60, false);
+    }
+    // a zero-length node (the tangent there ordinary, or zero too)
+    for (int w = 0; w < 20; w++) {
+        fresh_world();
+        build_ellipse(ri(12, 40), -1, false);                     // (fine enough that the bead can follow round every corner)
+        int n = g_path.n;
+        build_ellipse(n, ri(1, n - 1), chance(50));             // (not the head: its bead must rest there to start timing)
+        load_lines();
+        drive("a zero-length node", cil(), 3, 0, 0, true);
+        drive("a zero-length node, NaN positions and teleports", cil(), 2, 7, 45, false);
+    }
+    // ordinary lines, NaN positions and far teleports
+    for (int w = 0; w < 20; w++) {
+        fresh_world();
+        build_resource(ri(3, MAXSEG));
+        load_lines();
+        if (!cl(0)->res || !cil()->head) continue;
+        drive("NaN positions and teleports", cil(), 2, ri(3, 11), ri(20, 80), false);
+    }
+    // the line editor's line: nodes added one by one (no lengths: every one zero)
+    for (int w = 0; w < 20; w++) {
+        fresh_world();
+        build_ellipse(ri(3, 30), -1, false);
+        load_lines();
+        MIL_ctor(mil(), 0);
+        for (int k = 0; k < g_path.n; k++) {
+            Point2D q = {(float)g_path.x[k], (float)g_path.z[k]};
+            MIL_add_next_control(mil(), 0, &q, 10.0f, 1);
+        }
+        drive("the editor's line (zero lengths)", mil(), 2, 13, 50, false);
+    }
+    printf("drives: two-node lines, zero-length nodes, NaN positions, teleports and the editor's line -- done\n");
+}
+
+static void run_fix_tests() {
+    test_reset_vs_original();
+    test_nan_position();
+    test_null_readers();
+    test_two_node_tan();
+    test_zero_node_hangs_vs_original();
+    hook_all();
+    printf("(every rewrite hooked in the image now)\n");
+    test_drives();
+}
+#endif
+
 int main(int argc, char** argv) {
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
@@ -1105,15 +1857,20 @@ int main(int argc, char** argv) {
     if (gb != GLOBALS_BYTES) { printf("GLOBALS_BYTES is %u, should be %u\n", (unsigned)GLOBALS_BYTES, gb); return 2; }
     CreateThread(0, 0, watchdog, 0, 0, 0);
     for (g_world = 0; g_world < worlds; g_world++) {
+#ifdef FIX_TESTS
+        run_track_world();                                         // (the maths worlds are all NaNs and infinities)
+#else
         if (g_world % 4 == 3) run_math_world();
         else run_track_world();
+#endif
     }
     int failed = 0;
     long calls = 0;
-    printf("%-42s %8s %8s %8s %8s %8s %8s\n", "function", "calls", "changed", "replay", "faults", "differ", "fp-miss");
+    printf("%-42s %8s %8s %8s %8s %8s %8s %8s\n", "function", "calls", "changed", "replay", "faults", "differ", "fp-miss", "fixed");
     for (int i = 0; i < g_nstats; i++) {
         Stat& st = g_stats[i];
-        printf("%-42s %8ld %8ld %8ld %8ld %8ld %8ld\n", st.name, st.calls, st.changed, st.replay_only, st.faults, st.fails, st.fp_fails);
+        printf("%-42s %8ld %8ld %8ld %8ld %8ld %8ld %8ld\n", st.name, st.calls, st.changed, st.replay_only, st.faults, st.fails, st.fp_fails,
+               st.fixed);
         if (st.fails || st.fp_fails) failed++;
         calls += st.calls;
     }
@@ -1121,5 +1878,11 @@ int main(int argc, char** argv) {
     printf("covered:");
     for (int i = 0; i < C_N; i++) printf("%s %s %ld", i ? "," : "", g_cov_names[i], g_cov[i]);
     printf("\n");
+#ifdef FIX_TESTS
+    printf("ordinary worlds: %ld lost beads found (%ld checked against the brute-force nearest point)\n", g_fix_found, g_fix_nearest);
+    run_fix_tests();
+    printf("fix tests: %d failures\n", g_fix_fail);
+    if (g_fix_fail) failed++;
+#endif
     return failed ? 1 : 0;
 }

@@ -24,6 +24,11 @@
 // whole world, the return value and the stub log are compared bit for bit; the bytes the original changed must
 // lie inside the rewrite's footprint (replay_only footprints are reported, not counted). Worlds alternate the
 // x87 between single precision (the physics thread) and double (the main thread's usual state).
+//
+// The fixes (port.h: VP_FIX): the plain build defines VP_FAITHFUL and checks the rewrites against the originals as
+// above. Built with /DFIX_TESTS it compiles the fixed rewrites and runs the same worlds (sane counts: every one must
+// still equal the original), then gives AIDriverLounge::fixup_res and copy_res resources with more than 16 drivers
+// in a strength: the originals write past the bucket / the tables (shown), the fixed ones only the 16 there are.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -33,6 +38,9 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#ifndef FIX_TESTS
+#define VP_FAITHFUL                                 // the original's behaviour, bit for bit (the fixes: /DFIX_TESTS)
+#endif
 #include "../hook/port.h"
 
 #undef PORT_FN_BUILDS
@@ -704,6 +712,78 @@ static void run_world() {
     }
 }
 
+#ifdef FIX_TESTS
+// ==== the fix tests: more than 16 drivers in a strength =============================================================
+static int g_fix_fail;
+#define FIXCHECK(cond, ...)                                                                                     \
+    do {                                                                                                        \
+        if (!(cond)) {                                                                                          \
+            if (g_fix_fail++ < 30) { printf("FIX FAIL: "); printf(__VA_ARGS__); printf("\n"); }                 \
+        }                                                                                                       \
+    } while (0)
+static void run_fix_tests() {
+    static uint8_t before[ARENA_N];
+    AIDriverLounge* lounge = (AIDriverLounge*)(g_arena + A_LOUNGE);
+    uint8_t* res = g_arena + A_RES;
+    long orig_over_fix = 0, orig_over_copy = 0, runs = 0;
+    for (int it = 0; it < 3000; it++) {
+        build_world();
+        int32_t cnt[8];
+        for (int b = 0; b < 8; b++) {
+            cnt[b] = rnd() % 3 ? ri(0, 16) : ri(17, it % 2 ? 20 : 40);
+            *(int32_t*)(res + b * 0x2204 + 0x2200) = cnt[b];
+        }
+        if (it % 2) cnt[7] = *(int32_t*)(res + 7 * 0x2204 + 0x2200) = ri(17, 20);   // (the last bucket too: past the resource)
+        runs++;
+        memcpy(before, g_arena, ARENA_N);
+        // the originals (only where their overrun stays inside the arena: up to 20 in the last bucket)
+        if (cnt[7] <= 20) {
+            ((decltype(&Lounge_fixup_res))(uintptr_t)0x0041d660)(lounge, 0);
+            bool outside = false;
+            for (int b = 0; b < 8; b++)
+                for (int j = 16; j < cnt[b]; j++) outside = true;
+            if (outside) orig_over_fix++;
+            memcpy(g_arena, before, ARENA_N);
+            ((decltype(&Lounge_copy_res))(uintptr_t)0x0041d600)(lounge, 0);
+            if (memcmp(g_arena + A_LOUNGE + 0x228, before + A_LOUNGE + 0x228, 0x400 - 0x228) || outside) orig_over_copy++;
+            memcpy(g_arena, before, ARENA_N);
+        }
+        // the fixed fixup_res: names on each strength's first min(count, 16) drivers, from its own 16; nothing else
+        Lounge_fixup_res(lounge, 0);
+        for (int b = 0; b < 8; b++) {
+            const int n = cnt[b] > 16 ? 16 : cnt[b];
+            for (int j = 0; j < 16; j++) {
+                const uint32_t at = A_RES + b * 0x2204 + j * 0x220 + 0x210;
+                const uint32_t want = j < n ? k_driver_names[b * 16 + j] : *(const uint32_t*)(before + at);
+                FIXCHECK(*(const uint32_t*)(g_arena + at) == want, "fixup_res: strength %d driver %d (count %d)", b, j, cnt[b]);
+            }
+        }
+        for (uint32_t i = 0; i < ARENA_N; i++) {
+            if (g_arena[i] == before[i]) continue;
+            const bool name_slot = i >= A_RES && i < A_RES + 0x11020 && ((i - A_RES) % 0x2204) < 0x2200 && ((i - A_RES) % 0x2204) % 0x220 >= 0x210 &&
+                                   ((i - A_RES) % 0x2204) % 0x220 < 0x214;
+            FIXCHECK(name_slot, "fixup_res wrote arena+0x%x, not a driver's name", i);
+            if (!name_slot) break;
+        }
+        // the fixed copy_res: each table's first min(count, 16) drivers and that count; nothing past the tables
+        memcpy(g_arena, before, ARENA_N);
+        Lounge_copy_res(lounge, 0);
+        for (int b = 0; b < 8; b++) {
+            const int n = cnt[b] > 16 ? 16 : cnt[b];
+            FIXCHECK(lounge->tables[b].count == n, "copy_res: strength %d's count %d (resource %d)", b, lounge->tables[b].count, cnt[b]);
+            for (int j = 0; j < n; j++)
+                FIXCHECK((uint8_t*)lounge->tables[b].d[j] == res + b * 0x2204 + j * 0x220, "copy_res: strength %d driver %d", b, j);
+        }
+        FIXCHECK(!memcmp(g_arena + A_LOUNGE + 0x228, before + A_LOUNGE + 0x228, ARENA_N - (A_LOUNGE + 0x228)) &&
+                     !memcmp(g_arena, before, A_LOUNGE + 8),
+                 "copy_res wrote outside the lounge's tables");
+    }
+    printf("more than 16 drivers: %ld resources; the originals wrote past the bucket in %ld (fixup_res) and past a "
+           "table in %ld (copy_res); the fixed ones never\n", runs, orig_over_fix, orig_over_copy);
+    FIXCHECK(orig_over_fix > 500 && orig_over_copy > 500, "too few overrunning resources");
+}
+#endif
+
 int main(int argc, char** argv) {
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
@@ -750,5 +830,10 @@ int main(int argc, char** argv) {
         failed += st.fails || st.fp_fails;
     }
     printf("%d worlds; %d of %d functions differ or miss their footprint\n", worlds, failed, g_nstats);
+#ifdef FIX_TESTS
+    run_fix_tests();
+    printf("fix tests: %d failures\n", g_fix_fail);
+    if (g_fix_fail) failed++;
+#endif
     return failed ? 1 : 0;
 }

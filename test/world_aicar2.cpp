@@ -34,6 +34,14 @@
 // compared. The bytes the original changed must also lie inside the rewrite's footprint (unless replay_only).
 // A share of the worlds ("wild") has floats replaced by extreme values. A fault in both is counted, not
 // compared (the NULL-bead crash is one: faithful).
+//
+// The fixes (port.h: VP_FIX): the plain build defines VP_FAITHFUL and checks the rewrites against the originals as
+// above. Built with /DFIX_TESTS it compiles the fixed rewrites, with a fake driver lounge for begin_race's lookup:
+// every world must still equal the original, except init_rt_lat on a lost (NULL) bead, where the original faults
+// and the fixed one must run (and every byte it changes must be in its footprint); then the fixes on their own:
+// init_rt_lat on a NULL bead that reset_bead_position finds (the same result as the original's on that bead) or
+// doesn't (the racing-line offset left as it was), and begin_race with driver names of 32 characters and more
+// (and a NULL one): no fault, AIGetDriverNameByCar's strcpy not reached, the car as with a short name.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -42,6 +50,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef FIX_TESTS
+#define VP_FAITHFUL                                 // the original's behaviour, bit for bit (the fixes: /DFIX_TESTS)
+#endif
 #include "../hook/port.h"
 #undef PORT_FN_BUILDS
 #define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
@@ -192,7 +203,21 @@ static int __cdecl stub_random(int r) {
     return r > 0 ? v % r : v;
 }
 static float __cdecl stub_time() { log_put(0x71000000u); return g_script.time; }
+#ifdef FIX_TESTS
+// the driver lounge begin_race's fixed lookup goes through (AIDriverLounge::Get: a driver record, its name at +0x210)
+static const char* g_driver_name = "Doug";
+static uint8_t g_fake_driver[0x220];
+static const uint8_t* __fastcall stub_lounge_get(void*, int, int, int) {
+    *(const char**)(g_fake_driver + 0x210) = g_driver_name;
+    return g_fake_driver;
+}
+static void* g_fake_lounge_vt[4] = {0, (void*)&stub_lounge_get, 0, 0};
+static struct { void** vt; } g_fake_lounge = {g_fake_lounge_vt};
+static int g_reset_bead_to = -1;                 // reset_bead_position finds the bead at this ring node (-1: doesn't)
+static void __cdecl stub_driver_name(char* buf, int car) { log_put(0xd5a30000u); log_put((uint32_t)car); strcpy(buf, g_driver_name); }
+#else
 static void __cdecl stub_driver_name(char* buf, int car) { log_put(0xd5a30000u); log_put((uint32_t)car); strcpy(buf, "Doug"); }
+#endif
 static int __cdecl stub_track_number() { log_put(0x7ac40000u); return g_script.track; }
 static uint8_t __cdecl stub_isai(int car) { log_put(0x15a10000u); log_put((uint32_t)car); return g_script.isai[car & 15]; }
 static ILinePos* __fastcall stub_bead(IdealLine* line, int, ILinePos* ret) {
@@ -209,7 +234,12 @@ static float __fastcall stub_nearest(IdealLine* line, int, const Point2D* p, ILi
 static void __fastcall stub_update_car_info(IdealLine* line, int, const Point2D* p, const Point2D* v) {
     log_put(0xca410000u); log_put((uint32_t)line); log_put(fbits(p->x)); log_put(fbits(p->z)); log_put(fbits(v->x)); log_put(fbits(v->z));
 }
-static void __fastcall stub_reset_bead(IdealLine* line, int) { log_put(0x4e5e0000u); log_put((uint32_t)line); }
+static void __fastcall stub_reset_bead(IdealLine* line, int) {
+    log_put(0x4e5e0000u); log_put((uint32_t)line);
+#ifdef FIX_TESTS
+    if (g_reset_bead_to >= 0) g_script.bead_seg = &g_ring[g_reset_bead_to];
+#endif
+}
 static float __fastcall stub_dlong(CenterLine* cl, int) { log_put(0xd1000000u); log_put((uint32_t)cl); return g_script.dlong; }
 static ILinePos* __fastcall stub_m2i(CenterLine* cl, int, ILinePos* ret, uint32_t m) {
     log_put(0x3210000u); log_put((uint32_t)cl); log_put(m);
@@ -903,6 +933,98 @@ static uint32_t msgs_added(const State& start, const State& end) {
     return m;
 }
 
+#ifdef FIX_TESTS
+// ==== the fix tests ================================================================================================
+static int g_fix_fail;
+#define FIXCHECK(cond, ...)                                                                                     \
+    do {                                                                                                        \
+        if (!(cond)) {                                                                                          \
+            if (g_fix_fail++ < 30) { printf("FIX FAIL: "); printf(__VA_ARGS__); printf("\n"); }                 \
+        }                                                                                                       \
+    } while (0)
+static bool log_has(const Log& l, uint32_t v) { for (int i = 0; i < l.n && i < 256; i++) if (l.e[i] == v) return true; return false; }
+static void run_fix_tests() {
+    static State a, ra, b;
+    long same = 0, not_found = 0, orig_faults = 0;
+    // init_rt_lat on a lost bead: the fixed one asks reset_bead_position (the stub puts it at a ring node) and goes on
+    // as the original does on a bead already there
+    for (int it = 0; it < 20000; it++) {
+        randomize_world();
+        randomize_args(K_INIT_RT_LAT);
+        AICar* c = car();
+        c->line = (IdealLine*)g_line;
+        const int k = (int)(rnd() % g_nseg);
+        const float t = uni();
+        g_script.m2i_seg = &g_ring[rnd() % g_nseg];              // (a centre line: its absence is another crash)
+        g_script.bead_seg = 0;
+        g_script.bead_t = t;
+        g_reset_bead_to = chance(15) ? -1 : k;
+        save(a);
+        uint64_t r;
+        const int fn = run_guarded(K_INIT_RT_LAT, true, &r);
+        save(ra);
+        ra.log = g_log;
+        FIXCHECK(!fn, "init_rt_lat faulted on a NULL bead (world %d)", it);
+        FIXCHECK(log_has(ra.log, 0x4e5e0000u), "init_rt_lat didn't ask for the bead (world %d)", it);
+        g_script.bead_seg = 0;
+        load(a);
+        const int fo = run_guarded(K_INIT_RT_LAT, false, &r);
+        if (fo) orig_faults++;
+        if (g_reset_bead_to < 0) {
+            not_found++;
+            FIXCHECK(!memcmp(&((AICar*)ra.car)->line_lat, &((AICar*)a.car)->line_lat, 4), "no bead: line_lat changed");
+            g_reset_bead_to = -1;
+            continue;
+        }
+        // the original, on the bead where reset_bead_position put it
+        g_reset_bead_to = -1;
+        load(a);
+        g_script.bead_seg = &g_ring[k];
+        const int fb = run_guarded(K_INIT_RT_LAT, false, &r);
+        save(b);
+        if (fb) continue;
+        same++;
+        FIXCHECK(!memcmp(ra.car, b.car, CAR_BUF), "init_rt_lat: the found bead's result differs from the original's on it (world %d)", it);
+    }
+    g_reset_bead_to = -1;
+    printf("init_rt_lat, NULL bead: the original faulted %ld times; the fixed one found it (%ld as the original's on it) or not "
+           "(%ld, line_lat kept)\n", orig_faults, same, not_found);
+    FIXCHECK(orig_faults > 10000, "the original didn't fault on NULL beads");
+    // begin_race: long driver names (the original's strcpy would run over its stack: it isn't run on them)
+    static char name[8192];
+    long long_names = 0;
+    for (int it = 0; it < 4000; it++) {
+        randomize_world();
+        randomize_args(K_BEGIN_RACE);
+        *g_replay_play_p = 0;
+        save(a);
+        g_driver_name = "Doug";
+        uint64_t r;
+        const int fo = run_guarded(K_BEGIN_RACE, false, &r);
+        save(b);
+        b.log = g_log;
+        load(a);
+        const int kind = it % 5;
+        const int len = kind == 0 ? (int)(rnd() % 32) : 32 + (int)(rnd() % 8000);
+        for (int i = 0; i < len; i++) name[i] = (char)('a' + rnd() % 26);
+        name[len] = 0;
+        g_driver_name = kind == 4 && chance(20) ? 0 : name;
+        const int fn = run_guarded(K_BEGIN_RACE, true, &r);
+        save(ra);
+        ra.log = g_log;
+        g_driver_name = "Doug";
+        FIXCHECK(!fo && !fn, "begin_race faulted (original %d, fixed %d)", fo, fn);
+        FIXCHECK(!memcmp(ra.car, b.car, CAR_BUF), "begin_race: the car differs with a %d-character name", len);
+        if (kind == 0) FIXCHECK(log_has(ra.log, 0xd5a30000u), "begin_race: a short name not fetched");
+        else {
+            long_names++;
+            FIXCHECK(!log_has(ra.log, 0xd5a30000u), "begin_race: a %d-character name went to AIGetDriverNameByCar", len);
+        }
+    }
+    printf("begin_race: %ld names of 32 characters or more (or NULL) cut, none faulted; short ones fetched as before\n", long_names);
+}
+#endif
+
 int main(int argc, char** argv) {
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
@@ -938,6 +1060,9 @@ int main(int argc, char** argv) {
     *(void**)0x004edd70 = g_deity_obj;                   // RaceDeity::global
     *(Proxer**)0x004ec480 = &g_prox;
     *(void**)0x00521f7c = 0;                             // no splash sound
+#ifdef FIX_TESTS
+    *(void**)0x004eb8b0 = &g_fake_lounge;                // (begin_race's fixed lookup: AIDriverLounge::Get)
+#endif
     *(void**)0x004e642c = (void*)&stub_ov_begin;
     *(void**)0x004e6430 = (void*)&stub_ov_end;
     *(void**)0x004e6434 = (void*)&stub_prof_start;
@@ -952,6 +1077,7 @@ int main(int argc, char** argv) {
     int c_think_drive = 0, c_rev = 0, c_begin = 0, c_teleport = 0, c_stop = 0, c_side = 0, c_ahead = 0, c_contact = 0, c_headon = 0,
         c_lock = 0, c_speed_note = 0, c_lat_note = 0, c_cold = 0, c_angle = 0, c_lock_steer = 0, c_cap = 0, c_lap = 0,
         c_fouroff = 0, c_fmod_nan = 0, c_near_null = 0;
+    int fixed = 0;                                        // (FIX_TESTS: the original faulted, the fixed one ran)
     int total_w = 0;
     for (int i = 0; i < N_KINDS; i++) total_w += kind_weight[i];
     for (int it = 0; it < iterations; it++) {
@@ -973,6 +1099,11 @@ int main(int argc, char** argv) {
         save(rew);
         rew.log = g_log;
         per_kind[kind]++;
+#ifdef FIX_TESTS
+        // the fixed rewrite: its changes inside its footprint; a lost bead in init_rt_lat is the fix
+        fp_bad += check_footprint(start, rew, fp, it, kind);
+        if (fo && !fn && kind == K_INIT_RT_LAT && car()->line && !g_script.bead_seg) { fixed++; continue; }
+#endif
         if (fo || fn) {
             per_kind_fault[kind]++;
             if (fo != fn) {
@@ -1040,5 +1171,13 @@ int main(int argc, char** argv) {
            "  throttle cap %d, lap change %d, fouroff %d, init_rt_lat fmod of a bad length %d, in_path NULL bead %d\n",
            c_think_drive, c_rev, c_begin, c_teleport, c_stop, c_side, c_ahead, c_contact, c_headon, c_lock, c_speed_note, c_lat_note,
            c_cold, c_angle, c_lock_steer, c_cap, c_lap, c_fouroff, c_fmod_nan, c_near_null);
+#ifdef FIX_TESTS
+    printf("fixed: %d worlds where the original faulted on a NULL bead and the fixed one ran\n", fixed);
+    run_fix_tests();
+    printf("fix tests: %d failures\n", g_fix_fail);
+    if (g_fix_fail) differ++;
+#else
+    (void)fixed;
+#endif
     return differ || fp_bad ? 1 : 0;
 }
