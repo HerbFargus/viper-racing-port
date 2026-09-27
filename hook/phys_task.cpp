@@ -369,7 +369,7 @@ static void __cdecl PhysTaskBegin_rw(void* stream) {
     CarDeityBegin(WorldGameOptions());
     load_tv_cameras();
     g_cam_52108c = 0;
-    g_phobs = (PhobRoot**)MemAlloc(0x800);
+    g_phobs = (PhobRoot**)MemAlloc((int)m1_operand(0x00426894));  // push 0x800 (512 slots); M1 lifts it
     g_static_list = StaticObjectListGet(k_str_track_sol);
     for (int i = 0; i < 16; i++) g_cars[i] = 0;
     g_tick_overflow = 0;

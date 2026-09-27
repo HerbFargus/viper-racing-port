@@ -536,7 +536,9 @@ static void fp_update_common(Footprint& f, AICar* self, Edx) {
             if (uint8_t* s3d = *(uint8_t**)(ts + 0x34)) f.add(s3d + 4, 0x2a, "tire Sound3D");
         } else if (vt == 0x004dd7a0) f.add(ts, 0x10, "tire sound");
     }
-    if (self->car_index >= 0) f.add((uint8_t*)0x005540c2 + 368 * self->car_index, 368, "status string");
+    // the status string only: the char[256] at CarMgrInfo +0x32 (phys_car_update.cpp fp_update_common). The rest of
+    // the 368-byte record is the main thread's (WorldUpdate -> CarMgrUpdateCar writes its CarInfo every frame)
+    if (self->car_index >= 0) f.add((uint8_t*)0x005540c2 + 368 * self->car_index, 256, "status string");
 }
 PORT_FN(0x0042e6f0, "AICar::UpdateCommon", AICar_UpdateCommon, fp_update_common)
 

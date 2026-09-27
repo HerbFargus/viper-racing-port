@@ -71,6 +71,17 @@ grouping, with the same constants, on values of the same range, gets the same bi
    (it changes about one result in 5e8): it has to be right by construction.
 10. **Faithful first.** Reproduce the original's bugs and quirks exactly (a 0/0, a missing bounds check,
     dead stores that matter). Fixes come later, as their own step.
+10a. **Stores the result never needs still happen.** The physics thread runs with overflow and
+    divide-by-zero exceptions ON (`timer_vector` → `ExceptDiv0Crashes(1)`), so an `fst dword` whose value
+    is never read again still faults when it overflows. The compiler drops such a store from the rewrite,
+    which then carries on where the original stops. Force every store the original makes through a
+    `volatile float` (e.g. a small `st()` helper), including a value stored just before an early return.
+    Harnesses should also run with those exceptions unmasked to see this.
+12. **M1's lifted limits live in the original's code.** M1 (`viperport.cpp`) raises limits by patching
+    operands in place: the world and graphics object lists, the physics-object list's size, the model
+    and texture pools, the texture table. A rewrite of a function M1 patches reads each such value from
+    the original's instruction with `m1_operand(operand address)`, so it gets M1's value in the game and
+    the stock one in a harness. `tools/gen_port_tables.py` refuses to run if one is missed.
 11. **Dead branches** the original can never take (a compiler alias check comparing two of its own stack
     locals) may be left out; say so in a comment.
 
@@ -100,7 +111,8 @@ saves and restores the physics and AI statics when it runs on the physics thread
 on the main thread must list the statics it writes in its footprint (`f.add(address, bytes, "what")`).
 
 Crash sounds and the game's own replay events are outputs, captured automatically. Random numbers and
-the controls are inputs, fed to the rewrite automatically.
+the controls are inputs, fed to the rewrite automatically, and so is the physics clock (`PhysicsGetTime`)
+for a check on the main thread, where the physics can tick between the two passes.
 
 ## Checking
 

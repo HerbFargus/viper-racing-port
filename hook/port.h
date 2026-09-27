@@ -38,6 +38,12 @@
 #define VP_FIX 1
 #endif
 
+// M1 (viperport.cpp) lifts the game's limits by patching operands of the original code in place: list
+// addresses, capacities, pool sizes. A rewrite of a function M1 patches must take those values from the
+// original's own instruction, m1_operand(address of the operand), so it gets M1's value in the game and the
+// stock one in a harness (docs/PORTING.md rule 12).
+static inline uint32_t m1_operand(uint32_t at) { return *(const volatile uint32_t*)at; }
+
 enum PortMode { PORT_ORIGINAL, PORT_NEW, PORT_SHADOW };
 
 // ---- footprints: the memory a function may change, besides the physics and AI globals ----------------

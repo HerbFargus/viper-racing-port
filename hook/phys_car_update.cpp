@@ -912,8 +912,51 @@ static void __fastcall Car_Update(Car* self, Edx) {
 // RaceDeity::UpdateCar raises (GhostNewBestLap, RecordRaceOver: the ghost and record globals) plus the
 // CenterLine's checkpoint-time array (+0x60) -- neither can be told in advance, and they lie outside this
 // footprint (see the report). Random and the controls are inputs, fed automatically.
+//
+// Also, through PhobDyno::Update: the body's collision volumes (CollideGround runs each group sphere's, which
+// writes the sphere), and -- a queued external impulse over 741.67 with damage on resolving through
+// ResolveExternalImpulse -> ApplyDamage -> ActuallyApplyDamage -- the five live models' vertices (the dent, LOD 0
+// copied to LODs 1..4) and each model_info's +0x10 / +0x15 (mrModelBuild), and for an AICar its segment note's
+// hit_wall byte (AICar::ResolveExternalImpulse). The dented vertices are physics state, not just the look: each
+// wheel's hub vertex points into the LOD-0 mesh (Car::Setup) and Wheel::Update reads it, and the next dent's
+// nearest-vertex search and damage-grid rectangles read them. Left out, a shadow check's rewrite pass started
+// from the mesh the original pass had already dented: damage_grid / damaged and frame (through the hubs) came
+// out different in game while replays matched. (The same lists as phys_car.cpp's fp_models / fp_body_volume and
+// phys_aicar1.cpp's fp_resolve_impulse.)
+static void fp_car_volumes(Footprint& f, Car* self) {
+    for (int i = 0; i < self->num_volumes && i < 4; i++) {
+        uint8_t* v = (uint8_t*)self->volumes[i];
+        if (!v) continue;
+        f.object(v, "volume");
+        if (((CollisionVolume*)v)->type_tag == 0x47525550u) {           // 'GRUP': a SphereGroupVolume's spheres
+            const int n = *(const int32_t*)(v + 0x4c);
+            for (int k = 0; k < n && k < 12; k++)
+                if (void* s = ((void* const*)(v + 0x1c))[k]) f.object(s, "body sphere");
+        }
+    }
+}
+static void fp_car_models(Footprint& f, Car* self) {
+    const int32_t* live_models = (const int32_t*)((const uint8_t*)self + 0x4c4);       // Car +0x4c4 [5]
+    for (int i = 0; i < 5; i++) {
+        uint8_t* mi = (uint8_t*)(uintptr_t)live_models[i];
+        if (!mi) continue;
+        f.add(mi + 0x10, 8, "model_info");
+        const uint8_t* info = *(const uint8_t* const*)(mi + 0x10);         // mrModelInfo: count, vertices (32 bytes)
+        if (!info) continue;
+        const int32_t n = *(const int32_t*)info;
+        void* verts = *(void* const*)(info + 4);
+        if (verts && n > 0) f.add(verts, (uint32_t)n * 32, "model verts");
+    }
+    if (*(const uint32_t*)self == 0x004dbc28u) {                        // an AICar: seginfo[seg_index].hit_wall
+        uint8_t* seginfo = *(uint8_t* const*)((const uint8_t*)self + 0x1054);
+        const int32_t seg = *(const int32_t*)((const uint8_t*)self + 0x105c);
+        if (seginfo) f.add(seginfo + 24 * seg, 1, "segment note hit_wall");
+    }
+}
 static void fp_car_update(Footprint& f, Car* self, Edx) {
     f.object(self, "car");
+    fp_car_volumes(f, self);
+    fp_car_models(f, self);
     if (uint8_t* snd = g_splash_sound) f.add(snd + 8, 0x25, "splash Sound3D");
     if (self->is_plane) {
         f.add(self->wing_left, sizeof(Wing), "wing_left");
@@ -1051,8 +1094,12 @@ static void __fastcall Car_UpdateCommon(Car* self, Edx) {
 }
 // The car; the sounds it drives (their pitch, volume and flags: +4..+0x2d), the EngineSound and its samples'
 // Sound3Ds, the wheels' tyre sounds (as phys_wheel.cpp lists them), and the car's status string in the car
-// manager's static table (368 bytes each at 0x5540c2) -- listed rather than relying on the thread's statics,
-// as this runs from the frame side.
+// manager's static table -- listed rather than relying on the thread's statics, as this runs from the frame side.
+// The table's records are 368 bytes from 0x554090 (CarMgrInfo); the status string is the char[256] at +0x32
+// (0x5540c2 + 368 i, CarMgrGetStatusBuf). Only those 256 bytes: the record's CarInfo at +0x138..+0x170, and the
+// next record's head, belong to the main thread (WorldUpdate -> CarMgrUpdateCar copies each car's CarInfo in
+// every frame), so a check that saved and restored them saw the main thread's copy land between its passes
+// -- mismatches at "status string" +0x10c / +0x110 = CarInfo +0x6 / +0xa -- and could undo it.
 static void fp_update_common(Footprint& f, Car* self, Edx) {
     f.object(self, "car");
     if (EngineSound* es = self->engine_sound) {
@@ -1074,7 +1121,7 @@ static void fp_update_common(Footprint& f, Car* self, Edx) {
             if (uint8_t* s3d = *(uint8_t**)(ts + 0x34)) f.add(s3d + 4, 0x2a, "tire Sound3D");
         } else if (vt == 0x004dd7a0) f.add(ts, 0x10, "tire sound");   // DummyTireSound
     }
-    if (self->car_index >= 0) f.add((uint8_t*)0x005540c2 + 368 * self->car_index, 368, "status string");
+    if (self->car_index >= 0) f.add((uint8_t*)0x005540c2 + 368 * self->car_index, 256, "status string");
 }
 PORT_FN(0x004391b0, "Car::UpdateCommon", Car_UpdateCommon, fp_update_common)
 

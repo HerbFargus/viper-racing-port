@@ -970,8 +970,16 @@ static void __cdecl DriverUpdate(float dt) {
 
     if (tick) JoySetForce(*P<uint32_t>(S_FORCE_A), *P<uint32_t>(S_FORCE_B), *P<uint32_t>(S_FORCE_C));
 }
+// The driver's statics except the three force-feedback values, which DriverUpdate only reads (for JoySetForce):
+// they belong to the physics thread, whose PlayCar::Update writes them (DriverSetForce) at any moment of this
+// main-thread check. Listed, the check saved and restored them around its passes -- a physics-thread write
+// between the snapshot and the compare was reported as DriverUpdate's mismatch (driver.obj statics +0x64 =
+// force a), and the restore could undo a physics write in the middle of PlayCar::Update's own check (its
+// "driver force a, b" mismatch).
 static void fp_driver_update(Footprint& f, float) {
-    fp_driver_statics(f);
+    f.add(P<void>(DRV_BASE), S_FORCE_A - DRV_BASE, "driver.obj statics");
+    f.add(P<void>(S_FORCE_B + 4), S_FORCE_C - (S_FORCE_B + 4), "driver.obj statics");
+    f.add(P<void>(S_FORCE_C + 4), DRV_BASE + DRV_SIZE - (S_FORCE_C + 4), "driver.obj statics");
     fp_control_inputs(f);
 }
 PORT_FN(0x004417c0, "DriverUpdate", DriverUpdate, fp_driver_update)
@@ -1297,8 +1305,67 @@ static void __fastcall PlayCar_Update(void* self, Edx) {
     at<uint8_t>(s, SND_STOP_B) = 0;
     at<uint8_t>(s, SND_STOP_A) = 0;
 }
+// Car::Update's reach, as phys_car_update.cpp's fp_car_update lists it (it runs inside, as its original, in a
+// check): the body's collision volumes and group spheres; the five live models' vertices and model_info
+// +0x10/+0x15 (a dent: the wheels' hub vertices point into the LOD-0 mesh, so they are physics state); the splash
+// Sound3D; a plane's wings; and the deity -- RaceDeity::UpdateCar advances the car's record -- with the car's
+// CenterLine. Replay only where Car::Update's is (out of bounds, the damage reset, a deity that isn't a
+// RaceDeity), and when the airlift fires (the deity's TeleportToLine). Before, only the car was listed: the
+// rewrite pass's UpdateCar started from the record the original pass had already advanced, so the telemetry
+// taken from it (GetDLong -> PhysicsTelemetry, phystask.obj 0x520c58) came out a little different, and the
+// dents leaked as in Car::Update's own checks. (The horn-ball hack's thrown ball -- Car::SetHorn's footprint -- is
+// not listed: whether the horn rises is an input.)
+static void fp_playcar_car_update(Footprint& f, void* self) {
+    const uint8_t* c = (const uint8_t*)self;
+    const int32_t nvol = *(const int32_t*)(c + 0x24);                     // PhobRoot volumes[4] (+0x14), count
+    for (int i = 0; i < nvol && i < 4; i++) {
+        uint8_t* v = ((uint8_t* const*)(c + 0x14))[i];
+        if (!v) continue;
+        f.object(v, "volume");
+        if (*(const uint32_t*)(v + 0x14) == 0x47525550u) {                // 'GRUP': a SphereGroupVolume's spheres
+            const int n = *(const int32_t*)(v + 0x4c);
+            for (int k = 0; k < n && k < 12; k++)
+                if (void* s = ((void* const*)(v + 0x1c))[k]) f.object(s, "body sphere");
+        }
+    }
+    const int32_t* live_models = (const int32_t*)(c + 0x4c4);             // Car +0x4c4 [5]
+    for (int i = 0; i < 5; i++) {
+        uint8_t* mi = (uint8_t*)(uintptr_t)live_models[i];
+        if (!mi) continue;
+        f.add(mi + 0x10, 8, "model_info");
+        const uint8_t* info = *(const uint8_t* const*)(mi + 0x10);         // mrModelInfo: count, vertices (32 bytes)
+        if (!info) continue;
+        const int32_t n = *(const int32_t*)info;
+        void* verts = *(void* const*)(info + 4);
+        if (verts && n > 0) f.add(verts, (uint32_t)n * 32, "model verts");
+    }
+    if (uint8_t* snd = *(uint8_t**)0x00521f7c) f.add(snd + 8, 0x25, "splash Sound3D");
+    if (at<uint8_t>(self, C_IS_PLANE)) {
+        static const char* const wings[4] = {"wing_left", "wing_right", "elevator", "rudder"};
+        for (int i = 0; i < 4; i++) f.add(at<void*>(self, 0xbec + 4 * i), 60, wings[i]);
+    }
+    uint8_t* deity = (uint8_t*)*g_deity;
+    if (!deity || *(uint32_t*)deity != 0x004dc588u) { f.replay_only = "the deity isn't a RaceDeity (size unknown)"; return; }
+    f.add(deity, 2012, "deity");
+    const int32_t idx = at<int32_t>(self, C_CAR_INDEX);
+    if ((uint32_t)idx < 16u)
+        if (uint8_t* line = *(uint8_t**)(deity + 0x38 + 0x74 * idx + 0x6c)) f.add(line, 112, "centre line");
+    if (*P<uint8_t>(S_AIRLIFT) && (at<uint32_t>(self, PC_AIRLIFT_TIME) & 0x7fffffff) == 0) {
+        f.replay_only = "the airlift: the deity's TeleportToLine";
+        return;
+    }
+    if (((uint8_t(__cdecl*)(const void*))0x00438660)(c + C_POS)) {       // loc_is_out_of_bounds(frame.pos)
+        f.replay_only = "out of bounds: Car::Update teleports through the deity";
+        return;
+    }
+    const uint8_t damaged = at<uint8_t>(self, 0x48c);
+    const float last_damage = at<float>(self, 0x488);
+    if (!((uint8_t(__cdecl*)())0x0042bd60)() && damaged && !((D(last_damage) + 2.0f) >= PhysicsGetTime()))
+        f.replay_only = "Car::Update's reset_damage rebuilds the models";
+}
 static void fp_playcar_update(Footprint& f, void* self, Edx) {
-    f.object(self, "car");                                               // Car::Update's reach: the car
+    f.object(self, "car");
+    fp_playcar_car_update(f, self);
     f.add(P<void>(S_FORCE_A), 8, "driver force a, b");                   // DriverSetForce
     f.add(P<void>(S_FORCE_C), 4, "driver force c");
     f.add(P<void>(S_GEAR), 4, "driver gear");                            // DriverSetGear

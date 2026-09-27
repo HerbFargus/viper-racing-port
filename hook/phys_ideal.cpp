@@ -493,6 +493,9 @@ PORT_FN(0x004211d0, "ILineTry", ILineTry, fp_ilinetry)
 // one node, the distances summed afresh, the tangents negated, the checkpoints renumbered from 1)
 static void __cdecl fixup_res(IdealLineRes* res, uint8_t reverse) {
     int32_t count = res->count;
+    // FIX: a line with no nodes has nothing to link. The original still closes the loop, writing the "last"
+    // node's next pointer just before the array (and, reversed, memmoves -0x44 bytes): heap corruption.
+    if (VP_FIX && count <= 0) return;
     if (reverse) {
         uint8_t tmp[0x44];
         int32_t half = count / 2;                        // cdq; sub; sar: toward zero
@@ -558,7 +561,10 @@ static void __cdecl fixup_res(IdealLineRes* res, uint8_t reverse) {
     for (int32_t k = 0; k < count; k++) res_seg(res, k)->index = (int16_t)k;
 }
 static void fp_fixup_res(Footprint& f, IdealLineRes* res, uint8_t) {
-    if (res->count < 1) { f.replay_only = "an empty line: writes outside it"; return; }
+    if (res->count < 1) {
+        if (!VP_FIX) f.replay_only = "an empty line: writes outside it";   // fixed: writes nothing
+        return;
+    }
     f.add(res, 0xc + (uint32_t)res->count * 0x44, "IdealLineRes");
 }
 PORT_FN(0x004212b0, "fixup_res", fixup_res, fp_fixup_res)

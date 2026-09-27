@@ -1166,7 +1166,7 @@ static void fp_ghost_update_common(Footprint& f, GhostCarL* self, Edx) {
                 if (uint8_t* s3d = *(uint8_t**)(ts + 0x34)) f.add(s3d + 4, 0x2a, "tire Sound3D");
             } else if (vt == 0x004dd7a0) f.add(ts, 0x10, "tire sound");
         }
-        if (idx >= 0) f.add((uint8_t*)0x005540c2 + 368 * idx, 368, "status string");
+        if (idx >= 0) f.add((uint8_t*)0x005540c2 + 368 * idx, 256, "status string");   // not the CarInfo after it (main thread)
     } else if (self->prev_flags & 2) {
         uint8_t* sm = g_sound_manager;
         if (!sm) return;

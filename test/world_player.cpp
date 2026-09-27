@@ -9,7 +9,8 @@
 // Loads out\race_v10.exe at 0x400000 the way test/fuzz.cpp does. The world is race.exe's whole .data section
 // (the driver's and control mapping's statics, the control name table, the keyboard state, the mouse and
 // screen statics, the Xlator cookie, the deity pointer) plus an arena holding a PlayCar-sized car, a message
-// buffer, a net packet, string buffers, the telemetry, a fake Deity, four spotter sounds and 16 other cars.
+// buffer, a net packet, string buffers, the telemetry, a deity (RaceDeity's vtable, 2012 bytes; the virtuals the
+// rewrites call are patched to stubs), four spotter sounds and 16 other cars.
 // Everything is randomised per world (floats from a mix with occasional NaN / inf / denormal values). The
 // game functions these rewrites call are patched with logging stubs whose results come from a scripted
 // random stream, replayed identically for the original and the rewrite (Car::Set*, Car::Update, the deity's
@@ -164,12 +165,12 @@ enum : uint32_t {
     A_STRBUF = 0x1540, STRBUF_N = 64,
     A_CTLS = 0x1580, CTLS_N = 8 * 16,                  // scratch Controls
     A_TELEMETRY = 0x1600, TELEMETRY_N = 64,
-    A_DEITY = 0x1640,
+    A_DEITY = 0x22c0, DEITY_N = 2012,                  // a RaceDeity (its methods patched: the footprints size it)
     A_SOUNDS = 0x1700, SOUND_N = 128,                  // 4 sounds
     A_CARS = 0x1900, FAKE_CAR_N = 128,                 // 16 other cars: a vtable and a frame
     A_STRINGS = 0x2100, STRING_N = 32,                 // 8 fake translated strings
     A_ENTRIES = 0x2200,                                // 8 scratch ControlEntry rows
-    A_END = 0x22c0,
+    A_END = 0x2aa0,
 };
 static uint8_t* g_arena;
 static uint8_t* g_data;                                // race.exe .data
@@ -188,7 +189,7 @@ static const char* where(const void* p, char* buf) {
         struct { uint32_t o, n; const char* name; } parts[] = {
             {A_CAR, CAR_N, "car"}, {A_MSG, MSG_N, "msg"}, {A_PKT, PKT_N, "packet"}, {A_STATUS, STATUS_N, "status"},
             {A_STRBUF, STRBUF_N, "strbuf"}, {A_CTLS, CTLS_N, "controls"}, {A_TELEMETRY, TELEMETRY_N, "telemetry"},
-            {A_DEITY, 16, "deity"}, {A_SOUNDS, 4 * SOUND_N, "sounds"}, {A_CARS, 16 * FAKE_CAR_N, "other cars"},
+            {A_DEITY, DEITY_N, "deity"}, {A_SOUNDS, 4 * SOUND_N, "sounds"}, {A_CARS, 16 * FAKE_CAR_N, "other cars"},
             {A_STRINGS, 8 * STRING_N, "strings"}, {A_ENTRIES, 8 * 24, "entries"}};
         for (auto& q : parts)
             if (off >= q.o && off < q.o + q.n) { sprintf(buf, "%s+0x%x", q.name, off - q.o); return buf; }
@@ -310,10 +311,10 @@ static void __fastcall st_Xlator_xlate(void* self, int) {
         x->text = (const char*)0x004eb3fc;               // lookup failed: the "missing" string, cookie stale
     }
 }
-// the fake Deity's virtuals (one or two int-sized arguments, as the callers push)
+// the Deity's virtuals (one or two int-sized arguments, as the callers push): RaceDeity's own, patched, so the
+// deity has RaceDeity's vtable (PlayCar::Update's footprint accepts only a RaceDeity, as Car::Update's does)
 template <int SLOT> static uint32_t __fastcall st_deity1(void* self, int, uint32_t a) { lg('DEI1' + SLOT); lg((uint32_t)self); lg(a); return script(); }
 template <int SLOT> static uint32_t __fastcall st_deity2(void* self, int, uint32_t a, uint32_t b) { lg('DEI2' + SLOT); lg((uint32_t)self); lg(a); lg(b); return script(); }
-static void* g_deity_vt[24];
 // other cars: IsSolid (vtable +0x30)
 static unsigned char __fastcall st_is_solid(void* self, int) { lg('SOLD'); lg((uint32_t)self); return (unsigned char)(script() % 3 != 0); }
 static void* g_car_vt[16];
@@ -364,10 +365,10 @@ static void install_stubs() {
     patch_jump(0x0041afb0, (void*)st_Xlator_xlate);
     // KeyConvertScanKey calls MapVirtualKeyA through the import table: resolve it
     *(void**)0x005d769c = (void*)GetProcAddress(LoadLibraryA("user32.dll"), "MapVirtualKeyA");
-    g_deity_vt[0x2c / 4] = (void*)st_deity2<0x2c>;
-    g_deity_vt[0x3c / 4] = (void*)st_deity2<0x3c>;
-    g_deity_vt[0x48 / 4] = (void*)st_deity1<0x48>;
-    g_deity_vt[0x50 / 4] = (void*)st_deity1<0x50>;
+    patch_jump(0x00442fc0, (void*)st_deity2<0x2c>);                   // RaceDeity::RegisterCar(LocalCar)
+    patch_jump(0x00443a00, (void*)st_deity2<0x3c>);                   // RaceDeity::TeleportToLine
+    patch_jump(0x004441c0, (void*)st_deity1<0x48>);                   // RaceDeity::GetCurrentLap
+    patch_jump(0x00444220, (void*)st_deity1<0x50>);                   // RaceDeity::GetDLong
     g_car_vt[0x30 / 4] = (void*)st_is_solid;
     g_sound_vt[0] = (void*)st_sound_delete;
 }
@@ -487,7 +488,10 @@ static void build_world() {
     for (uint32_t off : {PC_SND_LEFT, PC_SND_RIGHT, PC_SND_BOTH, PC_SND_CLEAR})
         *(void**)(c + off) = rnd() % 4 == 0 ? 0 : sound(ri(0, 3));
     for (int i = 0; i < 4; i++) *(void**)sound(i) = g_sound_vt;
-    *(void**)(g_arena + A_DEITY) = g_deity_vt;
+    *(uint32_t*)(g_arena + A_DEITY) = 0x004dc588;                       // RaceDeity's vtable
+    // what PlayCar::Update's footprint follows for Car::Update (stubbed here): no collision volumes, no live models
+    *(int32_t*)(c + 0x24) = 0;
+    memset(c + 0x4c4, 0, 20);
     for (int i = 0; i < 16; i++) {
         uint8_t* o = (uint8_t*)fake_car(i);
         *(void**)o = g_car_vt;

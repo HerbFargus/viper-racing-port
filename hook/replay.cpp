@@ -420,6 +420,21 @@ static float __cdecl h_DriverGetSteering(float speed) {
     return v;
 }
 
+// The physics clock (PhysicsGetTime: the tick count x dt) is an input to a check made on the MAIN thread -- the
+// world's effects time their puffs and bursts by it -- because the physics thread can tick between the
+// original's pass and the rewrite's. On the physics thread it's one of the saved globals, so it isn't fed.
+enum { IN_CLOCK = 3 };
+typedef double(__cdecl* Clock_t)();
+static Clock_t o_PhysicsGetTime;
+static double __cdecl h_PhysicsGetTime() {
+    if (GetCurrentThreadId() == g_physics_thread_id) return o_PhysicsGetTime();
+    double v;                                          // exact: a tick count times a float
+    if (shadow_feed(IN_CLOCK, &v, 8)) return v;
+    v = o_PhysicsGetTime();
+    shadow_saw(IN_CLOCK, &v, 8);
+    return v;
+}
+
 // ---- install and report -----------------------------------------------------------------------------------
 void replay_install(const char* ini) {
     g_record = GetPrivateProfileIntA("replay", "record", 0, ini) != 0;
@@ -428,7 +443,7 @@ void replay_install(const char* ini) {
     char dumps[256];
     GetPrivateProfileStringA("replay", "dump_ticks", "", dumps, sizeof dumps, ini);
     for (char* s = strtok(dumps, ", "); s; s = strtok(0, ", ")) g_dump_ticks.push_back(atoi(s));
-    // the input hooks (Random, DriverGet*) are also a shadow check's inputs, so they go in for either
+    // the input hooks (Random, DriverGet*, the clock) are also a shadow check's inputs, so they go in for either
     const bool race = g_record || g_play[0];
     if (!race && !shadow_on()) return;
     if (race && !g_label[0]) {
@@ -456,6 +471,7 @@ void replay_install(const char* ini) {
         {0x00428c30, (void*)h_GetTicks, (void**)&o_GetTicks, "TimerConditioner::GetTicks", true},
         {0x0041b6b0, (void*)h_Randomize, (void**)&o_Randomize, "Randomize", true},
         {0x0041b6e0, (void*)h_Random, (void**)&o_Random, "Random"},
+        {0x0042bc80, (void*)h_PhysicsGetTime, (void**)&o_PhysicsGetTime, "PhysicsGetTime"},
         {0x00441df0, (void*)h_DriverGetSteering, (void**)&o_DriverGetSteering, "DriverGetSteering"},
         {0x00441e60, (void*)h_DriverGetThrottle, (void**)&o_DriverGetThrottle, "DriverGetThrottle"},
         {0x00441e70, (void*)h_DriverGetBraking, (void**)&o_DriverGetBraking, "DriverGetBraking"},
@@ -479,7 +495,7 @@ void replay_install(const char* ini) {
         // detour(0x00428c30) detour(0x0041b6e0) detour(0x00441df0) detour(0x00441e60) detour(0x00441e70)
         // detour(0x00441e80) detour(0x00441ec0) detour(0x00441ed0) detour(0x00441ef0) detour(0x00441f00)
         // detour(0x00441f10) detour(0x00441f20) detour(0x00441f30) detour(0x00441f40) detour(0x00441f50)
-        // detour(0x0041b6b0)
+        // detour(0x0041b6b0) detour(0x0042bc80)
         *h.orig = detour_front(h.v10, h.to, h.what);     // in front of the rewrite, where there is one
         ok += *h.orig != 0;
     }
@@ -489,7 +505,7 @@ void replay_install(const char* ini) {
         g_play[0] = 0;
         return;
     }
-    if (!race) logf("replay: input hooks in (random numbers and controls feed shadow checks)");
+    if (!race) logf("replay: input hooks in (random numbers, controls and the clock feed shadow checks)");
     else if (g_play[0]) logf("replay: will replay %s\\%s.vpr in the next race (this run's trace: %s)", g_dir, g_play, g_label);
     else logf("replay: recording every race to %s", g_dir);
 }

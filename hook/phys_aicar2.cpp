@@ -1057,12 +1057,44 @@ static void __fastcall AICar_Update(AICar* self, Edx) {
     i_pr_overhead_end();
     Car_Update(self, 0);
 }
+// Car::Update's reach beyond the car, as phys_car_update.cpp's fp_car_volumes / fp_car_models list it: the body's
+// collision volumes and group spheres (CollideGround), and the five live models' vertices and model_info
+// +0x10/+0x15 (a queued impulse over 741.67 dents the car through ActuallyApplyDamage). The dents are physics
+// state -- the wheels' hub vertices point into the LOD-0 mesh -- so a shadow check that left them out ran its
+// rewrite pass on the mesh the original pass had already dented (damage_grid, damaged and frame mismatches).
+static void fp_car_reach(Footprint& f, AICar* self) {
+    const uint8_t* c = (const uint8_t*)self;
+    const int32_t nvol = *(const int32_t*)(c + 0x24);                     // PhobRoot volumes[4] (+0x14), count
+    for (int i = 0; i < nvol && i < 4; i++) {
+        uint8_t* v = ((uint8_t* const*)(c + 0x14))[i];
+        if (!v) continue;
+        f.object(v, "volume");
+        if (*(const uint32_t*)(v + 0x14) == 0x47525550u) {                // 'GRUP': a SphereGroupVolume's spheres
+            const int n = *(const int32_t*)(v + 0x4c);
+            for (int k = 0; k < n && k < 12; k++)
+                if (void* s = ((void* const*)(v + 0x1c))[k]) f.object(s, "body sphere");
+        }
+    }
+    const int32_t* live_models = (const int32_t*)(c + 0x4c4);             // Car +0x4c4 [5]
+    for (int i = 0; i < 5; i++) {
+        uint8_t* mi = (uint8_t*)(uintptr_t)live_models[i];
+        if (!mi) continue;
+        f.add(mi + 0x10, 8, "model_info");
+        const uint8_t* info = *(const uint8_t* const*)(mi + 0x10);         // mrModelInfo: count, vertices (32 bytes)
+        if (!info) continue;
+        const int32_t n = *(const int32_t*)info;
+        void* verts = *(void* const*)(info + 4);
+        if (verts && n > 0) f.add(verts, (uint32_t)n * 32, "model verts");
+    }
+}
 // The car; its segment notes, proxer levels and racing line (IdealLine::update_car_info and the bead); in learn
-// mode the game state; and Car::Update's (phys_car_update.cpp): the splash Sound3D and the deity's per-car record
-// with its CenterLine. Left to the replay: a teleport (teleport_to_track firing: the deity's TeleportToLine), and
-// Car::Update's own cases -- out of bounds, the damage reset, a deity that isn't a RaceDeity.
+// mode the game state; and Car::Update's (phys_car_update.cpp): the collision volumes, the live models, the splash
+// Sound3D and the deity's per-car record with its CenterLine. Left to the replay: a teleport (teleport_to_track
+// firing: the deity's TeleportToLine), and Car::Update's own cases -- out of bounds, the damage reset, a deity that
+// isn't a RaceDeity.
 static void fp_ai_update(Footprint& f, AICar* self, Edx) {
     f.object(self, "car");
+    fp_car_reach(f, self);
     fp_seginfo(f, self);
     fp_proxer_info(f, self);
     if (self->line) f.add(self->line, sizeof(IdealLine), "ideal line");

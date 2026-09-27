@@ -48,7 +48,8 @@ code at its own address, puts the FPU in the physics thread's single precision, 
 whose footprint is pure against its original on millions of random inputs, NaN, infinity, denormals and
 overlapping arguments included.
 
-The rewrites so far (`hook/phys_*.cpp`, layouts in `hook/phys_types.h`), 881 functions:
+The rewrites so far, 1,155 functions (the physics and AI, 881 of them, in `hook/phys_*.cpp`, layouts in
+`hook/phys_types.h`):
 - **3.2, collisions:** the physics library's maths helpers, every collision volume (sphere, cube, sphere
   group, moveable sphere, cylinder, tube, box), the pairwise collision tests, and `collide.obj`'s crash
   reports, water and static objects.
@@ -72,8 +73,16 @@ The rewrites so far (`hook/phys_*.cpp`, layouts in `hook/phys_types.h`), 881 fun
 
 That is the whole physics and AI code, apart from the debug screens' drawing.
 
+- **The world** (`hook/wld_*.cpp`, 274 more): the terrain (the track's ground-contact
+  tree and the unused BSP), loading the track and parsing its world file (cars on the grid, obstacles,
+  wobbles, statics, checkpoints), the car list and the game's race set-up (`game.obj`), the car objects
+  the renderer draws (models, textures, smoke, dust, skids), and the effects (shadows, smoke puffs,
+  reflections, crash debris, sparks, splashes). The drawing itself is left for the graphics stage. The
+  world runs every frame on the main thread, so it is checked by shadow-mode races and by replays.
+
 Then a chosen set of the original's bugs is fixed, always on: the AI crash (a car losing its place on
-its racing line), degenerate racing lines, a ground-contact divide by zero, vrmod's obstacle wake, and
+its racing line), degenerate racing lines, a ground-contact divide by zero, vrmod's obstacle wake, a single race on a
+track with no AI racing line (it runs without AI cars instead of crashing), and
 buffer overruns that long mod-car, driver and track names could trigger. A fix only changes what happens
 where the original would crash, hang or overrun, so an ordinary race still replays identically on the
 original code. They are listed in `docs/FIXES.md`. A `race.exe` carrying vrmod's two engine fixes is

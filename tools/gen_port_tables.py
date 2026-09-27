@@ -367,11 +367,32 @@ def write_globals(exe, secs):
     return len(out), total
 
 
+# ---- M1's patches inside rewritten functions --------------------------------------------------------------
+# M1 (hook/viperport.cpp) lifts limits by patching operands of the original code: {instruction, operand
+# offset, ...} fields, and the texture table's (texture_table_fields.inc). A rewrite of a function holding
+# one must read that operand with m1_operand(its address), or it would undo the lift (docs/PORTING.md 12).
+def check_m1_operands(sizes):
+    src = (HOOK / "viperport.cpp").read_text(encoding="utf-8") + (HOOK / "texture_table_fields.inc").read_text(encoding="utf-8")
+    operands = sorted({int(at, 16) + int(off) for at, off in re.findall(r"\{\s*(0x[0-9a-fA-F]{6,8}),\s*(\d+),", src)})
+    texts = {f: f.read_text(encoding="utf-8") for f in HOOK.glob("*.cpp") if f.name != "viperport.cpp"}
+    pat = re.compile(r"PORT_FN(?:_BUILDS)?\(\s*(0x[0-9a-fA-F]+)")
+    missing = []
+    for f, t in texts.items():
+        for m in pat.finditer(t):
+            va = int(m.group(1), 16)
+            for op in operands:
+                if va <= op < va + sizes.get(va, 0) and not re.search(rf"m1_operand\(0x0*{op:x}\)", t, re.I):
+                    missing.append(f"{f.name}: the rewrite of {va:08x} doesn't read M1's operand at {op:08x}")
+    if missing:
+        raise SystemExit(chr(10).join(missing))
+
+
 def main():
     exe = (OUT / "race_v10.exe").read_bytes()
     secs = sections(exe)
     sizes = {int(r["va"], 16): int(r["size"]) for r in csv.DictReader(open(OUT / "inventory.csv", encoding="utf-8"))}
     types = json.loads((OUT / "types.json").read_text(encoding="utf-8"))
+    check_m1_operands(sizes)
     n = write_prologues(exe, secs, sizes)
     ns = write_stock(exe, secs, sizes)
     c, f = write_layout(types)

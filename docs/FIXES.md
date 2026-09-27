@@ -26,6 +26,8 @@ dozen places and the game dies.
   chord's direction instead of 0/0.
 - `advance_bead`, `get_rabbit_position`, `get_nearest_bead`: a zero-length (or NaN-length) node no
   longer makes them loop forever.
+- `fixup_res`: a racing-line file with no nodes no longer writes before its own allocation (heap
+  corruption) when it is loaded.
 
 ## Obstacles
 
@@ -38,6 +40,11 @@ dozen places and the game dies.
 - `SphereVolume::CollideGround`: a sphere just touching the ground with no sideways speed computed a
   friction limit divided by zero. The physics thread runs with divide-by-zero exceptions on, so that
   crashed the game (about 1 in 13 such contacts). No sideways speed now means no friction.
+
+## Tracks with no AI racing line
+
+- `LoadRace`: a single race on a track with no AI racing line (`default.ili`) crashed as it started. It
+  now runs without AI cars, and says so in the log.
 
 ## Names and tables (mostly mod cars and tracks)
 
@@ -60,7 +67,8 @@ dozen places and the game dies.
 
 ## Not fixed
 
-- A track with no AI racing line still crashes when AI cars are built (left as the original, for now).
+- A track with no AI racing line still crashes in a career race or a multiplayer race; those are fixed
+  with their own stages (the menus and career, multiplayer).
 - The AI's quirks that shape how it drives (its per-segment speed notes are computed and then
   overwritten) are gameplay, not bugs, and stay.
 - `collide_sphere_sphere`'s 0/0 for coincident centres needs no fix: it is caught before its result is
