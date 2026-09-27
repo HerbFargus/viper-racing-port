@@ -5,6 +5,9 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_krn_core.cpp
 //        /Fo%TEMP%\k1\ /Fe%TEMP%\k1\world_krn_core.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_krn_core.exe [worlds] [seed]
+//   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS -- the rewrites as the game has them, on the same
+//   worlds (ExceptBegin, the one fixed function, is left out of them and of the chain), then ExceptBegin's crash log in
+//   <race.exe's folder>\log\ (fix_except_begin; CreateDirectoryA is a stub that makes nothing).
 //
 // Loads out\race_v10.exe at 0x400000 in a child process (as test/fuzz.cpp) and resolves its KERNEL32 / USER32 / WINMM
 // imports; then every import slot the kernel uses holds a logging stub instead -- the heap (a bump heap in the arena),
@@ -42,7 +45,9 @@
 #include <vector>
 #include <tuple>
 #include <type_traits>
-#define VP_FAITHFUL
+#ifndef FIX_TESTS
+#define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+#endif
 #include "../hook/port.h"
 
 struct ChainReg {
@@ -177,6 +182,9 @@ static void chain_save(uint32_t at) {
 static void chain_patch() {
     g_nchain = 0;
     for (ChainReg* r = ChainReg::head(); r; r = r->next) {
+#ifdef FIX_TESTS
+        if (r->at == 0x004154a0) continue;             // (the fixed ExceptBegin: checked on its own, fix_except_begin)
+#endif
         if (r->at == 0x004188ad) {
             chain_save(0x004188ad);
             chain_save(0x00418912);
@@ -264,7 +272,7 @@ static const char* global_name(uint32_t a) {
     X(CREATEMAP) X(MAPVIEW) X(UNMAP) X(CLIPCURSOR) X(EXITPROCESS) X(IOCTL) X(LOCALTIME) X(RDTSC) X(REPORT) X(ERROR)      \
     X(PANIC) X(ERRSTR) X(W32TIME) X(APPINST) X(FWRITE) X(FCREATE) X(FCLOSE) X(FBEGIN) X(FEND) X(FVERIFY) X(LBEGIN)        \
     X(LEND) X(W32BEGIN) X(W32END) X(KBEGIN) X(KEND) X(SBEGIN) X(SEND) X(MBEGIN) X(MEND) X(JBEGIN) X(JEND) X(ATEXIT)       \
-    X(HOOK) X(TIMERCB) X(THREADFN) X(EXITHANDLER) X(STRICMP) X(STRNICMP) X(STRNCPY) X(SPRINTF) X(VSPRINTF) X(SSCANF)         X(STRSTR) X(QSORT) X(MEMMOVE)
+    X(HOOK) X(TIMERCB) X(THREADFN) X(EXITHANDLER) X(STRICMP) X(STRNICMP) X(STRNCPY) X(SPRINTF) X(VSPRINTF) X(SSCANF)         X(STRSTR) X(QSORT) X(MEMMOVE) X(CREATEDIR)
 enum LogKind {
     L_NONE,
 #define X(n) L_##n,
@@ -434,13 +442,29 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI st_setfilter(LPTOP_LEVEL_EXCEPTION_FI
     logn(L_SETFILTER, (uint32_t)(uintptr_t)f);
     return (LPTOP_LEVEL_EXCEPTION_FILTER)(uintptr_t)ctrl()->prev_filter;
 }
+#ifdef FIX_TESTS
+static const char* g_modname_override;           // the fix test's exe path ("": GetModuleFileNameA fails)
+#endif
 static DWORD WINAPI st_modname(HMODULE m, LPSTR buf, DWORD n) {
     logn(L_MODNAME, (uint32_t)(uintptr_t)m, P(buf), n);
+#ifdef FIX_TESTS
+    if (g_modname_override) {
+        const DWORD len = (DWORD)strlen(g_modname_override);
+        if (!len || !n) return 0;
+        if (len >= n) { memcpy(buf, g_modname_override, n - 1); buf[n - 1] = 0; return n; }   // cut short
+        memcpy(buf, g_modname_override, len + 1);
+        return len;
+    }
+#endif
     if (script() % 8 == 0) return 0;
     static const char path[] = "C:\\Games\\Viper Racing\\race.exe";
     memcpy(buf, path, sizeof path);
     return (DWORD)strlen(path);
 }
+#ifdef FIX_TESTS
+// the fixed ExceptBegin makes its log folder: logged, never made
+static BOOL WINAPI st_createdir(LPCSTR n, LPSECURITY_ATTRIBUTES sa) { logn(L_CREATEDIR, hash_str(n), P(sa)); return TRUE; }
+#endif
 static HANDLE WINAPI st_createfile(LPCSTR n, DWORD acc, DWORD sh, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD fl, HANDLE t) {
     logn(L_CREATEFILE, hash_str(n), acc, sh ^ (disp << 8) ^ (P(sa) << 16), fl, (uint32_t)(uintptr_t)t);
     uint32_t s = script() % 6;
@@ -645,11 +669,14 @@ static const SlotStub g_slot_stubs[] = {
     {"UnmapViewOfFile", (void*)st_unmap, 0x5d746c}, {"ClipCursor", (void*)st_clipcursor, 0x5d76b4},
     {"ExitProcess", (void*)st_exitprocess, 0x5d7478}, {"DeviceIoControl", (void*)st_ioctl, 0x5d74ec},
     {"GetLocalTime", (void*)st_localtime, 0x5d75f0},
+#ifdef FIX_TESTS
+    {"CreateDirectoryA", (void*)st_createdir, 0x5d7490},
+#endif
 };
 // the live pass keeps these as stubs (no process-wide side effects); everything else gets the real function
 static bool live_keeps_stub(const char* n) {
     static const char* const keep[] = {"SetUnhandledExceptionFilter", "GetModuleFileNameA", "CreateFileA", "GetFileSize",
-        "CreateFileMappingA", "MapViewOfFile", "UnmapViewOfFile", "ClipCursor", "ExitProcess", "DeviceIoControl"};
+        "CreateFileMappingA", "MapViewOfFile", "UnmapViewOfFile", "ClipCursor", "ExitProcess", "DeviceIoControl", "CreateDirectoryA"};
     for (const char* k : keep)
         if (!strcmp(k, n)) return true;
     return false;
@@ -1258,7 +1285,9 @@ static void check_except() {
         CHECK_BOTH(DumpExceptionString_rw, (int)(chance(80) ? 7 : 0), buf, S(f), rnd(), (uint32_t)(uintptr_t)arena_str(ri(0, 10)), 0u, 0u);
     }
     CHECK0_BOTH(get_mapfile_ptr_rw);
-    CHECK0_BOTH(ExceptBegin_rw);
+#ifndef FIX_TESTS
+    CHECK0_BOTH(ExceptBegin_rw);                         // (the fix build checks the fixed one on its own: fix_except_begin)
+#endif
     {
         static const uint32_t k_codes[] = {0x80000001, 0x80000002, 0x80000003, 0x80000004, 0x80000005, 0x80000000,
             0xc0000005, 0xc0000006, 0xc000001d, 0xc0000025, 0xc0000026, 0xc000008c, 0xc0000093, 0xc0000094,
@@ -1449,6 +1478,56 @@ static LiveResult live_run(bool rewrite) {
     fpu_reset();
     return r;
 }
+#ifdef FIX_TESTS
+// ExceptBegin's FIX: the crash log is <race.exe's folder>\log\except.log, the folder made; with no exe path, or one too
+// long for the file table's 0x100-byte names, c:\except.log as before. Checked on the stubs' log: the folder
+// CreateDirectoryA was asked for (a stub: nothing is made) and the name FileCreate got.
+static char g_long_exe[300];
+static int fix_except_begin() {
+    struct Case { const char* exe; const char* dir; const char* file; };
+    const char* long_exe = g_long_exe;                   // "C:\ddd...\race.exe": a 248-character folder
+    memcpy(g_long_exe, "C:\\", 3);
+    memset(g_long_exe + 3, 'd', 244);
+    strcpy(g_long_exe + 247, "\\race.exe");
+    const Case cases[] = {
+        {"C:\\Games\\Viper Racing\\race.exe", "C:\\Games\\Viper Racing\\log", "C:\\Games\\Viper Racing\\log\\except.log"},
+        {"D:\\race.exe", "D:\\log", "D:\\log\\except.log"},
+        {"", 0, "c:\\except.log"},                                            // GetModuleFileNameA fails
+        {long_exe, 0, "c:\\except.log"},                           // too long for log\except.log in 0x100
+    };
+    int bad = 0;
+    for (const Case& k : cases) {
+        random_world();
+        for (int i = 0; i < 256; i++) g_script[i] = 1;   // (FileCreate succeeds: File 7)
+        g_modname_override = k.exe;
+        g_pass = 1; g_nlog[1] = 0; g_si = 0;
+        __try {
+            ExceptBegin_rw();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            printf("  FAIL ExceptBegin (exe \"%.40s\") faulted\n", k.exe);
+            bad++;
+        }
+        fpu_reset();
+        uint32_t dirs = 0, dir_hash = 0, creates = 0, create_hash = 0;
+        for (int i = 0; i < g_nlog[1] && i < LOGN; i++) {
+            const LogEntry& e = g_log[1][i];
+            if (e.kind == L_CREATEDIR) dirs++, dir_hash = e.a[0];
+            if (e.kind == L_FCREATE && !creates++) create_hash = e.a[0];
+        }
+        const bool ok = creates == 1 && create_hash == hash_str(k.file) && G32(X_LOG) == 7 &&
+                        (k.dir ? dirs == 1 && dir_hash == hash_str(k.dir) : dirs == 0);
+        if (!ok) {
+            bad++;
+            printf("  FAIL ExceptBegin (exe \"%.40s\"): %u CreateDirectory (%s), %u FileCreate (%s), the log file %u\n", k.exe, dirs,
+                   k.dir && dir_hash == hash_str(k.dir) ? "right" : "wrong", creates, create_hash == hash_str(k.file) ? "right" : "wrong",
+                   G32(X_LOG));
+        }
+    }
+    g_modname_override = 0;
+    printf("fix build: ExceptBegin's crash log in <race.exe's folder>\\log\\: %d cases, %d wrong\n", (int)(sizeof cases / sizeof *cases), bad);
+    return bad;
+}
+#endif
 static int live_check() {
     LiveResult o = live_run(false), n = live_run(true);
     printf("live: %-10s began %d, BG hook ran %ld times in 0.5 s (cw %04x, priority %d), mem cur %u max %u, tasks %u, multi %u,"
@@ -1530,5 +1609,8 @@ int main(int argc, char** argv) {
     printf("%d rewrites; %d worlds, %ld checks; %d of %d check kinds differ or escape their footprint\n", nfn, worlds, calls, failed,
            (int)g_stats.size());
     int live = live_check();
+#ifdef FIX_TESTS
+    failed += fix_except_begin();
+#endif
     return failed || live ? 1 : 0;
 }

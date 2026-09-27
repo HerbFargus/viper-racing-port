@@ -6,7 +6,18 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_krn_file.cpp
 //        /Fo%TEMP%\k2\ /Fe%TEMP%\k2\world_krn_file.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //        user32.lib
-//   run:   world_krn_file.exe [scenarios] [seed]
+//   run:   world_krn_file.exe [scenarios] [seed] [moved]
+//          moved: the open-file table first moved as M1 moves it in the game (hook/res_table_fields.inc: 256 slots in
+//          memory of the harness's own, a guard page after them, alloc_file's imm8 capacity 0x7f), then the same
+//          scenarios -- the originals run on the moved table, the rewrites must follow it through m1_operand
+//   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS -- the rewrites as the game has them, run on the
+//   inputs the fixes are for instead of the scenarios (fix_tests, at the end): the user directory next to a fake
+//   race.exe and its one migration (from the VirtualStore's copies, the real folder, vrmod's relative "Config\"; the
+//   old files untouched; never twice; the 200-character guard), the log's folder and FileVerifyNoOpenFiles,
+//   FileReadLine on CRLF files (against the original), bare-LF and mixed ones (against a model) and exact lengths, and
+//   the open-file table as M1 moves it: 300 files through the rewrites (256 open at once, the 257th panics, every
+//   byte read back), the originals on the moved table (127 slots, then reuse, then their panic; their footprints
+//   checked), the two mixed, nothing written past the table or into the stock one.
 //
 // Loads out\race_v10.exe at 0x400000 the way test/fuzz.cpp does (a child process with the range reserved before
 // its heap exists; 0xb0000 too, the mono monitor's memory). The loader doesn't resolve the game's imports; this
@@ -52,7 +63,9 @@
 #include <algorithm>
 #include <tuple>
 #include <type_traits>
+#ifndef FIX_TESTS
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+#endif
 #include "../hook/port.h"
 
 struct ChainReg {
@@ -67,12 +80,17 @@ struct ChainReg {
     static constexpr auto VP_CAT(fpof_, NEW) = &FP;                                                        \
     static ChainReg VP_CAT(chain_, NEW)(V10, (void*)&NEW, NAME);
 
+static std::string g_logf_text;                    // what the rewrites logged (the fix tests read it)
+static bool g_logf_quiet;
 void logf(const char* fmt, ...) {
+    char b[2048];
     va_list ap;
     va_start(ap, fmt);
-    vprintf(fmt, ap);
+    vsnprintf(b, sizeof b, fmt, ap);
     va_end(ap);
-    putchar('\n');
+    g_logf_text += b;
+    g_logf_text += "\n";
+    if (!g_logf_quiet) printf("%s\n", b);
 }
 uint32_t A(uint32_t v10) { return v10; }
 bool have(uint32_t) { return true; }
@@ -635,8 +653,26 @@ static BOOL WINAPI st_DeleteDC(HDC dc) { lg(L_DeleteDC, V(dc)); return TRUE; }
 static LSTATUS WINAPI st_RegFlushKey(HKEY k) { lg(L_RegFlushKey, V(k)); return ERROR_SUCCESS; }
 static DWORD WINAPI st_timeGetTime() { const DWORD t = script(); lg(L_timeGetTime, t); return t; }
 
+#ifdef FIX_TESTS
+// the fixes find race.exe's folder with GetModuleFileNameA(NULL): a fake exe path in the sandbox ("": it fails)
+static std::string g_fake_exe;
+static DWORD WINAPI st_GetModuleFileNameA(HMODULE m, LPSTR buf, DWORD n) {
+    if (m || g_fake_exe.empty() || n == 0) return 0;
+    const DWORD len = (DWORD)g_fake_exe.size();
+    if (len >= n) {                                // cut short, as Windows does: n characters, n - 1 of them the path's
+        memcpy(buf, g_fake_exe.c_str(), n - 1);
+        buf[n - 1] = 0;
+        return n;
+    }
+    memcpy(buf, g_fake_exe.c_str(), len + 1);
+    return len;
+}
+#endif
 // the slots, by the imported name (every one these functions use)
 static const struct { const char* name; void* stub; } k_iat_stubs[] = {
+#ifdef FIX_TESTS
+    {"GetModuleFileNameA", (void*)&st_GetModuleFileNameA},
+#endif
     {"GetVersion", (void*)&st_GetVersion}, {"GetLastError", (void*)&st_GetLastError},
     {"GetCurrentProcess", (void*)&st_GetCurrentProcess}, {"CreateFileA", (void*)&st_CreateFileA},
     {"GetTempFileNameA", (void*)&st_GetTempFileNameA}, {"SetFilePointer", (void*)&st_SetFilePointer},
@@ -889,13 +925,37 @@ static void snapshot_tree(const std::string& dir, const std::string& rel, std::v
     FindClose(h);
 }
 
+// ---- the open-file table, moved as M1 moves it (the "moved" runs and the fix tests) ---------------------------------------
+enum { MOVED_BYTES = VP_LIFT_FILES * 0x104, MOVED_SPAN = (MOVED_BYTES + 0xfff) / 0x1000 * 0x1000 + 0x1000 };   // + a guard page
+static uint8_t* g_moved;                           // the table's memory (0: never moved)
+static bool g_moved_on;                            // the image's operands point at it
+static void move_file_table(bool on) {
+    struct Ref { uint32_t at; uint8_t off; uint32_t old; int table; };
+    static const Ref refs[] = {
+#include "../hook/res_table_fields.inc"
+    };
+    if (!g_moved) g_moved = (uint8_t*)VirtualAlloc(0, MOVED_SPAN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    const uint32_t base = (uint32_t)(uintptr_t)g_moved, end = base + MOVED_BYTES;
+    for (const Ref& r : refs) {
+        if (r.table < 2) continue;                 // (the options and language tables: krn_res's)
+        uint32_t* p = (uint32_t*)(uintptr_t)(r.at + r.off);
+        const uint32_t neu = r.table == 2 ? base + (r.old - 0x505ea8) : end + (r.old - 0x507f28);
+        if (*p != (on ? r.old : neu)) { printf("res_table_fields.inc: %08x+%u isn't what it should be\n", r.at, r.off); ExitProcess(3); }
+        *p = on ? neu : r.old;
+    }
+    *(uint8_t*)0x00411652 = on ? 0x7f : 0x20;      // alloc_file: cmp edx, 0x20 (an imm8)
+    FlushInstructionCache(GetCurrentProcess(), 0, 0);
+    g_moved_on = on;
+}
+
 // ---- the passes ---------------------------------------------------------------------------------------------------------
 struct GRange { uint32_t at, n; const char* what; };
-static const GRange g_granges[] = {
+static GRange g_granges[] = {
     {0x004e5a1c, 0x1c, "log statics (0x4e5a1c..)"}, {0x004e5c54, 8, "file statics"}, {0x004e5eac, 0x24, "win32 statics"},
     {0x004e6a74, 4, "abend flag"}, {0x00503a74, 4, "shmem count"}, {0x00505e58, 0x44, "log statics (0x505e58..)"},
     {0x00505ea0, 0x2088, "file table"}, {0x00507f30, 4, "splash bitmap"}, {0x00507f48, 0x104, "user directory"},
     {0x00508060, 8, "message hooks"}, {0x00508d38, 0x108, "message and mailslot"}, {0x005d5768, 0x28, "shmem blocks"},
+    {0, 0, "the open-file table, moved"},        // (filled in when it is)
 };
 static uint32_t ghash() {
     uint32_t h = 0;
@@ -933,6 +993,7 @@ static void pass_begin(int mode, uint32_t seed) {
     g_cur = &g_res[mode];
     *g_cur = PassResult();
     memcpy((void*)DATA_AT, g_pristine_data.data(), DATA_SIZE);
+    if (g_moved) memset(g_moved, 0, MOVED_SPAN);
     if (g_have_mono) memset((void*)MONO_AT, 0, MONO_SIZE);
     memset(g_arena, 0, ARENA_SIZE);
     g_str_top = 0;
@@ -978,6 +1039,7 @@ static void pass_end() {
     r.api = g_api;
     r.texts = g_texts;
     r.data.assign((uint8_t*)DATA_AT, (uint8_t*)DATA_AT + DATA_SIZE);
+    if (g_moved) r.data.insert(r.data.end(), g_moved, g_moved + MOVED_SPAN);   // (after .data: the moved table, its guard)
     if (g_have_mono) r.mono.assign((uint8_t*)MONO_AT, (uint8_t*)MONO_AT + MONO_SIZE);
     mask_maps();
     r.arena.assign(g_arena, g_arena + ARENA_SIZE);
@@ -1029,7 +1091,7 @@ template <typename F> static F pickf(uint32_t addr, F rw) { return g_mode == 1 ?
 // the footprint check (the originals' pass): every byte the call changed in the game's .data, the mono memory and the
 // arena must lie inside its footprint
 static Footprint g_fp;
-static std::vector<uint8_t> g_before_data, g_before_arena, g_before_mono;
+static std::vector<uint8_t> g_before_data, g_before_arena, g_before_mono, g_before_moved;
 static bool in_footprint(uint32_t a) {
     for (int k = 0; k < g_fp.n; k++)
         if (a >= (uint32_t)(uintptr_t)g_fp.r[k].p && a < (uint32_t)(uintptr_t)g_fp.r[k].p + g_fp.r[k].n) return true;
@@ -1043,6 +1105,12 @@ static void fp_check(const char* name) {
             if (st.fp_fails++ < 3) printf("FOOTPRINT %s: %08x (.data) changed outside it\n", name, DATA_AT + i);
             return;
         }
+    if (g_moved)
+        for (uint32_t i = 0; i < MOVED_SPAN; i++)
+            if (g_moved[i] != g_before_moved[i] && !in_footprint((uint32_t)(uintptr_t)(g_moved + i))) {
+                if (st.fp_fails++ < 3) printf("FOOTPRINT %s: the moved open-file table +0x%x changed outside it\n", name, i);
+                return;
+            }
     for (uint32_t i = 0; i < ARENA_SIZE; i++)
         if (g_arena[i] != g_before_arena[i] && !in_footprint((uint32_t)(uintptr_t)(g_arena + i))) {
             if (st.fp_fails++ < 3) printf("FOOTPRINT %s: arena+0x%x changed outside it\n", name, i);
@@ -1070,6 +1138,7 @@ template <typename Run, typename Fp> static uint64_t run_op(const char* name, Ru
         if (check) {
             g_before_data.assign((uint8_t*)DATA_AT, (uint8_t*)DATA_AT + DATA_SIZE);
             g_before_arena.assign(g_arena, g_arena + ARENA_SIZE);
+            if (g_moved) g_before_moved.assign(g_moved, g_moved + MOVED_SPAN);
             if (g_have_mono) g_before_mono.assign((uint8_t*)MONO_AT, (uint8_t*)MONO_AT + MONO_SIZE);
         }
     }
@@ -1308,7 +1377,8 @@ static void file_op(Ctx& c) {
         }
         break;
     }
-    case 32: if (chance(15)) {                                     // the table filled up with fake handles, to its panic
+    case 32: if (chance(15) && (!g_moved_on || *(int32_t*)0x00505ea0 < 90)) {   // the table filled up with fake handles, to its
+                                                                   // panic (moved: kept under the original's 127)
         for (int i = 0; i < 34; i++) {
             const int r = (int)CALL(alloc_file_rw, astr(("fake" + std::to_string(i)).c_str()), vnew(0, VK_FAKE));
             if (g_cur->trace.back().result) { g_cov[C_TABLE_FULL]++; break; }
@@ -1682,7 +1752,11 @@ static bool compare(int m, int scen) {
     else if (a.data != b.data) {
         what = ".data";
         for (size_t i = 0; i < a.data.size(); i++)
-            if (a.data[i] != b.data[i]) { printf("    .data differs at %08x (%s): %02x vs %02x\n", (unsigned)(DATA_AT + i), grange_of((uint32_t)(DATA_AT + i)), a.data[i], b.data[i]); break; }
+            if (a.data[i] != b.data[i]) {
+                if (i >= DATA_SIZE) printf("    the moved open-file table differs at +0x%x: %02x vs %02x\n", (unsigned)(i - DATA_SIZE), a.data[i], b.data[i]);
+                else printf("    .data differs at %08x (%s): %02x vs %02x\n", (unsigned)(DATA_AT + i), grange_of((uint32_t)(DATA_AT + i)), a.data[i], b.data[i]);
+                break;
+            }
     } else if (a.mono != b.mono) what = "the mono memory";
     else if (a.arena != b.arena) {
         what = "the arena";
@@ -1719,6 +1793,602 @@ static long check_error_strings() {
     printf("Win32GetErrorString(int): %ld codes, %ld differ\n", n, bad);
     return bad;
 }
+
+#ifdef FIX_TESTS
+// ---- the fixes (built with /DFIX_TESTS: the rewrites as the game has them) ---------------------------------------------------
+// The user directory (get_user_directory: <race.exe's folder>\Config\, the old one copied in once), the log
+// (log_file_begin: <race.exe's folder>\log\log.log; FileVerifyNoOpenFiles skips it) and FileReadLine's bare-LF lines.
+// race.exe's folder is a fake one in the sandbox (GetModuleFileNameA's slot), %LOCALAPPDATA% (the VirtualStore) is
+// the sandbox's too, and the stubs' own confinement puts "C:\Program Files\..." in the sandbox's _drv_c.
+static int g_fix_bad, g_fix_checks;
+#define FIX_CHECK(cond, ...)                                                                                     \
+    do {                                                                                                         \
+        g_fix_checks++;                                                                                          \
+        if (!(cond)) {                                                                                           \
+            g_fix_bad++;                                                                                         \
+            printf("  FAIL (line %d): ", __LINE__);                                                              \
+            printf(__VA_ARGS__);                                                                                 \
+            printf("\n");                                                                                        \
+        }                                                                                                        \
+    } while (0)
+
+static void mk_dirs(const std::string& path) {                         // every folder of an absolute path
+    for (size_t i = 3; i <= path.size(); i++)
+        if (i == path.size() || path[i] == '\\') CreateDirectoryA(path.substr(0, i).c_str(), 0);
+}
+static void put_abs(const std::string& path, const std::string& data, DWORD attrs = 0) {
+    mk_dirs(path.substr(0, path.rfind('\\')));
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) { printf("can't make %s (%lu)\n", path.c_str(), GetLastError()); ExitProcess(3); }
+    DWORD put;
+    if (!data.empty()) WriteFile(h, data.data(), (DWORD)data.size(), &put, 0);
+    CloseHandle(h);
+    if (attrs) SetFileAttributesA(path.c_str(), attrs);
+}
+static bool is_dir(const std::string& p) {
+    const DWORD a = GetFileAttributesA(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+static bool is_file(const std::string& p) {
+    const DWORD a = GetFileAttributesA(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+// a tree's folders and files: names, sizes, bytes, the read-only flag; `all`: every attribute and the creation and
+// last-write times too (for "untouched")
+static void tree_rec(const std::string& dir, const std::string& rel, bool all, std::vector<std::string>& out) {
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        const std::string p = dir + "\\" + fd.cFileName, r = rel + fd.cFileName;
+        const bool d = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        char line[600];
+        uint32_t hh = 0;
+        if (!d) {
+            HANDLE f = CreateFileA(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+            std::vector<uint8_t> b(fd.nFileSizeLow);
+            DWORD got = 0;
+            if (f != INVALID_HANDLE_VALUE) {
+                if (!b.empty()) ReadFile(f, b.data(), (DWORD)b.size(), &got, 0);
+                CloseHandle(f);
+                hh = hash_bytes(b.data(), got);
+            } else hh = 0xbadf11e;
+        }
+        const DWORD a = all ? fd.dwFileAttributes : fd.dwFileAttributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_DIRECTORY);
+        WIN32_FILE_ATTRIBUTE_DATA fa = {};             // (the entry's own times: a search's copy of a folder's is lazy)
+        if (all) GetFileAttributesExA(p.c_str(), GetFileExInfoStandard, &fa);
+        if (all)
+            snprintf(line, sizeof line, "%s%s [%lx] %lu %08x %08lx%08lx %08lx%08lx", r.c_str(), d ? "\\" : "", a, fd.nFileSizeLow,
+                     hh, fa.ftCreationTime.dwHighDateTime, fa.ftCreationTime.dwLowDateTime, fa.ftLastWriteTime.dwHighDateTime,
+                     fa.ftLastWriteTime.dwLowDateTime);
+        else
+            snprintf(line, sizeof line, "%s%s [%lx] %lu %08x", r.c_str(), d ? "\\" : "", a, fd.nFileSizeLow, hh);
+        out.push_back(line);
+        if (d) tree_rec(p, r + "\\", all, out);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+static std::vector<std::string> tree(const std::string& dir, bool all = false) {
+    std::vector<std::string> v;
+    tree_rec(dir, "", all, v);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+static std::string join(const std::vector<std::string>& v) {
+    std::string s;
+    for (auto& x : v) s += "      " + x + "\n";
+    return s;
+}
+
+static const char k_stock_dir[] = "C:\\Program Files\\MGI\\Viper98\\";   // the literal at 0x4e5fcc, stock
+static std::string g_fx;                               // the fix tests' folder in the sandbox (with a backslash)
+static char g_tmp[MAX_PATH];
+
+// a clean start: the image's .data, the sandbox, the file table, the log's statics (a recording sink), the cwd
+static void fix_begin() {
+    pass_begin(1, 1);
+    g_logf_text.clear();
+    *(void**)0x004e5a20 = (void*)&st_sink;
+    *(void**)0x004e5a24 = (void*)&st_sink_end;
+    *(int32_t*)0x00505e58 = 1;
+    *(int32_t*)0x00505e98 = 1;
+    *(uint8_t*)0x004e5a1c = 1;
+    ((void(__cdecl*)())0x00411540)();                  // FileBegin (the original)
+    g_fx = std::string(g_sb) + "\\fx\\";
+    mk_dirs(g_fx + "game");
+    g_fake_exe = g_fx + "game\\race.exe";
+    SetEnvironmentVariableA("LOCALAPPDATA", (g_fx + "appdata").c_str());
+    SetCurrentDirectoryA(g_sb);
+}
+static void fix_end() {
+    SetCurrentDirectoryA(g_sb);
+    pass_end();
+}
+static std::string ud() { return std::string(g_user_dir); }
+// get_user_directory with the image's literal `lit` (a string no longer than the stock one: it is written in place)
+static uint8_t user_dir_with(const char* lit) {
+    strcpy((char*)0x004e5fcc, lit);
+    memset(g_user_dir, 0xcc, 0x104);
+    g_logf_text.clear();
+    return get_user_directory_rw();
+}
+static bool logged(const std::string& s) { return g_logf_text.find(s) != std::string::npos; }
+
+// the files an old user directory might hold (a read-only one, a deep tree, a binary)
+static void make_old(const std::string& dir, const char* tag) {
+    put_abs(dir + "options.cfg", std::string("[video]\r\nresolution 640x480\r\n; ") + tag + "\r\n");
+    std::string sco(0x114c8, 0);
+    for (size_t i = 0; i < sco.size(); i++) sco[i] = (char)(i * 7 + tag[0]);
+    put_abs(dir + "bemidji.sco", sco);
+    put_abs(dir + "ghostcar\\bemidjiviper.gst", std::string("ghost ") + tag);
+    put_abs(dir + "setups\\bemidji.csu", std::string(0xd4, 'S'));
+    put_abs(dir + "paint1.tex", std::string("paint ") + tag, FILE_ATTRIBUTE_READONLY);
+    put_abs(dir + "deep\\a\\b\\c.txt", tag);
+    mk_dirs(dir + "empty");
+}
+
+static void fix_user_directory_tests() {
+    // 1. stock literal; the VirtualStore's Program Files copy, its Program Files (x86) copy and the real folder all
+    //    there: the first is copied, whole, once; none of them is touched
+    {
+        fix_begin();
+        const std::string game = g_fx + "game\\", cfg = game + "Config\\";
+        const std::string vs1 = g_fx + "appdata\\VirtualStore\\Program Files\\MGI\\Viper98\\";
+        const std::string vs2 = g_fx + "appdata\\VirtualStore\\Program Files (x86)\\MGI\\Viper98\\";
+        const std::string real = std::string(g_sb) + "\\_drv_c\\Program Files\\MGI\\Viper98\\";
+        make_old(vs1, "vs1");
+        make_old(vs2, "vs2");
+        make_old(real, "real");
+        const auto before1 = tree(vs1, true), before2 = tree(vs2, true), before3 = tree(real, true);
+        FIX_CHECK(user_dir_with(k_stock_dir) == 1, "get_user_directory didn't return 1");
+        FIX_CHECK(ud() == cfg, "the user directory is %s, not %s", ud().c_str(), cfg.c_str());
+        FIX_CHECK(tree(cfg) == tree(vs1), "the new user directory isn't the VirtualStore's copy:\n    new:\n%s    old:\n%s",
+                  join(tree(cfg)).c_str(), join(tree(vs1)).c_str());
+        FIX_CHECK(tree(vs1, true) == before1 && tree(vs2, true) == before2 && tree(real, true) == before3,
+                  "an old user directory changed");
+        FIX_CHECK(logged("fix: user directory " + cfg + " (copied 6 files from " + vs1 + ")"), "logged: %s", g_logf_text.c_str());
+        FIX_CHECK(g_texts.find("log: Config Dir: " + cfg) != std::string::npos, "the log didn't get \"Config Dir: %s\": %s",
+                  cfg.c_str(), g_texts.c_str());
+        // the game writes to its new user directory, and something new appears in the old one: never copied again
+        put_abs(cfg + "options.cfg", "[video]\r\nresolution 1920x1080\r\n");
+        put_abs(vs1 + "career1.dat", "new in the old folder");
+        const auto now = tree(cfg), old_now = tree(vs1, true);
+        FIX_CHECK(user_dir_with(k_stock_dir) == 1 && ud() == cfg, "second run: the user directory is %s", ud().c_str());
+        FIX_CHECK(tree(cfg) == now, "second run: the new user directory changed");
+        FIX_CHECK(tree(vs1, true) == old_now, "second run: the old user directory changed");
+        FIX_CHECK(logged("fix: user directory " + cfg + " (already there)"), "second run logged: %s", g_logf_text.c_str());
+        fix_end();
+    }
+    // 2. only the Program Files (x86) VirtualStore copy
+    {
+        fix_begin();
+        const std::string cfg = g_fx + "game\\Config\\";
+        const std::string vs2 = g_fx + "appdata\\VirtualStore\\Program Files (x86)\\MGI\\Viper98\\";
+        make_old(vs2, "x86");
+        const auto before = tree(vs2, true);
+        FIX_CHECK(user_dir_with(k_stock_dir) == 1 && ud() == cfg, "(x86): the user directory is %s", ud().c_str());
+        FIX_CHECK(tree(cfg) == tree(vs2), "(x86): the new user directory isn't the old one");
+        FIX_CHECK(tree(vs2, true) == before, "(x86): the old user directory changed:\n    before:\n%s    after:\n%s",
+                  join(before).c_str(), join(tree(vs2, true)).c_str());
+        FIX_CHECK(logged("(copied 6 files from " + vs2 + ")"), "(x86) logged: %s", g_logf_text.c_str());
+        fix_end();
+    }
+    // 3. only the real C:\Program Files\MGI\Viper98\ (a game once run elevated, or XP)
+    {
+        fix_begin();
+        const std::string cfg = g_fx + "game\\Config\\";
+        const std::string real = std::string(g_sb) + "\\_drv_c\\Program Files\\MGI\\Viper98\\";
+        make_old(real, "real");
+        const auto before = tree(real, true);
+        FIX_CHECK(user_dir_with(k_stock_dir) == 1 && ud() == cfg, "(real): the user directory is %s", ud().c_str());
+        FIX_CHECK(tree(cfg) == tree(real), "(real): the new user directory isn't the old one");
+        FIX_CHECK(tree(real, true) == before, "(real): the old user directory changed");
+        FIX_CHECK(logged(std::string("(copied 6 files from ") + k_stock_dir + ")"), "(real) logged: %s", g_logf_text.c_str());
+        fix_end();
+    }
+    // 4. no old user directory anywhere: a new, empty one
+    {
+        fix_begin();
+        const std::string cfg = g_fx + "game\\Config\\";
+        FIX_CHECK(user_dir_with(k_stock_dir) == 1 && ud() == cfg, "(none): the user directory is %s", ud().c_str());
+        FIX_CHECK(is_dir(cfg) && tree(cfg).empty(), "(none): the new user directory isn't there and empty");
+        FIX_CHECK(logged(std::string("(new; no old user directory at ") + k_stock_dir + ")"), "(none) logged: %s", g_logf_text.c_str());
+        fix_end();
+    }
+    // 5. vrmod's relative "Config\": started from the game's folder it is the new one (nothing to copy; and with its
+    //    files already there, nothing happens); started from elsewhere, that folder's Config\ is copied
+    {
+        fix_begin();
+        const std::string game = g_fx + "game\\", cfg = game + "Config\\";
+        SetCurrentDirectoryA(game.c_str());
+        FIX_CHECK(user_dir_with("Config\\") == 1 && ud() == cfg, "(relative, same): the user directory is %s", ud().c_str());
+        FIX_CHECK(is_dir(cfg) && tree(cfg).empty(), "(relative, same): the new user directory isn't there and empty");
+        FIX_CHECK(logged("(new; the old user directory " + cfg + " is this one)"), "(relative, same) logged: %s", g_logf_text.c_str());
+        fix_end();
+        fix_begin();
+        make_old(cfg, "vrmod");
+        const auto before = tree(cfg, true);
+        SetCurrentDirectoryA(game.c_str());
+        FIX_CHECK(user_dir_with("Config\\") == 1 && ud() == cfg, "(relative, there): the user directory is %s", ud().c_str());
+        FIX_CHECK(tree(cfg, true) == before, "(relative, there): the user directory changed");
+        FIX_CHECK(logged("(already there)"), "(relative, there) logged: %s", g_logf_text.c_str());
+        fix_end();
+        fix_begin();
+        const std::string other = g_fx + "elsewhere\\";
+        make_old(other + "Config\\", "cwd");
+        const auto before2 = tree(other, true);
+        SetCurrentDirectoryA(other.c_str());
+        FIX_CHECK(user_dir_with("Config\\") == 1 && ud() == cfg, "(relative, elsewhere): the user directory is %s", ud().c_str());
+        FIX_CHECK(tree(cfg) == tree(other + "Config\\"), "(relative, elsewhere): the new user directory isn't the old one");
+        FIX_CHECK(tree(other, true) == before2, "(relative, elsewhere): the old user directory changed");
+        FIX_CHECK(logged("(copied 6 files from " + other + "Config\\)"), "(relative, elsewhere) logged: %s", g_logf_text.c_str());
+        fix_end();
+    }
+    // 6. the guard: <folder>Config\ of exactly 200 characters is taken, 201 keeps the literal (nothing made or
+    //    copied); so do a failed or cut-short GetModuleFileNameA
+    for (int extra = 0; extra < 2; extra++) {
+        fix_begin();
+        make_old(std::string(g_sb) + "\\_drv_c\\Program Files\\MGI\\Viper98\\", "real");
+        std::string game = g_fx;                       // pad to <game>\ + "Config\" = 200 + extra
+        const size_t want = 200 + extra - 7;           // the folder's length with its backslash
+        while (game.size() < want) {
+            const size_t room = want - game.size() - 1;   // (each component ends with a backslash; none is empty)
+            game += std::string(room > 100 ? (room - 100 >= 2 ? 100 : room - 2) : room, 'p') + "\\";
+        }
+        mk_dirs(game.substr(0, game.size() - 1));
+        g_fake_exe = game + "race.exe";
+        const std::string cfg = game + "Config\\";
+        const uint8_t r = user_dir_with(k_stock_dir);
+        if (extra == 0) {
+            FIX_CHECK(r == 1 && ud() == cfg && cfg.size() == 200, "(200 characters): the user directory is %s (%u)", ud().c_str(),
+                      (unsigned)ud().size());
+            FIX_CHECK(tree(cfg) == tree(std::string(g_sb) + "\\_drv_c\\Program Files\\MGI\\Viper98\\"), "(200 characters): not copied");
+        } else {
+            FIX_CHECK(r == 1 && ud() == k_stock_dir, "(201 characters): the user directory is %s, not the literal", ud().c_str());
+            FIX_CHECK(!is_dir(cfg), "(201 characters): %s was made", cfg.c_str());
+            FIX_CHECK(logged("would be 201 characters (the game takes 200); keeping " + std::string(k_stock_dir)),
+                      "(201 characters) logged: %s", g_logf_text.c_str());
+        }
+        fix_end();
+    }
+    {
+        fix_begin();
+        g_fake_exe = "";
+        FIX_CHECK(user_dir_with(k_stock_dir) == 1 && ud() == k_stock_dir, "(no exe path): the user directory is %s", ud().c_str());
+        FIX_CHECK(logged("race.exe's folder not found; keeping"), "(no exe path) logged: %s", g_logf_text.c_str());
+        g_fake_exe = g_fx + std::string(300, 'q') + "\\race.exe";   // GetModuleFileNameA cuts it short
+        FIX_CHECK(user_dir_with(k_stock_dir) == 1 && ud() == k_stock_dir, "(cut short): the user directory is %s", ud().c_str());
+        fix_end();
+    }
+    strcpy((char*)0x004e5fcc, k_stock_dir);
+}
+
+static void fix_log_tests() {
+    typedef int(__cdecl* Open_t)(const char*);
+    const Open_t file_open = (Open_t)0x00411780;
+    // the log in <race.exe's folder>\log\, the folder made; FileVerifyNoOpenFiles skips it (and only it)
+    for (int again = 0; again < 2; again++) {
+        fix_begin();
+        const std::string logdir = g_fx + "game\\log", path = logdir + "\\log.log";
+        if (again) mk_dirs(logdir);                    // (the folder already there)
+        FIX_CHECK(log_file_begin_rw() == 1, "log_file_begin failed");
+        const int f = g_log_file;
+        FIX_CHECK(f > 0 && is_file(path) && path == file_at(m1_operand(0x00411583), f - 1)->name, "the log isn't %s (file %d: %s)", path.c_str(), f,
+                  f > 0 ? file_at(m1_operand(0x00411583), f - 1)->name : "-");
+        FIX_CHECK(logged("fix: the game's log is " + path), "logged: %s", g_logf_text.c_str());
+        const int other = file_open("a.txt");
+        g_texts.clear();
+        FileVerifyNoOpenFiles_rw();
+        FIX_CHECK(other > 0 && g_texts == "log: Handle to a.txt was never freed.\n", "FileVerifyNoOpenFiles reported: %s", g_texts.c_str());
+        fix_end();
+    }
+    // a folder too long for the file table's names: the literal, as the original (the stubs put it in _drv_c)
+    {
+        fix_begin();
+        g_fake_exe = g_fx + std::string(250 - g_fx.size() - 1, 'r') + "\\race.exe";   // a 250-character folder
+        FIX_CHECK(log_file_begin_rw() == 1, "(long) log_file_begin failed");
+        const int f = g_log_file;
+        FIX_CHECK(f > 0 && !strcmp(file_at(m1_operand(0x00411583), f - 1)->name, "c:\\log.log") && is_file(std::string(g_sb) + "\\_drv_c\\log.log") &&
+                      s_log_path[0] == 0, "(long): the log isn't c:\\log.log");
+        FIX_CHECK(logged("the game's log stays at c:\\log.log"), "(long) logged: %s", g_logf_text.c_str());
+        const int other = file_open("a.txt");
+        g_texts.clear();
+        FileVerifyNoOpenFiles_rw();
+        FIX_CHECK(other > 0 && g_texts == "log: Handle to a.txt was never freed.\n", "(long) FileVerifyNoOpenFiles reported: %s",
+                  g_texts.c_str());
+        fix_end();
+    }
+}
+
+// FileReadLine as the fix has it: from `at` in `s`, into buf[0..n): {return, bytes consumed, buffer}. A CRLF line's '\r'
+// is cut (the original's behaviour), a bare LF line keeps every character, nothing is written outside buf[0..n).
+struct LineModel { uint8_t r; size_t used; std::string buf; };
+static LineModel line_model(const std::string& s, size_t at, int n, const std::string& prior) {
+    LineModel m{0, 0, prior};
+    if (n <= 0) return m;
+    int i = 0;
+    while (at + m.used < s.size()) {
+        const char c = s[at + m.used++];
+        if (c == '\n') {
+            if (i > 0 && m.buf[i - 1] == '\r') m.buf[i - 1] = 0;
+            m.buf[i] = 0;
+            m.r = 1;
+            return m;
+        }
+        m.buf[i++] = c;
+        if (i >= n) return m;
+    }
+    return m;
+}
+static std::string rand_line(bool cr_inside) {
+    std::string l;
+    const int len = chance(15) ? 0 : chance(10) ? ri(40, 90) : ri(1, 12);
+    for (int i = 0; i < len; i++) {
+        const int k = ri(0, 60);
+        l += cr_inside && k == 0 ? '\r' : k == 1 ? '\t' : (char)ri(0x20, 0x7e);
+    }
+    return l;
+}
+static void fix_read_line_tests() {
+    typedef uint8_t(__cdecl* ReadLine_t)(int, char*, int);
+    typedef int(__cdecl* Open_t)(const char*);
+    const ReadLine_t orig = (ReadLine_t)0x004119b0;
+    const Open_t file_open = (Open_t)0x00411780;
+    typedef void(__cdecl* Close_t)(int*);
+    const Close_t file_close = (Close_t)0x00411850;
+    enum { GUARD = 16, CAP = 160 };
+    long files = 0, calls[2] = {0, 0}, underruns = 0, bad_crlf = 0, bad_model = 0, lf_lines = 0, exact = 0;
+    // the explicit cases first: the fixture's bare-LF file, and exact buffer lengths
+    {
+        fix_begin();
+        const int f = file_open("lf.txt");                 // "\nsecond\nthird line\n\nfifth"
+        char* b = (char*)abuf(GUARD);
+        const char* want[] = {"", "second", "third line", ""};
+        for (int k = 0; k < 4; k++) {
+            memset(b - GUARD, 0x5a, 64 + 2 * GUARD);
+            const uint8_t r = FileReadLine_rw(f, b, 64);
+            FIX_CHECK(r == 1 && !strcmp(b, want[k]) && b[-1] == 0x5a, "lf.txt line %d: %d \"%s\" (before the buffer: %02x)", k, r, b,
+                      (uint8_t)b[-1]);
+        }
+        memset(b - GUARD, 0x5a, 64 + 2 * GUARD);
+        FIX_CHECK(FileReadLine_rw(f, b, 64) == 0 && !memcmp(b, "fifth", 5) && b[5] == 0x5a, "lf.txt: the last line");
+        int ff = f;
+        file_close(&ff);
+        // n = 8: a line that fills n - 1 bytes (LF: 7 characters; CRLF: 6 and its '\r') is read whole; one that
+        // fills all 8 returns 0 unterminated, and its '\n' is then read as an empty line -- which the original ended by
+        // writing buf[-1] (for CRLF too: the '\r' was the buffer's last byte)
+        for (int crlf = 0; crlf < 2; crlf++) {
+            const std::string text = crlf ? "abcdef\r\nabcdefg\r\n" : "abcdefg\nabcdefgh\n";
+            const char* const tag = crlf ? "CRLF" : "LF";
+            put_file("exact.txt", text.data(), text.size(), 0);
+            const int g = file_open("exact.txt");
+            const int n = 8;
+            memset(b - GUARD, 0x5a, n + 2 * GUARD);
+            uint8_t r = FileReadLine_rw(g, b, n);
+            FIX_CHECK(r == 1 && !strcmp(b, crlf ? "abcdef" : "abcdefg") && b[-1] == 0x5a, "exact (%s): the n - 1 line: %d \"%s\"", tag, r, b);
+            memset(b - GUARD, 0x5a, n + 2 * GUARD);
+            r = FileReadLine_rw(g, b, n);
+            FIX_CHECK(r == 0 && !memcmp(b, crlf ? "abcdefg\r" : "abcdefgh", 8) && b[-1] == 0x5a && b[8] == 0x5a,
+                      "exact (%s): the full line: %d", tag, r);
+            memset(b - GUARD, 0x5a, n + 2 * GUARD);
+            r = FileReadLine_rw(g, b, n);
+            FIX_CHECK(r == 1 && b[0] == 0 && b[-1] == 0x5a && b[1] == 0x5a,
+                      "exact (%s): the lone '\\n' after a full buffer: %d, before the buffer %02x", tag, r, (uint8_t)b[-1]);
+            memset(b - GUARD, 0x5a, n + 2 * GUARD);
+            FIX_CHECK(FileReadLine_rw(g, b, n) == 0 && b[0] == 0x5a, "exact (%s): the end", tag);
+            ff = g;
+            file_close(&ff);
+        }
+        fix_end();
+    }
+    // random files: CRLF-only ones must read exactly as the original (bytes, return, position) -- apart from the
+    // original's write before the buffer when a call starts at a '\n' (a CRLF line split after its '\r'), where the
+    // fix leaves that byte alone; LF-only and mixed ones must read as the model says
+    for (int round = 0; round < 40; round++) {
+        fix_begin();
+        for (int it = 0; it < 60; it++, files++) {
+            const int kind = it % 3;                       // 0 CRLF, 1 bare LF, 2 mixed
+            std::string text;
+            const int nl = ri(0, 12);
+            for (int k = 0; k < nl; k++) {
+                text += rand_line(kind == 0 || kind == 2);
+                text += kind == 0 ? "\r\n" : kind == 1 ? "\n" : chance(50) ? "\r\n" : "\n";
+            }
+            if (chance(50)) text += rand_line(kind != 1);
+            put_file("rl.txt", text.data(), text.size(), 0);
+            const int fa = file_open("rl.txt"), fb = file_open("rl.txt");
+            size_t pos = 0;
+            for (int call = 0; call < 200; call++) {
+                // n: random, or around the next line's length (exact fits and full buffers)
+                size_t next = text.find('\n', pos);
+                const int line_len = (int)((next == std::string::npos ? text.size() : next) - pos);
+                const int pick_n = ri(0, 9);
+                int n = pick_n < 3 ? line_len + pick_n : pick_n == 3 ? line_len : pick_n == 4 ? ri(0, 2) : ri(1, 100);
+                if (n > CAP) n = CAP;
+                if (n == line_len || n == line_len + 1) exact++;
+                char* ba = (char*)abuf(GUARD);
+                char* bb = (char*)abuf(0x1000 + GUARD);
+                for (int k = 0; k < CAP + 2 * GUARD; k++) ba[k - GUARD] = bb[k - GUARD] = (char)(0xa0 + (k & 15));
+                const std::string prior(bb, CAP);
+                const uint8_t rb = FileReadLine_rw(fb, bb, n);
+                calls[1]++;
+                const DWORD posb = kSetFilePointer(FH(m1_operand(0x00411555), fb - 1), 0, 0, FILE_CURRENT);
+                if (kind == 0) {
+                    const uint8_t ra = orig(fa, ba, n);
+                    calls[0]++;
+                    const DWORD posa = kSetFilePointer(FH(m1_operand(0x00411555), fa - 1), 0, 0, FILE_CURRENT);
+                    const bool starts_lf = pos < text.size() && text[pos] == '\n' && n > 0;
+                    if (starts_lf && ba[-1] == 0 && bb[-1] == (char)(0xa0 + ((GUARD - 1) & 15))) {
+                        underruns++;
+                        ba[-1] = bb[-1];                   // (the original's write before the buffer: the fix's one change)
+                    }
+                    if ((ra != rb || posa != posb || memcmp(ba - GUARD, bb - GUARD, CAP + 2 * GUARD)) && bad_crlf++ < 5)
+                        printf("  FAIL CRLF file %ld call %d (n %d, at %u): original %d at %lu, fix %d at %lu, buffers %s\n", files, call, n,
+                               (unsigned)pos, ra, posa, rb, posb, memcmp(ba - GUARD, bb - GUARD, CAP + 2 * GUARD) ? "differ" : "same");
+                }
+                const LineModel m = line_model(text, pos, n, prior);
+                const bool guards_ok = [&]() {
+                    for (int k = -GUARD; k < 0; k++)
+                        if (bb[k] != (char)(0xa0 + ((k + GUARD) & 15))) return false;
+                    for (int k = n > 0 ? n : 0; k < CAP + GUARD; k++)
+                        if (bb[k] != (char)(0xa0 + ((k + GUARD) & 15))) return false;
+                    return true;
+                }();
+                if (kind != 0 && m.r == 1 && (int)m.used > 0) lf_lines++;
+                if ((rb != m.r || posb != pos + m.used || memcmp(bb, m.buf.data(), n > 0 ? n : 0) || !guards_ok) && bad_model++ < 5)
+                    printf("  FAIL %s file %ld call %d (n %d, at %u): %d at %lu, the model %d at %u, buffer %s, guards %s\n",
+                           kind == 0 ? "CRLF" : kind == 1 ? "LF" : "mixed", files, call, n, (unsigned)pos, rb, posb, m.r,
+                           (unsigned)(pos + m.used), memcmp(bb, m.buf.data(), n > 0 ? n : 0) ? "differs" : "same", guards_ok ? "intact" : "WRITTEN");
+                pos = posb;
+                if (pos >= text.size() && rb == 0) break;
+            }
+            int x = fa, y = fb;
+            file_close(&x);
+            file_close(&y);
+        }
+        fix_end();
+    }
+    g_fix_checks += 2;
+    g_fix_bad += (bad_crlf != 0) + (bad_model != 0);
+    printf("  FileReadLine: %ld random files, %ld calls (%ld against the original on CRLF files: %ld differ; %ld where the original "
+           "wrote before the buffer), %ld bare-LF lines, %ld exact-length buffers; %ld differ from the model\n",
+           files, calls[1], calls[0], bad_crlf, underruns, lf_lines, exact, bad_model);
+}
+
+// the open-file table as M1 moves it (the stock one must stay untouched)
+static bool zeros(const uint8_t* p, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (p[i]) return false;
+    return true;
+}
+static int slot_of_handle_count() {                    // slots holding a handle
+    int k = 0;
+    for (int i = 0; i < VP_LIFT_FILES; i++)
+        if (*(HANDLE*)(g_moved + i * 0x104 + 0x100) != INVALID_HANDLE_VALUE) k++;
+    return k;
+}
+static void fix_file_table_tests() {
+    move_file_table(true);
+    g_granges[sizeof g_granges / sizeof *g_granges - 1] = {(uint32_t)(uintptr_t)g_moved, MOVED_SPAN, "the open-file table, moved"};
+    const uint8_t* stock = (const uint8_t*)0x00505ea8;
+    // 1. the rewrites, chained as in the game: 300 files, 256 open at once
+    {
+        fix_begin();
+        g_mode = 2;
+        chain_patch();
+        FIX_CHECK(slot_of_handle_count() == 0 && zeros(g_moved + MOVED_BYTES, MOVED_SPAN - MOVED_BYTES),
+                  "FileBegin (the original, moved): every slot free");
+        std::vector<int> fs;
+        int bad_read = 0, panic_at = -1;
+        for (int i = 0; i < 300; i++) {
+            char nm[32], body[64];
+            snprintf(nm, sizeof nm, "tbl%03d.txt", i);
+            const int len = snprintf(body, sizeof body, "file %d of the moved table", i);
+            put_file(nm, body, (size_t)len, 0);
+            const int f = (int)CALL(FileOpen_rw, (const char*)astr(nm));
+            if (g_cur->trace.back().result) { panic_at = i; break; }
+            fs.push_back(f);
+        }
+        std::vector<int> sorted = fs;
+        std::sort(sorted.begin(), sorted.end());
+        bool distinct = std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end() && !sorted.empty() && sorted.front() == 1 &&
+                        sorted.back() == VP_LIFT_FILES;
+        for (size_t i = 0; i < fs.size(); i++) {
+            char want[64];
+            const int len = snprintf(want, sizeof want, "file %d of the moved table", (int)i);
+            uint8_t* b = abuf(0);
+            memset(b, 0, 64);
+            const int size = (int)CALL(FileSize_rw, fs[i]);
+            const uint8_t ok = (uint8_t)CALL(FileReadExact_rw, fs[i], (void*)b, len);
+            if (size != len || !ok || memcmp(b, want, len)) bad_read++;
+        }
+        const int held = slot_of_handle_count();
+        FIX_CHECK((int)fs.size() == VP_LIFT_FILES && panic_at == VP_LIFT_FILES && distinct && !bad_read && held == VP_LIFT_FILES,
+                  "the rewrites: %d files open (Files 1..%d distinct: %d), the next %s, %d read back wrong, %d slots held",
+                  (int)fs.size(), VP_LIFT_FILES, distinct, panic_at == VP_LIFT_FILES ? "panics (MAX_FILES)" : "DOESN'T", bad_read, held);
+        *acell(1) = fs[77];
+        CALL(FileClose_rw, acell(1));
+        const int again = (int)CALL(FileOpen_rw, (const char*)astr("tbl000.txt"));
+        FIX_CHECK(again == fs[77], "a slot freed in the full table is reused: File %d (want %d)", again, fs[77]);
+        for (size_t i = 0; i < fs.size(); i++) {
+            *acell(1) = fs[i];
+            CALL(FileClose_rw, acell(1));
+        }
+        CALL0(FileVerifyNoOpenFiles_rw);
+        FIX_CHECK(slot_of_handle_count() == 0 && zeros(g_moved + MOVED_BYTES, MOVED_SPAN - MOVED_BYTES) && zeros(stock, 32 * 0x104),
+                  "all closed: %d slots held; nothing past the moved table; the stock table untouched: %d", slot_of_handle_count(),
+                  zeros(stock, 32 * 0x104));
+        fix_end();
+    }
+    // 2. the originals on the moved table (their footprints checked: the rewrites' footprints must cover them)
+    {
+        fix_begin();
+        g_mode = 0;
+        int n = 0, panic_at = -1;
+        for (int i = 0; i < 140; i++) {
+            char nm[32];
+            snprintf(nm, sizeof nm, "orig%03d.txt", i);
+            put_file(nm, "x", 1, 0);
+            const int f = (int)CALL(FileOpen_rw, (const char*)astr(nm));
+            if (g_cur->trace.back().result) { panic_at = i; break; }
+            n++;
+            *acell(10 + i) = f;
+        }
+        FIX_CHECK(n == 0x7f && panic_at == 0x7f && *(int32_t*)0x00505ea0 == 0x7f,
+                  "the originals: %d files open (the imm8's 127), the next %s", n, panic_at == 0x7f ? "panics" : "DOESN'T");
+        CALL(FileClose_rw, acell(10 + 40));
+        const int again = (int)CALL(FileOpen_rw, (const char*)astr("orig000.txt"));
+        FIX_CHECK(again == 41, "the originals reuse a freed slot: File %d (want 41)", again);
+        // 3. mixed: the rewrite (the whole table) after the originals' 127
+        g_mode = 1;
+        int m = 0;
+        for (int i = 0; i < 140; i++) {
+            put_file("mixed.txt", "y", 1, 0);
+            const int f = (int)CALL(FileOpen_rw, (const char*)astr("mixed.txt"));   // (FileOpen_rw calls the ORIGINAL alloc_file)
+            if (g_cur->trace.back().result) break;
+            (void)f;
+            m++;
+        }
+        FIX_CHECK(m == 0, "FileOpen's rewrite with the original alloc_file: still the original's limit (%d more)", m);
+        int k = 0;
+        for (int i = 0; i < 140; i++) {
+            const int s = (int)CALL(alloc_file_rw, (const char*)astr("fake"), (HANDLE)(uintptr_t)(0x70000 + i));
+            if (g_cur->trace.back().result) break;
+            if (s != 0x7f + i) break;
+            k++;
+        }
+        FIX_CHECK(k == VP_LIFT_FILES - 0x7f && *(int32_t*)0x00505ea0 == VP_LIFT_FILES &&
+                      zeros(g_moved + MOVED_BYTES, MOVED_SPAN - MOVED_BYTES) && zeros(stock, 32 * 0x104),
+                  "alloc_file's rewrite after them: slots 127..%d (%d), then its panic; nothing past the table, the stock one "
+                  "untouched", 0x7f + k - 1, k);
+        for (int i = 0; i < VP_LIFT_FILES; i++) *(HANDLE*)(g_moved + i * 0x104 + 0x100) = INVALID_HANDLE_VALUE;   // (the fakes)
+        fix_end();
+    }
+    move_file_table(false);
+    g_granges[sizeof g_granges / sizeof *g_granges - 1] = {0, 0, "the open-file table, moved"};
+}
+
+static int fix_tests() {
+    g_logf_quiet = true;
+    GetTempPathA(MAX_PATH, g_tmp);
+    fix_user_directory_tests();
+    printf("fix build: the user directory: %d checks, %d failed\n", g_fix_checks, g_fix_bad);
+    const int c0 = g_fix_checks, b0 = g_fix_bad;
+    fix_log_tests();
+    printf("fix build: the log: %d checks, %d failed\n", g_fix_checks - c0, g_fix_bad - b0);
+    const int c1 = g_fix_checks, b1 = g_fix_bad;
+    fix_read_line_tests();
+    printf("fix build: FileReadLine: %d checks, %d failed\n", g_fix_checks - c1, g_fix_bad - b1);
+    const int c2 = g_fix_checks, b2 = g_fix_bad;
+    fix_file_table_tests();
+    printf("fix build: the open-file table, moved: %d checks, %d failed\n", g_fix_checks - c2, g_fix_bad - b2);
+    SetCurrentDirectoryA(g_tmp);
+    rm_tree(g_sb);
+    printf("fix build: %d checks, %d failed\n", g_fix_checks, g_fix_bad);
+    return g_fix_bad ? 1 : 0;
+}
+#endif
 
 int main(int argc, char** argv) {
     // never a dialog on the desktop: no Windows error boxes, no CRT message boxes (inherited by the child)
@@ -1762,6 +2432,15 @@ int main(int argc, char** argv) {
     if (!g_arena) g_arena = (uint8_t*)VirtualAlloc(0, ARENA_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     printf("imports: %d stubbed, %d real (KERNEL32), %d trapped; %d fixtures; mono %s; sandbox %s\n", g_nstubbed, g_nreal,
            g_ntrapped, (int)g_fixtures.size(), g_have_mono ? "yes" : "no", g_sb);
+    if (argc > 3 && !strcmp(argv[3], "moved")) {
+        move_file_table(true);
+        g_granges[sizeof g_granges / sizeof *g_granges - 1] = {(uint32_t)(uintptr_t)g_moved, MOVED_SPAN, "the open-file table, moved"};
+        printf("the open-file table moved as M1 moves it: %d slots at %p (alloc_file's imm8 0x7f)\n", VP_LIFT_FILES, g_moved);
+    }
+#ifdef FIX_TESTS
+    (void)scenarios;
+    return fix_tests();
+#endif
     long bad = check_error_strings();
     long ok_scen = 0;
     for (int i = 0; i < scenarios; i++) {

@@ -212,6 +212,7 @@ static bool patch_fields(Field* f, int n, const char* what) {
         *(uint32_t*)p = neu;
         VirtualProtect(p, 4, old, &old);
         FlushInstructionCache(GetCurrentProcess(), p, 4);
+        port_note_m1((uint32_t)p, 4);                                // (a trampoline over it must copy the new value)
     }
     logf("lifted %s (%d fields)", what, n);
     return true;
@@ -387,6 +388,53 @@ static void relocate_texture_table() {
     // then trusted -- and the front end died in txSelect ("unknown wrap mode").
     fields[n + 1] = {0x45a6db, 2, 0xfa, TEX_TABLE};            // tc_lookup: cmp ebx, 250 (not found)
     patch_fields(fields, n + 2, "the texture table, 250 -> 1000");
+}
+
+// ---- M1: the options, language and open-file tables -----------------------------------------------------------------
+// opt.obj keeps the options in a 256-item table (0x90 bytes each, 0x55a078) and find_item appends to it with no bound:
+// the 257th item overwrote the colour constants and the telemetry after it. locale.obj keeps the languages (*.lng) in
+// 8 LangInfos (0x40 bytes each, 0x509438), filled with no bound either: a 9th overwrote the language count. file.obj
+// keeps every open file in 32 slots {char name[0x100]; HANDLE handle} at 0x505ea8, and alloc_file panics when they're
+// all taken ("increase MAX_FILES") -- each loaded resource set keeps its archive open, so that was also the limit of
+// 32 sets at once (fewer: the log and log.cfg hold two).
+// Every instruction that addresses one of the tables -- 10, 6 and 20, and file.obj's two loop ends, listed in
+// res_table_fields.inc (tools/gen_res_tables.py, which also checks that nothing else runs to a table's end or compares
+// with its capacity) -- is repointed at a bigger table here, all or nothing per table. The rewrites (krn_res.cpp,
+// krn_file.cpp) read the same operands (m1_operand) and use the new capacity (VP_LIFT_*).
+// alloc_file's capacity is `cmp edx, 0x20`, an imm8: it can say at most 0x7f. M1 makes it 0x7f, so alloc_file left
+// original (viperport.ini) hands out at most 127 never-used slots and then only reuses free ones below that -- inside
+// the 256-slot table, so safe; its rewrite uses all 256. Either way nothing is written past the table.
+// v1.0 race.exe only: the race.bin builds keep theirs (they have no rewrites to agree with, and their tables aren't in
+// sites_*.inc). Below the old limits nothing changes but where the entries live.
+static uint8_t g_opt_table[VP_LIFT_OPTIONS * 0x90];
+static struct { uint8_t before[0x40]; uint8_t t[VP_LIFT_LANGUAGES * 0x40]; } g_lang_table;   // (index -1: a blank name)
+static uint8_t g_file_table[VP_LIFT_FILES * 0x104];
+
+static void relocate_res_tables() {
+    if (!build_is_v10()) {
+        logf("NOT lifting the options, language and open-file tables: v1.0 race.exe only");
+        return;
+    }
+    struct Ref { uint32_t at; uint8_t off; uint32_t old; int table; };
+    static const Ref refs[] = {
+#include "res_table_fields.inc"
+    };
+    const int n = sizeof refs / sizeof refs[0];
+    static Field opt[sizeof refs / sizeof refs[0]], lang[sizeof refs / sizeof refs[0]], files[sizeof refs / sizeof refs[0] + 1];
+    int nopt = 0, nlang = 0, nfiles = 0;
+    const uint32_t fbase = (uint32_t)g_file_table, fend = fbase + VP_LIFT_FILES * 0x104;
+    for (int i = 0; i < n; i++) {
+        const Ref& r = refs[i];
+        if (r.table == 0) opt[nopt++] = {r.at, r.off, r.old, (uint32_t)g_opt_table + (r.old - 0x55a078)};
+        else if (r.table == 1) lang[nlang++] = {r.at, r.off, r.old, (uint32_t)g_lang_table.t + (r.old - 0x509438)};
+        else if (r.table == 2) files[nfiles++] = {r.at, r.off, r.old, fbase + (r.old - 0x505ea8)};
+        else files[nfiles++] = {r.at, r.off, r.old, fend + (r.old - 0x507f28)};                  // a loop end
+    }
+    // alloc_file: cmp edx, 0x20 (83 FA 20) -- the dword from its imm8 on (20 7D 0B 8B: the jge after it), 0x20 -> 0x7f
+    files[nfiles++] = {0x411650, 2, 0x8b0b7d20, 0x8b0b7d7f};
+    patch_fields(opt, nopt, "the options table, 256 -> 4096 items");
+    patch_fields(lang, nlang, "the languages, 8 -> 64");
+    patch_fields(files, nfiles, "the open-file table, 32 -> 256");
 }
 
 static int peak_textures() {                                    // entries in use at the moment
@@ -635,6 +683,7 @@ static void install() {
     lift_limits();
     lift_texture_limit();
     relocate_texture_table();
+    relocate_res_tables();
     char ini[MAX_PATH];                         // viperport.ini, beside this DLL
     GetModuleFileNameA(g_self, ini, MAX_PATH);
     char* slash = strrchr(ini, '\\');
@@ -654,7 +703,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         char* slash = strrchr(path, '\\');
         lstrcpyA(slash ? slash + 1 : path, "viperport.log");
         g_log = fopen(path, "w");
-        logf("viperport loaded (M1: object limits, texture limit + table; M3: rewritten functions, race recorder)");
+        logf("viperport loaded (M1: object limits, texture limit + table, options + language + open-file tables; M3: rewritten functions, race recorder)");
         install();
     } else if (reason == DLL_PROCESS_DETACH) {
         logf("exit: new Obstacle::Update ran %ld times, woke obstacles %ld times, put them to sleep %ld times",
@@ -664,6 +713,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         logf("exit: highest texture number drawn through the deferred buckets %ld (stock crashes past 118); %ld past %d",
              g_peak_tex, g_tex_overflows, TEX_BUCKETS);
         logf("exit: texture table entries in use at the peak %ld (stock table 250)", g_peak_table);
+        if (build_is_v10())
+            logf("exit: options items %ld (stock table 256), languages %ld (stock 8), open-file slots ever used %ld (stock 32)",
+                 *(volatile LONG*)0x0055a05c, *(volatile LONG*)0x00509638, *(volatile LONG*)0x00505ea0);
         replay_report();
         port_report();
         renderer_report();

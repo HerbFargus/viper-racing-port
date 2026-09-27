@@ -29,6 +29,7 @@
 #include <string.h>
 #include "viperport.h"
 #include "port.h"
+#include "fix_paths.h"
 #include "x87.h"
 #include "phys_types.h"
 
@@ -52,7 +53,8 @@ struct TimerConditioner {
 static_assert(sizeof(TimerConditioner) == 16, "TimerConditioner");
 
 // TimerWatchdog (the one at 0x521668, 0x21c bytes -- the recovered type's 288 is only its last seen use): a
-// histogram of the timer thread's tick-to-tick jitter, written to c:\timer.log by PhysicsStop
+// histogram of the timer thread's tick-to-tick jitter, written to c:\timer.log by PhysicsStop (the FIX: to
+// <race.exe's folder>\log\timer.log; see TimerWatchdog::dump)
 struct TimerWatchdog {
     int32_t ticks;                     // +0x00 tick_begin calls; the first 100 aren't measured
     int32_t measured;                  // +0x04
@@ -1174,9 +1176,18 @@ static void fp_physics_thread(Footprint& f) { f.replay_only = "the timer thread'
 PORT_FN(0x0042c050, "physics_thread", physics_thread_rw, fp_physics_thread)
 
 // ==== TimerWatchdog (0x42c140 dump, 0x42c1e0 init, 0x42c200 tick_end, 0x42c220 tick_begin) =======================
+// FIX: c:\timer.log -- the root of C:, not writable without elevation, so it was never written -- is
+// <race.exe's folder>\log\timer.log instead, the folder made (fix_paths.h; vrmod's patched "log\timer.log" names the
+// same file from the game's folder). A folder too long for the file table's 0x100-byte names keeps the literal.
 static void __fastcall TimerWatchdog_dump_rw(TimerWatchdog* self, Edx) {
     char line[0x80];
-    int file = FileCreate(k_str_timer_log);
+    const char* name = k_str_timer_log;
+    char path[0x100];
+    if (VP_FIX) {
+        if (vp_log_path(path, sizeof path, "timer.log")) name = path;
+        else logf("fix: race.exe's folder isn't known, or is too long for the timer log's path; it stays at %s", name);
+    }
+    int file = FileCreate(name);
     if (!file) {
         LogReport(k_str_timer_fail);
         return;
@@ -1186,7 +1197,7 @@ static void __fastcall TimerWatchdog_dump_rw(TimerWatchdog* self, Edx) {
     if (n) FilePrintf(file, line, k_fmt_timer_avg, n, self->outlier_sum / n);
     FileClose(&file);
 }
-static void fp_watchdog_dump(Footprint& f, TimerWatchdog*, Edx) { f.replay_only = "it writes c:\\timer.log"; }
+static void fp_watchdog_dump(Footprint& f, TimerWatchdog*, Edx) { f.replay_only = "it writes timer.log"; }
 PORT_FN(0x0042c140, "TimerWatchdog::dump", TimerWatchdog_dump_rw, fp_watchdog_dump)
 
 static void __fastcall TimerWatchdog_init_rw(TimerWatchdog* self, Edx) {

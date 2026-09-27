@@ -7,7 +7,8 @@
 //   run:   world_task.exe [worlds] [seed]
 //   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS (or /DVP_TEST_FIXES) -- the rewrites as the game builds them (the
 //   random streams' records fit create_phob's buffer, so they must still match); then create_phob on records bigger
-//   than its buffer, or of a negative size.
+//   than its buffer, or of a negative size; and TimerWatchdog::dump's timer.log in <race.exe's folder>\log\ (its random
+//   check is left out of the worlds: the file name differs; GetModuleFileNameA and CreateDirectoryA are stubs).
 //
 // Loads out\race_v10.exe at 0x400000 the way test/fuzz.cpp does. A world is one tracked arena holding:
 //   * a phob list of up to 12 physics objects of the real classes (PlayCar, Ball, Obstacle, CheckPoint,
@@ -444,7 +445,28 @@ static int __cdecl st_sprintf(char* buf, const char* fmt, ...) {
     logn(L_SPRINTF, P(buf), P(fmt), h, (uint32_t)n);
     return n;
 }
-static int __cdecl st_file_create(const char* name) { logn(L_FILE_CREATE, P(name)); return ctrl()->file_handle; }
+#ifdef VP_TEST_FIXES
+static char g_fc_name[512], g_cd_name[512];         // the last names FileCreate and CreateDirectoryA got
+static const char* g_fake_exe = "C:\\Games\\Viper Racing\\race.exe";   // GetModuleFileNameA(NULL) ("": it fails)
+static uint32_t __stdcall st_modname(void* m, char* buf, uint32_t n) {
+    const uint32_t len = (uint32_t)strlen(g_fake_exe);
+    if (m || !len || !n) return 0;
+    if (len >= n) { memcpy(buf, g_fake_exe, n - 1); buf[n - 1] = 0; return n; }
+    memcpy(buf, g_fake_exe, len + 1);
+    return len;
+}
+static int __stdcall st_createdir(const char* name, void*) {  // (nothing is made)
+    snprintf(g_cd_name, sizeof g_cd_name, "%s", name);
+    return 1;
+}
+#endif
+static int __cdecl st_file_create(const char* name) {
+#ifdef VP_TEST_FIXES
+    snprintf(g_fc_name, sizeof g_fc_name, "%s", name);
+#endif
+    logn(L_FILE_CREATE, P(name));
+    return ctrl()->file_handle;
+}
 static void __cdecl st_file_printf(int h, char* buf, const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -530,6 +552,11 @@ static void install_stubs() {
         {k_ctor_addr[6], (void*)&st_ctor<6>}, {k_ctor_addr[7], (void*)&st_ctor<7>}, {k_ctor_addr[8], (void*)&st_ctor<8>},
     };
     for (auto& x : p) patch_jmp(x.at, x.to);
+#ifdef VP_TEST_FIXES
+    // the import slots TimerWatchdog::dump's FIX calls (the loader resolves no imports)
+    *(void**)0x005d74e4 = (void*)&st_modname;                   // GetModuleFileNameA
+    *(void**)0x005d7490 = (void*)&st_createdir;                 // CreateDirectoryA
+#endif
     // the profiler's function pointers
     *(void**)0x004e642c = (void*)&st_pr_begin;
     *(void**)0x004e6430 = (void*)&st_pr_end;
@@ -1041,7 +1068,11 @@ static void random_call() {
         break;
     }
     case 24: MAIN(CHECK(TimerWatchdog_init_rw, g_watchdog, 0)); break;
+#ifndef VP_TEST_FIXES
     case 25: MAIN(CHECK(TimerWatchdog_dump_rw, g_watchdog, 0)); break;
+#else
+    case 25: break;                                    // (the fixed one's file name differs: fix_timer_log)
+#endif
     // physics.obj, the main thread's
     case 26: MAIN(CHECK0(PhysicsGetTime_rw); CHECK0(PhysicsGetTemperature_rw); CHECK(PhysicsSetTemperature_rw, ubits(sp(rf(200, 350)))));
              break;
@@ -1240,6 +1271,52 @@ static int fix_create_phob() {
 }
 #endif
 
+#ifdef VP_TEST_FIXES
+// TimerWatchdog::dump's FIX: timer.log in <race.exe's folder>\log\, the folder made; with no exe path, or one too long
+// for the file table's 0x100-byte names, c:\timer.log as before. Otherwise the same calls as the original's, with the
+// same arguments (FileCreate's name apart), on random watchdogs.
+static char g_long_exe[300];
+static int fix_timer_log() {
+    struct Case { const char* exe; const char* dir; const char* file; };
+    memcpy(g_long_exe, "C:\\", 3);                     // "C:\ddd...\race.exe": a 248-character folder
+    memset(g_long_exe + 3, 'd', 244);
+    strcpy(g_long_exe + 247, "\\race.exe");
+    const Case cases[] = {
+        {"C:\\Games\\Viper Racing\\race.exe", "C:\\Games\\Viper Racing\\log", "C:\\Games\\Viper Racing\\log\\timer.log"},
+        {"E:\\vr\\race.exe", "E:\\vr\\log", "E:\\vr\\log\\timer.log"},
+        {"", "", "c:\\timer.log"},                                             // GetModuleFileNameA fails
+        {g_long_exe, "", "c:\\timer.log"},                                     // too long for log\timer.log in 0x100
+    };
+    int bad = 0, runs = 0;
+    g_logf_quiet = 1;
+    for (int it = 0; it < 400; it++, runs++) {
+        const Case& k = cases[it % 4];
+        setup_world();
+        for (int i = 0; i < 64; i++) g_script[i] = rnd();
+        g_fake_exe = k.exe;
+        g_pass = 0; g_nlog[0] = 0; g_si = 0;
+        TimerWatchdog_dump_o(g_watchdog, 0);
+        g_cd_name[0] = g_fc_name[0] = 0;
+        g_pass = 1; g_nlog[1] = 0; g_si = 0;
+        TimerWatchdog_dump_rw(g_watchdog, 0);
+        bool same = g_nlog[0] == g_nlog[1];
+        for (int i = 0; same && i < g_nlog[0] && i < LOGN; i++) {
+            LogEntry a = g_log[0][i], b = g_log[1][i];
+            if (a.kind == L_FILE_CREATE && b.kind == L_FILE_CREATE) a.a[0] = b.a[0] = 0;
+            same = !memcmp(&a, &b, sizeof a);
+        }
+        const bool ok = same && !strcmp(g_fc_name, k.file) && !strcmp(g_cd_name, k.dir);
+        if (!ok && bad++ < 4)
+            printf("  FIX TimerWatchdog::dump (exe \"%.40s\"): calls %s, FileCreate(\"%s\"), CreateDirectory(\"%s\")\n", k.exe,
+                   same ? "same" : "DIFFER", g_fc_name, g_cd_name);
+    }
+    g_logf_quiet = 0;
+    g_fake_exe = "C:\\Games\\Viper Racing\\race.exe";
+    printf("fix build: TimerWatchdog::dump's timer.log in <race.exe's folder>\\log\\: %d runs, %d wrong\n", runs, bad);
+    return bad;
+}
+#endif
+
 int main(int argc, char** argv) {
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
@@ -1276,6 +1353,7 @@ int main(int argc, char** argv) {
     printf("\n");
 #ifdef VP_TEST_FIXES
     failed += fix_create_phob();
+    failed += fix_timer_log() != 0;
 #endif
     return failed ? 1 : 0;
 }

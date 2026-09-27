@@ -37,7 +37,7 @@ static void* make_trampoline(const Prologue& p) {
     if (!g_tramp_page || g_tramp_used + 32 > 65536) return 0;
     uint8_t* t = g_tramp_page + g_tramp_used;
     g_tramp_used += 32;
-    memcpy(t, p.bytes, p.len);
+    memcpy(t, (const void*)p.v10, p.len);                         // the live bytes: M1's operands included
     if (p.rel >= 0) {                                             // a call/jmp rel32 moved: re-aim it
         int32_t d = *(int32_t*)(p.bytes + p.rel);
         uint32_t target = p.v10 + p.rel + 4 + d;
@@ -59,11 +59,29 @@ static void write_jmp(uint32_t at, void* to) {
     FlushInstructionCache(GetCurrentProcess(), p, 5);
 }
 
-// the prologue record for v10, if the live bytes are still v1.0's
+// M1's patches (viperport.cpp, patch_fields): an operand it moved can lie in a function's first bytes -- FileVerifyNoOpenFiles'
+// `mov esi, <the open-file table>` -- so those bytes differ from prologues.inc's, and a trampoline must carry M1's value
+static struct { uint32_t at, n; } g_m1[512];
+static int g_nm1;
+void port_note_m1(uint32_t at, uint32_t n) {
+    if (g_nm1 < (int)(sizeof g_m1 / sizeof g_m1[0])) g_m1[g_nm1++] = {at, n};
+    else logf("port: too many M1 patches noted (%08x)", at);
+}
+static bool m1_patched(uint32_t a) {
+    for (int i = 0; i < g_nm1; i++)
+        if (a >= g_m1[i].at && a < g_m1[i].at + g_m1[i].n) return true;
+    return false;
+}
+
+// the prologue record for v10, if the live bytes are still v1.0's (apart from bytes M1 patched)
 static const Prologue* live_prologue(uint32_t v10) {
     if (!is_v10()) return 0;
     for (const Prologue& p : k_prologues)
-        if (p.v10 == v10) return memcmp((void*)v10, p.bytes, p.len) == 0 ? &p : 0;
+        if (p.v10 == v10) {
+            for (int i = 0; i < p.len; i++)
+                if (((const uint8_t*)v10)[i] != p.bytes[i] && !m1_patched(v10 + i)) return 0;
+            return &p;
+        }
     return 0;
 }
 

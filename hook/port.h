@@ -43,6 +43,13 @@
 // original's own instruction, m1_operand(address of the operand), so it gets M1's value in the game and the
 // stock one in a harness (docs/PORTING.md rule 12).
 static inline uint32_t m1_operand(uint32_t at) { return *(const volatile uint32_t*)at; }
+// ... except an operand in the first 5 bytes of a function the port hooks: the hook's jmp overwrites it. It is read
+// there only while the function's first byte is still the original's (`first`: a harness, or the function left
+// original), else from `other`, another instruction M1 repoints at the same table, plus `delta` (the difference of
+// their stock values). tools/gen_port_tables.py requires this form for such an operand.
+static inline uint32_t m1_operand_hooked(uint32_t at, uint32_t fn, uint8_t first, uint32_t other, int32_t delta) {
+    return *(const volatile uint8_t*)fn == first ? m1_operand(at) : m1_operand(other) + (uint32_t)delta;
+}
 
 enum PortMode { PORT_ORIGINAL, PORT_NEW, PORT_SHADOW };
 
@@ -149,6 +156,7 @@ VP_SHADOW_CC(__stdcall)
 
 // ---- the framework ----------------------------------------------------------------------------------------
 void port_check_stock();                       // before anything is patched: find non-stock functions
+void port_note_m1(uint32_t at, uint32_t n);    // M1 patched these bytes (a trampoline may copy them: see port.cpp)
 void port_install(const char* ini);            // read [port], hook every registered function
 void port_report();                            // the exit log: per function, calls / checks / mismatches
 bool port_is_new(const PortFn& f);             // is the rewrite in force (new or shadow)?

@@ -46,10 +46,21 @@
 // copies (repne scasb; rep movsd; rep movsb) are the same instructions, so overlapping and overlong copies behave
 // exactly as the original's; the locals that overflow into each other keep the original's layout.
 //
+// Fixes (docs/PORTING.md, "Fixes"; each marked FIX:): set names of 16+ characters (kept whole in the DLL, the node
+// holding a mark), TOC names of exactly 16 characters (no terminator in the TOC), paths of 64+ characters in
+// ResourceGet and 32+ in ResourceExists (split in buffers of their own), names too long for the resource directories'
+// and the user directory's MAX_PATH buffers, hunted file resources' base names of 15+ characters, long language file
+// and language names, and the options and language tables' capacities. M1 (viperport.cpp, relocate_res_tables)
+// moves those two tables into the DLL -- 256 -> 4096 options, 8 -> 64 languages -- by repointing every instruction
+// that addresses them (res_table_fields.inc); the rewrites read the same operands with m1_operand, and stop at the
+// capacity (the originals have no bound).
+//
 // Skipped: the $E static initialisers ($E1/$E2 of each object reach rcfunc_is_internal; locale's $E5..$E41 point
 // `locale` at its LocaleInfo and construct the 12 unit Xlators; opt's $E5..$E50 set colour constants): the CRT
 // runs them before any hook exists.
+#include <intrin.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "viperport.h"
 #include "port.h"
@@ -129,7 +140,7 @@ struct ResourceTOCEntry {                  // 0x24, as in the file (refs and dat
 static_assert(sizeof(ResourceTOCEntry) == 0x24, "ResourceTOCEntry");
 
 struct ResourceSetNode {                   // 0x3c (MemAlloc)
-    char name[16];                         // +0x00 strcpy'd, unbounded ("" for a hunted singleton)
+    char name[16];                         // +0x00 strcpy'd, unbounded ("" for a hunted singleton; FIX: a mark for 16+)
     ResourceSetNode* next;                 // +0x10
     ResourceTOCEntry* toc;                 // +0x14 the heap copy of the file's first hdr_size - 16 bytes
     uint32_t magic;                        // +0x18 the file's header, copied
@@ -147,12 +158,12 @@ static_assert(sizeof(Xlator) == 12, "Xlator");
 struct LangPair { const char* key; const char* text; };
 struct LangResource { char name[0x40]; int32_t count; LangPair pairs[1]; };   // offsets fixed up by fixup_res
 static_assert(offsetof(LangResource, pairs) == 0x44, "LangResource");
-struct LangInfo { char name[0x20]; char file[0x20]; };                       // 8 at 0x509438
+struct LangInfo { char name[0x20]; char file[0x20]; };                       // 8 at 0x509438 (M1: 64 in the DLL)
 static_assert(sizeof(LangInfo) == 0x40, "LangInfo");
 struct LocaleTime { uint16_t year, month, dow, day, hour, minute, second, ms; };   // SYSTEMTIME
 
 // opt.obj
-struct OptionsItem {                       // 0x90, 256 at 0x55a078
+struct OptionsItem {                       // 0x90, 256 at 0x55a078 (M1: 4096 in the DLL)
     char section[0x20];                    // +0x00 (strcpy, unbounded)
     char key[0x20];                        // +0x20 (strcpy, unbounded)
     uint8_t b, _41[3];                     // +0x40 "yes"
@@ -193,7 +204,9 @@ static_assert(sizeof(TmMetric) == 0x44 && sizeof(TmPending) == 0x48 && sizeof(Tm
 #define g_locale_units  ((void*)0x00509360)                         // a copy of one LocaleUnits
 #define g_metric        (*(volatile uint8_t*)0x00509390)
 #define g_mon_sep       ((char*)0x00509394)                         // [2] the currency decimal separator
-#define g_langs         ((LangInfo*)0x00509438)                     // [8]
+// the languages: 8 LangInfos at 0x509438 -- M1 repoints every instruction that addresses them at a table of 64 in
+// the DLL (viperport.cpp, res_table_fields.inc), so each rewrite reads its own instruction's operand (m1_operand)
+#define g_langs         ((LangInfo*)m1_operand(0x0041aac1))        // [8], or [VP_LIFT_LANGUAGES] (set_lang_by_name's)
 #define g_nlang         (*(volatile int32_t*)0x00509638)
 #define g_cur_lang      (*(volatile int32_t*)0x0050963c)
 #define g_lang_res      (*(LangResource* volatile*)0x00509640)
@@ -202,7 +215,9 @@ static_assert(sizeof(TmMetric) == 0x44 && sizeof(TmPending) == 0x48 && sizeof(Tm
 #define g_opt_multi     (*(volatile int32_t*)0x004f53f8)
 #define g_opt_path      ((char*)0x00559f58)                         // <user dir>options.cfg
 #define g_opt_count     (*(volatile int32_t*)0x0055a05c)
-#define g_opt_items     ((OptionsItem*)0x0055a078)                  // [0x100]
+// the items: 256 at 0x55a078 -- M1 repoints every instruction that addresses them at a table of 4096 in the DLL,
+// as the languages'
+#define g_opt_items     ((OptionsItem*)m1_operand(0x0047185c))     // [0x100], or [VP_LIFT_OPTIONS] (find_item's)
 #define g_opt_global    (*(const char* const*)0x004dd694)          // -> "GLOBAL", the section before any [..]
 #define g_opt_gx        (*(const char* const*)0x004dd698)          // -> "GX"
 #define g_opt_control   (*(const char* const*)0x004dd69c)          // -> "CONTROL"
@@ -363,6 +378,117 @@ static const uint32_t k_ser = 0x52455330;   // "0SER"
 static const uint32_t k_igm = 0x4d474921;   // "!IGM"
 static const uint32_t k_lang = 0x4c414e47;  // 'LANG'
 
+// ---- fixes (docs/PORTING.md, "Fixes"): names and paths too long for the original's fixed buffers ------------------
+// FIX: resource set names of 16 characters and more. A set's node keeps its name in 16 bytes, strcpy'd before the
+// node's list link, TOC pointer and header copy are written over its tail, so the name stored is never the one
+// asked for: "set/res" lookups, ResourceSetUnload and a second load never find the set again (it stays loaded, and
+// another load makes another node) -- in practice car file names were limited to 11 characters ("<car>.car/...") --
+// and a name of 60+ characters runs past the node's allocation. The full name is kept here, keyed by the node, and
+// the node's 16 bytes hold a mark instead: 0x01, a serial and the name's start. No file name has a 0x01, so the mark
+// matches nothing the game asks for, and a function left original (viperport.ini) doesn't find the set, as before.
+// Names up to 15 characters are stored exactly as the original stores them.
+namespace {
+struct LongSetName { const ResourceSetNode* node; char mark[16]; char* name; };
+}  // namespace
+static LongSetName* g_long_sets;
+static int g_nlong_sets, g_cap_long_sets;
+static uint32_t g_long_serial;
+static volatile long g_long_lock;                   // (sets are loaded and looked up from both threads)
+static void long_lock() { while (_InterlockedCompareExchange(&g_long_lock, 1, 0)) _mm_pause(); }
+static void long_unlock() { _InterlockedExchange(&g_long_lock, 0); }
+static void mark_name(char* mark, uint32_t serial, const char* name, int keep) {   // 0x01, 4 hex digits, `keep` chars
+    static const char hex[] = "0123456789abcdef";
+    memset(mark, 0, 16);
+    mark[0] = 1;
+    for (int k = 0; k < 4; k++) mark[1 + k] = hex[(serial >> (12 - 4 * k)) & 15];
+    for (int k = 0; k < keep && name[k]; k++) mark[5 + k] = name[k];
+}
+// the node's name as the game asked for it
+static const char* set_name(const ResourceSetNode* n) {
+    if (!VP_FIX || n->name[0] != 1) return n->name;
+    const char* r = n->name;
+    long_lock();
+    for (int i = 0; i < g_nlong_sets; i++)
+        if (g_long_sets[i].node == n && !memcmp(g_long_sets[i].mark, n->name, 16)) { r = g_long_sets[i].name; break; }
+    long_unlock();
+    return r;
+}
+// load_resource_set: a new node's long name (the mark is written first: a null node faults there, as the original)
+static void set_long_name(ResourceSetNode* node, const char* name) {
+    char mark[16];
+    long_lock();
+    mark_name(mark, ++g_long_serial, name, 10);
+    long_unlock();
+    memcpy(node->name, mark, 16);
+    size_t len = strlen(name);
+    char* full = (char*)malloc(len + 1);
+    if (!full) return;                              // (no memory: the set is only found by an unqualified name)
+    memcpy(full, name, len + 1);
+    long_lock();
+    int i = 0;
+    while (i < g_nlong_sets && g_long_sets[i].node != node) i++;   // a node freed by an original function: reused
+    if (i == g_nlong_sets) {
+        if (g_nlong_sets == g_cap_long_sets) {
+            int cap = g_cap_long_sets ? g_cap_long_sets * 2 : 16;
+            LongSetName* t = (LongSetName*)realloc(g_long_sets, cap * sizeof *t);
+            if (!t) { long_unlock(); free(full); return; }
+            g_long_sets = t;
+            g_cap_long_sets = cap;
+        }
+        g_nlong_sets++;
+    } else {
+        free(g_long_sets[i].name);
+    }
+    g_long_sets[i].node = node;
+    memcpy(g_long_sets[i].mark, mark, 16);
+    g_long_sets[i].name = full;
+    long_unlock();
+}
+// ResourceSetUnload: the node goes
+static void forget_long_name(const ResourceSetNode* node) {
+    if (!VP_FIX) return;
+    long_lock();
+    for (int i = 0; i < g_nlong_sets; i++)
+        if (g_long_sets[i].node == node) {
+            free(g_long_sets[i].name);
+            g_long_sets[i] = g_long_sets[--g_nlong_sets];
+            break;
+        }
+    long_unlock();
+}
+
+// FIX: a TOC name of exactly 16 characters. The TOC's name field is 16 bytes, so such a name has no terminator and
+// stricmp runs on into the entry's type: the name was never found, and the resource was hunted for as a file
+// instead (a texture drawn as a flat colour). The original's compare decides first; only when it fails and the
+// field is full is it compared again as a 16-character string.
+static bool toc_name_is(const char* res, const char* entry) {
+    if (!stricmp_o(res, entry)) return true;
+    if (!VP_FIX || !entry[15] || memchr(entry, 0, 16) || strlen(res) != 16) return false;
+    char b[17];
+    memcpy(b, entry, 16);
+    b[16] = 0;
+    return !stricmp_o(res, b);
+}
+
+// FIX: the resource directories are MAX_PATH buffers the name is strcat'd onto, unbounded -- a name too long
+// overran into the other directory and the locale's statics. A name that doesn't fit isn't looked for there
+// (Windows couldn't open a path that long anyway).
+static bool dir_fits(int32_t dir_len, const char* name) { return !VP_FIX || (uint32_t)dir_len + strlen(name) < 0x104; }
+
+// FIX: the log formats into 256 bytes (and overruns them): a name the fixes let through at any length is
+// reported cut to 128 characters
+static const char* log_name(const char* s, char (&tmp)[0x88]) {
+    if (!VP_FIX || strlen(s) <= 0x80) return s;
+    memcpy(tmp, s, 0x80);
+    memcpy(tmp + 0x80, "...", 4);
+    return tmp;
+}
+
+// FIX: a path of 64 characters or more overran ResourceGet's 64-byte copy of it (its end is the return address),
+// and one of 32 or more ResourceExists' 32-byte one. Such a path is split in buffers of this size instead; one
+// longer still isn't found, as a missing resource.
+enum { k_long_path = 0x400 };
+
 // ======================================================================================================================
 // res.obj
 // ======================================================================================================================
@@ -438,14 +564,17 @@ PORT_FN(0x00419710, "ResourceSetAttemptLoad", ResourceSetAttemptLoad_rw, fp_load
 // dir2 + name (each directory's buffer has the name appended and cut off again)
 static uint8_t __cdecl load_resource_set_name_rw(const char* name) {
     for (ResourceSetNode* n = g_res_sets; n; n = n->next)
-        if (!stricmp_o(name, n->name)) {
+        if (!stricmp_o(name, set_name(n))) {
             ((volatile ResourceSetNode*)n)->loads++;
             return 1;
         }
-    i_strcat(g_dir1, name);
-    int32_t fh = FileOpen(g_dir1);
-    g_dir1[g_dir1_len] = 0;
-    if (!fh) {
+    int32_t fh = 0;
+    if (dir_fits(g_dir1_len, name)) {                               // FIX: (dir_fits) not past the directory's buffer
+        i_strcat(g_dir1, name);
+        fh = FileOpen(g_dir1);
+        g_dir1[g_dir1_len] = 0;
+    }
+    if (!fh && dir_fits(g_dir2_len, name)) {
         i_strcat(g_dir2, name);
         fh = FileOpen(g_dir2);
         g_dir2[g_dir2_len] = 0;
@@ -476,7 +605,8 @@ static uint8_t __cdecl load_resource_set_file_rw(int fh, const char* name) {
     } else {
         node = 0;
     }
-    i_strcpy(node->name, name);                                     // (a null node faults here, as the original)
+    if (VP_FIX && strlen(name) >= 16) set_long_name(node, name);    // FIX: (set_long_name) a name of 16+ characters
+    else i_strcpy(node->name, name);                                // (a null node faults here, as the original)
     OneShot_o(shots[3], S(0x004eae94), name);                       // "Alloc2 %s"
     int32_t toc_bytes = (int32_t)(hdr[3] - 0x10);
     ResourceTOCEntry* toc = (ResourceTOCEntry*)MemAlloc(toc_bytes);
@@ -521,7 +651,8 @@ PORT_FN(0x00419840, "load_resource_set(file)", load_resource_set_file_rw, fp_loa
 // ResourceSetMustLoad (0x419a30)
 static void __cdecl ResourceSetMustLoad_rw(const char* name) {
     MultiEnter(g_res_multi, 0, 0);
-    if (!load_resource_set_name(name)) LogPanic(S(0x004eaecc), name);   // "Can't load resource set \"%s\""
+    char tmp[0x88];
+    if (!load_resource_set_name(name)) LogPanic(S(0x004eaecc), log_name(name, tmp));   // "Can't load resource set \"%s\""
     MultiLeave(g_res_multi, 0, 0);
 }
 static void fp_must_load(Footprint& f, const char*) { f.replay_only = "it opens, reads and maps a resource set"; }
@@ -531,9 +662,10 @@ PORT_FN(0x00419a30, "ResourceSetMustLoad", ResourceSetMustLoad_rw, fp_must_load)
 static void __cdecl ResourceSetMaximize_rw(const char* name) {
     ResourceSetNode* n;
     for (n = g_res_sets; n; n = n->next)
-        if (!stricmp_o(name, n->name)) break;
+        if (!stricmp_o(name, set_name(n))) break;
     if (!n) {
-        LogPanic(S(0x004eaeec), name);                              // "ResourceSetMaximize: Can't find %s"
+        char tmp[0x88];
+        LogPanic(S(0x004eaeec), log_name(name, tmp));               // "ResourceSetMaximize: Can't find %s"
         return;
     }
     volatile ResourceSetNode* v = n;
@@ -556,11 +688,12 @@ PORT_FN(0x00419a80, "ResourceSetMaximize", ResourceSetMaximize_rw, fp_set_maximi
 static void __cdecl ResourceSetMinimize_rw(const char* name) {
     ResourceSetNode* n;
     for (n = g_res_sets; n; n = n->next)
-        if (!stricmp_o(name, n->name)) {
+        if (!stricmp_o(name, set_name(n))) {
             FileInfo_unmap(&n->file, 0);
             return;
         }
-    LogPanic(S(0x004eaf10), name);                                  // "ResourceSetMinimize: Can't find %s"
+    char tmp[0x88];
+    LogPanic(S(0x004eaf10), log_name(name, tmp));                   // "ResourceSetMinimize: Can't find %s"
 }
 static void fp_set_minimize(Footprint& f, const char*) { f.replay_only = "it unmaps a resource set's file"; }
 PORT_FN(0x00419b10, "ResourceSetMinimize", ResourceSetMinimize_rw, fp_set_minimize)
@@ -575,7 +708,7 @@ PORT_FN(0x00419ba0, "ResourceMaximizeAll", ResourceMaximizeAll_rw, fp_all_sets)
 // apply_to_all_sets (0x419b70): every set that isn't a hunted singleton, by its name
 static void __cdecl apply_to_all_sets_rw(void* fn) {       // void(__cdecl*)(char const*)
     for (ResourceSetNode* n = g_res_sets; n; n = ((volatile ResourceSetNode*)n)->next)
-        if (!is_singleton_o(((volatile ResourceSetNode*)n)->toc, 0)) ((NameFn_t)fn)(n->name);
+        if (!is_singleton_o(((volatile ResourceSetNode*)n)->toc, 0)) ((NameFn_t)fn)(set_name(n));
 }
 static void fp_apply_all(Footprint& f, void*) { f.replay_only = "it runs a callback on every resource set"; }
 PORT_FN(0x00419b70, "apply_to_all_sets", apply_to_all_sets_rw, fp_apply_all)
@@ -586,10 +719,11 @@ static void __cdecl ResourceSetUnload_rw(const char* name) {
     MultiEnter(g_res_multi, 0, 0);
     ResourceSetNode* prev = 0;
     ResourceSetNode* n;
+    char tmp[0x88];
     for (n = g_res_sets; n; prev = n, n = n->next)
-        if (!stricmp_o(name, n->name)) break;
+        if (!stricmp_o(name, set_name(n))) break;
     if (!n) {
-        LogReport(S(0x004eaf64), name);                             // "Tried to unload absent resource set \"%s\""
+        LogReport(S(0x004eaf64), log_name(name, tmp));              // "Tried to unload absent resource set \"%s\""
         MultiLeave(g_res_multi, 0, 0);
         return;
     }
@@ -604,13 +738,14 @@ static void __cdecl ResourceSetUnload_rw(const char* name) {
     for (uint32_t i = 0; v->preload > i; i++, at += 0x24) {
         ResourceTOCEntry* e = (ResourceTOCEntry*)((uint8_t*)v->toc + at);
         int32_t refs = ((volatile ResourceTOCEntry*)e)->refs;
-        if (refs) LogReport(S(0x004eaf34), name, e, refs);          // "ResourceSetUnload(\"%s\"): \"%s\" still used by %d"
+        if (refs) LogReport(S(0x004eaf34), log_name(name, tmp), e, refs);   // "ResourceSetUnload(\"%s\"): \"%s\" still used by %d"
     }
     op_delete(v->toc);
     if (prev) ((volatile ResourceSetNode*)prev)->next = v->next;
     else g_res_sets = v->next;
     FileInfo_unmap(&n->file, 0);
     FileInfo_unload(&n->file, 0);
+    forget_long_name(n);
     op_delete(n);
     MultiLeave(g_res_multi, 0, 0);
 }
@@ -621,8 +756,8 @@ PORT_FN(0x00419bb0, "ResourceSetUnload", ResourceSetUnload_rw, fp_set_unload)
 // the entry ResourceGet would find for `path` (0: it would hunt a file, or the path overruns its buffers)
 static ResourceTOCEntry* fp_find_entry(const char* path) {
     size_t len = strlen(path);
-    if (len >= 0x40) return 0;                                      // overruns ResourceGet's own buffers
-    char set[0x40], res[0x40];
+    if (len >= (VP_FIX ? k_long_path : 0x40)) return 0;             // overruns ResourceGet's own buffers (FIX: never found)
+    char set[k_long_path], res[k_long_path];
     memcpy(set, path, len + 1);
     char* slash = strrchr(set, '/');
     if (slash) {
@@ -632,11 +767,11 @@ static ResourceTOCEntry* fp_find_entry(const char* path) {
         set[0] = 0;
         memcpy(res, path, len + 1);
     }
-    if (strlen(res) >= 0x20 || res[0] == '*' || res[0] == '~') return 0;
+    if ((len < 0x40 && strlen(res) >= 0x20) || res[0] == '*' || res[0] == '~') return 0;
     for (ResourceSetNode* n = g_res_sets; n; n = n->next) {
-        if (set[0] && stricmp_o(set, n->name)) continue;
+        if (set[0] && stricmp_o(set, set_name(n))) continue;
         for (int32_t i = 0; i < (int32_t)n->count; i++)
-            if (!stricmp_o(res, n->toc[i].name)) return &n->toc[i];
+            if (toc_name_is(res, n->toc[i].name)) return &n->toc[i];
     }
     return 0;
 }
@@ -666,6 +801,9 @@ PORT_FN(0x00419ce0, "ResourceTry", ResourceTry_rw, fp_resource_get)
 // set name's 32 bytes run into the resource name's, then the path buffer.
 static uint8_t __cdecl ResourceExists_rw(const char* path) {
     struct { char set[0x20]; char res[0x20]; char buf[0x104]; } L;
+    struct { char set[k_long_path]; char res[k_long_path]; } B;     // FIX: a path of 32+ characters (k_long_path)
+    char* set = L.set;
+    char* res = L.res;
     MultiEnter(g_res_multi, 0, 0);
     char c = path[0];
     if (c == '*') {
@@ -674,18 +812,34 @@ static uint8_t __cdecl ResourceExists_rw(const char* path) {
         return r;
     }
     if (c == '~') {
-        sprintf_o(L.buf, S(0x004eaf90), Win32GetUserDirectory(), path + 1);   // "%s%s"
+        const char* ud = Win32GetUserDirectory();
+        // FIX: a user-directory path too long for the MAX_PATH buffer (it overran the stack) doesn't exist
+        if (VP_FIX && strlen(ud) + strlen(path + 1) >= 0x104) {
+            MultiLeave(g_res_multi, 0, 0);
+            return 0;
+        }
+        sprintf_o(L.buf, S(0x004eaf90), ud, path + 1);             // "%s%s"
         uint8_t r = FileExists_o(L.buf);
         MultiLeave(g_res_multi, 0, 0);
         return r;
     }
-    split_res_path_o(L.set, L.res, path);
+    // FIX: (k_long_path) the whole path is copied into the 32-byte set name first: 32+ characters ran into the
+    // resource name (a set part of 32+ characters was compared cut and run into it), 0x144+ past the frame
+    if (VP_FIX && strlen(path) >= 0x20) {
+        if (strlen(path) >= k_long_path) {
+            MultiLeave(g_res_multi, 0, 0);
+            return 0;
+        }
+        set = B.set;
+        res = B.res;
+    }
+    split_res_path_o(set, res, path);
     for (ResourceSetNode* n = g_res_sets; n; n = ((volatile ResourceSetNode*)n)->next) {
-        if (L.set[0] && stricmp_o(L.set, n->name)) continue;
+        if (set[0] && stricmp_o(set, set_name(n))) continue;
         int32_t cnt = (int32_t)((volatile ResourceSetNode*)n)->count;
         uint32_t at = 0;
         for (int32_t i = 0; i < cnt; i++, at += 0x24)
-            if (!stricmp_o(L.res, (const char*)((volatile ResourceSetNode*)n)->toc + at)) {
+            if (toc_name_is(res, (const char*)((volatile ResourceSetNode*)n)->toc + at)) {
                 MultiLeave(g_res_multi, 0, 0);
                 return 1;
             }
@@ -747,22 +901,36 @@ PORT_FN(0x00419f70, "ResourceGetDiscardable", ResourceGetDiscardable_rw, fp_disc
 // name (64), which is where the whole path is copied first.
 static void* __cdecl ResourceGet_rw(const char* path, uint32_t type, uint32_t* ver, int32_t* size, uint8_t* first, uint8_t* fresh) {
     struct { const char* name; char res[0x20]; char set[0x40]; } L;
+    struct { char res[k_long_path]; char set[k_long_path]; } B;     // FIX: a path of 64+ characters (k_long_path)
+    char tmp[0x88];
+    char* set = L.set;
+    char* res = L.res;
     ResourceSetNode* n;
     uint32_t i;
     MultiEnter(g_res_multi, 0, 0);
-    split_res_path_o(L.set, L.res, path);
-    L.name = L.res;
-    if (L.res[0] == '*') {
-        L.name = L.res + 1;
+    // FIX: (k_long_path) the whole path is copied into the 64-byte set name first: 64+ characters ran over the
+    // return address. It is split in buffers of its own; one too long for those is a missing resource.
+    if (VP_FIX && strlen(path) >= 0x40) {
+        if (strlen(path) >= k_long_path) {
+            L.name = path;
+            goto fail;
+        }
+        set = B.set;
+        res = B.res;
+    }
+    split_res_path_o(set, res, path);
+    L.name = res;
+    if (res[0] == '*') {
+        L.name = res + 1;
         goto hunt;
     }
-    if (L.res[0] == '~') goto hunt;
+    if (res[0] == '~') goto hunt;
     for (n = g_res_sets; n; n = ((volatile ResourceSetNode*)n)->next) {
-        if (L.set[0] && stricmp_o(L.set, n->name)) continue;
+        if (set[0] && stricmp_o(set, set_name(n))) continue;
         int32_t cnt = (int32_t)((volatile ResourceSetNode*)n)->count;
         uint32_t at = 0;
         for (i = 0; (int32_t)i < cnt; i++, at += 0x24)
-            if (!stricmp_o(L.res, (const char*)((volatile ResourceSetNode*)n)->toc + at)) goto hit;
+            if (toc_name_is(res, (const char*)((volatile ResourceSetNode*)n)->toc + at)) goto hit;
         continue;
     hit:
         if (!(((volatile ResourceSetNode*)n)->preload > i)) {
@@ -781,7 +949,7 @@ found:
         volatile ResourceTOCEntry* e = (volatile ResourceTOCEntry*)((uint8_t*)v->toc + at);
         uint32_t et = e->type;
         if (type != et) {
-            LogPanic(S(0x004eafc8), L.name, type, et);              // "ResourceGet(\"%s\"): Expected type 0x%x, got type 0x%x"
+            LogPanic(S(0x004eafc8), log_name(L.name, tmp), type, et);   // "ResourceGet(\"%s\"): Expected type 0x%x, got type 0x%x"
             goto fail;
         }
         uint32_t s = e->size;
@@ -799,7 +967,7 @@ found:
         return ((volatile ResourceTOCEntry*)((uint8_t*)v->toc + at))->data + 8;
     }
 fail:
-    if (!g_res_try) LogReport(S(0x004eb000), L.name);               // "ResourceGet(\"%s\") returning NULL!"
+    if (!g_res_try) LogReport(S(0x004eb000), log_name(L.name, tmp));   // "ResourceGet(\"%s\") returning NULL!"
     g_res_try = 0;
     MultiLeave(g_res_multi, 0, 0);
     return 0;
@@ -819,13 +987,18 @@ static ResourceSetNode* __cdecl hunt_for_resource_rw(const char* name) {
     ResourceSetNode* n = 0;
     if (name[0] == '~') {
         const char* ud = Win32GetUserDirectory();
+        // FIX: a user-directory path too long for the MAX_PATH buffer (it overran the stack) isn't looked for
+        if (VP_FIX && strlen(ud) + strlen(name + 1) >= 0x104) return 0;
         sprintf_o(L.path, S(0x004eb024), ud, name + 1);             // "%s%s"
         L.fh = FileOpen(L.path);
     } else {
-        i_strcat(g_dir1, name);
-        L.fh = FileOpen(g_dir1);
-        g_dir1[g_dir1_len] = 0;
-        if (!L.fh) {
+        L.fh = 0;
+        if (dir_fits(g_dir1_len, name)) {                           // FIX: (dir_fits) not past the directory's buffer
+            i_strcat(g_dir1, name);
+            L.fh = FileOpen(g_dir1);
+            g_dir1[g_dir1_len] = 0;
+        }
+        if (!L.fh && dir_fits(g_dir2_len, name)) {
             i_strcat(g_dir2, name);
             L.fh = FileOpen(g_dir2);
             g_dir2[g_dir2_len] = 0;
@@ -847,9 +1020,22 @@ static ResourceSetNode* __cdecl hunt_for_resource_rw(const char* name) {
         v->toc = (ResourceTOCEntry*)MemAlloc(0x24);
         const char* base = strrchr_o(name, '\\');
         base = base ? base + 1 : name;
-        i_strcpy(v->toc->name, base);
-        char* nm = v->toc->name;
-        nm[i_strlen(nm) + 1] = '*';                                 // the singleton mark, after the terminator
+        // FIX: a base name of 15+ characters doesn't fit the entry's 16-byte name with its terminator and the
+        // singleton mark: the mark landed on the entry's type (written next), so the resource was never freed, and a
+        // longer name ran over the entry's fields (35+: past its allocation). The entry is named with a mark
+        // instead (0x01, a serial, the name's start: it matches no name asked for), terminated, then the '*'.
+        if (VP_FIX && strlen(base) >= 15) {
+            char mark[16];
+            long_lock();
+            mark_name(mark, ++g_long_serial, base, 9);
+            long_unlock();
+            mark[15] = '*';
+            memcpy(v->toc->name, mark, 16);
+        } else {
+            i_strcpy(v->toc->name, base);
+            char* nm = v->toc->name;
+            nm[i_strlen(nm) + 1] = '*';                             // the singleton mark, after the terminator
+        }
         volatile ResourceTOCEntry* e = v->toc;
         e->type = L.hdr[1];
         e->version = L.hdr[2];
@@ -1007,18 +1193,33 @@ static void __cdecl LocaleBegin_rw() {
 static void fp_locale_begin(Footprint& f) { f.replay_only = "it loads the languages"; }
 PORT_FN(0x0041a7f0, "LocaleBegin", LocaleBegin_rw, fp_locale_begin)
 
+// the language table's capacity: M1's (VP_LIFT_LANGUAGES) once it has moved the table, else the stock 8
+static int32_t lang_capacity() { return m1_operand(0x0041aac1) == 0x00509438u ? 8 : VP_LIFT_LANGUAGES; }
+
 // enumerate_language_resources (0x41a910): each *.lng file that loads as a LANG resource: its file name and its
-// language name (the resource's first string) into the next of the 8 LangInfos -- unbounded, both of them
+// language name (the resource's first string) into the next of the 8 LangInfos -- unbounded, both of them. (M1
+// moves the table: each copy goes where its own instruction addresses it.)
 static void __cdecl enumerate_language_resources_rw() {
     char name[0x80];
     g_nlang = 0;
     void* h = FileFindFirst(S(0x004eb32c), name, 0x80);             // "*.lng"
     if (h != (void*)-1) {
         do {
+            // FIX: a file name of 32+ characters (FileFindFirst's copy of 128+ isn't even terminated) doesn't fit
+            // the LangInfo's 32 bytes and ran into the next language: that file is skipped. So is every language
+            // past the table's capacity (the 9th overwrote the language count), and a language name of 32+ characters
+            // (a LANG resource has 64 bytes for it) is cut to 31 rather than run into the file name.
+            if (VP_FIX && (!memchr(name, 0, 0x20) || g_nlang >= lang_capacity())) continue;
             LangResource* r = get_resource_o(name);
             if (r) {
-                i_strcpy(g_langs[g_nlang].file, name);
-                i_strcpy(g_langs[g_nlang].name, r->name);
+                i_strcpy((char*)m1_operand(0x0041a97c) + g_nlang * 0x40, name);         // lea edi, [eax + table.file]
+                char* ln = (char*)m1_operand(0x0041a9a9) + g_nlang * 0x40;              // lea edi, [eax + table]
+                if (VP_FIX && !memchr(r->name, 0, 0x20)) {
+                    memcpy(ln, r->name, 0x1f);
+                    ln[0x1f] = 0;
+                } else {
+                    i_strcpy(ln, r->name);
+                }
                 g_nlang++;
                 ResourceForget_o(r);
             }
@@ -1073,8 +1274,9 @@ PORT_FN(0x0041aa90, "fixup_res(locale.obj)", fixup_res_rw, fp_fixup_lang)
 
 // set_lang_by_name (0x41aab0)
 static uint8_t __cdecl set_lang_by_name_rw(const char* name) {
+    const LangInfo* langs = (const LangInfo*)m1_operand(0x0041aac1);   // mov ebp, table (M1 moves it)
     for (int32_t i = 0; i < g_nlang; i++)
-        if (!stricmp_o(name, g_langs[i].name)) {
+        if (!stricmp_o(name, langs[i].name)) {
             LocaleSetLang_o(i);
             return 1;
         }
@@ -1089,7 +1291,7 @@ static void __cdecl LocaleEnd_rw() {
     g_lang_res = 0;
     g_xl_warn = 0;
     int32_t cur = g_cur_lang;
-    OptionsSet_s_o(g_locale_section, S(0x004eb378), g_langs[cur].name);   // "language"
+    OptionsSet_s_o(g_locale_section, S(0x004eb378), ((const LangInfo*)m1_operand(0x0041ab32))[cur].name);   // "language"
 }
 static void fp_locale_end(Footprint& f) { f.replay_only = "it forgets the language resource"; }
 PORT_FN(0x0041ab00, "LocaleEnd", LocaleEnd_rw, fp_locale_end)
@@ -1147,7 +1349,7 @@ PORT_FN(0x0041ac10, "LocaleFormatShortDate", LocaleFormatShortDate_rw, fp_short_
 // LocaleGetLang (0x41ac90): -1 is the current one
 static const LangInfo* __cdecl LocaleGetLang_rw(int i) {
     if (i == -1) i = g_cur_lang;
-    if (i >= 0 && g_nlang > i) return &g_langs[i];
+    if (i >= 0 && g_nlang > i) return &((const LangInfo*)m1_operand(0x0041acae))[i];   // add eax, table
     return 0;
 }
 static void fp_none_i(Footprint&, int) {}
@@ -1160,7 +1362,7 @@ static void __cdecl LocaleSetLang_rw(int i) {
         LogPanic(S(0x004eb3a8));                                    // "Can't swap langs at runtime!"
         ResourceForget_o(g_lang_res);
     }
-    g_lang_res = get_resource_o(g_langs[i].file);
+    g_lang_res = get_resource_o((const char*)m1_operand(0x0041acfb) + i * 0x40);   // add eax, table.file
     Xlator_InvalidateCache_o();
     reset_units_o();
     g_cur_lang = i;
@@ -1323,7 +1525,7 @@ static void __cdecl OptionsFlush_rw() {
         sprintf_o(L.buf, S(0x004f55a4), 1);                         // "version %d\r\n"
         FileWrite(L.fh, L.buf, (int)i_strlen(L.buf));
         for (int32_t i = 0; g_opt_count > i; i++) {
-            OptionsItem* it = &g_opt_items[i];
+            OptionsItem* it = (OptionsItem*)(m1_operand(0x004711a4) - 0x20) + i;   // mov ebp, table.key (M1 moves it)
             if (stricmp_o(it->section, L.cur)) {
                 i_strcpy(L.cur, it->section);
                 sprintf_o(L.buf, S(0x004f55b4), L.cur);             // "[%s]\r\n"
@@ -1363,12 +1565,17 @@ static void __cdecl OptionsEnd_rw() {
 static void fp_options_end(Footprint& f) { f.replay_only = "it writes the options file and frees the lock"; }
 PORT_FN(0x00471330, "OptionsEnd", OptionsEnd_rw, fp_options_end)
 
+// the options table's capacity: M1's (VP_LIFT_OPTIONS) once it has moved the table, else the stock 256
+static int32_t opt_capacity() { return m1_operand(0x0047185c) == 0x0055a078u ? 0x100 : VP_LIFT_OPTIONS; }
+static OptionsItem g_opt_spare;                                     // FIX: find_item's item when the table is full
+
 // the typed Get / Set overloads: a Get of an item that isn't there sets it to what the caller holds
 static void fp_items(Footprint& f) {
     f.add((void*)0x0055a05c, 4, "options count");
-    f.add((void*)0x0055a078, 0x100 * sizeof(OptionsItem), "options items");
-    int32_t n = g_opt_count;                                        // an item appended past the table's end
-    if (n >= 0x100 && n < 0x10000) f.add(&g_opt_items[n], sizeof(OptionsItem), "options item past the table");
+    int32_t n = g_opt_count, cap = opt_capacity();
+    f.add(g_opt_items, (uint32_t)(n >= 0 && n < cap ? n + 1 : cap) * sizeof(OptionsItem), "options items");
+    if (n >= cap && n < 0x10000) f.add(&g_opt_items[n], sizeof(OptionsItem), "options item past the table");
+    if (VP_FIX) f.add(&g_opt_spare, sizeof g_opt_spare, "options spare item");
 }
 static void __cdecl OptionsGet_f_rw(const char* sec, const char* key, float* v) {
     OptionsItem* it;
@@ -1502,22 +1709,34 @@ PORT_FN(0x004715b0, "load_options", load_options_rw, fp_load_options)
 static uint8_t __cdecl find_item_rw(OptionsItem** out, const char* sec, const char* key) {
     ASSERT_MSG_opt(strchr_o(key, ' ') == 0, S(0x004f569c), sec, key);   // "find_item: %s:%s has a space in it"
     MultiEnter(g_opt_multi, 0, 0);
+    const OptionsItem* items = (const OptionsItem*)m1_operand(0x0047185c);   // mov ebp, table (M1 moves it)
     for (int32_t i = 0; g_opt_count > i; i++) {
-        OptionsItem* it = &g_opt_items[i];
+        const OptionsItem* it = &items[i];
         if (!stricmp_o(sec, it->section) && !stricmp_o(key, it->key)) {
             MultiLeave(g_opt_multi, 0, 0);
-            *out = it;
+            *out = (OptionsItem*)(m1_operand(0x00471960) + i * 0x90);   // add ecx, table
             return 1;
         }
     }
-    i_strcpy(g_opt_items[g_opt_count].section, sec);
-    i_strcpy(g_opt_items[g_opt_count].key, key);
-    volatile OptionsItem* it = &g_opt_items[g_opt_count];
-    it->s[0] = 0;
-    it->b = 0;
-    it->i = 0;
-    it->f = 0;
-    *out = (OptionsItem*)it;
+    // FIX: the table full: the original appended past its end (the 257th item overwrote the colour constants and
+    // the telemetry after the stock table). The item is made in a spare instead: the caller reads and sets it as
+    // usual, but it isn't kept (nor written to options.cfg).
+    if (VP_FIX && g_opt_count >= opt_capacity()) {
+        memset(&g_opt_spare, 0, sizeof g_opt_spare);
+        strncpy_o(g_opt_spare.section, sec, 0x1f);
+        strncpy_o(g_opt_spare.key, key, 0x1f);
+        *out = &g_opt_spare;
+        MultiLeave(g_opt_multi, 0, 0);
+        return 0;
+    }
+    i_strcpy((char*)m1_operand(0x004718b3) + g_opt_count * 0x90, sec);   // lea edi, [eax + table]
+    i_strcpy((char*)m1_operand(0x004718e3) + g_opt_count * 0x90, key);   // lea edi, [eax + table.key]
+    int32_t at = g_opt_count * 0x90;
+    *(volatile char*)(m1_operand(0x00471904) + at) = 0;             // mov byte ptr [eax + table.s], cl
+    *(volatile uint8_t*)(m1_operand(0x0047190c) + at) = 0;          // .b
+    *(volatile int32_t*)(m1_operand(0x00471912) + at) = 0;          // .i
+    *(volatile uint32_t*)(m1_operand(0x00471918) + at) = 0;         // .f
+    *out = (OptionsItem*)(m1_operand(0x0047191d) + at);             // add eax, table
     g_opt_count = g_opt_count + 1;
     MultiLeave(g_opt_multi, 0, 0);
     return 0;

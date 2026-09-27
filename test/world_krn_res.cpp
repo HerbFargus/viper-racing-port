@@ -37,6 +37,22 @@
 // "isolated": the rewrite alone (its callees the originals); "chain": every rewrite of the group patched into the
 // image for the rewrite's pass (ASSERT_MSG and OneShot excepted: their logging stubs stay; they are checked alone).
 // No dialog can appear: SetErrorMode in the parent, the game CRT's fatal-message routines patched to exit.
+//
+// The fixes (port.h: VP_FIX): the plain build defines VP_FAITHFUL and checks the rewrites against the originals as
+// above. Built with /DFIX_TESTS it compiles the fixed rewrites and first moves the options and language tables into
+// the arena, as M1 does in the game (res_table_fields.inc: 4096 options, 64 languages), then:
+//   * runs the same rounds with ordinary inputs only (set names under 16 characters, TOC names under 16, paths
+//     under 32, hunted names -- language files too -- under 15, language names under 32) -- the original (on the moved
+//     tables) and the fixed rewrite must still agree everywhere, 256+ options and 8+ languages included;
+//   * then the fixes on their own, with every rewrite patched in ("chain"), each an expectation that passes or
+//     fails: set names of 15..200 characters loaded, found as "set/res", loaded again and unloaded; a name too long
+//     for the resource directories (not loaded, the directories intact); TOC names of exactly 16 characters found
+//     (and 15, and a 17-character request not); ResourceGet / ResourceExists paths of 64..5000 characters (no fault;
+//     found where the long set exists, else not found); '~' and '*' paths too long for MAX_PATH; a hunted file
+//     resource with a long name (found, and freed by its last ResourceForget); more than 32 sets (the 32-slot limit
+//     is file.obj's: the stub's table as M1 lifts it, 256 sets and the 257th's panic); 1000 options loaded, flushed and read back, and 5000 (the
+//     table stops at 4096, nothing written past it); 70 language files (64 kept, nothing past the table), a long
+//     language file name (skipped) and a long language name (cut to 31).
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -52,7 +68,12 @@
 #include <string>
 #include <vector>
 #include <type_traits>
+#ifndef FIX_TESTS
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+static const bool k_ordinary = false;
+#else
+static const bool k_ordinary = true;        // the random rounds keep to inputs the fixes don't change
+#endif
 #include "../hook/port.h"
 
 struct ChainReg {
@@ -184,7 +205,13 @@ enum : uint32_t {
     ARGS_OFF = 0x8000, ARGS_CAP = 0x10000,                 // a check's arguments and outputs
     METER_OFF = 0x18000,                                   // telemetry meters (floats that persist)
     WF_OFF = 0x20000, WF_CAP = 0x40000, NWF = 6,           // the writable files' contents
+#ifdef FIX_TESTS                                           // the tables M1 moves (a guard page after each)
+    OPT_TBL_OFF = WF_OFF + NWF * WF_CAP, OPT_TBL_SIZE = VP_LIFT_OPTIONS * 0x90,
+    LANG_TBL_OFF = OPT_TBL_OFF + OPT_TBL_SIZE + PG + 0x40, LANG_TBL_SIZE = VP_LIFT_LANGUAGES * 0x40,   // (a blank before)
+    HEAP_OFF = (LANG_TBL_OFF + LANG_TBL_SIZE + 2 * PG - 1) & ~(PG - 1),
+#else
     HEAP_OFF = WF_OFF + NWF * WF_CAP,
+#endif
     MAP_SIZE = 400u << 20,                                 // the memory maps' region (not in the arena)
 };
 static uint8_t* g_ar;
@@ -219,17 +246,19 @@ static bool in_arena(const void* p, size_t n) {
 
 // the stubs' state, in the arena (so it is saved, restored and compared with everything else)
 struct Slot { int32_t file, pos, open; };
+enum { MAX_SLOTS = VP_LIFT_FILES };                          // (FIX_TESTS: file.obj's table as M1 lifts it)
+static int g_file_slots = 32;                                // file.obj's MAX_FILES
 struct View { uint32_t off, len, prot; };
 struct Ctrl {
     uint32_t heap_top, allocs, null_at;
     int32_t next_multi;
     int32_t nslots;
-    Slot slot[32];                                           // file.obj's MAX_FILES
+    Slot slot[MAX_SLOTS];                                    // g_file_slots of them in use
     int32_t wf_len[NWF];                                     // -1: the file doesn't exist
     uint32_t map_top, nviews;
     View views[512];
     int32_t find_pos, nlng;
-    char lng[24][0x90];                                      // what FindFirstFile("*.lng") lists
+    char lng[80][0x90];                                      // what FindFirstFile("*.lng") lists
     uint8_t joy, locale_fake, currency_fake, _p;
     int32_t megs;
     char fake_lang[0x40];
@@ -394,13 +423,13 @@ static void __cdecl st_delete(void* p) {
 }
 // the file layer (file.obj): a handle is a slot + 1
 static Slot* slot_of(int h) {
-    if (h < 1 || h > 32 || h > C()->nslots || !C()->slot[h - 1].open) return 0;
+    if (h < 1 || h > g_file_slots || h > C()->nslots || !C()->slot[h - 1].open) return 0;
     return &C()->slot[h - 1];
 }
 static int slot_alloc(int file, const char* name) {         // alloc_file: the next slot while fewer than 32, else a free one
     Ctrl* c = C();
     int k = -1;
-    if (c->nslots < 32) k = c->nslots++;
+    if (c->nslots < g_file_slots) k = c->nslots++;
     else
         for (int i = 0; i < c->nslots; i++)
             if (!c->slot[i].open) { k = i; break; }
@@ -834,7 +863,13 @@ static const char* arena_region(uint32_t off) {
     if (off < ARGS_OFF) return "stub state";
     if (off < ARGS_OFF + ARGS_CAP) return "arguments";
     if (off < WF_OFF) return "meters";
-    if (off < HEAP_OFF) return "written files";
+    if (off < WF_OFF + NWF * WF_CAP) return "written files";
+#ifdef FIX_TESTS
+    if (off < OPT_TBL_OFF + OPT_TBL_SIZE) return "options table (moved)";
+    if (off < LANG_TBL_OFF - 0x40) return "options table's guard page";
+    if (off < LANG_TBL_OFF + LANG_TBL_SIZE) return "language table (moved)";
+    if (off < HEAP_OFF) return "language table's guard page";
+#endif
     return "heap";
 }
 
@@ -1083,7 +1118,7 @@ static SynSet make_synset(int kind) {
     int n = kind == 1 ? 0 : kind == 2 ? ri(200, 600) : ri(1, 40);
     for (int i = 0; i < n; i++) {
         Ent e;
-        int len = chance(10) ? 16 : chance(10) ? 15 : chance(3) ? 0 : ri(3, 12);
+        int len = chance(10) ? (k_ordinary ? 15 : 16) : chance(10) ? 15 : chance(3) ? 0 : ri(3, 12);
         e.name = rname(len);
         if (!e.name.empty() && chance(50)) e.name.back() = 'x';
         if (i > 0 && chance(5)) e.name = recase(s.e[rnd() % i].name);   // a duplicate (the first one wins)
@@ -1267,7 +1302,8 @@ static void fetch_all(int budget) {
     struct Req { std::string set, res; uint32_t type; };
     std::vector<Req> reqs;
     int nraw = collect_reqs(g_raw, 30000);
-    for (int i = 0; i < nraw; i++) reqs.push_back({g_raw[i].set, g_raw[i].res, g_raw[i].type});
+    for (int i = 0; i < nraw; i++)
+        if (!k_ordinary || strlen(g_raw[i].res) < 16) reqs.push_back({g_raw[i].set, g_raw[i].res, g_raw[i].type});
     for (size_t i = reqs.size(); i > 1; i--) std::swap(reqs[i - 1], reqs[rnd() % i]);
     std::vector<const uint8_t*> got;
     for (size_t i = 0; i < reqs.size() && (int)i < budget; i++) {
@@ -1310,8 +1346,12 @@ static void round_resources(int r) {
         int kind = chance(70) ? 0 : ri(1, 5);
         SynSet s = make_synset(kind);
         int nl = chance(70) ? ri(4, 12) : chance(50) ? ri(13, 16) : ri(17, 58);
+        if (k_ordinary) nl = std::min(nl, 11);                   // (FIX_TESTS: set names under 16 characters)
         s.name = rname(nl) + (chance(50) ? ".res" : ".trk");
-        if (chance(10) && !g_real.empty()) s.name = g_real[rnd() % g_real.size()].name;   // shadows a real set
+        if (chance(10) && !g_real.empty()) {                     // shadows a real set
+            const std::string& rn = g_real[rnd() % g_real.size()].name;
+            if (!k_ordinary || rn.size() < 16) s.name = rn;
+        }
         int vi = vfs_mem(g_synthdir + s.name, make_tsr(s.e, s.preload, s.hdr_mode, s.magic));
         g_vfs[vi].bad = s.hdr_mode != 0 || s.preload > s.e.size();   // its TOC block isn't what the header says
         synth.push_back(s.name);
@@ -1319,6 +1359,7 @@ static void round_resources(int r) {
     std::vector<std::string> hunts;
     for (int i = 0; i < 6; i++) {
         int nl = chance(60) ? ri(3, 12) : chance(50) ? ri(13, 16) : ri(17, 40);
+        if (k_ordinary) nl = std::min(nl, 9);                    // (FIX_TESTS: hunted names under 15 characters)
         std::string nm = rname(nl) + ".dat";
         uint32_t type = k_types[rnd() % 6];
         std::vector<uint8_t> d = make_ser(type, chance(80) ? 0 : 1, rbytes(ri(0, 3000)), chance(5) ? 7 : 0);
@@ -1336,6 +1377,7 @@ static void round_resources(int r) {
     std::vector<std::string> want;
     for (int k = 0; k < 4 && !g_real.empty(); k++) {
         const RealSet& rs = g_real[rot++ % g_real.size()];
+        if (k_ordinary && rs.name.size() >= 16) continue;
         if (budget + rs.hdr > (90u << 20) && k) break;
         budget += rs.hdr;
         want.push_back(chance(20) ? recase(rs.name) : rs.name);
@@ -1508,6 +1550,7 @@ static long g_all_sets, g_all_entries, g_all_found, g_all_verified;
 static std::vector<std::string> g_all_missing;
 static void round_all_real() {
     for (const RealSet& rs : g_real) {
+        if (k_ordinary && rs.name.size() >= 16) continue;    // (FIX_TESTS: in fix_tests)
         reset_world();
         c_begin(g_gamedir, g_synthdir);                      // the game dir first (a synthetic set may shadow the name)
         long ok0 = g_payload_ok;
@@ -1515,6 +1558,7 @@ static void round_all_real() {
         int nraw = collect_reqs(g_raw, 30000);
         std::vector<RawReq> reqs(g_raw, g_raw + nraw);
         for (const RawReq& r : reqs) {
+            if (k_ordinary && strlen(r.res) >= 16) continue;
             std::string path = chance(50) ? std::string(r.res) : rs.name + "/" + r.res;
             const uint8_t* p = c_get(path, r.type, chance(80) ? 0 : ri(1, 3));
             g_all_entries++;
@@ -1543,7 +1587,7 @@ static void round_direct() {
         std::string name;
         if (i == 5 && !g_real.empty()) {
             const RealSet& rs = g_real[rnd() % g_real.size()];
-            if (rs.hdr < (40u << 20)) name = rs.name;
+            if (rs.hdr < (40u << 20) && (!k_ordinary || rs.name.size() < 16)) name = rs.name;
         }
         std::string path;
         if (name.empty()) {
@@ -1574,7 +1618,7 @@ static void round_direct() {
     fetch_all(300);
     // hunt_for_resource, destroy_hunted_resource by name and by node (and a node that isn't in the list)
     for (int i = 0; i < 12; i++) {
-        std::string nm = rname(chance(80) ? ri(3, 12) : ri(13, 20)) + ".ser";
+        std::string nm = rname(k_ordinary ? ri(3, 9) : chance(80) ? ri(3, 12) : ri(13, 20)) + ".ser";
         bool user = chance(30);
         vfs_mem((user ? g_userdir : g_synthdir) + nm, make_ser(k_types[rnd() % 6], 0, rbytes(ri(0, 500))));
         args_reset();
@@ -1818,11 +1862,14 @@ static void round_locale(int r) {
     Ctrl* c = C();
     c->nlng = 0;
     auto add_lng = [&](const std::string& n) { if (c->nlng < 24) { strncpy(c->lng[c->nlng], n.c_str(), 0x8f); c->nlng++; } };
+    // (FIX_TESTS: file names under 15 characters -- a language is hunted as a file resource, and a hunted name of 15+
+    // is a fix -- and language names under 32)
+    const int fmax = k_ordinary ? 10 : 40, fshort = k_ordinary ? 10 : 12, lmax = k_ordinary ? 31 : 60;
     if (chance(90)) add_lng("english.lng");
     int extra = chance(80) ? ri(0, 4) : ri(5, 10);
     for (int i = 0; i < extra; i++) {
-        std::string file = rname(ri(3, chance(90) ? 12 : 40)) + ".lng";
-        std::string lname = chance(90) ? rname(ri(3, 12)) : rname(ri(30, 60));   // (64+: the next LangInfo runs into this one's file name, and ResourceGet's 64-byte path buffer overflows)
+        std::string file = rname(ri(3, chance(90) ? fshort : fmax)) + ".lng";
+        std::string lname = chance(90) ? rname(ri(3, 12)) : rname(ri(30, lmax));   // (64+: the next LangInfo runs into this one's file name, and ResourceGet's 64-byte path buffer overflows)
         int kind = ri(0, 19);
         vfs_mem(g_synthdir + file, make_lang(lname, ri(0, 120), kind == 0 ? 3 : 0, kind != 1, kind == 2 ? 0x54455820 : 0x4c414e47));
         add_lng(file);
@@ -2036,6 +2083,369 @@ static void evidence() {
     c_end();
 }
 
+#ifdef FIX_TESTS
+// ---- the fixes on their own (FIX_TESTS) -------------------------------------------------------------------------------------
+// M1's move of the options and language tables, into the arena here (the game: DLL statics)
+static void relocate_tables() {
+    struct Ref { uint32_t at; uint8_t off; uint32_t old; int table; };
+    static const Ref refs[] = {
+#include "../hook/res_table_fields.inc"
+    };
+    for (const Ref& r : refs) {
+        if (r.table >= 2) continue;                          // (file.obj's table: the file layer is a stub here)
+        uint32_t* p = (uint32_t*)(uintptr_t)(r.at + r.off);
+        if (*p != r.old) { printf("res_table_fields.inc: %08x+%u isn't %08x\n", r.at, r.off, r.old); ExitProcess(4); }
+        *p = r.table == 0 ? (uint32_t)(uintptr_t)(g_ar + OPT_TBL_OFF) + (r.old - 0x55a078)
+                          : (uint32_t)(uintptr_t)(g_ar + LANG_TBL_OFF) + (r.old - 0x509438);
+    }
+    FlushInstructionCache(GetCurrentProcess(), 0, 0);
+    printf("M1: the options table moved to the arena (%d items), the languages (%d)\n", (int)opt_capacity(), (int)lang_capacity());
+}
+static bool zeros(const uint8_t* p, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        if (p[i]) return false;
+    return true;
+}
+
+static long g_fix_ok, g_fix_bad;
+static void expect(bool ok, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    printf("  %s ", ok ? "ok  " : "FAIL");
+    vprintf(fmt, ap);
+    putchar('\n');
+    va_end(ap);
+    (ok ? g_fix_ok : g_fix_bad)++;
+}
+// a call to the function at `at` with every rewrite patched in (the fixed ones), alone: its outcome in g_rw
+static int g_rw;                                             // 0 returned, 1 panicked, 2 faulted
+template <typename F, typename... Args> static uint64_t rw(uint32_t at, F, Args... a) {
+    F entry = (F)(uintptr_t)at;
+    g_pass = 1;
+    g_log[1].clear();
+    g_panic_returns = false;
+    g_pc = 53;
+    uint64_t r = 0;
+    auto run = [=]() { return invoke(entry, a...); };
+    chain_on();
+    g_rw = run_pass(run, &r);
+    chain_off();
+    ww_sync();
+    return r;
+}
+static int nodes() {
+    int k = 0;
+    for (ResourceSetNode* n = g_res_sets; n; n = n->next) k++;
+    return k;
+}
+static Ent ent(const std::string& name, uint32_t type = 0x54455820) {
+    Ent e;
+    e.name = name;
+    e.type = type;
+    e.ver = 0;
+    e.size = 0;
+    e.payload = rbytes(ri(1, 200));
+    return e;
+}
+static void f_begin() {
+    args_reset();
+    rw(0x00419640, ResourceBegin_rw, (const char*)arg_str(g_synthdir), (const char*)arg_str(g_gamedir));
+}
+static uint8_t f_load(const std::string& name) {
+    args_reset();
+    return (uint8_t)rw(0x00419710, ResourceSetAttemptLoad_rw, (const char*)arg_str(name));
+}
+static void f_unload(const std::string& name) {
+    args_reset();
+    rw(0x00419bb0, ResourceSetUnload_rw, (const char*)arg_str(name));
+}
+static const uint8_t* f_get(const std::string& path, uint32_t type = 0x54455820) {
+    args_reset();
+    const char* p = arg_str(path);
+    uint32_t* ver = (uint32_t*)arg_buf(4);
+    int32_t* size = (int32_t*)arg_buf(4);
+    return (const uint8_t*)(uintptr_t)(uint32_t)rw(0x00419fa0, ResourceGet_rw, p, type, ver, size, (uint8_t*)0, (uint8_t*)0);
+}
+static uint8_t f_exists(const std::string& path) {
+    args_reset();
+    return (uint8_t)rw(0x00419d10, ResourceExists_rw, (const char*)arg_str(path));
+}
+static bool payload_ok(const uint8_t* p) {
+    long k = g_payload_ok;
+    verify_payload(p);
+    return p && g_payload_ok == k + 1;
+}
+
+static void fix_tests() {
+    printf("-- the fixes --\n");
+    // set names of 16+ characters: loaded, found as "set/res" (a path of 64+ characters for the longest), found by
+    // ResourceExists (a path of 32+), loaded again (one node, two loads), unloaded twice
+    printf(" set names:\n");
+    reset_world();
+    f_begin();
+    for (int len : {11, 15, 16, 20, 40, 59, 100, 200}) {
+        std::string name = rname(len - 4) + ".car";
+        std::vector<Ent> e = {ent("f.t"), ent("cockpit.tab", 0x53544142)};
+        vfs_mem(g_synthdir + name, make_tsr(e, 1, 0));
+        uint8_t ok = f_load(name);
+        int k1 = g_rw;
+        uint8_t again = f_load(recase(name));
+        int nn = nodes();
+        const uint8_t* p = f_get(name + "/cockpit.tab", 0x53544142);
+        int k2 = g_rw;
+        const uint8_t* q = f_get(recase(name) + "/f.t");
+        uint8_t ex = f_exists(name + "/f.t");
+        uint8_t ex2 = f_exists(name + "/nope.t");
+        bool pay = payload_ok(p) && payload_ok(q);
+        f_unload(name);
+        int n1 = nodes();
+        f_unload(recase(name));
+        int n2 = nodes();
+        expect(ok && again && !k1 && !k2 && nn == 1 && p && q && ex && !ex2 && pay && n1 == 1 && n2 == 0,
+               "a %3d-character set name: loaded %d (again %d) -> %d node(s); \"set/cockpit.tab\" %s, \"set/f.t\" %s (payloads %s); "
+               "exists %d / a missing entry %d; unloaded twice -> %d, %d node(s)",
+               len, ok, again, nn, p ? "found" : "NOT found", q ? "found" : "NOT found", pay ? "match" : "DIFFER", ex, ex2, n1, n2);
+    }
+    // a set name too long for the resource directories' MAX_PATH buffers: not loaded, the directories intact
+    {
+        std::string name = rname(0x104 - 4) + ".car";
+        vfs_mem(g_synthdir + name, make_tsr({ent("f.t")}, 1, 0));
+        uint8_t before[0x218], after[0x218];
+        memcpy(before, (void*)0x00509128, sizeof before);
+        uint8_t locale_before[0x40], locale_after[0x40];
+        memcpy(locale_before, (void*)0x00509340, sizeof locale_before);
+        uint8_t ok = f_load(name);
+        memcpy(after, (void*)0x00509128, sizeof after);
+        memcpy(locale_after, (void*)0x00509340, sizeof locale_after);
+        expect(!ok && g_rw == 0 && !memcmp(before, after, sizeof before) && !memcmp(locale_before, locale_after, sizeof locale_before),
+               "a %zu-character set name (past the directories' MAX_PATH): not loaded (%d), no fault (%d), the directories "
+               "and the locale after them untouched", name.size(), ok, g_rw);
+    }
+    // TOC names of exactly 16 characters (no terminator in the TOC), preloaded and mapped; 15; 17 and a prefix not
+    printf(" TOC names:\n");
+    {
+        reset_world();
+        f_begin();
+        std::vector<Ent> e = {ent("sixteen_chars.tx"), ent("fifteen_chars.t"), ent("SIXTEEN_CHARS.TX"), ent("x16_mapped_name1")};
+        vfs_mem(g_synthdir + "names16.res", make_tsr(e, 2, 0));
+        f_load("names16.res");
+        const uint8_t* a = f_get("sixteen_chars.tx");
+        const uint8_t* b = f_get("Sixteen_Chars.TX");
+        const uint8_t* c = f_get("names16.res/x16_mapped_name1");
+        const uint8_t* d = f_get("fifteen_chars.t");
+        const uint8_t* x = f_get("sixteen_chars.txx");
+        const uint8_t* y = f_get("sixteen_chars.t");
+        uint8_t ea = f_exists("sixteen_chars.tx"), ec = f_exists("names16.res/x16_mapped_name1"), ex = f_exists("sixteen_chars.txx");
+        expect(a && a == b && payload_ok(a) && c && payload_ok(c) && d && payload_ok(d) && !x && !y && ea && ec && !ex,
+               "16 characters: preloaded %s (the first of two), mapped %s; 15: %s; a 17-character name %s, a 15-character "
+               "prefix %s; exists: %d, %d, 17 characters %d",
+               a ? "found" : "NOT found", c ? "found" : "NOT found", d ? "found" : "NOT found", x ? "FOUND" : "not found",
+               y ? "FOUND" : "not found", ea, ec, ex);
+        f_unload("names16.res");
+    }
+    // long paths: no fault, not found (the long sets' found paths are above)
+    printf(" long paths:\n");
+    {
+        reset_world();
+        f_begin();
+        vfs_mem(g_synthdir + "buf.res", make_tsr({ent("short.tex")}, 1, 0));
+        f_load("buf.res");
+        bool all = true;
+        std::string worst;
+        for (int len : {63, 64, 100, 255, 256, 1023, 1024, 5000}) {
+            std::string forms[] = {std::string(len, 'r'), "buf.res/" + std::string(len - 8, 'r'), std::string(len - 10, 's') + "/short.tex",
+                                   "~" + std::string(len - 1, 'u'), "*" + std::string(len - 1, 'h')};
+            for (const std::string& path : forms) {
+                const uint8_t* p = f_get(path);
+                int k1 = g_rw;
+                uint8_t e = f_exists(path);
+                int k2 = g_rw;
+                if (p || k1 || e || k2) {
+                    all = false;
+                    char b[120];
+                    sprintf(b, "%zu characters \"%.12s...\": get %p (%d), exists %d (%d)", path.size(), path.c_str(), p, k1, e, k2);
+                    worst = b;
+                }
+            }
+        }
+        const uint8_t* p = f_get("buf.res/short.tex");
+        expect(all && p, "ResourceGet / ResourceExists on paths of 63..5000 characters (a resource, \"set/res\", a long set part, "
+               "'~', '*'): no fault, not found%s%s; \"buf.res/short.tex\" still %s", worst.empty() ? "" : " -- ", worst.c_str(),
+               p ? "found" : "NOT found");
+    }
+    // a file resource with a long base name (15+ characters): found, and freed by its last ResourceForget
+    printf(" file resources:\n");
+    for (const char* nm : {"~a_long_file_resource_name.dat", "*abcdefghijk.dat", "~abcdefghijkl.d", "abcdefghijklmnopqrstu.dat"}) {
+        reset_world();
+        f_begin();
+        std::string file = nm[0] == '~' ? g_userdir + (nm + 1) : g_synthdir + (nm[0] == '*' ? nm + 1 : nm);
+        std::vector<uint8_t> pl = rbytes(100);
+        vfs_mem(file, make_ser(0x54455820, 0, pl));
+        const uint8_t* p = f_get(nm);
+        int mid = nodes();
+        bool pay = p && !memcmp(p, pl.data(), pl.size());          // (its entry has a mark for a name: compared here)
+        args_reset();
+        uint8_t freed = (uint8_t)rw(0x0041a450, ResourceForget_rw, (void*)p);
+        expect(p && pay && mid == 1 && freed && nodes() == 0, "\"%s\": %s (payload %s), %d node; its ResourceForget frees it: %d, %d node(s) left",
+               nm, p ? "found" : "NOT found", pay ? "matches" : "DIFFERS", mid, freed, nodes());
+    }
+    // more than 32 sets: res.obj has no limit of its own -- the 33rd set can't open its file (file.obj's 32 slots);
+    // with file.obj's table lifted (the stub's slots as M1 makes them: 256), 256 sets, and the 257th can't
+    printf(" many sets:\n");
+    {
+        reset_world();
+        f_begin();
+        int loaded = 0;
+        for (int i = 0; i < 40; i++) {
+            char nm[32];
+            sprintf(nm, "many%03d.res", i);
+            vfs_mem(g_synthdir + nm, make_tsr({ent("e.t")}, 1, 0));
+            if (f_load(nm) && !g_rw) loaded++;
+            else break;
+        }
+        printf("  (with file.obj's 32 file slots: %d sets loaded, then %s)\n", loaded, g_rw == 1 ? "the file layer's panic, MAX_FILES" : "?");
+        reset_world();
+        f_begin();
+        g_file_slots = MAX_SLOTS;
+        const int N = VP_LIFT_FILES;
+        loaded = 0;
+        int found = 0, pay = 0;
+        for (int i = 0; i < N; i++) {
+            char nm[32], en[16];
+            sprintf(nm, "many%03d.res", i);
+            sprintf(en, "e%03d.t", i);
+            vfs_mem(g_synthdir + nm, make_tsr({ent(en), ent("common.t")}, i & 1, 0));
+            loaded += f_load(nm) && !g_rw;
+        }
+        vfs_mem(g_synthdir + "one_more.res", make_tsr({ent("x.t")}, 1, 0));
+        uint8_t more = f_load("one_more.res");
+        const int more_rw = g_rw;
+        for (int i = 0; i < N; i++) {
+            char path[48];
+            sprintf(path, "many%03d.res/e%03d.t", i, i);
+            const uint8_t* p = f_get(path);
+            found += p != 0;
+            pay += payload_ok(p);
+        }
+        int all = nodes();
+        for (int i = 0; i < N; i++) {
+            char nm[32];
+            sprintf(nm, "many%03d.res", i);
+            f_unload(nm);
+        }
+        expect(loaded == N && !more && more_rw == 1 && found == N && pay == N && all == N && nodes() == 0,
+               "with the file layer's %d slots: %d of %d sets loaded (%d nodes), the next %s; %d \"set/res\" found (%d payloads "
+               "match), all unloaded (%d left)", MAX_SLOTS, loaded, N, all, more_rw == 1 ? "panics (MAX_FILES)" : "DOESN'T PANIC",
+               found, pay, nodes());
+        g_file_slots = 32;
+    }
+    // options: 1000 items loaded, read, changed, flushed and read back; 5000 (the table stops at its capacity)
+    printf(" options:\n");
+    {
+        reset_world();
+        std::string def = "version 1\r\n[GX]\r\n";
+        for (int i = 0; i < 1000; i++) def += "key" + std::to_string(i) + " " + std::to_string(i * 7) + "\r\n";
+        vfs_mem("options.def", vec(def));
+        C()->wf_len[0] = -1;
+        C()->joy = 0;
+        C()->megs = 8;
+        rw(0x00470ee0, OptionsBegin_rw);
+        int n0 = g_opt_count, k0 = g_rw;
+        auto get_i = [](int i) {
+            args_reset();
+            int* v = (int*)arg_buf(4);
+            *v = -12345;
+            rw(0x004713e0, OptionsGet_i_rw, (const char*)arg_str("GX"), (const char*)arg_str("key" + std::to_string(i)), v);
+            return *v;
+        };
+        int wrong = 0;
+        for (int i = 0; i < 1000; i++) wrong += get_i(i) != i * 7;
+        for (int i = 0; i < 1000; i += 3) {
+            args_reset();
+            rw(0x00471430, OptionsSet_i_rw, (const char*)arg_str("GX"), (const char*)arg_str("key" + std::to_string(i)), i * 11);
+        }
+        for (int i = 0; i < 200; i++) {
+            args_reset();
+            rw(0x00471560, OptionsSet_s_rw, (const char*)arg_str("NEW"), (const char*)arg_str("new" + std::to_string(i)),
+               (const char*)arg_str("text" + std::to_string(i)));
+        }
+        int n1 = g_opt_count;
+        rw(0x00471110, OptionsFlush_rw);
+        int flushed = C()->wf_len[0];
+        // read back: options.def has nothing, options.cfg is what was flushed
+        reset_world();
+        vfs_mem("options.def", vec("version 1\r\n"));
+        rw(0x00470ee0, OptionsBegin_rw);
+        int n2 = g_opt_count, wrong2 = 0;
+        for (int i = 0; i < 1000; i++) wrong2 += get_i(i) != (i % 3 ? i * 7 : i * 11);
+        for (int i = 0; i < 200; i++) {
+            args_reset();
+            char* buf = (char*)arg_buf(0x40, 0);
+            rw(0x00471500, OptionsGet_s_rw, (const char*)arg_str("NEW"), (const char*)arg_str("new" + std::to_string(i)), buf, 0x40);
+            wrong2 += strcmp(buf, ("text" + std::to_string(i)).c_str()) != 0;
+        }
+        expect(k0 == 0 && n0 == 1000 && !wrong && n1 == 1200 && flushed > 0 && n2 == 1200 && !wrong2,
+               "1000 items loaded (%d, %d wrong), %d after sets; flushed (%d bytes) and read back: %d items, %d wrong", n0, wrong, n1,
+               flushed, n2, wrong2);
+        // 5000: 4096 kept, nothing past the table, the rest still answer (not kept)
+        reset_world();
+        memset(g_ar + OPT_TBL_OFF, 0, OPT_TBL_SIZE);
+        def = "version 1\r\n[GX]\r\n";
+        for (int i = 0; i < 5000; i++) def += "key" + std::to_string(i) + " " + std::to_string(i * 7) + "\r\n";
+        vfs_mem("options.def", vec(def));
+        C()->wf_len[0] = -1;
+        rw(0x00470ee0, OptionsBegin_rw);
+        int n3 = g_opt_count, k3 = g_rw;
+        bool guard = zeros(g_ar + OPT_TBL_OFF + OPT_TBL_SIZE, PG);
+        int a = get_i(100), b = get_i(4095), c = get_i(4500);
+        int n4 = g_opt_count;
+        expect(k3 == 0 && n3 == VP_LIFT_OPTIONS && guard && a == 700 && b == 4095 * 7 && c == -12345 && n4 == VP_LIFT_OPTIONS,
+               "5000 items: %d kept (the table's %d), nothing written past it: %s; key100 %d, key4095 %d, key4500 (not kept) %d; "
+               "%d items after", n3, VP_LIFT_OPTIONS, guard ? "yes" : "NO", a, b, c, n4);
+    }
+    // languages: 70 files (64 kept), a file name of 32+ characters (skipped), a language name of 32+ (cut to 31)
+    printf(" languages:\n");
+    {
+        reset_world();
+        f_begin();
+        Ctrl* c = C();
+        c->nlng = 0;
+        std::string longfile = "a_language_file_name_of_32_chars.lng", longname = std::string(50, 'N');
+        for (int i = 0; i < 70; i++) {
+            char f[32], l[32];
+            sprintf(f, "lang%02d.lng", i);
+            sprintf(l, "Lang%02d", i);
+            std::string file = f, lname = l;
+            if (i == 5) file = longfile;
+            if (i == 7) lname = longname;
+            vfs_mem(g_synthdir + file, make_lang(lname, 5, 0, true));
+            strcpy(c->lng[c->nlng++], file.c_str());
+        }
+        memset(g_ar + LANG_TBL_OFF - 0x40, 0, 0x40 + LANG_TBL_SIZE);
+        rw(0x0041a910, enumerate_language_resources_rw);
+        int k = g_rw, n = g_nlang, bad = 0;
+        bool skipped = true, cut = false;
+        for (int i = 0; i < n && i < VP_LIFT_LANGUAGES; i++) {
+            const LangInfo& li = g_langs[i];
+            if (!strcmp(li.file, longfile.c_str()) || strlen(li.file) >= 0x20) skipped = false;
+            if (!strcmp(li.file, "lang07.lng")) cut = !strcmp(li.name, longname.substr(0, 31).c_str());
+            else if (strlen(li.file) == 10 && (li.name[4] != li.file[4] || li.name[5] != li.file[5])) bad++;
+        }
+        bool guard = zeros(g_ar + LANG_TBL_OFF + LANG_TBL_SIZE, PG - 0x40) && zeros(g_ar + LANG_TBL_OFF - 0x40, 0x40);
+        rw(0x0041acc0, LocaleSetLang_rw, 40);
+        bool set40 = g_cur_lang == 40 && g_lang_res && !strcmp(g_lang_res->name, g_langs[40].name);
+        const LangInfo* l63 = (const LangInfo*)(uintptr_t)(uint32_t)rw(0x0041ac90, LocaleGetLang_rw, 63);
+        const LangInfo* l64 = (const LangInfo*)(uintptr_t)(uint32_t)rw(0x0041ac90, LocaleGetLang_rw, 64);
+        expect(k == 0 && n == VP_LIFT_LANGUAGES && skipped && cut && !bad && guard && set40 && l63 == &g_langs[63] && !l64,
+               "70 .lng files: %d languages kept (the table's %d), nothing written past it: %s; the 36-character file name "
+               "skipped: %s; the 50-character language name cut to 31: %s; names and files paired: %s; LocaleSetLang(40): %s; "
+               "LocaleGetLang(63) %s, (64) %s", n, VP_LIFT_LANGUAGES, guard ? "yes" : "NO", skipped ? "yes" : "NO", cut ? "yes" : "NO",
+               bad ? "NO" : "yes", set40 ? "that language" : "WRONG", l63 == &g_langs[63] ? "its entry" : "WRONG", l64 ? "AN ENTRY" : "none");
+    }
+    printf("fixes: %ld expectations met, %ld failed\n", g_fix_ok, g_fix_bad);
+}
+#endif
+
 // ---- main ---------------------------------------------------------------------------------------------------------------------
 static const char* g_phase = "setup";
 static LONG WINAPI unhandled(EXCEPTION_POINTERS* e) {
@@ -2101,6 +2511,9 @@ int main(int argc, char** argv) {
     memcpy(g_stub_bytes[1], (void*)0x00471970, 5);
     memcpy(g_stub_bytes[2], (void*)0x0041a620, 5);
     install_stubs();
+#ifdef FIX_TESTS
+    relocate_tables();
+#endif
     ((void(__cdecl*)())0x004ce150)();                             // _cfltcvt_init
     const uint32_t inits[] = {0x0041a660, 0x0041a680, 0x0041a6a0, 0x0041a6c0, 0x0041a6e0, 0x0041a700, 0x0041a720,
                               0x0041a740, 0x0041a760, 0x0041a780, 0x0041a7a0, 0x0041a7c0, 0x0041a7e0};
@@ -2121,8 +2534,10 @@ int main(int argc, char** argv) {
         printf("-- %s --\n", g_chain ? "chain" : "isolated");
         g_phase = "small";
         round_small();
+#ifndef FIX_TESTS
         g_phase = "limits";
-        round_limits();
+        round_limits();                                         // (FIX_TESTS: fix_tests, below)
+#endif
         g_phase = "direct";
         round_direct();
         g_phase = "every real set";
@@ -2137,8 +2552,10 @@ int main(int argc, char** argv) {
             g_phase = "telemetry";
             if (r % 4 == 0) round_telemetry(r);
         }
+#ifndef FIX_TESTS
         g_phase = "evidence";
         if (!g_chain) evidence();
+#endif
     }
     printf("\n%-44s %8s %6s %6s %6s %6s %6s %s\n", "function", "checks", "differ", "panics", "faults", "ronly", "fp", "(fault-state, runaway)");
     std::sort(g_stats.begin(), g_stats.end(), [](const Stat& a, const Stat& b) { return a.name < b.name; });
@@ -2152,5 +2569,11 @@ int main(int argc, char** argv) {
            g_all_found, g_all_verified);
     for (auto& m : g_all_missing) printf("  not found: %s\n", m.c_str());
     printf("%ld checks, %ld differ\n", g_checks_total, g_mismatch_total);
+#ifdef FIX_TESTS
+    g_phase = "fixes";
+    fix_tests();
+    return g_mismatch_total || g_fix_bad ? 1 : 0;
+#else
     return g_mismatch_total ? 1 : 0;
+#endif
 }

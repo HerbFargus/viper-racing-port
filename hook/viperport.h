@@ -6,6 +6,11 @@
 // viperport.log, one timestamped line per call
 void logf(const char* fmt, ...);
 
+// M1 (viperport.cpp, relocate_res_tables): the options, language and open-file tables moved into the DLL, v1.0 only,
+// and their capacities there (stock: 256 options, 8 languages, 32 open files -- each loaded resource set keeps one).
+// The rewrites (krn_res.cpp, krn_file.cpp) stop at them.
+enum { VP_LIFT_OPTIONS = 4096, VP_LIFT_LANGUAGES = 64, VP_LIFT_FILES = 256 };
+
 // is the running build v1.0 race.exe (the reference build, whose addresses need no table)?
 bool build_is_v10();
 

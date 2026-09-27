@@ -369,19 +369,26 @@ def write_globals(exe, secs):
 
 # ---- M1's patches inside rewritten functions --------------------------------------------------------------
 # M1 (hook/viperport.cpp) lifts limits by patching operands of the original code: {instruction, operand
-# offset, ...} fields, and the texture table's (texture_table_fields.inc). A rewrite of a function holding
-# one must read that operand with m1_operand(its address), or it would undo the lift (docs/PORTING.md 12).
+# offset, ...} fields, the texture table's (texture_table_fields.inc) and the options and language tables'
+# (res_table_fields.inc: the open-file table's too). A rewrite of a function holding one must read that operand with m1_operand(its
+# address), or it would undo the lift (docs/PORTING.md 12).
 def check_m1_operands(sizes):
-    src = (HOOK / "viperport.cpp").read_text(encoding="utf-8") + (HOOK / "texture_table_fields.inc").read_text(encoding="utf-8")
+    src = "".join((HOOK / f).read_text(encoding="utf-8") for f in ("viperport.cpp", "texture_table_fields.inc", "res_table_fields.inc"))
     operands = sorted({int(at, 16) + int(off) for at, off in re.findall(r"\{\s*(0x[0-9a-fA-F]{6,8}),\s*(\d+),", src)})
     texts = {f: f.read_text(encoding="utf-8") for f in HOOK.glob("*.cpp") if f.name != "viperport.cpp"}
-    pat = re.compile(r"PORT_FN(?:_BUILDS)?\(\s*(0x[0-9a-fA-F]+)")
+    pat = re.compile(r"\bPORT_FN(?:_BUILDS)?\(\s*(0x[0-9a-fA-F]+)")
     missing = []
     for f, t in texts.items():
         for m in pat.finditer(t):
             va = int(m.group(1), 16)
             for op in operands:
-                if va <= op < va + sizes.get(va, 0) and not re.search(rf"m1_operand\(0x0*{op:x}\)", t, re.I):
+                if not va <= op < va + sizes.get(va, 0):
+                    continue
+                if op < va + 5:                    # the hook's jmp overwrites it: port.h's m1_operand_hooked
+                    if not re.search(rf"m1_operand_hooked\(0x0*{op:x},", t, re.I):
+                        missing.append(f"{f.name}: M1's operand at {op:08x} is in the bytes the hook of {va:08x} overwrites: "
+                                       f"read it with m1_operand_hooked")
+                elif not re.search(rf"m1_operand\(0x0*{op:x}\)", t, re.I):
                     missing.append(f"{f.name}: the rewrite of {va:08x} doesn't read M1's operand at {op:08x}")
     if missing:
         raise SystemExit(chr(10).join(missing))

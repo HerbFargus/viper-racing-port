@@ -27,7 +27,8 @@
 // passed as the ORIGINAL's addresses (0x414a60, 0x414ba0, 0x414920, 0x414950, 0x415680, 0x418990, 0x4189e0,
 // 0x413aa0), strings as the game's own (a Multi/Single table keeps the name pointer). Globals are read and written
 // through volatile at the points the original does (the other thread may be looking). Bugs and races are kept; the
-// fix candidates are listed where they happen (// FIX CANDIDATE:) -- none is fixed here.
+// fix candidates are listed where they happen (// FIX CANDIDATE:). One is fixed (// FIX:): the crash log's path
+// (ExceptBegin).
 //
 // The x87: only ProfBegin (the TSC calibration) and prof_report (the per-profile percentage) use it; both are asm
 // sequences copied from the original, so they give its bits at whatever precision the thread runs.
@@ -49,6 +50,7 @@
 #include <string.h>
 #include "viperport.h"
 #include "port.h"
+#include "fix_paths.h"
 
 typedef int Edx;                                    // the unused edx of a __thiscall received as __fastcall
 
@@ -743,7 +745,7 @@ PORT_FN(0x0041888f, "pr_sys_end", pr_sys_end_rw, fp_reads_tsc)
 // (14 bytes), and the 5-byte jump to the rewrite there; the harness hooks it that way.
 // In the game it stays original (rdtsc; ret is the instruction itself): only the harness, which can hook it, registers it.
 static uint64_t __cdecl rdtsc_rw() { return KRN_RDTSC(); }
-#ifdef VP_FAITHFUL
+#if defined(VP_FAITHFUL) || defined(FIX_TESTS)   // (a harness build: faithful, or the fix tests)
 #define HARNESS_ONLY_FN PORT_FN      // (a name tools/gen_port_tables.py doesn't pick up)
 HARNESS_ONLY_FN(0x004188ad, "rdtsc", rdtsc_rw, fp_reads_tsc)
 #endif
@@ -1509,14 +1511,23 @@ static void fp_dump_exception_string(Footprint& f, int, char*, const char*, uint
 }
 PORT_FN(0x00415450, "DumpExceptionString", DumpExceptionString_rw, fp_dump_exception_string)
 
-// FIX CANDIDATE: the crash log is c:\except.log -- the root of C:, which a normal user can't write on NT 6+, so
-// FileCreate fails and the handler writes no log at all (the map-file trace goes only to the game's log).
+// The crash log is c:\except.log.
+// FIX: the root of C: isn't writable without elevation on NT 6+, so FileCreate failed and the handler wrote no crash
+// log at all (the map-file trace went only to the game's log). It is <race.exe's folder>\log\except.log instead, the
+// folder made (fix_paths.h; vrmod's patched "log\except.log" names the same file from the game's folder). A folder
+// too long for the file table's 0x100-byte names keeps the literal.
 static void __cdecl ExceptBegin_rw() {
     LPTOP_LEVEL_EXCEPTION_FILTER prev =
         IAT(SetUnhandledExceptionFilter, 0x5d7570)((LPTOP_LEVEL_EXCEPTION_FILTER)(uintptr_t)k_my_handler);
     G32(X_PREV) = (uint32_t)(uintptr_t)prev;
     ExceptDiv0Crashes(0);
-    G32(X_LOG) = (uint32_t)FileCreate(S(0x4e6a80));    // "c:\\except.log"
+    const char* name = S(0x4e6a80);                      // "c:\\except.log"
+    char path[0x100];
+    if (VP_FIX) {
+        if (vp_log_path(path, sizeof path, "except.log")) name = path;
+        else logf("fix: race.exe's folder isn't known, or is too long for the crash log's path; it stays at %s", name);
+    }
+    G32(X_LOG) = (uint32_t)FileCreate(name);
     G32(X_MAP) = (uint32_t)(uintptr_t)get_mapfile_ptr();
 }
 static void fp_except_begin(Footprint& f) { f.replay_only = "installs the exception filter, opens files"; }

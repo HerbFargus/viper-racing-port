@@ -73,11 +73,56 @@ dozen places and the game dies.
 - `create_phob`: an oversized creation record is read up to the buffer and skipped past; a negative size
   reads only the header.
 
+## Where the game writes
+
+- `get_user_directory`: saves (options, career, records, ghosts, setups, paint) go to `<game folder>\Config\`,
+  built from `race.exe`'s own path, not `C:\Program Files\MGI\Viper98\` (the v1.0 exe's literal) or a
+  path relative to the current directory (vrmod's writepaths patch). The released `race.bin` and vrmod
+  already use `Config\`. The first time the folder is made, the old user directory is copied into it,
+  the UAC VirtualStore copy first; the old files are only read. A game folder over 200 characters keeps
+  the old behaviour (the game's own limit).
+- `log_file_begin`, `ExceptBegin`, `TimerWatchdog::dump`: `log.log`, `except.log` and `timer.log` go to
+  `<game folder>\log\` instead of the root of C:, which isn't writable without elevation, so there was
+  no log at all (and every race end tried to create `c:\timer.log`). `c:\career.log` is written by the
+  career code, which isn't ported yet.
+
+## Files and resources
+
+- `FileReadLine`: a line ending in a bare LF (a file saved on Linux or a Mac) kept all but its last
+  character, and an empty first line wrote before the buffer. Only a real `
+` is cut now; CRLF files
+  read exactly as before.
+- Resource names of exactly 16 characters, the most a table of contents holds, were never found (there
+  is no terminator to compare against). They are now. That makes 11-character car names work
+  (`<car>10.mod` is 16), where 10 was the limit.
+- Archive (set) names of 16 or more characters overran their 16-byte field, so later lookups failed and
+  the archive was never unloaded; the full name is now kept beside it. (A car can't use one: its
+  resource names would pass 16 characters.)
+- `ResourceGet`, `ResourceExists`, `hunt_for_resource`: paths of 64 or more characters (32 or more for
+  the archive part) overran the stack; they are now simply not found. A directory plus archive name
+  too long for its buffer is skipped. Hunted files with long names are freed again.
+- `enumerate_language_resources`: a `.lng` file name of 32 or more characters is skipped and a long
+  language name cut, instead of overrunning the table.
+
+## Limits lifted
+
+Like M1's limits, these move a table into the DLL for the original code and the rewrites alike, so
+nothing changes below the old limit (`viperport.log` says "lifted ...").
+
+- Open files 32 -> 256. Every loaded archive keeps its file open, so this is the archive limit: the
+  33rd panicked. (`alloc_file` left original stops at 127, the most its one-byte compare holds.)
+- Options 256 -> 4096 (past the end the table overran); a full table now hands out a spare item that
+  isn't saved.
+- Language files 8 -> 64 (a 9th overwrote the language count).
+
 ## Not fixed
 
 - A track with no AI racing line still crashes in a career race or a multiplayer race; those are fixed
   with their own stages (the menus and career, multiplayer).
 - The AI's quirks that shape how it drives (its per-segment speed notes are computed and then
   overwritten) are gameplay, not bugs, and stay.
+- Texture names of exactly 16 characters: the texture cache and model surfaces keep them in 16-byte
+  fields too (seen as an unterminated `willysjeep11.tex` in the log); that is graphics code, for its
+  stage.
 - `collide_sphere_sphere`'s 0/0 for coincident centres needs no fix: it is caught before its result is
   used.

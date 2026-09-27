@@ -6,11 +6,12 @@
 // Win32System ...), kernel:winerror.obj (Win32GetErrorString: a table of 565 error names), kernel:msg.obj (a
 // message client / server over mailslots) and kernel:shmem.obj (triple-buffered blocks shared between tasks).
 //
-// Written from the v1.0 disassembly, faithful (no fixes): every call in the original's order. A Windows API the
-// original calls through its import table (`call dword ptr [0x5d7xxx]`) is called through THAT game IAT slot
-// (IAT() below), never through this DLL's own imports -- the DLL patches some game imports, Wine may too, and a
-// harness can stub a slot. The C runtime functions it calls (vsprintf, strncpy, strchr, stricmp, memmove,
-// isspace, chdir: the game's statically linked LIBC, with its own locale state) are called at their game
+// Written from the v1.0 disassembly, faithful: every call in the original's order; then three fixes, each marked
+// `// FIX:` (docs/FIXES.md): the user directory and the log moved next to race.exe, and FileReadLine's bare-LF
+// lines. A Windows API the original calls through its import table (`call dword ptr [0x5d7xxx]`) is called through
+// THAT game IAT slot (IAT() below), never through this DLL's own imports -- the DLL patches some game imports, Wine
+// may too, and a harness can stub a slot. The C runtime functions it calls (vsprintf, strncpy, strchr, stricmp,
+// memmove, isspace, chdir: the game's statically linked LIBC, with its own locale state) are called at their game
 // addresses; the ones the 1998 compiler inlined (strcpy, strcat, strlen, memset: rep movs / repne scas / rep
 // stos) are done here. Game functions -- this group's own too -- are called by their v1.0 address, so a hooked
 // rewrite or the original is what runs. Callbacks and window procedures are passed as the originals' addresses
@@ -24,7 +25,7 @@
 //             locks, 0x505e5c the mono line log() prints on (0..24), 0x505e60 the log file (a File number),
 //             0x505e68 the hook count and 0x505e6c the 10 hooks.
 //   file.obj  0x4e5c54 the "File" Multi lock, 0x4e5c58 FileCreateTemp's counter, 0x505ea0 how many of the 32
-//             slots have ever been used, 0x505ea8 the 32 slots {char name[0x100]; HANDLE handle} (-1 free). A
+//             slots have ever been used, 0x505ea8 the 32 slots (M1: 256 in the DLL) {char name[0x100]; HANDLE handle} (-1 free). A
 //             File is a slot's index + 1 (0: failed).
 //   win32.obj 0x4e5eac the game window, 0x4e5eb0 the window in front before it, 0x4e5eb4 the instance, 0x4e5eb8
 //             the command line, 0x4e5ebc the keyboard hook, 0x4e5ec0 inactive (switched away), 0x4e5ec4 the
@@ -59,9 +60,11 @@
 #define NOMINMAX
 #include <windows.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include "viperport.h"
 #include "port.h"
+#include "fix_paths.h"
 
 typedef int Edx;                                    // the unused edx of a __thiscall received as __fastcall
 
@@ -121,6 +124,7 @@ typedef DWORD(WINAPI* GetVersion_t)(void);            // (GetVersion is declared
 #define kBitBlt              IAT(0x005d7444, BitBlt)
 #define kDeleteDC            IAT(0x005d7450, DeleteDC)
 #define kRegFlushKey         IAT(0x005d7410, RegFlushKey)
+#define kGetFullPathNameA    IAT(0x005d7594, GetFullPathNameA)   // (the user directory's FIX)
 typedef DWORD(WINAPI* TimeGetTime_t)(void);           // (winmm, not included here)
 #define kTimeGetTime         (*(TimeGetTime_t volatile*)(uintptr_t)0x005d76d8)
 
@@ -318,9 +322,12 @@ typedef uint8_t(__cdecl* MsgHook_t)(uint32_t, int, int);
 #define g_file_multi     (*(volatile int32_t*)0x004e5c54)
 #define g_temp_count     (*(volatile uint32_t*)0x004e5c58)
 #define g_nfiles         (*(volatile int32_t*)0x00505ea0)
-#define g_files          ((FileEntry*)0x00505ea8)             // [32]
-static FileEntry* file_at(int i) { return (FileEntry*)(0x00505ea8 + i * 0x104); }
-#define FH(i)            (*(HANDLE volatile*)&file_at(i)->handle)
+// The slots: 32 at 0x505ea8 -- M1 (viperport.cpp, relocate_res_tables) repoints every instruction that addresses them
+// at 256 in the DLL (res_table_fields.inc), so each rewrite reads its own instruction's operand (docs/PORTING.md 12):
+// file_at(m1_operand(op), i) for an operand that addresses the names (0x505ea8), FH(m1_operand(op), i) for one that
+// addresses the handles (0x505fa8).
+static FileEntry* file_at(uint32_t names, int i) { return (FileEntry*)(uintptr_t)(names + (uint32_t)i * 0x104); }
+#define FH(handles, i)   (*(HANDLE volatile*)(uintptr_t)((handles) + (uint32_t)(i) * 0x104))
 // win32.obj
 #define g_hwnd           (*(HWND volatile*)0x004e5eac)
 #define g_prev_fg        (*(HWND volatile*)0x004e5eb0)
@@ -416,8 +423,23 @@ static void fp_log_begin(Footprint& f) { f.replay_only = "it opens log.cfg and t
 PORT_FN(0x00410d10, "LogBegin", LogBegin_rw, fp_log_begin)
 
 // log_file_begin (0x410ef0): c:\log.log, created (the root of C: -- not writable without elevation today)
+// FIX: the root of C: isn't writable without elevation, so there was no log at all. The log is
+// <race.exe's folder>\log\log.log instead, the folder made (vrmod's patched "log\log.log", run from the game's
+// folder, is the same file). A folder too long for the file table's 0x100-byte names keeps the literal. The path
+// used is kept for FileVerifyNoOpenFiles, which must skip the log (the original compares a second literal).
+static char s_log_path[0x100];                                     // the fixed log's path ("": the literal's)
 static uint8_t __cdecl log_file_begin_rw() {
-    const int f = FileCreate_o(S(0x004e5ae8));                     // "c:\log.log"
+    const char* name = S(0x004e5ae8);                              // "c:\log.log"
+    if (VP_FIX) {
+        if (vp_log_path(s_log_path, sizeof s_log_path, "log.log")) {
+            name = s_log_path;
+            logf("fix: the game's log is %s", name);
+        } else {
+            s_log_path[0] = 0;
+            logf("fix: race.exe's folder isn't known, or is too long for the log's path; the game's log stays at %s", name);
+        }
+    }
+    const int f = FileCreate_o(name);
     g_log_file = f;
     return f != 0;
 }
@@ -652,9 +674,10 @@ PORT_FN(0x00411500, "mono_clear", mono_clear_rw, fp_mono_clear)
 // FileBegin (0x411540): the "File" lock; every slot free (the used count isn't reset)
 static void __cdecl FileBegin_rw() {
     g_file_multi = MultiBegin(S(0x004e5c5c));                      // "File"
-    for (int i = 0; i < 32; i++) {
-        FH(i) = INVALID_HANDLE_VALUE;
-        *(volatile char*)file_at(i)->name = 0;
+    // mov eax, table.handle ... cmp eax, <the handle after the last> (M1 moves both)
+    for (uint32_t h = m1_operand(0x00411555); h < m1_operand(0x00411565); h += 0x104) {
+        *(HANDLE volatile*)(uintptr_t)h = INVALID_HANDLE_VALUE;
+        *(volatile char*)(uintptr_t)(h - 0x100) = 0;               // the slot's name
     }
 }
 static void fp_file_begin(Footprint& f) { f.replay_only = "it makes the File lock"; }
@@ -662,9 +685,16 @@ PORT_FN(0x00411540, "FileBegin", FileBegin_rw, fp_file_begin)
 
 // FileVerifyNoOpenFiles (0x411580): each open slot but the log file's reported
 static void __cdecl FileVerifyNoOpenFiles_rw() {
-    for (int i = 0; i < 32; i++)
-        if (FH(i) != INVALID_HANDLE_VALUE && stricmp_o(S(0x004e5c64), file_at(i)->name) != 0)   // "c:\log.log"
-            LogReport(S(0x004e5c70), file_at(i)->name);            // "Handle to %s was never freed."
+    // FIX: the log file is skipped by the path log_file_begin gave it (see there)
+    const char* log_name = VP_FIX && s_log_path[0] ? (const char*)s_log_path : S(0x004e5c64);   // "c:\log.log"
+    // mov esi, table ... cmp esi, <the name after the last> (M1 moves both). The first is in the bytes the hook
+    // overwrites: once hooked, FileBegin's `mov eax, table.handle` (less the name's 0x100) says where the table is.
+    const uint32_t table = m1_operand_hooked(0x00411583, 0x00411580, 0x56, 0x00411555, -0x100);   // (0x56: push esi)
+    for (uint32_t a = table; a < m1_operand(0x004115bc); a += 0x104) {
+        const FileEntry* e = (const FileEntry*)(uintptr_t)a;
+        if (*(HANDLE volatile*)&e->handle != INVALID_HANDLE_VALUE && stricmp_o(log_name, e->name) != 0)
+            LogReport(S(0x004e5c70), e->name);                     // "Handle to %s was never freed."
+    }
 }
 static void fp_file_verify(Footprint& f) { f.replay_only = "it writes the log"; }
 PORT_FN(0x00411580, "FileVerifyNoOpenFiles", FileVerifyNoOpenFiles_rw, fp_file_verify)
@@ -686,29 +716,34 @@ PORT_FN(0x004115f0, "FileCreate", FileCreate_rw, fp_file_io_name)
 // alloc_file (0x411630): under the lock, the next never-used slot while fewer than 32 have been used, then the
 // first free one; none panics. The name is copied unbounded into the slot's 0x100 bytes (a name of 0x100..0x103
 // characters runs into the handle, which is written after it; longer ones into the next slot).
+// The capacity (M1): the original's `cmp edx, 0x20` is an imm8 -- it can't say 256 -- so M1, moving the table to 256
+// slots, makes it 0x7f: the original, if left original, hands out at most 127 never-used slots and then reuses free
+// ones below that, all inside the 256-slot table. This rewrite uses the whole table: 256 once M1 has moved it (the
+// imm8 no longer 0x20), else the stock 32. Both are safe, mixed too: every slot either hands out is inside the table.
+static int32_t file_capacity() { return (uint8_t)m1_operand(0x00411652) == 0x20 ? 0x20 : VP_LIFT_FILES; }
 static int __cdecl alloc_file_rw(const char* name, HANDLE h) {
     MultiEnter(g_file_multi, 0, 0);
     int slot = -1;
     const int n = g_nfiles;
-    if (n < 0x20) {
+    if (n < file_capacity()) {
         slot = n;
         g_nfiles = n + 1;
     } else {
         for (int i = 0; i < n; i++)
-            if (FH(i) == INVALID_HANDLE_VALUE) { slot = i; break; }
+            if (FH(m1_operand(0x00411667), i) == INVALID_HANDLE_VALUE) { slot = i; break; }   // mov ecx, table.handle
     }
     if (slot == -1) {
         LogPanic(S(0x004e5c90), name);                             // "file.cpp: Can't alloc file \"%s\", increase MAX_FILES"
     } else {
-        str_copy(file_at(slot)->name, name);
-        FH(slot) = h;
+        str_copy(file_at(m1_operand(0x004116ac), slot)->name, name);           // lea edi, [edx + table]
+        FH(m1_operand(0x004116bf), slot) = h;                                  // mov [edx + table.handle], ecx
     }
     MultiLeave(g_file_multi, 0, 0);
     return slot;
 }
 static void fp_alloc_file(Footprint& f, const char*, HANDLE) {
     f.add((void*)0x00505ea0, 4, "file slots used");
-    f.add((void*)0x00505ea8, 0x2080, "file table");
+    f.add(file_at(m1_operand(0x004116ac), 0), (uint32_t)file_capacity() * 0x104, "file table");   // (32 or, moved by M1, 256 slots)
 }
 PORT_FN(0x00411630, "alloc_file", alloc_file_rw, fp_alloc_file)
 
@@ -760,15 +795,15 @@ PORT_FN(0x00411810, "FileOpenWritable", FileOpenWritable_rw, fp_file_io_name)
 static void __cdecl FileClose_rw(int* fp) {
     volatile int* f = fp;
     *f = *f - 1;
-    kCloseHandle(FH(*f));
-    FH(*f) = INVALID_HANDLE_VALUE;
+    kCloseHandle(FH(m1_operand(0x00411864), *f));
+    FH(m1_operand(0x0041187b), *f) = INVALID_HANDLE_VALUE;
     *f = 0;
 }
 static void fp_file_close(Footprint& f, int*) { f.replay_only = "file I/O"; }
 PORT_FN(0x00411850, "FileClose", FileClose_rw, fp_file_close)
 
 // FileSize (0x411890)
-static int __cdecl FileSize_rw(int f) { return (int)kGetFileSize(FH(f - 1), 0); }
+static int __cdecl FileSize_rw(int f) { return (int)kGetFileSize(FH(m1_operand(0x004118a1), f - 1), 0); }
 static void fp_file_size(Footprint& f, int) { f.replay_only = "file I/O"; }
 PORT_FN(0x00411890, "FileSize", FileSize_rw, fp_file_size)
 
@@ -776,13 +811,13 @@ PORT_FN(0x00411890, "FileSize", FileSize_rw, fp_file_size)
 static uint8_t __cdecl FileReadExact_rw(int f, void* buf, int n) {
     const int i = f - 1;
     DWORD got;
-    if (!kReadFile(FH(i), buf, (DWORD)n, &got, 0)) {
+    if (!kReadFile(FH(m1_operand(0x004118d0), i), buf, (DWORD)n, &got, 0)) {
         const DWORD e = kGetLastError();
-        LogPanic(S(0x004e5cf4), file_at(i)->name, n, e);           // "ReadFile(\"%s\",%d) fails (0x%x)"
+        LogPanic(S(0x004e5cf4), file_at(m1_operand(0x00411918), i)->name, n, e);           // "ReadFile(\"%s\",%d) fails (0x%x)"
         return 0;
     }
     if ((int)got == n) return 1;
-    LogPanic(S(0x004e5cd4), n, file_at(i)->name);                  // "Can't read %d bytes from \"%s\""
+    LogPanic(S(0x004e5cd4), n, file_at(m1_operand(0x004118fb), i)->name);                  // "Can't read %d bytes from \"%s\""
     return 0;
 }
 static void fp_file_read_exact(Footprint& f, int, void*, int) { f.replay_only = "file I/O"; }
@@ -792,9 +827,9 @@ PORT_FN(0x004118b0, "FileReadExact", FileReadExact_rw, fp_file_read_exact)
 static uint8_t __cdecl FileRead_rw(int f, void* buf, int* n) {
     const int i = f - 1;
     DWORD got;
-    if (!kReadFile(FH(i), buf, (DWORD)*n, &got, 0)) {
+    if (!kReadFile(FH(m1_operand(0x0041195e), i), buf, (DWORD)*n, &got, 0)) {
         const DWORD e = kGetLastError();
-        LogPanic(S(0x004e5d14), file_at(i)->name, n, e);           // "ReadFile(\"%s\",%d) fails (0x%x)"
+        LogPanic(S(0x004e5d14), file_at(m1_operand(0x0041198d), i)->name, n, e);           // "ReadFile(\"%s\",%d) fails (0x%x)"
         return 0;
     }
     *n = (int)got;
@@ -806,6 +841,9 @@ PORT_FN(0x00411940, "FileRead", FileRead_rw, fp_file_read)
 // FileReadLine (0x4119b0): a byte at a time, up to n, to a '\n'; then the byte before the '\n' is cleared (the
 // '\r' of a CRLF line -- of a bare LF line, its last character; of an empty first line, buf[-1]) and the byte
 // after it. A full buffer or the end of the file returns 0 with the line unterminated.
+// FIX: the byte before the '\n' is cleared only if it is a '\r' of this line: a bare LF line keeps its last
+// character, and an empty line no longer writes before the buffer. A CRLF line is read exactly as before (the
+// same bytes, return value and file position).
 static uint8_t __cdecl FileReadLine_rw(int f, char* buf, int n) {
     int count = 1;
     char c = 0;
@@ -823,6 +861,10 @@ static uint8_t __cdecl FileReadLine_rw(int f, char* buf, int n) {
     }
     if (c != '\n') return 0;
 line:
+    if (VP_FIX && (p == buf || p[-1] != '\r')) {                   // FIX: (above) no '\r' to cut
+        p[0] = 0;
+        return 1;
+    }
     p[-1] = 0;
     p[0] = 0;
     return 1;
@@ -833,10 +875,10 @@ PORT_FN(0x004119b0, "FileReadLine", FileReadLine_rw, fp_file_read_line)
 // FileWrite (0x411a30): all n bytes, or a panic
 static uint8_t __cdecl FileWrite_rw(int f, const void* data, int n) {
     const int i = f - 1;
-    FileEntry* e = file_at(i);
+    FileEntry* e = file_at(m1_operand(0x00411a4b), i);
     ASSERT_MSG_file(n > 0 ? 1 : 0, S(0x004e5d34), e->name);        // "Attempt to write 0 bytes to file %s"
     DWORD put;
-    if (!kWriteFile(FH(i), data, (DWORD)n, &put, 0)) {
+    if (!kWriteFile(FH(m1_operand(0x00411a78), i), data, (DWORD)n, &put, 0)) {
         const DWORD err = kGetLastError();
         LogPanic(S(0x004e5d88), e->name, n, err);                  // "WriteFile(\"%s\",%d) fails (0x%x)"
         return 0;
@@ -852,7 +894,7 @@ PORT_FN(0x00411a30, "FileWrite", FileWrite_rw, fp_file_write)
 static void __cdecl FileFlush_rw(int f) {
     HANDLE dup;
     HANDLE to = kGetCurrentProcess();
-    HANDLE h = FH(f - 1);
+    HANDLE h = FH(m1_operand(0x00411b17), f - 1);
     HANDLE from = kGetCurrentProcess();
     if (kDuplicateHandle(from, h, to, &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) kCloseHandle(dup);
 }
@@ -880,11 +922,11 @@ PORT_FN(0x00411ba0, "FileRemove", FileRemove_rw, fp_file_io_name)
 
 // FileSeekAbsolute (0x411bc0) / FileSeekRelative (0x411bf0): not permitted -- a panic (nothing calls them)
 static uint8_t __cdecl FileSeekAbsolute_rw(int f, int pos) {
-    LogPanic(S(0x004e5da8), file_at(f - 1)->name, pos);            // "FileSeekAbsolute(\"%s\",%d): Seeking is not permitted."
+    LogPanic(S(0x004e5da8), file_at(m1_operand(0x00411bd4), f - 1)->name, pos);   // "FileSeekAbsolute(\"%s\",%d): Seeking is not permitted."
     return 0;
 }
 static uint8_t __cdecl FileSeekRelative_rw(int f, int pos) {
-    LogPanic(S(0x004e5de0), file_at(f - 1)->name, pos);            // "FileSeekRelative(\"%s\",%d): Seeking is not permitted."
+    LogPanic(S(0x004e5de0), file_at(m1_operand(0x00411c04), f - 1)->name, pos);   // "FileSeekRelative(\"%s\",%d): Seeking is not permitted."
     return 0;
 }
 static void fp_file_seek(Footprint& f, int, int) { f.replay_only = "it panics (ends the game)"; }
@@ -987,7 +1029,7 @@ static FileMemoryMap* __cdecl create_fake_memory_map_rw(FileMemoryMap* ret, int 
     FileMemoryMap m;                                               // (the pad and, on a panic, .map: stack contents)
     m.mem = 0;
     m.fake = 1;
-    const char* name = file_at(slot)->name;
+    const char* name = file_at(m1_operand(0x00411e81), slot)->name;
     int f = FileOpen_o(name);
     if (f) {
         const int size = FileSize_o(f);
@@ -1022,7 +1064,7 @@ static FileMemoryMap* __cdecl FileCreateMemoryMap_rw(FileMemoryMap* ret, int f) 
     FileMemoryMap m;
     m.fake = 0;
     const int i = f - 1;
-    HANDLE map = kCreateFileMappingA(FH(i), 0, PAGE_READONLY, 0, 0, 0);
+    HANDLE map = kCreateFileMappingA(FH(m1_operand(0x00411f53), i), 0, PAGE_READONLY, 0, 0, 0);
     if (!map) {
         LogReport(S(0x004e5e8c), Win32GetErrorString_o());         // "Can't CreateFileMapping! (%s)"
         create_fake_memory_map_o(ret, i);
@@ -1090,12 +1132,150 @@ PORT_FN(0x004123b0, "start_unique_instance", start_unique_instance_rw, fp_win_os
 static void __cdecl end_unique_instance_rw() { kCloseHandle(g_semaphore); }
 PORT_FN(0x00412420, "end_unique_instance", end_unique_instance_rw, fp_win_os)
 
+// ---- FIX: the user directory next to race.exe -------------------------------------------------------------------------
+// The original's user directory is a literal: "C:\Program Files\MGI\Viper98\" on a stock exe -- wherever the game is
+// installed, shared by every install on the machine, and not writable without elevation (UAC then puts what the game
+// writes in %LOCALAPPDATA%\VirtualStore\Program Files\MGI\Viper98\) -- or vrmod's writepaths patch's relative
+// "Config\", which follows the current directory. The fix makes it <race.exe's folder>\Config\, from
+// GetModuleFileNameA(NULL). The first time (no such folder yet), the old user directory's whole tree is copied into
+// it: the literal as this exe has it -- an absolute one's VirtualStore copies first (where a game without elevation
+// really wrote), then the folder itself; a relative one from the current directory, unless that is the new folder.
+// The old files are only read. Every user of the directory (options.cfg, the *.sco records, ghostcar\, setups\,
+// paint*.tex, the career files, replays) appends a file name to Win32GetUserDirectory() in a MAX_PATH-sized buffer
+// (FileCreateDirectoryRecursively's prefixes and the file table's names are 0x100 bytes), and WinMain logs "Long
+// User Directory (%d), I am scared." past 200 characters: a longer path keeps the original's literal.
+enum { FIX_USER_DIR_MAX = 0xc8 };
+
+// is `dir` (with its trailing backslash) a directory?
+static bool fix_is_dir(const char* dir) {
+    char p[MAX_PATH];
+    size_t n = strlen(dir);
+    if (n < 2 || n >= MAX_PATH) return false;
+    memcpy(p, dir, n + 1);
+    if (p[n - 1] == '\\') p[n - 1] = 0;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = kFindFirstFileA(p, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    kFindClose(h);
+    return (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+// every file and folder under from\ copied into to\ (both with a trailing backslash; to\ exists): nothing is
+// overwritten, the source only read. Links and folders nested past 16 levels are left out.
+struct FixCopy { int files, failed, skipped; };
+static void fix_copy_tree(const char* from, const char* to, FixCopy& st, int depth) {
+    char a[MAX_PATH], b[MAX_PATH];
+    const size_t nf = strlen(from), nt = strlen(to);
+    if (nf + 2 > MAX_PATH) { st.skipped++; return; }
+    memcpy(a, from, nf);
+    memcpy(a + nf, "*", 2);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = kFindFirstFileA(a, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        const char* nm = fd.cFileName;
+        if (!strcmp(nm, ".") || !strcmp(nm, "..")) continue;
+        const size_t nn = strlen(nm);
+        const bool dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (nf + nn + 2 > MAX_PATH || nt + nn + 2 > MAX_PATH ||
+            (dir && (depth >= 16 || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)))) {
+            st.skipped++;
+            continue;
+        }
+        memcpy(a + nf, nm, nn + 1);
+        memcpy(b, to, nt);
+        memcpy(b + nt, nm, nn + 1);
+        if (!dir) {
+            if (kCopyFileA(a, b, TRUE)) st.files++;
+            else st.failed++;
+            continue;
+        }
+        if (!kCreateDirectoryA(b, 0) && kGetLastError() != ERROR_ALREADY_EXISTS) { st.failed++; continue; }
+        memcpy(a + nf + nn, "\\", 2);
+        memcpy(b + nt + nn, "\\", 2);
+        fix_copy_tree(a, b, st, depth + 1);
+    } while (kFindNextFileA(h, &fd));
+    kFindClose(h);
+}
+
+// g_user_dir <- <race.exe's folder>\Config\, made, with the old user directory copied into it the first time.
+// false (g_user_dir untouched, logged) where it can't: the original's literal is used.
+static bool fix_user_directory() {
+    const char* lit = S(0x004e5fcc);                               // the literal, as this exe has it
+    char dir[MAX_PATH];
+    const uint32_t n = vp_exe_dir(dir, sizeof dir);
+    if (n == 0) {
+        logf("fix: user directory: race.exe's folder not found; keeping %s", lit);
+        return false;
+    }
+    if (n + 7 > FIX_USER_DIR_MAX) {
+        logf("fix: user directory: %sConfig\\ would be %u characters (the game takes %d); keeping %s", dir, n + 7,
+             FIX_USER_DIR_MAX, lit);
+        return false;
+    }
+    memcpy(dir + n, "Config", 7);
+    const BOOL made = kCreateDirectoryA(dir, 0);                   // (made now: a new user directory)
+    const DWORD err = made ? 0 : kGetLastError();
+    memcpy(dir + n + 6, "\\", 2);
+    char note[3 * MAX_PATH];
+    if (!made) {
+        if (err == ERROR_ALREADY_EXISTS) snprintf(note, sizeof note, "already there");
+        else snprintf(note, sizeof note, "can't be made: error %lu", (unsigned long)err);
+    } else {
+        // the old user directory: an absolute literal's VirtualStore copies (Program Files, then Program Files (x86)),
+        // then the literal itself -- a relative one taken from the current directory
+        char cand[3][MAX_PATH];
+        int nc = 0;
+        if (lit[0] && lit[1] == ':' && lit[2] == '\\') {
+            char la[MAX_PATH];
+            const DWORD k = GetEnvironmentVariableA("LOCALAPPDATA", la, sizeof la);   // (not a game import: the DLL's)
+            if (k && k < sizeof la) {
+                int w = snprintf(cand[nc], MAX_PATH, "%s\\VirtualStore\\%s", la, lit + 3);
+                if (w > 0 && w < MAX_PATH) nc++;
+                if (_strnicmp(lit + 3, "Program Files\\", 14) == 0) {
+                    w = snprintf(cand[nc], MAX_PATH, "%s\\VirtualStore\\Program Files (x86)\\%s", la, lit + 17);
+                    if (w > 0 && w < MAX_PATH) nc++;
+                }
+            }
+        }
+        const DWORD k = kGetFullPathNameA(lit, MAX_PATH, cand[nc], 0);
+        if (k && k < MAX_PATH) nc++;
+        const char* old = 0;
+        for (int i = 0; i < nc && !old; i++)
+            if (fix_is_dir(cand[i])) old = cand[i];
+        if (!old) {
+            snprintf(note, sizeof note, "new; no old user directory at %s", lit);
+        } else {
+            char from[MAX_PATH];
+            const size_t no = strlen(old);
+            memcpy(from, old, no + 1);
+            if (no && from[no - 1] != '\\' && no + 1 < MAX_PATH) memcpy(from + no, "\\", 2);
+            if (_strnicmp(dir, from, strlen(from)) == 0) {           // the same folder (or the new one inside it)
+                snprintf(note, sizeof note, "new; the old user directory %s is this one", from);
+            } else {
+                FixCopy st = {0, 0, 0};
+                fix_copy_tree(from, dir, st, 0);
+                int w = snprintf(note, sizeof note, "copied %d files from %s", st.files, from);
+                if (st.failed && w > 0 && w < (int)sizeof note)
+                    w += snprintf(note + w, sizeof note - w, ", %d failed", st.failed);
+                if (st.skipped && w > 0 && w < (int)sizeof note)
+                    snprintf(note + w, sizeof note - w, ", %d left out", st.skipped);
+            }
+        }
+    }
+    logf("fix: user directory %s (%s)", dir, note);
+    str_copy(g_user_dir, dir);
+    return true;
+}
+
 // get_user_directory (0x412430): always "C:\Program Files\MGI\Viper98\" -- wherever the game is installed -- made
 // (its result ignored) and logged
+// FIX: <race.exe's folder>\Config\, the old one migrated (above)
 typedef uint8_t(__cdecl* CreateDir_t)(const char*);
 static const CreateDir_t create_directory_o = (CreateDir_t)0x00412480;
 static uint8_t __cdecl get_user_directory_rw() {
-    str_copy(g_user_dir, S(0x004e5fcc));                           // "C:\Program Files\MGI\Viper98\"
+    if (!(VP_FIX && fix_user_directory()))
+        str_copy(g_user_dir, S(0x004e5fcc));                       // "C:\Program Files\MGI\Viper98\"
     create_directory_o(g_user_dir);
     LogReport(S(0x004e5fec), g_user_dir);                          // "Config Dir: %s"
     return 1;
