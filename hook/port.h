@@ -140,6 +140,10 @@ bool port_is_new(const PortFn& f);             // is the rewrite in force (new o
 // (0 if the build isn't v1.0 or the bytes aren't what prologues.inc expects). For the harness's own
 // hooks (the recorder): they always call the original through the trampoline.
 void* detour(uint32_t v10, void* to, const char* what);
+// The same for a hook in front of a function that may also be rewritten (the recorder, the shadow outputs):
+// the jump at v10 goes to `to`, and what comes back is what `to` calls on to -- the rewrite when it's in
+// force (in shadow mode, its checking entry), otherwise the original through a trampoline. After port_install.
+void* detour_front(uint32_t v10, void* to, const char* what);
 
 // the class a game object's vtable belongs to, and its size (state_layout.inc); 0 if unknown
 const char* class_of(const void* obj, uint32_t* size);

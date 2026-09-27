@@ -483,6 +483,7 @@ static void __cdecl collide_phobs(void) {
     void** ph = *(void***)G.phobs;
     int n = *(int*)G.nphobs;
     const bool collisions = *(uint8_t*)G.collisions != 0, walls = *(uint8_t*)G.walls != 0;
+    if ((g_pair_ticks & 255) == 0) note_peaks();                   // every track has this, not every one obstacles
     // 1. every dynamic object's volumes move to where their object now is
     for (int i = 0; i < n; i++) {
         void* p = ph[i];

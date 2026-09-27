@@ -480,7 +480,7 @@ void replay_install(const char* ini) {
         // detour(0x00441e80) detour(0x00441ec0) detour(0x00441ed0) detour(0x00441ef0) detour(0x00441f00)
         // detour(0x00441f10) detour(0x00441f20) detour(0x00441f30) detour(0x00441f40) detour(0x00441f50)
         // detour(0x0041b6b0)
-        *h.orig = detour(h.v10, h.to, h.what);
+        *h.orig = detour_front(h.v10, h.to, h.what);     // in front of the rewrite, where there is one
         ok += *h.orig != 0;
     }
     if (ok != wanted) {

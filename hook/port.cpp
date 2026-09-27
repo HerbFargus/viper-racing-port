@@ -79,6 +79,15 @@ void* detour(uint32_t v10, void* to, const char* what) {
     return t;
 }
 
+void* detour_front(uint32_t v10, void* to, const char* what) {
+    for (PortFn* f : registry()) {
+        if (f->v10 != v10 || f->mode == PORT_ORIGINAL || !f->orig) continue;
+        write_jmp(v10, to);                                       // in front of the rewrite port_install hooked
+        return f->mode == PORT_SHADOW ? f->shadow : f->repl;
+    }
+    return detour(v10, to, what);
+}
+
 // ---- stock fingerprints (stock.inc) --------------------------------------------------------------------------
 // A rewrite replaces only the exact stock v1.0 function it was written from: its code and every read-only
 // constant it reads. On a race.exe with vrmod's patches (engine fixes, hornball, the AI crash fix) a
@@ -273,9 +282,9 @@ static void run_outputs(const std::vector<uint8_t>& log) {
 
 static void install_outputs() {
     // detour(0x0043c560) detour(0x0043c510) detour(0x0042d8b0) -- listed for gen_port_tables.py
-    o_play_vel = (PlayVel_t)detour(0x0043c560, (void*)out_play_vel, "CollisionSound::Play (output)");
-    o_play_f = (PlayF_t)detour(0x0043c510, (void*)out_play_f, "CollisionSound::Play(float) (output)");
-    o_add_event = (AddEvent_t)detour(0x0042d8b0, (void*)out_add_event, "PhysReplayAddEvent (output)");
+    o_play_vel = (PlayVel_t)detour_front(0x0043c560, (void*)out_play_vel, "CollisionSound::Play (output)");
+    o_play_f = (PlayF_t)detour_front(0x0043c510, (void*)out_play_f, "CollisionSound::Play(float) (output)");
+    o_add_event = (AddEvent_t)detour_front(0x0042d8b0, (void*)out_add_event, "PhysReplayAddEvent (output)");
     logf("shadow: outputs %s: crash sounds and the game's replay events are compared, then made once",
          o_play_vel && o_play_f && o_add_event ? "hooked" : "NOT all hooked");
 }
