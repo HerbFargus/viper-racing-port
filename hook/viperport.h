@@ -10,6 +10,9 @@ void logf(const char* fmt, ...);
 // and their capacities there (stock: 256 options, 8 languages, 32 open files -- each loaded resource set keeps one).
 // The rewrites (krn_res.cpp, krn_file.cpp) stop at them.
 enum { VP_LIFT_OPTIONS = 4096, VP_LIFT_LANGUAGES = 64, VP_LIFT_FILES = 256 };
+// M1 (viperport.cpp, relocate_graf_lists): the track graph's two facing-model lists (stock 512 at 0x558968 and 514 at
+// 0x558160, filled by draw_tree with no bound) moved into the DLL, v1.0 only; the rewrite (wld_draw.cpp) stops at it.
+enum { VP_LIFT_GRAF_FACING = 8192 };
 
 // is the running build v1.0 race.exe (the reference build, whose addresses need no table)?
 bool build_is_v10();

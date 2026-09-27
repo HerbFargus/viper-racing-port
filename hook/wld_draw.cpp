@@ -266,8 +266,11 @@ enum : uint32_t {
     S_SKY_ON = 0x00555874, S_SKY_MODEL = 0x00555898, S_SKY_FRAME = 0x005558b8, S_FOV = 0x005558ac,
     S_DRAW_DIST = 0x00555864,
     // graf.obj
-    S_GRAF_FRAME = 0x00558118, S_GRAF_ROOT = 0x0055997c, S_FACING_N = 0x00558108, S_FACING = 0x00558968,
-    S_UPRIGHT_N = 0x00559998, S_UPRIGHT = 0x00558160, S_MIN_LOD = 0x004f5284, S_LOD_BIAS = 0x004f5290,
+    S_GRAF_FRAME = 0x00558118, S_GRAF_ROOT = 0x0055997c, S_FACING_N = 0x00558108, S_UPRIGHT_N = 0x00559998,
+    S_FACING_STOCK = 0x00558968, S_UPRIGHT_STOCK = 0x00558160,       // the lists' v1.0 homes (M1 moves them)
+    S_FACING_OP_TREE = 0x0046e04a, S_UPRIGHT_OP_TREE = 0x0046e066,   // draw_tree's stores: mov [eax*4 + list], esi
+    S_FACING_OP_DRAW = 0x0046dcb7, S_UPRIGHT_OP_DRAW = 0x0046ddcb,   // GrafDraw's loops: mov ebp / esi, list
+    S_MIN_LOD = 0x004f5284, S_LOD_BIAS = 0x004f5290,
     S_GRAF_CLIP = 0x004f528c,
     // mr / light
     S_ALPHA_LEVEL = 0x00522a1c,         // mrCaps +4: 0 no alpha, 1 some blends, 2 all
@@ -667,8 +670,18 @@ PORT_FN(0x00466840, "ViewDrawMirror", ViewDrawMirror, fp_view_draw_mirror)
 // camera-facing list, 2 the upright list, 4 none, else a panic), 2 an LOD group (drawn while the camera's distance
 // squared, + the min LOD, x the bias, is below +0x18 and not below +0x1c; +0x1c = -1 never), 1 a sphere-culled
 // group (+0xc the flag; the sphere +0x10 radius +0x1c), 0 a group; a group's children (+8) recursively.
-// FIX CANDIDATE: the facing lists have no bound: the 513th camera-facing node (mode 1) writes 0x559168 (the dynamic
-// models), the 515th upright one (mode 2) the camera-facing list.
+// FIX: the facing lists had no bound: the 513th camera-facing node (mode 1) wrote 0x559168 (the dynamic models), the
+// 515th upright one (mode 2) the camera-facing list. M1 moves both lists into the DLL with 8192 slots each
+// (viperport.cpp, relocate_graf_lists; the lists are read from the original's operands), and a node past the capacity
+// -- the lifted one, or the stock 512 / 514 where M1 didn't move them -- is dropped (not drawn; logged once).
+static uint32_t facing_capacity() { return m1_operand(0x0046e04a) == S_FACING_STOCK ? 512 : VP_LIFT_GRAF_FACING; }
+static uint32_t upright_capacity() { return m1_operand(0x0046e066) == S_UPRIGHT_STOCK ? 514 : VP_LIFT_GRAF_FACING; }
+static bool facing_full(uint32_t k, uint32_t cap) {
+    if (k < cap) return false;
+    static bool said;
+    if (!said) { said = true; logf("draw_tree: more than %u facing models of one kind in view: the rest aren't drawn", cap); }
+    return true;
+}
 static void __cdecl draw_tree(uint8_t* n) {
     for (; n; n = Pat(n, 4)) {
         const int32_t type = Iat(n, 0);
@@ -681,12 +694,14 @@ static void __cdecl draw_tree(uint8_t* n) {
             const int32_t mode = Iat(n, 0x38);
             if (mode == 1) {
                 const int32_t k = I(S_FACING_N);
+                if (VP_FIX && facing_full((uint32_t)k, facing_capacity())) continue;
                 I(S_FACING_N)++;
-                P<uint8_t*>(S_FACING)[k] = n;
+                P<uint8_t*>(m1_operand(0x0046e04a))[k] = n;
             } else if (mode == 2) {
                 const int32_t k = I(S_UPRIGHT_N);
+                if (VP_FIX && facing_full((uint32_t)k, upright_capacity())) continue;
                 I(S_UPRIGHT_N)++;
-                P<uint8_t*>(S_UPRIGHT)[k] = n;
+                P<uint8_t*>(m1_operand(0x0046e066))[k] = n;
             } else if (mode != 4) {
                 LogPanic((const char*)0x004f52a8);                   // "poorly formed graf: bad facing mode"
             }
@@ -732,7 +747,7 @@ static void __cdecl GrafDraw(int) {
     Frame f;
     float* r = f.rot.m;
     for (int i = 0; I(S_FACING_N) > i; i++) {
-        uint8_t* node = P<uint8_t*>(S_FACING)[i];
+        uint8_t* node = P<uint8_t*>(m1_operand(0x0046dcb7))[i];
         cp12(&f.pos, node + 0x3c);
         const P3* c = mrGetCameraPos();
         const float dx = (float)(D(f.pos.x) - c->x), dy = (float)(D(f.pos.y) - c->y), dz = (float)(D(f.pos.z) - c->z);
@@ -747,7 +762,7 @@ static void __cdecl GrafDraw(int) {
         mrModelDraw(Iat(node, 0xc), &f);
     }
     for (int i = 0; I(S_UPRIGHT_N) > i; i++) {
-        uint8_t* node = P<uint8_t*>(S_UPRIGHT)[i];
+        uint8_t* node = P<uint8_t*>(m1_operand(0x0046ddcb))[i];
         cp12(&f.pos, node + 0x3c);
         const P3* c = mrGetCameraPos();
         const float dx = (float)(D(f.pos.x) - c->x), dy = (float)(D(f.pos.y) - c->y);
@@ -982,8 +997,15 @@ PORT_FN(0x0046a4c0, "CarObject::Draw", CarObject_Draw, fp_car_draw)
 // ==== CarObject::Draw2D (0x46ad80) ==============================================================================
 // Another car's name tag within 100 m: its position 1 m up projected, 32 pixels above: "name (n)" in multiplayer;
 // with the status hack on, thought.stp and the status text. The canvas stays set (the original doesn't restore it).
-// FIX CANDIDATE: "%s (%d)" goes into 44 bytes of the original's stack (to its saved registers); a long name (the car
-// manager's +5, up to 45 bytes) overruns it. The rewrite's buffer holds 256, matching wherever the original survives.
+// FIX: "%s (%d)" went into 44 bytes of the original's stack (up to its saved registers), so a long name (the car
+// manager's +5, up to 45 bytes) overran it. The name is cut so the tag fits in 44 bytes (43 characters); a tag that
+// fits is formatted exactly as before.
+static int decimal_length(int32_t v) {                               // the characters %d writes
+    uint32_t u = v < 0 ? 0u - (uint32_t)v : (uint32_t)v;
+    int n = v < 0 ? 2 : 1;
+    while (u >= 10) { u /= 10; n++; }
+    return n;
+}
 static void __fastcall CarObject_Draw2D(CarObject* self, Edx, void* canvas) {
     if (WorldGetFocusCar() == self->index) return;
     const float* cam = P<float>(S_CAMERA_POS);
@@ -1001,7 +1023,15 @@ static void __fastcall CarObject_Draw2D(CarObject* self, Edx, void* canvas) {
     const int32_t num = Iat(info, 0x140);
     if (MultiEnabled()) {
         char buf[256];
-        game_sprintf(buf, (const char*)0x004f4f5c, info + 5, num);    // "%s (%d)"
+        const char* name = (const char*)info + 5;
+        char cut[44];
+        const int room = 43 - 3 - decimal_length(num);                 // 44 bytes less " (", ")" and the number
+        if (VP_FIX && (int)strlen(name) > room) {
+            memcpy(cut, name, (size_t)room);
+            cut[room] = 0;
+            name = cut;
+        }
+        game_sprintf(buf, (const char*)0x004f4f5c, name, num);         // "%s (%d)"
         const int y = x87_ftol(q.y);
         gxTextCentered(x87_ftol(q.x), y, buf, (uint32_t)I(S_CAR_TAG_COLOR));
     }
@@ -1029,8 +1059,10 @@ PORT_FN(0x0046ad80, "CarObject::Draw2D", CarObject_Draw2D, fp_car_draw2d)
 // then at the tyre's contact point (the frame 1 tyre radius down -- the front radius on all four), tyre smoke (a
 // free puff, not paused) and dust: one particle every 0.1 s (or at once when the clock hasn't moved or went back).
 // (The distance argument is unused.)
-// FIX CANDIDATE: the wheel LOD is the LOD table's column ("<car>L.tab", atoi) with no bound: a value above 2 reads
-// the wheel model handle from past wheel_models[3] (the wheel frames) and draws a garbage handle.
+// FIX: the wheel LOD is the LOD table's column ("<car>L.tab", atoi) with no bound: a value above 2 read the wheel
+// model handle from past wheel_models[3] (the wheel frames) and drew a garbage handle. The model is now picked from
+// wheel_models[2] for any value above 2 (negative ones draw no wheel, as before); the rest of the wheel -- the spin,
+// the x-ray offset -- still goes by the value itself.
 static void __fastcall CarObject_DrawWheel(CarObject* self, Edx, int i, uint32_t, uint8_t xray) {
     int32_t lod = self->lod_p[self->lod_now2].faces;
     if (xray) lod = 2;
@@ -1066,7 +1098,8 @@ static void __fastcall CarObject_DrawWheel(CarObject* self, Edx, int i, uint32_t
     }
     WheelMsg* w = wheel_msg(self, i);
     const bool fast = fabs(D(w->omega)) > 30.0f;                      // fabs; fcomp 30; test ah,0x41
-    const uint8_t* wm = (const uint8_t*)self + 0x518 + ((uint32_t)lod << 4);   // wheel_models[lod]
+    const int32_t mlod = VP_FIX && lod > 2 ? 2 : lod;
+    const uint8_t* wm = (const uint8_t*)self + 0x518 + ((uint32_t)mlod << 4);   // wheel_models[lod]
     int32_t model;
     if (i == 0 || i == 1) model = *(const int32_t*)(wm + (fast ? 0 : 4));
     else model = *(const int32_t*)(wm + (fast ? 8 : 12));

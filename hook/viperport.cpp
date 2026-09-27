@@ -387,6 +387,30 @@ static void relocate_res_tables() {
     patch_fields(files, nfiles, "the open-file table, 32 -> 256");
 }
 
+// ---- M1: the track graph's facing-model lists ---------------------------------------------------------------------------
+// draw_tree queues every camera-facing model node (mode 1) into 512 slots at 0x558968 and every upright one (mode 2) into
+// 514 at 0x558160, with no bound: past them it overwrote the dynamic-model table (0x559168) and the other list. Only
+// four instructions address the lists (draw_tree's two stores, GrafDraw's two loops); they're repointed at bigger lists
+// here, v1.0 only (the race.bin builds keep theirs). The rewrites read the same operands (m1_operand) and stop at
+// VP_LIFT_GRAF_FACING (wld_draw.cpp).
+static uint8_t* g_graf_facing[VP_LIFT_GRAF_FACING];
+static uint8_t* g_graf_upright[VP_LIFT_GRAF_FACING];
+
+static void relocate_graf_lists() {
+    if (!build_is_v10()) {
+        logf("NOT lifting the graf's facing lists: v1.0 race.exe only");
+        return;
+    }
+    const uint32_t facing = (uint32_t)&g_graf_facing[0], upright = (uint32_t)&g_graf_upright[0];
+    Field f[] = {
+        {0x46dcb6, 1, 0x558968, facing},                      // GrafDraw: mov ebp, facing list
+        {0x46e047, 3, 0x558968, facing},                      // draw_tree: mov [eax*4 + facing list], esi
+        {0x46ddca, 1, 0x558160, upright},                     // GrafDraw: mov esi, upright list
+        {0x46e063, 3, 0x558160, upright},                     // draw_tree: mov [eax*4 + upright list], esi
+    };
+    patch_fields(f, sizeof f / sizeof f[0], "the graf's facing lists, 512 / 514 -> 8192");
+}
+
 static int peak_textures() {                                    // entries in use at the moment
     int used = 0;
     for (int i = 0; i < TEX_TABLE; i++) used += g_tex_table[i * TEX_ENTRY] != 0;
@@ -627,6 +651,7 @@ static void install() {
     lift_texture_limit();
     relocate_texture_table();
     relocate_res_tables();
+    relocate_graf_lists();
     char ini[MAX_PATH];                         // viperport.ini, beside this DLL
     GetModuleFileNameA(g_self, ini, MAX_PATH);
     char* slash = strrchr(ini, '\\');

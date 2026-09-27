@@ -45,6 +45,11 @@
 // the same buckets, order and passes as the stock ones). They are build-agnostic (addresses through A()) and carry
 // the race.bin builds' prologues, as M1's hooks did.
 //
+// Fixes (docs/PORTING.md, "Fixes"; each marked FIX:, off in a VP_FAITHFUL build): 16-character names in the 16-byte name
+// fields read as terminated names (name16); a missing model logged and loaded as an empty model instead of a panic and a
+// read through NULL; a model with no surfaces queues nothing when deferred; the lighting tables' indices clamped to the
+// tables; mrLightSpecial's light number bounded to the eight lights.
+//
 // Skipped: the $E static initialisers of all five objects (the CRT runs them before any hook exists; light.obj's $E53
 // too), and the bare `ret` stubs, too short to hook and with nothing to port: dxMatrixEnd (0x45db70), dxMatrixRelease
 // (0x45db80), dxMatrixRestore (0x45db90), mr_feature_end (0x457880), mr_model_release (0x4558a0), mr_model_restore
@@ -114,6 +119,27 @@ static __forceinline int32_t magic_int(double v) {
     return (int32_t)((uint32_t)b - 0x80000000u);
 }
 }  // namespace
+
+// A fix branch taken (docs/PORTING.md "Fixes"): nothing in the DLL; the harness counts them to tell a world a fix changed
+// from an ordinary one, which must still give the original's bits.
+#ifndef GX_FIX_FIRED
+#define GX_FIX_FIRED() ((void)0)
+#endif
+
+// FIX: a name in a 16-byte field (a .mod surface's texture name, a remap entry's, a model_surface_info's) is 16
+// characters with no terminator when it is exactly 16 long -- legal, since the resource and texture layers take 16-character
+// names -- and the original then reads on into whatever follows the field (the surface type, the remap value) as more
+// name, so the texture it asks for and every comparison went wrong. Such a name is read here as its 16 characters with a
+// terminator; one with a terminator inside the field is handed on as it is (the original's bytes).
+static __forceinline const char* name16(const char* s, char* buf17) {
+    if (VP_FIX && s && strnlen(s, 16) == 16) {
+        memcpy(buf17, s, 16);
+        buf17[16] = 0;
+        GX_FIX_FIRED();
+        return buf17;
+    }
+    return s;
+}
 
 // ---- statics ---------------------------------------------------------------------------------------------------
 enum : uint32_t {
@@ -1170,9 +1196,9 @@ PORT_FN(0x00457ed0, "mrPopState", mrPopState, fp_mrPopState)
 
 // ================================================================================================================
 // light.obj -- CPU lighting into D3DLVERTEX. The colour is a grey from the diffuse table, L_DIFF[0x80 + N.L*255]
-// (N.L*255 rounded by the magic-number trick, negative -> 0, no upper bound: FIX CANDIDATE, a normal longer than 1 reads
-// past the 0x200-entry table), OR'd with the model alpha; the specular is a grey from the 256-entry specular table
-// (no bound either way: FIX CANDIDATE) with the fog factor in its alpha: 0xff when fog is off or the squared distance
+// (N.L*255 rounded by the magic-number trick, negative -> 0; FIX: clamped to the 0x200-entry table, which a normal longer
+// than 1 read past), OR'd with the model alpha; the specular is a grey from the 256-entry specular table
+// (FIX: clamped to its ends; the original had no bound either way) with the fog factor in its alpha: 0xff when fog is off or the squared distance
 // is within the fog start, else round((end - d^2) x scale), at least 0x80 and only its low byte kept.
 // ================================================================================================================
 typedef int(__cdecl* ProfStart_t)(const char*);
@@ -1181,7 +1207,12 @@ static __forceinline P3* V3(uint32_t addr) { return (P3*)(uintptr_t)addr; }
 // the diffuse table entry for magic-rounded index i (negative -> 0), with the model alpha
 static __forceinline uint32_t diffuse_of(int32_t i) {
     if (i < 0) i = 0;
-    return Ua(L_DIFF + 4u * (uint32_t)(Ia(L_BASE) + i)) | Ua(L_ALPHA_OR);
+    uint32_t k = (uint32_t)(Ia(L_BASE) + i);
+    if (VP_FIX && k > 0x1ff) {                                        // FIX: a normal longer than 1 (a mod model's unnormalised
+        k = 0x1ff;                                                    // normals) read past the 0x200-entry table: its last entry
+        GX_FIX_FIRED();
+    }
+    return Ua(L_DIFF + 4u * k) | Ua(L_ALPHA_OR);
 }
 // the fog alpha byte (<< 24): d2 compared as the original compares it (a register, or the float it stored), d2sub
 // what it subtracts from the fog end
@@ -1201,7 +1232,13 @@ static __forceinline void copy_pos_uv(uint8_t* o, const uint8_t* in) {
     cp4(o + 0x18, in + 0x18);
     cp4(o + 0x1c, in + 0x1c);
 }
-static __forceinline uint32_t spec_of(int32_t i) { return Ua(L_SPECT + 4u * (uint32_t)i); }
+static __forceinline uint32_t spec_of(int32_t i) {
+    if (VP_FIX && (uint32_t)i > 0xff) {                               // FIX: the specular index had no bound either way (an
+        i = i < 0 ? 0 : 0xff;                                         // unnormalised normal or half vector): the table's ends
+        GX_FIX_FIRED();
+    }
+    return Ua(L_SPECT + 4u * (uint32_t)i);
+}
 
 // ==== mr_light_begin (0x45add0), mr_light_end (0x45ade0), mr_light_release (0x45adf0), mr_light_restore (0x45ae00)
 static void __cdecl mr_light_begin() { light_begin_o(); }
@@ -1728,15 +1765,20 @@ static void fp_mrLightMode(Footprint& f, int) {
 PORT_FN(0x0045bf70, "mrLightMode", mrLightMode, fp_mrLightMode)
 
 // ==== mrLightSpecial (0x45c050) ==================================================================================
-// at night, light i (no bound: FIX CANDIDATE) on for 2 frames at the frame's position, along its z axis
+// at night, light i (FIX: 0..7; others ignored) on for 2 frames at the frame's position, along its z axis
 static void __cdecl mrLightSpecial(int i, const uint8_t* fr) {
     if (Ia(L_MODE) != 1) return;
+    if (VP_FIX && (uint32_t)i >= 8) {                                // FIX: a light number past the eight wrote over the
+        GX_FIX_FIRED();                                               // statics after the lights' tables: ignored
+        return;
+    }
     Ia(L_STATE + 4u * (uint32_t)i) = 2;
     cp12(P<uint8_t>(L_POS + 12u * (uint32_t)i), fr + 0x24);
     cp12(P<uint8_t>(L_DIR + 12u * (uint32_t)i), fr + 0x18);
 }
 static void fp_mrLightSpecial(Footprint& f, int i, const uint8_t*) {
     if (Ia(L_MODE) != 1) return;
+    if (VP_FIX && (uint32_t)i >= 8) return;
     f.add(P<uint8_t>(L_STATE + 4u * (uint32_t)i), 4, "light: frames left");
     f.add(P<uint8_t>(L_POS + 12u * (uint32_t)i), 12, "light: position");
     f.add(P<uint8_t>(L_DIR + 12u * (uint32_t)i), 12, "light: direction");
@@ -2215,9 +2257,19 @@ static void fp_mr_model_last(Footprint& f) { f.replay_only = "gxForgetTexture ca
 PORT_FN(0x00455880, "mr_model_last", mr_model_last, fp_mr_model_last)
 
 // ==== mrModelLoad (0x4558c0) / mrModelLoadRemap (0x455900) / mrModelUnload (0x455950) ============================
-// FIX CANDIDATE: a model that isn't found (mrModelInfoGet panics and returns NULL) is read through NULL here
+// FIX: a model that isn't found (mrModelInfoGet logs it and returns NULL) was read through NULL here: it becomes a model
+// with an empty info (no vertices, surfaces or triangles), which draws nothing; mrModelUnload doesn't hand that info back
+// to the resource layer.
+static uint8_t g_empty_info[0x28];
+static __forceinline uint8_t* info_or_empty(uint8_t* info) {
+    if (VP_FIX && !info) {
+        GX_FIX_FIRED();
+        return g_empty_info;
+    }
+    return info;
+}
 static int __cdecl mrModelLoad(const char* name) {
-    uint8_t* info = (uint8_t*)mrModelInfoGet_o(name);
+    uint8_t* info = info_or_empty((uint8_t*)mrModelInfoGet_o(name));
     const int m = mrModelCreate_o(name, Ip(info, 0x10));
     mrModelBuild_o(m, info, 7);
     return m;
@@ -2227,7 +2279,7 @@ static void fp_mrModelLoad(Footprint& f, const char*) { fp_load(f); }
 PORT_FN(0x004558c0, "mrModelLoad", mrModelLoad, fp_mrModelLoad)
 
 static int __cdecl mrModelLoadRemap(const char* name, void* remap, int n) {
-    uint8_t* info = (uint8_t*)mrModelInfoGet_o(name);
+    uint8_t* info = info_or_empty((uint8_t*)mrModelInfoGet_o(name));
     const int m = mrModelCreate_o(name, Ip(info, 0x10));
     mrModelRemapTextures_o(m, remap, n);
     mrModelBuild_o(m, info, 7);
@@ -2238,7 +2290,7 @@ PORT_FN(0x00455900, "mrModelLoadRemap", mrModelLoadRemap, fp_mrModelLoadRemap)
 
 static void __cdecl mrModelUnload(int m) {
     uint8_t* info = Pp(mip(m), 0x10);
-    if (info) mrModelInfoForget_o(info);
+    if (info && !(VP_FIX && info == g_empty_info)) mrModelInfoForget_o(info);
     mrModelDestroy_o(m);
 }
 static void fp_mrModelUnload(Footprint& f, int) { f.replay_only = "frees a model"; }
@@ -2298,7 +2350,8 @@ static void fp_mrModelDestroyCopy(Footprint& f, int) { f.replay_only = "frees a 
 PORT_FN(0x00455b30, "mrModelDestroyCopy", mrModelDestroyCopy, fp_mrModelDestroyCopy)
 
 // ==== mrModelCreate (0x455b40) ===================================================================================
-// FIX CANDIDATE: strncpy 16 -- a 16-character name is left unterminated in the model_info
+// A 16-character name is left unterminated in the model_info (strncpy 16, the original's bytes): nothing reads it but
+// model_copy_transform, which hands it on terminated (name16)
 static int __cdecl mrModelCreate(const char* name, int ntris) {
     uint8_t* mi = (uint8_t*)PoolBase_alloc_v10(*P<void*>(S_MODEL_POOL), 0);
     game_strncpy((char*)mi, name, 0x10);
@@ -2413,7 +2466,8 @@ static void __cdecl direct_model_build(int m, uint8_t* info, uint8_t lit, int fl
             prev = ns2;
             cur = 0;
         } else {
-            const int same = game_stricmp((const char*)s, (const char*)cur);
+            char sb[17], cb[17];
+            const int same = game_stricmp(name16((const char*)s, sb), name16((const char*)cur, cb));
             set_texture_id_o(m, same == 0 ? (const char*)cur : (const char*)s, cur);
             prev = cur;
             cur = Pp(cur, 0x28);
@@ -2520,7 +2574,8 @@ PORT_FN(0x00455ec0, "mrModelDraw(m)", mrModelDraw1, fp_mrModelDraw1)
 
 // ==== set_texture_id (0x4560d0) ==================================================================================
 // the surface's texture from its name, through the model's remap table (new name and value; the texture handed
-// back through the entry's pointer); nothing if the name and value are what it has. FIX CANDIDATE: strncpy 16.
+// back through the entry's pointer); nothing if the name and value are what it has. The 16-byte names are read through
+// name16 (FIX: 16-character names).
 static void __cdecl set_texture_id(int m, const char* name, uint8_t* si) {
     int32_t k = 0, value = 0;
     uint8_t* entry = 0;
@@ -2529,7 +2584,8 @@ static void __cdecl set_texture_id(int m, const char* name, uint8_t* si) {
         entry = remap;
         if (Ip(mi, 0x1c) > k) {
             do {
-                if (game_stricmp(name, (const char*)entry) == 0) break;
+                char nb[17], eb[17];
+                if (game_stricmp(name16(name, nb), name16((const char*)entry, eb)) == 0) break;
                 entry += 0x28;
                 k++;
             } while (Ip(mi, 0x1c) > k);
@@ -2543,10 +2599,11 @@ static void __cdecl set_texture_id(int m, const char* name, uint8_t* si) {
             entry = 0;
         }
     }
-    if (game_stricmp((const char*)si, name) == 0 && Ip(si, 0x10) == value) return;
+    char sb[17], nb[17];
+    if (game_stricmp(name16((const char*)si, sb), name16(name, nb)) == 0 && Ip(si, 0x10) == value) return;
     game_strncpy((char*)si, name, 0x10);
     Ip(si, 0x10) = value;
-    const int t = gxGetTexture(name, value);
+    const int t = gxGetTexture(name16(name, nb), value);
     if (Ip(si, 0x14) != -1) gxForgetTexture(Ip(si, 0x14));
     Ip(si, 0x14) = t;
     if (entry && Pp(entry, 0x24)) Ip(Pp(entry, 0x24), 0) = t;
@@ -2556,7 +2613,7 @@ PORT_FN(0x004560d0, "set_texture_id", set_texture_id, fp_set_texture_id)
 
 // ==== direct_model_draw (0x456190) ===============================================================================
 // deferred: every surface to the buckets (a do-while: a model with no surfaces still queues one, through its NULL
-// surface info -- FIX CANDIDATE); else each surface (in the env pass only type 1) lit and drawn
+// surface info -- FIX: now it queues nothing); else each surface (in the env pass only type 1) lit and drawn
 static void __cdecl direct_model_draw(int m) {
     uint8_t* mi = mip(m);
     uint8_t* info = Pp(mi, 0x10);
@@ -2564,6 +2621,10 @@ static void __cdecl direct_model_draw(int m) {
     uint8_t* surf = Pp(info, 0xc);
     int32_t n = Ip(info, 8);
     if (Ba(S_DEFERRED)) {
+        if (VP_FIX && n <= 0) {                                       // FIX: a model with no surfaces queued one anyway, through
+            GX_FIX_FIRED();                                           // its NULL surface info (a crash): it draws nothing
+            return;
+        }
         do {
             n--;
             add_deferred_surf_o(info, surf, si);
@@ -2609,6 +2670,11 @@ static void* __cdecl mrModelInfoGet(const char* name) {
     int32_t size;
     uint8_t* v = (uint8_t*)ResourceGet(name, 0x4d494e46, &version, &size, 0, &fresh);
     if (!v) {
+        if (VP_FIX) {                                                 // FIX: a missing model was a panic (the game ends); every
+            LogReport(P<const char>(0x004f227c), name);               // direct caller copes with NULL, and mrModelLoad /
+            GX_FIX_FIRED();                                           // LoadRemap make an empty model instead: logged, carry on
+            return 0;
+        }
         LogPanic(P<const char>(0x004f227c), name);
         return 0;
     }
@@ -3097,7 +3163,8 @@ PORT_FN_BUILDS(0x00457340, "draw_alpha_deferred_surfs", draw_alpha_deferred_surf
 static int __cdecl model_copy_transform(int m, const uint8_t* fr, uint8_t** out) {
     uint8_t* mi = mip(m);
     const uint8_t* src = Pp(mi, 0x10);
-    const int m2 = mrModelCreate_o((const char*)mi, Ip(src, 0x10));
+    char nb[17];
+    const int m2 = mrModelCreate_o(name16((const char*)mi, nb), Ip(src, 0x10));
     const uint32_t vb = (uint32_t)Ip(src, 0) << 5, tb = (uint32_t)Ip(src, 0x10) << 3, sb = (uint32_t)Ip(src, 8) << 5,
                    rb = (uint32_t)Ip(src, 0x18) << 4, qb = (uint32_t)Ip(src, 0x20) << 2;
     uint8_t* p = (uint8_t*)MemAlloc((int)(qb + vb + rb + sb + tb + 0x28));

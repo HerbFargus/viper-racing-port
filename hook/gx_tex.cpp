@@ -44,19 +44,27 @@
 //     footprint can name them before the Lock; both passes' Locks hand out the same pixels, and each Unlock's
 //     recorded call carries the pixels as that pass left them, so the check compares them.
 //
-// FIX CANDIDATES (not fixed: step G1 is faithful; each marked in place):
-//   * tc_add copies the texture name to entry+0x08 with an unbounded strcpy, into a 16-byte field followed by the key
-//     (+0x18), the loaded flag (+0x1c), sys (+0x20), vid (+0x24) and the next entry. See tc_add for what each length
-//     corrupts and what reads it.
+// Fixes (docs/PORTING.md, "Fixes"; each marked FIX:, VP_FIX; test/world_gx_tex.cpp built with /DFIX_TESTS tests them):
+//   * texture names of any length (tc_add's unbounded strcpy into the entry's 16-byte name): a name of 16+ characters
+//     is kept whole in the DLL and the entry holds a mark (set_long_tex_name / entry_name); every reader of the name
+//     uses the full one. Names up to 15 characters are stored and read exactly as the original does. Long names are
+//     reported to the log cut to 128 characters (the log formats into 256 bytes).
+//   * an entry without a system copy (sys NULL: its surface couldn't be made, or a free entry) is treated as no
+//     texture by TextureSelect / HasAlpha / GetSize / Blit / AlphaBlit / Grab, where the original crashed.
+// Not fixed (not crashes in reachable play):
 //   * dump_texture_format builds its flag list in a 0x50-byte stack buffer; the ten names total 98 characters, so a
 //     pixel format with most flags set overruns the original's frame (its return address). Unreachable: nothing in
-//     v1.0 calls it.
-//   * texture_info pointers / ids are trusted everywhere (TextureDestroy(-1) indexes entry -1, TextureSelect of a
-//     failed txLoadSystem's entry calls txLoadVideo(NULL), txRelease without a grab reads NULL->dtex).
+//     v1.0 calls it; the rewrite's overrun lands in a spill area of its own frame.
+//   * txRelease without a grab reads NULL->dtex: TextureRelease only calls it with a grab id set, which a failed
+//     txGrab (a lost surface) leaves behind -- but every caller releases only after a successful grab, and the next
+//     grab replaces the id.
+//   * TextureDestroy(-1) indexes entry -1 (no caller passes -1); TextureRestoreAll(1) / TextureBeginFrame leave `sys`
+//     dangling when a reload fails (a pool element still valid memory, reused by the next texture_info).
 //
 // Skipped: the $E static initialisers of gx.obj, texture.obj, tmap.obj and tex.obj (colour constants; the CRT runs
 // them before any hook exists).
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "port.h"
 
@@ -368,6 +376,82 @@ static const MipLevel_t get_mip_level = (MipLevel_t)0x00461180;
 typedef void(__cdecl* TexTransfer_t)(uint8_t*, Canvas*);
 static const TexTransfer_t texTransfer = (TexTransfer_t)0x004613b0, texAlphaBlit = (TexTransfer_t)0x00461470;
 
+// ---- fixes (docs/PORTING.md, "Fixes") ---------------------------------------------------------------------------------
+// FIX: texture names of 16 characters and more. tc_add strcpy's the name into the entry's 16-byte field (+0x08),
+// after the key, flags and copies are set, so a long name overwrites them (see tc_add): a 16-character keyed name is
+// never found again, 21+ crash the first time they're drawn, 24+ reload a garbage name. The full name is kept here,
+// keyed by the entry, and the entry's 16 bytes hold a mark instead: 0x01, a serial in 4 hex digits and the name's first
+// 10 characters, NUL-terminated. No texture name has a 0x01, so the mark matches nothing the game asks for; every
+// reader of the name (tc_lookup, TextureRestoreAll / BeginFrame's reloads, TextureEnd / Destroy's reports,
+// TextureRevert) asks entry_name() for the full one. A record is trusted only while the entry still holds its mark:
+// an entry written by an original function (viperport.ini, or a shadow check keeping the original's result) is read
+// as its own bytes, as the original reads them. Names up to 15 characters are stored exactly as the original stores
+// them. The records are DLL memory, not the game's: no footprint lists them, and a shadow check neither saves nor
+// compares them (the mark check makes a stale record harmless). Textures live on the main thread: no lock.
+namespace {
+struct LongTexName { const uint8_t* entry; char mark[16]; char* name; };
+}  // namespace
+static LongTexName* g_long_tex;
+static int g_nlong_tex, g_cap_long_tex;
+static uint32_t g_long_tex_serial;
+// the entry's name as TextureGet / TextureCreate were given it
+static const char* entry_name(const uint8_t* e) {
+    const char* n = (const char*)(e + 8);
+    if (!VP_FIX || n[0] != 1) return n;
+    for (int i = 0; i < g_nlong_tex; i++)
+        if (g_long_tex[i].entry == e && !memcmp(g_long_tex[i].mark, n, 16)) return g_long_tex[i].name;
+    return n;
+}
+// tc_add: a new entry's long name (the mark in the entry, the name kept here)
+static void set_long_tex_name(uint8_t* e, const char* name) {
+    char mark[16];
+    static const char hex[] = "0123456789abcdef";
+    const uint32_t serial = ++g_long_tex_serial;
+    memset(mark, 0, 16);
+    mark[0] = 1;
+    for (int k = 0; k < 4; k++) mark[1 + k] = hex[(serial >> (12 - 4 * k)) & 15];
+    for (int k = 0; k < 10 && name[k]; k++) mark[5 + k] = name[k];
+    memcpy(e + 8, mark, 16);
+    const size_t len = strlen(name);
+    char* full = (char*)malloc(len + 1);
+    if (!full) return;                              // (no memory: the texture just isn't found again, like the original)
+    memcpy(full, name, len + 1);
+    int i = 0;
+    while (i < g_nlong_tex && g_long_tex[i].entry != e) i++;       // the entry's old record, reused
+    if (i == g_nlong_tex) {
+        if (g_nlong_tex == g_cap_long_tex) {
+            const int cap = g_cap_long_tex ? g_cap_long_tex * 2 : 16;
+            LongTexName* t = (LongTexName*)realloc(g_long_tex, cap * sizeof *t);
+            if (!t) { free(full); return; }
+            g_long_tex = t;
+            g_cap_long_tex = cap;
+        }
+        g_nlong_tex++;
+    } else {
+        free(g_long_tex[i].name);
+    }
+    g_long_tex[i].entry = e;
+    memcpy(g_long_tex[i].mark, mark, 16);
+    g_long_tex[i].name = full;
+}
+// tc_add: a short name in an entry that had a long one: its record goes
+static void forget_long_tex_name(const uint8_t* e) {
+    for (int i = 0; i < g_nlong_tex; i++)
+        if (g_long_tex[i].entry == e) {
+            free(g_long_tex[i].name);
+            g_long_tex[i] = g_long_tex[--g_nlong_tex];
+            return;
+        }
+}
+// FIX: the log formats into 256 bytes (and overruns them): a name the fix lets through at any length is reported cut
+// to 128 characters
+static const char* log_name(const char* s, char (&tmp)[0x88]) {
+    if (!VP_FIX || strlen(s) <= 0x80) return s;
+    memcpy(tmp, s, 0x80);
+    memcpy(tmp + 0x80, "...", 4);
+    return tmp;
+}
+
 // ---- footprint helpers ------------------------------------------------------------------------------------------------
 // the table's capacity (tc_add's count: 250, or M1's 1000) and entry i, as the function's operand at `op` for the field
 // at offset `fo` addresses it
@@ -378,7 +462,7 @@ static int32_t fp_lookup(const char* name, int32_t key) {
     const int32_t n = tex_capacity();
     TexEntry* t = (TexEntry*)(uintptr_t)m1_operand(0x0045a6ab);
     for (int32_t i = 0; i < n; i++)
-        if (t[i].in_use && crt_stricmp(t[i].name, name) == 0 && t[i].key == key) return i;
+        if (t[i].in_use && crt_stricmp(entry_name((const uint8_t*)&t[i]), name) == 0 && t[i].key == key) return i;
     return -1;
 }
 static int32_t fp_first_free() {
@@ -685,7 +769,8 @@ static void __cdecl TextureEnd_rw() {
     do {
         TexEntry* t = (TexEntry*)e;
         if (t->in_use == 1) {
-            LogReport(S(0x004f3278), t->name);                  // "freeing unreleased texture elements: %s"
+            char tmp[0x88];
+            LogReport(S(0x004f3278), log_name(entry_name(e), tmp));   // "freeing unreleased texture elements: %s"
             if (TexInfo* v = t->vid) txUnloadVideo(v);
             if (TexInfo* s = t->sys) txUnloadSystem(s);
             t->in_use = 0;
@@ -751,7 +836,7 @@ static void __cdecl TextureRestoreAll_rw(uint8_t sys) {
     if (!sys) return;
     uint8_t* e = (uint8_t*)(uintptr_t)m1_operand(0x0045a099);    // the table
     do {
-        if (e[0] == 1) txLoadSystem((char*)(e + 8), (TexInfo**)(e + 0x20));
+        if (e[0] == 1) txLoadSystem((char*)entry_name(e), (TexInfo**)(e + 0x20));   // FIX: (entry_name) the full name
         e += 0x28;
     } while ((uintptr_t)e < m1_operand(0x0045a0b7));             // the end
 }
@@ -808,7 +893,8 @@ static int __cdecl TextureCreate_rw(const char* name, int key, int size) {
         txCreateSystem((TexInfo**)(uintptr_t)TE_AT(m1_operand(0x0045a19e), id), size);   // &entry.sys
         return id;
     }
-    LogPanic(S(0x004f32a0), name);                               // "already there: can't create texture: %s"
+    char tmp[0x88];
+    LogPanic(S(0x004f32a0), log_name(name, tmp));                // "already there: can't create texture: %s"
     return id;
 }
 static void fp_texture_create(Footprint& f, const char* name, int key, int) {
@@ -831,7 +917,9 @@ static void __cdecl TextureDestroy_rw(int id) {
         }
         return;
     }
-    LogPanic(S(0x004f32c8), (char*)(uintptr_t)TE_AT(m1_operand(0x0045a22c), id));   // "not last texture: can't destroy texture: %s"
+    char tmp[0x88];
+    const uint8_t* e = (const uint8_t*)(uintptr_t)TE_AT(m1_operand(0x0045a22c), id) - 8;   // entry.name's entry
+    LogPanic(S(0x004f32c8), log_name(entry_name(e), tmp));       // "not last texture: can't destroy texture: %s"
 }
 static void fp_texture_destroy(Footprint& f, int id) {
     if (!id_ok(id)) { f.replay_only = "an id outside the texture table"; return; }
@@ -841,11 +929,16 @@ static void fp_texture_destroy(Footprint& f, int id) {
 }
 PORT_FN(0x0045a1d0, "TextureDestroy", TextureDestroy_rw, fp_texture_destroy)
 
+// FIX: an entry without a system copy (sys NULL: its txLoadSystem / txCreateSystem failed -- the surface couldn't be
+// made -- or a free entry) crashed whatever used it: TextureSelect (txLoadVideo(NULL)), TextureHasAlpha (every frame
+// the texture is drawn late), TextureGetSize, TextureBlit, TextureAlphaBlit, TextureGrab. Such an entry now behaves as
+// no texture (id -1): not selected (0), no alpha, size 4, nothing blitted, not grabbed.
 // TextureBlit (0x45a240): src's system copy BltFast'ed into dst's, level by level (txBlit); the floats go on as bits
 static void __cdecl TextureBlit_rw(int src, int dst, uint32_t u0, uint32_t v0, uint32_t u1, uint32_t v1) {
     if (src == -1 || dst == -1) return;
     TexInfo* d = TEP(m1_operand(0x0045a26f), dst);                           // entry.sys (dst's read first)
     TexInfo* s = TEP(m1_operand(0x0045a277), src);
+    if (VP_FIX && (!s || !d)) return;                                         // FIX: no system copy: nothing to blit
     txBlit(s, d, u0, v0, u1, v1);
 }
 static void fp_texture_blit(Footprint& f, int src, int dst, uint32_t, uint32_t, uint32_t, uint32_t) {
@@ -860,7 +953,9 @@ PORT_FN(0x0045a240, "TextureBlit", TextureBlit_rw, fp_texture_blit)
 // TextureAlphaBlit (0x45a290): the .tex `name` alpha-pasted over every level of the texture's system copy
 static void __cdecl TextureAlphaBlit_rw(char* name, int id) {
     if (id == -1) return;
-    txAlphaBlit(name, TEP(m1_operand(0x0045a2a3), id));                      // entry.sys
+    TexInfo* s = TEP(m1_operand(0x0045a2a3), id);                            // entry.sys
+    if (VP_FIX && !s) return;                                                 // FIX: no system copy: nothing to blit
+    txAlphaBlit(name, s);
 }
 static void fp_texture_alpha_blit(Footprint& f, char*, int id) {
     if (id != -1) f.replay_only = "fetches the .tex resource (texGet: ResourceGetDiscardable may load its file)";
@@ -883,8 +978,10 @@ PORT_FN(0x0045a2f0, "TextureUnloadVideo", TextureUnloadVideo_rw, fp_texture_unlo
 // TextureGrab (0x45a300): a canvas over the system copy's top level (locked until TextureRelease)
 static uint8_t __cdecl TextureGrab_rw(int id, Canvas* c) {
     if (id == -1) return 0;
+    TexInfo* s = TEP(m1_operand(0x0045a31c), id);                            // entry.sys
+    if (VP_FIX && !s) return 0;                         // FIX: no system copy: not grabbed (and no grab to release)
     GI(X_GRAB_ID) = id;
-    return txGrab(TEP(m1_operand(0x0045a31c), id), c);                        // entry.sys
+    return txGrab(s, c);
 }
 static void fp_tx_grab(Footprint& f, TexInfo*, Canvas* c);
 static void fp_texture_grab(Footprint& f, int id, Canvas* c) {
@@ -919,7 +1016,7 @@ PORT_FN(0x0045a330, "TextureRelease", TextureRelease_rw, fp_texture_release)
 static void __cdecl TextureRevert_rw(int id) {
     if (id == -1) return;
     TexInfo* s = TEP(m1_operand(0x0045a3a0), id);                            // entry.sys
-    txRevert((char*)(uintptr_t)TE_AT(m1_operand(0x0045a3ae), id), s);         // entry.name
+    txRevert((char*)entry_name((const uint8_t*)(uintptr_t)TE_AT(m1_operand(0x0045a3ae), id) - 8), s);   // entry.name (FIX: full)
     if (TE8(m1_operand(0x0045a3bd), id) != 0) {                              // entry.loaded
         TexInfo* v = TEP(m1_operand(0x0045a3c6), id);                         // entry.vid
         txReloadVideo(TEP(m1_operand(0x0045a3cc), id), v);                    // entry.sys
@@ -930,7 +1027,9 @@ PORT_FN(0x0045a390, "TextureRevert", TextureRevert_rw, fp_dx_only)
 // TextureGetSize (0x45a3e0)
 static int __cdecl TextureGetSize_rw(int id) {
     if (id == -1) return 4;
-    return txGetSize(TEP(m1_operand(0x0045a3f5), id));                        // entry.sys
+    TexInfo* s = TEP(m1_operand(0x0045a3f5), id);                            // entry.sys
+    if (VP_FIX && !s) return 4;                                               // FIX: no system copy: as id -1
+    return txGetSize(s);
 }
 PORT_FN(0x0045a3e0, "TextureGetSize", TextureGetSize_rw, fp_nothing_i)
 
@@ -956,7 +1055,8 @@ static void __cdecl TextureBeginFrame_rw() {
     p = (uint8_t*)(uintptr_t)m1_operand(0x0045a46d);             // &entry.sys
     txConserveMode(1);
     do {
-        if (p[-0x20] != 0 && *(TexInfo* volatile*)p != 0) txLoadSystem((char*)(p - 0x18), (TexInfo**)p);
+        if (p[-0x20] != 0 && *(TexInfo* volatile*)p != 0)
+            txLoadSystem((char*)entry_name(p - 0x20), (TexInfo**)p);   // FIX: (entry_name) the full name
         p += 0x28;
     } while ((uintptr_t)p < m1_operand(0x0045a496));
     G8(X_DERES) = 0;
@@ -989,7 +1089,9 @@ static uint8_t __cdecl TextureSelect_rw(int id) {
         if (G8(X_DERES) != 0) goto fail;
         {
             TexInfo** vid = (TexInfo**)(uintptr_t)TE_AT(m1_operand(0x0045a50c), id);   // &entry.vid
-            if (!txLoadVideo(TEP(m1_operand(0x0045a512), id), vid)) goto fail;       // entry.sys
+            TexInfo* s = TEP(m1_operand(0x0045a512), id);                            // entry.sys
+            if (VP_FIX && !s) return 0;                     // FIX: no system copy: not selected (no de-rez either)
+            if (!txLoadVideo(s, vid)) goto fail;
         }
         TE8(m1_operand(0x0045a526), id) = 1;
     }
@@ -1004,6 +1106,7 @@ static void fp_texture_select(Footprint& f, int id) {
     if (!id_ok(id)) { f.replay_only = "an id outside the texture table"; return; }
     if (fp_table()[id].loaded) { fp_dx_result(f); return; }
     if (G8(X_DERES)) { f.add((void*)X_DERES, 1, "the de-rez flag"); return; }
+    if (VP_FIX && !fp_table()[id].sys) return;                  // (FIX: no system copy: nothing happens)
     f.replay_only = "makes the texture's video copy";
 }
 PORT_FN(0x0045a4e0, "TextureSelect", TextureSelect_rw, fp_texture_select)
@@ -1026,7 +1129,9 @@ PORT_FN(0x0045a550, "TextureUnload", TextureUnload_rw, fp_texture_unload)
 // TextureHasAlpha (0x45a590)
 static uint8_t __cdecl TextureHasAlpha_rw(int id) {
     if (id == -1) return 0;
-    return txHasAlpha(TEP(m1_operand(0x0045a5a2), id));                       // entry.sys
+    TexInfo* s = TEP(m1_operand(0x0045a5a2), id);                            // entry.sys
+    if (VP_FIX && !s) return 0;                                               // FIX: no system copy: as id -1
+    return txHasAlpha(s);
 }
 PORT_FN(0x0045a590, "TextureHasAlpha", TextureHasAlpha_rw, fp_nothing_i)
 
@@ -1062,28 +1167,25 @@ static uint8_t __cdecl tc_add_rw(const char* name, int key, int* out) {
             TEP(m1_operand(0x0045a641), edx) = 0;                             // entry.sys
             TEP(m1_operand(0x0045a647), edx) = 0;                             // entry.vid
             TE8(m1_operand(0x0045a64d), edx) = 0;                             // entry.loaded
-            // FIX CANDIDATE: the name is strcpy'd, unbounded, into the 16-byte field at entry+0x08, AFTER the key,
-            // flags and copies above were set. Its terminator lands at +0x08 + len:
+            // The original strcpy's the name, unbounded, into the 16-byte field at entry+0x08, AFTER the key, flags and
+            // copies above were set. Its terminator lands at +0x08 + len:
             //  * 16 characters: the NUL is the key's low byte (+0x18). tc_lookup (stricmp on +0x08, then the key)
             //    still matches the name, but the key only if its low byte was 0 -- so a keyed texture (a car's damage
-            //    copy: key car + 1 / car + 0x20) is never found again: every TextureGet adds and loads another entry
-            //    (the table fills, each copy a surface of its own); with key 0 (most textures) it happens to work.
+            //    copy: key car + 1 / car + 0x20) is never found again: every TextureGet adds and loads another entry.
             //  * 17..19: the key's low bytes are name characters: never found again, for any key.
-            //  * 20: the NUL lands on `loaded` (+0x1c, already 0). 21..23: `loaded` becomes a character (non-zero):
-            //    TextureSelect skips txLoadVideo and calls txSelect(vid = NULL) -- a crash (NULL->wrap) the first time
-            //    the texture is drawn; TextureUnload / Reload / Release call txUnloadVideo / txReloadVideo on NULL.
-            //  * 24+: sys (+0x20) is name bytes until TextureGet's txLoadSystem stores the real pointer over them --
-            //    which also cuts the stored name (+0x08) to its first 24 characters followed by the pointer's bytes:
-            //    TextureRestoreAll(1) / a de-rez (TextureBeginFrame) reload "name[0..23]<ptr>..." and fail ("bad
-            //    texture name" / "tex not found": the red dummy); TextureCreate's txCreateSystem likewise. On a failed
-            //    txLoadSystem sys stays the name's bytes: a wild texture_info.
-            //  * 28+: vid (+0x24) is name bytes: TextureSelect (loaded set by char 20) calls txSelect on a wild
-            //    pointer; 32+ runs into the next entry (+0x28: its in_use, refs, name...).
-            // Readers of the damage: tc_lookup (every TextureGet / Create), TextureSelect / Unload / ReloadVideo /
-            // Release / Revert (`loaded`, vid), TextureRestoreAll / BeginFrame (the name, sys), TextureEnd /
-            // TextureDestroy's reports (the name). A fix would cut the name to 15 characters at the copy (and compare
-            // the same cut in tc_lookup), or store the whole name elsewhere.
-            gxt_strcpy((char*)(uintptr_t)TE_AT(m1_operand(0x0045a662), edx), name);   // entry.name
+            //  * 20: the NUL lands on `loaded` (+0x1c, already 0). 21..23: `loaded` becomes a character: TextureSelect
+            //    skips txLoadVideo and calls txSelect(vid = NULL) -- a crash (0x4601f3) the first time it's drawn.
+            //  * 24+: sys (+0x20) is name bytes until txLoadSystem stores the real pointer over them, which also cuts
+            //    the stored name to 24 characters and the pointer's bytes: TextureRestoreAll(1) / a de-rez reload a
+            //    garbage name. 28+: vid (+0x24) is name bytes. 32+: into the next entry.
+            char* field = (char*)(uintptr_t)TE_AT(m1_operand(0x0045a662), edx);   // entry.name
+            // FIX: a name of 16+ characters: kept whole in the DLL, a mark in the field (set_long_tex_name)
+            if (VP_FIX && strlen(name) >= 16) {
+                set_long_tex_name((uint8_t*)field - 8, name);
+            } else {
+                gxt_strcpy(field, name);
+                if (VP_FIX && g_nlong_tex) forget_long_tex_name((const uint8_t*)field - 8);
+            }
             esi = edx;
         } else {
             LogPanic(S(0x004f3330));                             // "out of texture cache entries" (never returns)
@@ -1100,7 +1202,7 @@ static void fp_tc_add(Footprint& f, const char* name, int key, int* out) {
     i = fp_first_free();
     if (i < 0) return;                                          // full: the panic
     const uint32_t len = 8 + (uint32_t)strlen(name) + 1;         // the name's copy runs on past a long name's entry
-    f.add(&fp_table()[i], len > 0x28 ? len : 0x28, "the new entry (and what a long name overruns)");
+    f.add(&fp_table()[i], len > 0x28 && !VP_FIX ? len : 0x28, "the new entry (and what a long name overruns)");
 }
 PORT_FN(0x0045a5d0, "tc_add", tc_add_rw, fp_tc_add)
 
@@ -1110,7 +1212,7 @@ static int __cdecl tc_lookup_rw(const char* name, int key) {
     int32_t ebx = 0;
     uint8_t* e = (uint8_t*)(uintptr_t)m1_operand(0x0045a6ab);    // the table
     do {
-        if (*e != 0 && crt_stricmp((const char*)(e + 8), name) == 0 && *(volatile int32_t*)(e + 0x18) == key) break;
+        if (*e != 0 && crt_stricmp(entry_name(e), name) == 0 && *(volatile int32_t*)(e + 0x18) == key) break;   // FIX: full
         e += 0x28;
         ebx++;
     } while ((uintptr_t)e < m1_operand(0x0045a6d5));
@@ -1226,7 +1328,8 @@ static uint8_t __cdecl txLoadSystem_rw(char* name, TexInfo** out) {
     int32_t edi = 0;
     int32_t size = 0x80;
     if (crt_strstr(n, S(0x004f3f10)) == 0 && crt_strstr(n, S(0x004f3f18)) == 0) {   // ".tex" / ".TEX"
-        LogReport(S(0x004f3f40), n);                                            // "bad texture name: %s"
+        char tmp[0x88];
+        LogReport(S(0x004f3f40), log_name(n, tmp));                             // "bad texture name: %s"
     } else {
         vi->tt = texGet(n);
         vi->tfmt = vi->tt[0];
@@ -1269,7 +1372,8 @@ static uint8_t __cdecl txLoadSystem_rw(char* name, TexInfo** out) {
         *out = id;
         return 1;
     }
-    LogReport(S(0x004f3f58), n);                                 // "can't create system texture surface: %s"
+    char tmp[0x88];
+    LogReport(S(0x004f3f58), log_name(n, tmp));                  // "can't create system texture surface: %s"
     return 0;
 }
 static void fp_tx_load_system(Footprint& f, char*, TexInfo**) { f.replay_only = "loads the .tex resource and makes its surface"; }
@@ -1614,16 +1718,19 @@ static void __cdecl load_texmap_rw(char* name, TexInfo* t) {
     gxSetCanvas(&c);
     gxClear(G32(X_BLUE));
     if (crt_strstr(name, S(0x004f4008)) || crt_strstr(name, S(0x004f4010))) {   // ".bmp" / ".BMP"
-        LogReport(S(0x004f4018), name);
+        char tmp[0x88];
+        LogReport(S(0x004f4018), log_name(name, tmp));
         txRelease();
         return;
     }
     if (crt_strstr(name, S(0x004f403c)) || crt_strstr(name, S(0x004f4044))) {   // ".stp" / ".STP"
-        LogReport(S(0x004f404c), name);
+        char tmp[0x88];
+        LogReport(S(0x004f404c), log_name(name, tmp));
         txRelease();
         return;
     }
-    LogReport(S(0x004f4070), name);                              // "obsolete empty texture support: %s"
+    char tmp[0x88];
+    LogReport(S(0x004f4070), log_name(name, tmp));               // "obsolete empty texture support: %s"
     txRelease();
 }
 static void fp_load_texmap(Footprint& f, char*, TexInfo* t) {
@@ -1992,14 +2099,16 @@ static uint8_t* __cdecl load_file_rw(const char* name) {
     int32_t size;
     uint8_t* d = (uint8_t*)ResourceGetDiscardable(name, G32(X_TEX_TYPE), &version, &size);
     if (d) {
-        if (G32(X_TEX_VER) != version) LogPanic(S(0x004f4310), name, version);   // "%s bad tex version: %d"
+        char tmp[0x88];
+        if (G32(X_TEX_VER) != version) LogPanic(S(0x004f4310), log_name(name, tmp), version);   // "%s bad tex version: %d"
         if (d[0] == 3 && GI(X_MRCAPS_ALPHA) != 0) d += size / 2;
         return d;
     }
     G16(X_DUMMY + 4) = 0;
     GI(X_DUMMY + 8) = 3;
     G8(X_DUMMY) = 0;
-    LogReport(S(0x004f4328), name);                              // "tex not found: %s"
+    char tmp[0x88];
+    LogReport(S(0x004f4328), log_name(name, tmp));               // "tex not found: %s"
     return (uint8_t*)(uintptr_t)X_DUMMY;
 }
 static void fp_load_file(Footprint& f, const char*) { f.replay_only = "fetches the .tex resource (ResourceGetDiscardable may load its file)"; }

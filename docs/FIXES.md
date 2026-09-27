@@ -104,6 +104,35 @@ dozen places and the game dies.
 - `enumerate_language_resources`: a `.lng` file name of 32 or more characters is skipped and a long
   language name cut, instead of overrunning the table.
 
+## Drawing
+
+- Texture names of 16 characters or more overran the texture table's 16-byte name field: a keyed
+  16-character name (a car's damaged copy) was never found again, so every use loaded another copy;
+  names of 21 or more crashed the first time they were drawn, and names of 24 or more reloaded a garbage
+  name after a mode change or a de-rez. The full name is now kept beside the table, so names of any
+  length work (`willysjeep11.tex`, 16 characters, is the case that found it); names of 15 or fewer are
+  stored exactly as before.
+- A texture whose surface couldn't be made crashed when it was drawn, grabbed, blitted or sized; it is now
+  treated as no texture.
+- Model surface texture names of exactly 16 characters (the whole field, no terminator) ran on into the
+  next field: names compared wrongly, every rebuild fetched the textures again, and the texture cache was
+  asked for the name with junk on the end. They are read as exactly 16 characters now.
+- A missing model (`mrModelInfoGet`) ended the game, and the loaders then read through the empty result.
+  It is now logged and loads as an empty model that draws nothing.
+- A model with no surfaces crashed when drawn in deferred mode; it now draws nothing.
+- Lighting: a normal longer than 1 (mod models can carry unnormalised normals) read past the diffuse
+  table, and the specular index had no bound either way; both are clamped to their tables, so in-range
+  values are unchanged. `mrLightSpecial` ignores a light number outside 0-7 instead of writing past the
+  lights.
+- A car with an 11-character name (the longest whose models fit): its skin texture's name, `<car>1.tex`, is
+  16 characters, and its terminator landed past the car object's 16-byte field, which the next field then
+  overwrote, so the damage texture asked for the name with junk on the end. The name is kept to the field
+  and read back as 16 characters.
+- `CarObject::Draw2D`: a multiplayer name tag longer than 43 characters is cut to 43 instead of
+  overrunning the stack.
+- `CarObject::DrawWheel`: a wheel detail level above 2 in a car's `L.tab` draws the lowest-detail wheel
+  instead of a garbage model handle.
+
 ## Limits lifted
 
 Like M1's limits, these move a table into the DLL for the original code and the rewrites alike, so
@@ -114,6 +143,9 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
 - Options 256 -> 4096 (past the end the table overran); a full table now hands out a spare item that
   isn't saved.
 - Language files 8 -> 64 (a 9th overwrote the language count).
+- A track's camera-facing and upright models in view (trees, signs): 512 and 514 -> 8192 each. More than
+  512 overwrote the dynamic-model table, more than 514 the other list. Past 8192 the rest aren't drawn,
+  and the log says so once.
 
 ## Not fixed
 
@@ -121,8 +153,5 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
   with their own stages (the menus and career, multiplayer).
 - The AI's quirks that shape how it drives (its per-segment speed notes are computed and then
   overwritten) are gameplay, not bugs, and stay.
-- Texture names of exactly 16 characters: the texture cache and model surfaces keep them in 16-byte
-  fields too (seen as an unterminated `willysjeep11.tex` in the log); that is graphics code, for its
-  stage.
 - `collide_sphere_sphere`'s 0/0 for coincident centres needs no fix: it is caught before its result is
   used.

@@ -46,7 +46,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef VP_GX_FIXES                 // (built with /DVP_GX_FIXES: the fixes on, and tested -- see main)
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#endif
+static int g_fix_fired;             // fix branches the rewrite took in this pass
+#define GX_FIX_FIRED() (++g_fix_fired)
 #define VP_GX_HARNESS               // gx_model.cpp: the deferred buckets' M1 bookkeeping stays local
 #include "../hook/port.h"
 #undef PORT_FN_BUILDS
@@ -1066,6 +1070,7 @@ static unsigned g_pc;
 static bool g_unmask;
 static int run_guarded(Kind k, bool rw, uint64_t* ret) {
     g_log.n = 0;
+    g_fix_fired = 0;
     g_heap = g_heap_mark;
     g_tex_next = 1000;
     g_file_next = 0;
@@ -1091,6 +1096,138 @@ static const char* where(uint32_t a, char* buf) {
     sprintf(buf, "0x%08x", a);
     return buf;
 }
+
+#ifdef VP_GX_FIXES
+// ---- the fixes, each on the input that used to fail ------------------------------------------------------------------
+static int guarded(void (*fn)()) {
+    unsigned cw;
+    __asm fninit
+    _controlfp_s(&cw, _MCW_EM, _MCW_EM);
+    _controlfp_s(&cw, _PC_53, _MCW_PC);                              // (at 24 bits the lighting's rounding trick gives 0)
+    g_log.n = 0;
+    g_fix_fired = 0;
+    int fault = 0;
+    __try { fn(); } __except (EXCEPTION_EXECUTE_HANDLER) { fault = 1; }
+    __asm fninit
+    _controlfp_s(&cw, _PC_53, _MCW_PC);
+    return fault;
+}
+static int count_tag(uint32_t tag) { int n = 0; for (uint32_t i = 0; i < g_log.n && i < LOG_MAX; i++) n += g_log.w[i] == tag; return n; }
+static uint8_t* g_t_info;
+static int g_t_m, g_t_ret;
+static const char* const k_name16 = "sixteen_chars_ab";                  // 16 characters
+static void t_build_orig() { ((void(__cdecl*)(int, void*, uint8_t, int))0x00455ed0)(g_t_m, g_t_info, 0, 2); }
+static void t_build_new() { direct_model_build(g_t_m, g_t_info, 0, 2); }
+static void t_load_orig() { g_t_ret = ((int(__cdecl*)(const char*))0x004558c0)("nosuchmodel.mod"); }
+static void t_load_new() { g_t_ret = mrModelLoad("nosuchmodel.mod"); }
+static void t_draw_orig() { ((void(__cdecl*)(int))0x00456190)(g_t_m); }
+static void t_draw_new() { direct_model_draw(g_t_m); }
+static void t_unload_new() { mrModelUnload(g_t_m); }
+static void t_light_orig() { ((void(__cdecl*)(void*, void*, void*))0x0045c8c0)(ARG(G_SURF), *(uint8_t**)(info_at(0) + 4), AR(A_OUT)); }
+static void t_light_new() { light_nopre_nofog_someenv(ARG(G_SURF), *(uint8_t**)(info_at(0) + 4), AR(A_OUT)); }
+static void t_special_orig() { ((void(__cdecl*)(int, const void*))0x0045c050)(g_t_ret, ARG(G_FRAME)); }
+static void t_special_new() { mrLightSpecial(g_t_ret, ARG(G_FRAME)); }
+static int directed_fix_tests() {
+    int bad = 0;
+    auto check = [&](bool ok, const char* what) { if (!ok) printf("  fix test: %s FAILED\n", what); bad += !ok; };
+    int orig_refetch = 0, clamped_total = 0, same_total = 0;
+    for (int round = 0; round < 50; round++) {
+        // (a) 16-character texture names, the byte after them non-zero (the surface type 1)
+        do { setup_world(); } while (!g_setup_ok || !g_nmodels);
+        random_statics();
+        g_t_m = g_models[0];
+        g_t_info = *(uint8_t**)((uint8_t*)(uintptr_t)g_t_m + 0x10);
+        const int32_t ns = *(int32_t*)(g_t_info + 8);
+        uint8_t* surfs = *(uint8_t**)(g_t_info + 0xc);
+        for (int k = 0; k < ns; k++) { memcpy(surfs + 32 * k, k_name16, 16); surfs[32 * k + 0x10] = 1; }
+        *(int32_t*)((uint8_t*)(uintptr_t)g_t_m + 0x18) = 0;             // no remap table
+        if (ns > 0) {
+            guarded(t_build_new);                                    // the first build names the surfaces
+            const int f1 = guarded(t_build_new);                     // the second must find them all as they are
+            check(!f1 && count_tag('GXGT') == 0, "(a) a rebuild keeps surfaces with 16-character names (no texture fetched again)");
+            guarded(t_build_orig);
+            orig_refetch += count_tag('GXGT');
+            *(int32_t*)(*(uint8_t**)((uint8_t*)(uintptr_t)g_t_m + 0x28) + 0x10) = 5;   // force one fetch
+            guarded(t_build_new);
+            bool named = false;
+            for (uint32_t i = 0; i + 2 < g_log.n; i++) if (g_log.w[i] == 'GXGT') named = g_log.w[i + 1] == 16 && g_log.w[i + 2] == hash_bytes(k_name16, 16);
+            check(named, "(a) the texture asked for is the 16-character name, terminated");
+        }
+        // (b) a missing model: the original reads through NULL; the rewrite makes an empty model that draws nothing
+        g_script.res_found = 0;
+        const int fo = guarded(t_load_orig);
+        uint8_t saved[5];                                            // mrModelLoad calls mrModelInfoGet by address: in the
+        memcpy(saved, (void*)0x004562f0, 5);                         // game that is its (fixed) rewrite
+        patch_jmp(0x004562f0, (void*)&mrModelInfoGet);
+        const int fn = guarded(t_load_new);
+        memcpy((void*)0x004562f0, saved, 5);
+        check(fo && !fn && g_t_ret && count_tag('REPT') == 1 && count_tag('PANC') == 0, "(b) a missing model: logged (no panic), an empty model made");
+        g_t_m = g_t_ret;
+        *(uint8_t*)S_DEFERRED = 1;
+        int f2 = guarded(t_draw_new);
+        const int queued = count_tag('MALC');
+        *(uint8_t*)S_DEFERRED = 0;
+        f2 |= guarded(t_draw_new);
+        check(!f2 && queued == 0 && count_tag('DXDD') == 0, "(b)(c) the empty model draws nothing, deferred or not");
+        f2 = guarded(t_unload_new);
+        check(!f2 && count_tag('RFGT') == 0, "(b) unloading it hands nothing back to the resource layer");
+        // (c) a model with no surfaces, deferred: the original crashes on the NULL surface info
+        g_t_m = g_models[0];
+        *(int32_t*)(*(uint8_t**)((uint8_t*)(uintptr_t)g_t_m + 0x10) + 8) = 0;
+        *(uint8_t**)((uint8_t*)(uintptr_t)g_t_m + 0x28) = 0;
+        *(uint8_t*)S_DEFERRED = 1;
+        const int co = guarded(t_draw_orig), cn = guarded(t_draw_new);
+        check(co && !cn && count_tag('MALC') == 0, "(c) no surfaces, deferred: the original faults, the rewrite queues nothing");
+        // (d) unnormalised normals: every colour and specular the original read from inside the tables is the same, the
+        // rest are the tables' ends
+        do { setup_world(); } while (!g_setup_ok);
+        random_statics();
+        *(int32_t*)L_BASE = 0x80;
+        uint8_t* s0 = ARG(G_SURF);
+        uint8_t* inf = info_at(0);
+        while (*(int32_t*)inf < 20) random_info(inf, 200);
+        const int32_t nv = *(int32_t*)inf;
+        memset(s0, 0, 32);
+        *(int16_t*)(s0 + 0x1a) = (int16_t)(nv < 60 ? nv : 60);
+        float* vs = *(float**)(inf + 4);
+        for (int i = 0; i < *(int16_t*)(s0 + 0x1a); i++) for (int c = 3; c < 6; c++) vs[8 * i + c] *= range(0.5f, 4.0f);
+        static uint8_t out_o[0xbb80];
+        guarded(t_light_orig);
+        memcpy(out_o, AR(A_OUT), sizeof out_o);
+        guarded(t_light_new);
+        const uint32_t last_d = *(uint32_t*)(L_DIFF + 0x7fc) | *(uint32_t*)L_ALPHA_OR, last_s = *(uint32_t*)(L_SPECT + 0x3fc),
+                       first_s = *(uint32_t*)L_SPECT;
+        int wrong = 0;
+        for (int i = 0; i < *(int16_t*)(s0 + 0x1a); i++) {
+            const uint32_t* a = (const uint32_t*)(out_o + 32 * i);
+            const uint32_t* b = (const uint32_t*)(AR(A_OUT) + 32 * i);
+            for (int f = 4; f < 6; f++) {
+                if (a[f] == b[f]) same_total++;
+                else if (b[f] == (f == 4 ? last_d : last_s) || (f == 5 && b[f] == first_s)) clamped_total++;
+                else wrong++;
+            }
+        }
+        check(!wrong, "(d) unnormalised normals: in-table entries unchanged, the rest the tables' ends");
+        // mrLightSpecial past the eight lights
+        *(int32_t*)L_MODE = 1;
+        g_t_ret = 8 + (int)(rnd() % 100);
+        memcpy(g_data_snap, DATA, DATA_BYTES);
+        guarded(t_special_new);
+        check(!memcmp(g_data_snap, DATA, DATA_BYTES), "(d) mrLightSpecial with a light number past 7 writes nothing");
+        g_t_ret = (int)(rnd() % 8);
+        guarded(t_special_orig);
+        memcpy(g_data_after, DATA, DATA_BYTES);
+        memcpy(DATA, g_data_snap, DATA_BYTES);
+        guarded(t_special_new);
+        check(!memcmp(g_data_after, DATA, DATA_BYTES), "(d) mrLightSpecial with lights 0..7: the original's bytes");
+        if (bad) break;
+    }
+    check(clamped_total > 0 && same_total > 0, "(d) both in-table and clamped entries were seen");
+    printf("directed fix tests (50 rounds): %s -- the original fetched %d textures again on rebuilds, the fixed %s; lighting: %d "
+           "values unchanged, %d clamped\n", bad ? "FAILED" : "all passed", orig_refetch, bad ? "?" : "none", same_total, clamped_total);
+    return bad;
+}
+#endif
 
 // ---- main ----------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
@@ -1153,7 +1290,13 @@ int main(int argc, char** argv) {
     static Footprint fp;
     const bool trace = GetEnvironmentVariableA("VP_TRACE", 0, 0) != 0;
     int unmasked_runs = 0, differ = 0, faults = 0, fault_both = 0, fp_bad = 0, replay_only = 0, wild_runs = 0, wild_differ = 0, setup_bad = 0;
-    static int per[N_KINDS], per_bad[N_KINDS], per_fault[N_KINDS];
+    static int per[N_KINDS], per_bad[N_KINDS], per_fault[N_KINDS], per_fix[N_KINDS];
+    int fix_worlds = 0, fix_saved = 0, fix_faulted = 0;
+#ifdef VP_GX_FIXES
+    const int directed_bad = directed_fix_tests();
+#else
+    const int directed_bad = 0;
+#endif
     // coverage
     int c_proj_fail = 0, c_fresh_v0 = 0, c_panic = 0, c_env2 = 0, c_fog_far = 0, c_overrun = 0, c_draws = 0, c_asserts = 0, c_deres = 0;
     int total_w = 0;
@@ -1201,6 +1344,17 @@ int main(int argc, char** argv) {
         const int fn = run_guarded(kind, true, &rn);
         if (kind == K_SEQ_LIFTED) { seq_lifted_patch(false); memcpy((void*)0x00457340, g_alpha_prologue, 5); }
         per[kind]++;
+        if (g_fix_fired) {                                           // a fix changed this world: counted, not compared
+            fix_worlds++;
+            per_fix[kind]++;
+            if (fo && !fn) fix_saved++;
+            if (fn) {
+                fix_faulted++;
+                printf("  (world %d, %s: a fix fired and the rewrite faulted, %08x at %08x; the original %s)\n", it, kind_names[kind],
+                       g_fault_code, g_fault_eip, fo ? "faulted too" : "didn't");
+            }
+            continue;
+        }
         if (fo || fn) {
             faults++;
             per_fault[kind]++;
@@ -1290,5 +1444,10 @@ int main(int argc, char** argv) {
     for (int i = 0; i < N_KINDS; i++) printf("  %-32s %6d / %5d / %d\n", kind_names[i], per[i], per_fault[i], per_bad[i]);
     printf("coverage: panics %d, draws %d, env-map pass asserts %d, flush de-res frames %d, picks missed %d, fresh v0 .mod %d, env 2 %d, fog on %d, deferred overruns past 118 %d\n",
            c_panic, c_draws, c_asserts, c_deres, c_proj_fail, c_fresh_v0, c_env2, c_fog_far, c_overrun);
-    return differ || fp_bad ? 1 : 0;
+#ifdef VP_GX_FIXES
+    printf("fixes: %d worlds a fix changed (the original faulted and the rewrite didn't in %d; the rewrite faulted in %d, from "
+           "causes no fix covers); every other world compared as above. Per function:\n", fix_worlds, fix_saved, fix_faulted);
+    for (int i = 0; i < N_KINDS; i++) if (per_fix[i]) printf("  %-32s %6d\n", kind_names[i], per_fix[i]);
+#endif
+    return differ || fp_bad || directed_bad ? 1 : 0;
 }

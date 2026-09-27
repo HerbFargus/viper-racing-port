@@ -33,6 +33,13 @@
 // compared, and every byte the original changed must lie in the rewrite's footprint unless it's replay_only. The FPU
 // runs at a random precision (24 or 53 bits), in 30% of the worlds with overflow and divide-by-zero unmasked. A share
 // of the worlds has floats replaced by extreme values (never the pointers).
+// The fixes (port.h: VP_FIX): the plain build defines VP_FAITHFUL and checks the rewrites as above. Built with
+// /DFIX_TESTS it compiles the fixed rewrites, moves the graf's facing lists into the arena as M1 does in the game
+// (relocate_graf_lists: 8192 slots each), runs the same worlds with inputs the fixes don't change (wheel LODs -1..2,
+// names that fit, lists under capacity) -- original and fixed rewrite must still agree -- and then fix_tests(): the
+// facing lists filled past 512 / 514 (stock) and 8192 (lifted), nothing written past either; name tags of 0..45
+// characters with numbers of 1..11 characters (cut to 43 characters, as the original where it fits); wheel LODs -7,
+// -1, 0..2 (as the original), 3, 5, 255 and 0x7fffffff (wheel_models[2]'s model).
 // Debugging: VP_TRACE=1 names each world's function; VP_DUMP=<world> prints both passes' logs side by side (and the
 // camera and upright graf nodes) if that world differs; VP_XPRD=1 replaces CrossProduct by a logging copy (and
 // VP_XPRD2=1 prints the caller's stack at each call, for GrafDraw's locals).
@@ -44,8 +51,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 
-#define VP_FAITHFUL
+#ifndef FIX_TESTS
+#define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+static const bool k_fixes = false;
+#else
+static const bool k_fixes = true;   // the fixed rewrites: ordinary inputs in the random worlds, then fix_tests()
+#endif
 #include "../hook/port.h"
 #undef PORT_FN_BUILDS
 #define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
@@ -137,7 +150,7 @@ static void patch_jmp(uint32_t at, void* to) {
 
 // ---- the world: an arena, and the image's .data/.bss ------------------------------------------------------------
 enum : uint32_t {
-    ARENA_BYTES = 0x20000,
+    ARENA_BYTES = 0x31000,
     A_CAR = 0x0000,                          // CarObject (0x844)
     A_LODROWS = 0x0900,                      // 8 LodRows
     A_LODMODELS = 0x0980,                    // 8 model ids
@@ -153,6 +166,7 @@ enum : uint32_t {
     A_XINFO = 0x9000,                        // their mrModelInfos
     A_CARINFO = 0x9200, A_CANVAS = 0x9400, A_PIX = 0x9800, A_SMOKEOBJS = 0xa000, A_STAMP = 0xa400,
     A_END = 0xa500,
+    A_FACING = 0x20000, A_UPRIGHT = 0x28000,   // FIX_TESTS: the graf lists where M1 moves them (8192 slots each)
 };
 static uint8_t* g_arena;
 static uint8_t* g_arena_snap;
@@ -419,7 +433,7 @@ static void random_car() {
         LodRow* r = (LodRow*)AR(A_LODROWS) + k;
         r->dist = range(0.0f, 100.0f);
         const int f = (int)(rnd() % 10);
-        r->faces = f < 2 ? -1 : f < 9 ? (int)(rnd() % 3) : (int)(rnd() % 6);
+        r->faces = f < 2 ? -1 : f < 9 || k_fixes ? (int)(rnd() % 3) : (int)(rnd() % 6);   // (3+: the fix's own case)
         r->spec = (uint8_t)chance(50);
         r->alpha = (uint8_t)chance(30);
         ((int32_t*)AR(A_LODMODELS))[k] = 0x100 + k;
@@ -623,8 +637,8 @@ static void random_world() {
     *(int32_t*)X_FACING_N = (int32_t)(rnd() % 4);
     *(int32_t*)X_UPRIGHT_N = (int32_t)(rnd() % 4);
     for (int k = 0; k < 4; k++) {
-        ((uint8_t**)0x00558968)[k] = AR(A_GRAF) + 0x50 * (rnd() % (g_graf_nodes ? g_graf_nodes : 1));
-        ((uint8_t**)0x00558160)[k] = AR(A_GRAF) + 0x50 * (rnd() % (g_graf_nodes ? g_graf_nodes : 1));
+        (*(uint8_t***)0x0046e04a)[k] = AR(A_GRAF) + 0x50 * (rnd() % (g_graf_nodes ? g_graf_nodes : 1));   // (the lists
+        (*(uint8_t***)0x0046e066)[k] = AR(A_GRAF) + 0x50 * (rnd() % (g_graf_nodes ? g_graf_nodes : 1));   //  wherever they are)
     }
     g_args.i = (int)(rnd() % 4);
     g_args.b = (uint8_t)(chance(30) ? 1 : 0);
@@ -777,6 +791,158 @@ static const char* where(uint32_t a, char* buf) {
 static bool logged(const CallLog& l, uint32_t tag) { for (uint32_t i = 0; i < l.n && i < LOG_MAX; i++) if (l.w[i] == tag) return true; return false; }
 static int count_tag(const CallLog& l, uint32_t tag) { int n = 0; for (uint32_t i = 0; i < l.n && i < LOG_MAX; i++) n += l.w[i] == tag; return n; }
 
+// ---- the fixes (FIX_TESTS) ------------------------------------------------------------------------------------------
+// M1's lift of the graf lists (viperport.cpp, relocate_graf_lists): the four operands repointed, here at the arena
+// (lifted) or back at the stock lists
+static void move_graf_lists(bool lifted) {
+    const uint32_t f = lifted ? (uint32_t)(uintptr_t)AR(A_FACING) : 0x00558968u, u = lifted ? (uint32_t)(uintptr_t)AR(A_UPRIGHT) : 0x00558160u;
+    *(uint32_t*)0x0046dcb7 = f; *(uint32_t*)0x0046e04a = f;
+    *(uint32_t*)0x0046ddcb = u; *(uint32_t*)0x0046e066 = u;
+}
+#ifdef FIX_TESTS
+static int g_fix_bad, g_fix_ok;
+static void expect(bool ok, const char* what) {
+    printf("  %-4s %s\n", ok ? "ok" : "FAIL", what);
+    (ok ? g_fix_ok : g_fix_bad)++;
+}
+// n facing nodes of one mode, siblings
+static uint8_t* facing_chain(int n, int mode) {
+    for (int i = 0; i < n; i++) {
+        uint8_t* g = AR(A_GRAF) + 0x50 * i;
+        memset(g, 0, 0x50);
+        *(int32_t*)g = 4;
+        *(int32_t*)(g + 0xc) = 0x500 + i;
+        *(int32_t*)(g + 0x38) = mode;
+        *(uint8_t**)(g + 4) = i + 1 < n ? g + 0x50 : 0;
+    }
+    return AR(A_GRAF);
+}
+static bool log_string(uint32_t tag, std::string& out) {         // the first logged string after `tag` (sprintf's)
+    for (uint32_t i = 0; i + 2 < g_log.n && i + 2 < LOG_MAX; i++)
+        if (g_log.w[i] == tag) { const uint32_t n = g_log.w[i + 2]; out.assign((const char*)&g_log.w[i + 3], n); return true; }
+    return false;
+}
+static int fix_tests() {
+    printf("-- the fixes --\n");
+    char what[200];
+    // (a) the facing lists: the stock ones (M1 not applied) stop at 512 / 514, the lifted ones at 8192; nothing past
+    for (int lifted = 0; lifted < 2; lifted++) {
+        move_graf_lists(lifted != 0);
+        for (int mode = 1; mode <= 2; mode++) {
+            const uint32_t cap = lifted ? VP_LIFT_GRAF_FACING : mode == 1 ? 512 : 514;
+            for (uint32_t start : {cap - 5, cap - 1, cap, cap + 3}) {
+                random_world();
+                memset(AR(A_GRAF), 0, 0x50 * 120);
+                const uint32_t countat = mode == 1 ? X_FACING_N : X_UPRIGHT_N;
+                uint8_t** list = *(uint8_t***)(mode == 1 ? 0x0046e04a : 0x0046e066);
+                uint32_t* after = (uint32_t*)(list + cap);                 // what follows the list
+                const uint32_t sentinel = 0x5e5e5e5e;
+                uint32_t save_after[4];
+                for (int i = 0; i < 4; i++) { save_after[i] = after[i]; after[i] = sentinel; }
+                *(int32_t*)countat = (int32_t)start;
+                g_log.n = 0; g_rand = g_script.seed;
+                draw_tree(facing_chain(10, mode));
+                const uint32_t n = *(uint32_t*)countat;
+                bool untouched = true;
+                for (int i = 0; i < 4; i++) untouched &= after[i] == sentinel;
+                const uint32_t want = start >= cap ? start : cap;
+                bool entries = true;
+                for (uint32_t k = start; k < cap && k < start + 10; k++) entries &= list[k] == AR(A_GRAF) + 0x50 * (k - start);
+                sprintf(what, "%s list, %s: count %u + 10 nodes -> %u (want %u), queued %d, nothing past its %u slots %d",
+                        mode == 1 ? "camera-facing" : "upright", lifted ? "lifted" : "stock", start, n, want, entries, cap, untouched);
+                expect(n == want && entries && untouched, what);
+                for (int i = 0; i < 4; i++) after[i] = save_after[i];
+            }
+        }
+    }
+    // below the capacity nothing changes: the original and the fix queue the same, on the stock lists and the lifted
+    for (int lifted = 0; lifted < 2; lifted++) {
+        move_graf_lists(lifted != 0);
+        random_world();
+        memset(AR(A_GRAF), 0, 0x50 * 120);
+        *(int32_t*)X_FACING_N = 100; *(int32_t*)X_UPRIGHT_N = 7;
+        memcpy(g_arena_snap, g_arena, ARENA_BYTES); memcpy(g_data_snap, DATA, DATA_BYTES);
+        ((void(__cdecl*)(uint8_t*))0x0046dff0)(facing_chain(40, 1 + lifted));
+        memcpy(g_arena_after, g_arena, ARENA_BYTES); memcpy(g_data_after, DATA, DATA_BYTES);
+        memcpy(g_arena, g_arena_snap, ARENA_BYTES); memcpy(DATA, g_data_snap, DATA_BYTES);
+        draw_tree(facing_chain(40, 1 + lifted));
+        sprintf(what, "40 %s nodes under the capacity (%s lists): as the original", lifted ? "upright" : "camera-facing", lifted ? "lifted" : "stock");
+        expect(!memcmp(g_data_after, DATA, DATA_BYTES) && !memcmp(g_arena_after, g_arena, ARENA_BYTES), what);
+    }
+    move_graf_lists(true);
+    // (b) the name tag: names that fit give the original's text; longer ones are cut so the tag is 43 characters
+    for (int len : {0, 5, 25, 34, 35, 36, 37, 38, 39, 40, 44, 45}) {
+        for (int32_t num : {0, 7, 42, 99, 123456, -5, (int32_t)0x80000000}) {
+            random_world();
+            *(int32_t*)X_FOCUS = 9;
+            CarObject* c = (CarObject*)AR(A_CAR);
+            memcpy(&c->frame.pos, (float*)X_CAMERA + 9, 12);
+            uint8_t* ci = AR(A_CARINFO);
+            memset(ci + 5, 0, 0x32 - 5);
+            for (int i = 0; i < len; i++) ci[5 + i] = (uint8_t)('a' + i % 26);
+            *(int32_t*)(ci + 0x140) = num;
+            char want[160];
+            sprintf(want, "%s (%d)", (const char*)ci + 5, num);
+            const bool fits = strlen(want) <= 43;
+            if (!fits) {                                     // (a 45-byte name has no terminator: it runs on into the status)
+                const int room = 43 - ((int)strlen(want) - (int)strlen((const char*)ci + 5));
+                sprintf(want, "%.*s (%d)", room, (const char*)ci + 5, num);
+            }
+            std::string got;
+            bool drawn = false;
+            for (int tries = 0; tries < 256 && !drawn; tries++) {             // (seeds until the scripted answers draw it)
+                g_script.seed = (uint32_t)(0x1234567 + tries * 7919) | 1;
+                g_log.n = 0; g_rand = g_script.seed;
+                CarObject_Draw2D(c, 0, AR(A_CANVAS));
+                drawn = log_string('SPRF', got);
+            }
+            bool same_as_original = true;
+            if (fits && drawn) {                                             // the original, where it survives
+                g_log.n = 0; g_rand = g_script.seed;
+                ((void(__fastcall*)(void*, int, void*))0x0046ad80)(c, 0, AR(A_CANVAS));
+                std::string orig;
+                same_as_original = log_string('SPRF', orig) && orig == got;
+            }
+            sprintf(what, "name of %d, number %d: \"%s\" (%u characters)%s", len, num, got.c_str(), (unsigned)got.size(),
+                    fits ? ", as the original" : ", cut");
+            expect(drawn && got == want && got.size() <= 43 && same_as_original, what);
+        }
+    }
+    // (c) the wheel LOD: 3, 5, 255 and 0x7fffffff draw wheel_models[2]'s model; -1 and -7 no wheel; 0..2 as the original
+    for (int32_t lod : {-7, -1, 0, 1, 2, 3, 5, 255, 0x7fffffff}) {
+        for (int wheel = 0; wheel < 4; wheel++) {
+            random_world();
+            CarObject* c = (CarObject*)AR(A_CAR);
+            c->lod_p[c->lod_now2].faces = lod;
+            const bool fast = fabs((double)wheel_msg(c, wheel)->omega) > 30.0;
+            const WheelModels& wm = c->wheel_models[lod < 0 ? 0 : lod > 2 ? 2 : lod];
+            const int32_t want = lod < 0 ? -1 : wheel < 2 ? (fast ? wm.fwheel_front : wm.wheel_front) : (fast ? wm.fwheel_rear : wm.wheel_rear);
+            memcpy(g_arena_snap, g_arena, ARENA_BYTES); memcpy(g_data_snap, DATA, DATA_BYTES);
+            g_log.n = 0; g_rand = g_script.seed;
+            CarObject_DrawWheel(c, 0, wheel, 0, 0);
+            int32_t drawn = -1;
+            for (uint32_t i = 0; i + 1 < g_log.n && i + 1 < LOG_MAX; i++) if (g_log.w[i] == 'MDRW') { drawn = (int32_t)g_log.w[i + 1]; break; }
+            bool same = true;
+            if (lod <= 2) {                                                  // the original, where it reads a real model
+                static CallLog mine;
+                mine = g_log;
+                memcpy(g_arena_after, g_arena, ARENA_BYTES);
+                memcpy(g_arena, g_arena_snap, ARENA_BYTES); memcpy(DATA, g_data_snap, DATA_BYTES);
+                g_log.n = 0; g_rand = g_script.seed;
+                ((void(__fastcall*)(void*, int, int, uint32_t, uint8_t))0x0046af10)(c, 0, wheel, 0, 0);
+                same = g_log.n == mine.n && !memcmp(g_log.w, mine.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)) &&
+                       !memcmp(g_arena_after, g_arena, ARENA_BYTES);
+            }
+            sprintf(what, "wheel LOD %d, wheel %d: model %#x (want %#x)%s", lod, wheel, (unsigned)drawn, (unsigned)want,
+                    lod <= 2 ? ", as the original" : "");
+            expect(drawn == want && same, what);
+        }
+    }
+    printf("fixes: %d expectations met, %d failed\n", g_fix_ok, g_fix_bad);
+    return g_fix_bad;
+}
+#endif
+
 // ---- main ----------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -823,6 +989,7 @@ int main(int argc, char** argv) {
     for (auto& st : stubs) patch_jmp(st.at, st.to);
     if (getenv("VP_XPRD")) patch_jmp(0x0043b120, (void*)&s_Cross);
     g_arena = (uint8_t*)VirtualAlloc(0, ARENA_BYTES, MEM_COMMIT, PAGE_READWRITE);
+    if (k_fixes) move_graf_lists(true);                   // as M1 does in the game
     g_arena_snap = (uint8_t*)malloc(ARENA_BYTES);
     g_arena_after = (uint8_t*)malloc(ARENA_BYTES);
     g_data_snap = (uint8_t*)malloc(DATA_BYTES);
@@ -998,5 +1165,10 @@ int main(int argc, char** argv) {
            c_alpha_sorted, c_mirror_drawn, c_lod_draw, c_facing, c_upright, c_panic);
     printf("shadow hit %d / missed %d; reflection drawn %d; tag %d, status %d; sparks drawn %d; skid quads %d, cleared %d; physics tris %d; sky %d; deletes %d\n",
            c_shadow_hit, c_shadow_miss, c_refl, c_tag, c_status, c_sparks, c_skid_quads, c_skid_clear, c_phys, c_sky, c_delete);
+#ifdef FIX_TESTS
+    const int fix_bad = fix_tests();
+    return differ || fp_bad || fix_bad ? 1 : 0;
+#else
     return differ || fp_bad ? 1 : 0;
+#endif
 }

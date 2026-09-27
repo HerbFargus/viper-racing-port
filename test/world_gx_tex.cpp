@@ -54,7 +54,12 @@
 #include <utility>
 #include <vector>
 
-#define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#ifndef FIX_TESTS
+#define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+static const bool k_ordinary = false;
+#else
+static const bool k_ordinary = true;        // the random rounds keep to inputs the fixes don't change
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: every PORT_FN with a generic caller -------------------------------------------------------------
@@ -106,6 +111,8 @@ GEN_CC(__stdcall)
 
 void Footprint::add(void* p, uint32_t bytes, const char* what) { if (n < MAX) r[n++] = {p, bytes, what}; }
 void Footprint::object(void* obj, const char* what) { add(obj, 4, what); }
+// a pointer left aimed at the function's own stack frame: listed (the comparison treats gx's current canvas so)
+void Footprint::stack_ptr(void* p, const char* what) { add(p, 4, what); }
 void logf(const char* fmt, ...) { va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); putchar('\n'); }
 
 #include "../hook/gx_tex.cpp"
@@ -311,6 +318,7 @@ static void __stdcall stub_ExitProcess(uint32_t code) { lg('EXIT'); lg(code); Ra
 // ---- the .tex resources ------------------------------------------------------------------------------------------------
 struct TexRes { std::string name; uint8_t* data; int32_t size; uint32_t version; };
 static std::vector<TexRes> g_tex;
+static std::vector<std::pair<std::string, size_t>> g_alias;   // the fix tests' long names: resources of their own
 static uint32_t name_hash(const char* s) { uint32_t h = 2166136261u; for (; *s; s++) h = (h ^ (uint8_t)tolower((uint8_t)*s)) * 16777619u; return h; }
 static const void* __cdecl stub_ResourceGetDiscardable(const char* name, uint32_t type, uint32_t* version, int32_t* size) {
     lg('RGET'); lg_str(name); lg(type);
@@ -319,6 +327,7 @@ static const void* __cdecl stub_ResourceGetDiscardable(const char* name, uint32_
     if (missing) { lg(0); return 0; }
     const TexRes* t = 0;
     for (auto& r : g_tex) if (_stricmp(r.name.c_str(), name) == 0) { t = &r; break; }
+    for (auto& a : g_alias) if (!t && _stricmp(a.first.c_str(), name) == 0) t = &g_tex[a.second];
     if (!t) {
         const uint32_t h = name_hash(name);
         if (h & 1) t = &g_tex[(h >> 1) % g_tex.size()];              // a made-up name: some texture, deterministically
@@ -618,7 +627,14 @@ static const char* const k_odd_names[] = {
     "abcdefghijklmnop.tex", "abcdefghijklmnopq.tex", "abcdefghijklmnopqrst.tex", "abcdefghijklmnopqrstuvw.tex",
     "abcdefghijklmnopqrstuvwxyz0123.tex", "a_very_long_texture_name_indeed_x.tex",
 };
+static std::string pick_name_any();
 static std::string pick_name() {
+    for (;;) {
+        std::string s = pick_name_any();
+        if (!k_ordinary || s.size() <= 15) return s;
+    }
+}
+static std::string pick_name_any() {
     if (!g_tex.empty() && chance(70)) {
         std::string s = g_tex[rnd() % g_tex.size()].name;
         if (chance(10)) for (char& c : s) c = (char)toupper((uint8_t)c);
@@ -1112,16 +1128,237 @@ static const char* where(const void* p, char* buf) {
     return buf;
 }
 
+
+// ---- the fixes (built with /DFIX_TESTS) --------------------------------------------------------------------------------
+// ordinary rounds: a call that would take a fix's path (an entry without a system copy) is left out
+static bool sys_null(int id) {
+    if (id == -1) return false;
+    bool r = false;
+    __try { r = entry(id)->sys == 0; } __except (EXCEPTION_EXECUTE_HANDLER) { r = false; }
+    return r;
+}
+static bool fix_case(const Reg* r) {
+    const int a0 = (int)g_args[0], a1 = (int)g_args[1];
+    switch (r->at) {
+    case 0x0045a4e0: return sys_null(a0) && !entry(a0)->loaded && !G8(X_DERES);             // TextureSelect
+    case 0x0045a590: case 0x0045a3e0: case 0x0044e540: case 0x0045a300: case 0x0044e490: return sys_null(a0);
+    case 0x0045a240: case 0x0044e380: return a0 != -1 && a1 != -1 && (sys_null(a0) || sys_null(a1));
+    case 0x0045a290: case 0x0044e3d0: return sys_null(a1);                                    // (name, id)
+    default: return false;
+    }
+}
+
+#ifdef FIX_TESTS
+typedef int(__cdecl* Get_t)(const char*, int);
+typedef int(__cdecl* Create_t)(const char*, int, int);
+typedef uint8_t(__cdecl* Sel_t)(int);
+typedef void(__cdecl* Id_t)(int);
+typedef void(__cdecl* Byte_t2)(uint8_t);
+typedef int(__cdecl* Size_t)(int);
+typedef void(__cdecl* Blit_t)(int, int, uint32_t, uint32_t, uint32_t, uint32_t);
+typedef void(__cdecl* ABlit_t)(const char*, int);
+typedef uint8_t(__cdecl* Grab_t)(int, void*);
+static Get_t const F_Get = (Get_t)0x0045a0c0;
+static Create_t const F_Create = (Create_t)0x0045a170;
+static Sel_t const F_Select = (Sel_t)0x0045a4e0, F_HasAlpha = (Sel_t)0x0045a590;
+static Id_t const F_Forget = (Id_t)0x0045a110, F_Destroy = (Id_t)0x0045a1d0;
+static Byte_t2 const F_RestoreAll = (Byte_t2)0x0045a090;
+static V_t const F_BeginFrame = (V_t)0x0045a420, F_End = (V_t)0x00459fa0;
+static Size_t const F_GetSize = (Size_t)0x0045a3e0;
+static Blit_t const F_Blit = (Blit_t)0x0045a240;
+static ABlit_t const F_ABlit = (ABlit_t)0x0045a290;
+static Grab_t const F_Grab = (Grab_t)0x0045a300;
+
+static int g_fix_checks, g_fix_fail;
+static void expect(bool ok, const char* what, int len) {
+    g_fix_checks++;
+    if (!ok) { g_fix_fail++; printf("  FIX FAILED (%d chars, M1 %d): %s\n", len, g_m1_on, what); }
+}
+template <typename F> static int guarded(F f) {                  // 0, or the exception (LogPanic's included)
+    unsigned cw;
+    int r = 0;
+    __asm fninit
+    _controlfp_s(&cw, _PC_24, _MCW_PC);
+    __try { f(); } __except (fault_filter(GetExceptionInformation())) { r = (int)g_fault_code; }
+    __asm fninit
+    _controlfp_s(&cw, _PC_53, _MCW_PC);
+    return r;
+}
+static void clean_world(bool m1) {
+    memcpy(DATA, g_data_pristine, DATA_BYTES);
+    memset(AR(0), 0, A_HEAP);
+    hdr()->heap = A_HEAP; hdr()->com = A_COM;
+    set_m1(m1);
+    setup_objects();
+    GI(0x005228d0) = 5;
+    GI(0x00522a1c) = 2; G8(0x00522a21) = 1; G8(0x005229ed) = 1; GI(0x00522ad4) = 16; G8(0x004f1e9c) = 1; G8(0x00522ae8) = 0;
+    GI(0x00522ac8) = 3;
+    g_nformats = 0;
+    make_format(g_formats[g_nformats++], 0x40, 16, 0xf800, 0x7e0, 0x1f, 0);
+    make_format(g_formats[g_nformats++], 0x41, 16, 0xf00, 0xf0, 0xf, 0xf000);
+    make_format(g_formats[g_nformats++], 0x41, 16, 0x7c00, 0x3e0, 0x1f, 0x8000);
+    g_script = g_quiet;
+    g_log.n = 0;
+}
+// the log's words from `from` on: does it hold `tag` followed by the string (as lg_str logs it, up to 256 characters)?
+static bool log_has(uint32_t from, uint32_t tag, uint32_t fmt, const char* str) {
+    const uint32_t n = g_log.n < LOG_MAX ? g_log.n : LOG_MAX;
+    const uint32_t len = (uint32_t)strlen(str) < 256 ? (uint32_t)strlen(str) : 256;
+    for (uint32_t i = from; i < n; i++) {
+        if (g_log.w[i] != tag) continue;
+        uint32_t j = i + 1;
+        if (fmt) { if (j >= n || g_log.w[j] != fmt) continue; j++; }
+        if (j >= n || g_log.w[j] != len) continue;
+        if (j + 1 + (len + 3) / 4 > n || memcmp(&g_log.w[j + 1], str, len)) continue;
+        return true;
+    }
+    return false;
+}
+static bool log_has_fmt(uint32_t from, uint32_t tag, uint32_t fmt) {
+    const uint32_t n = g_log.n < LOG_MAX ? g_log.n : LOG_MAX;
+    for (uint32_t i = from; i + 1 < n; i++) if (g_log.w[i] == tag && g_log.w[i + 1] == fmt) return true;
+    return false;
+}
+static void long_name(char* buf, int len, char c) {          // `len` characters ending ".tex"
+    for (int i = 0; i < len - 4; i++) buf[i] = (char)(c + i % 7);
+    memcpy(buf + len - 4, ".tex", 5);
+}
+static bool entry_bytes_same(const uint8_t* a, const uint8_t* b, int keep1, int keep2) {   // but the entries named
+    for (int i = 0; i < table_cap(); i++) {
+        if (i == keep1 || i == keep2) continue;
+        if (memcmp(a + i * 0x28, b + i * 0x28, 0x28)) return false;
+    }
+    return true;
+}
+
+static void fix_names(bool m1) {
+    static const int lens[] = {15, 16, 17, 18, 19, 20, 21, 22, 24, 25, 28, 31, 32, 33, 40, 64, 128, 129, 200, 1000};
+    static char name[1100], upper[1100];
+    static uint8_t table_before[1000 * 0x28];
+    for (int len : lens) {
+        clean_world(m1);
+        long_name(name, len, 'a');
+        for (int i = 0; i <= len; i++) upper[i] = (char)toupper((uint8_t)name[i]);
+        g_alias.clear();
+        g_alias.push_back({name, 0});
+        for (size_t t = 0; t < g_tex.size(); t++)
+            if (g_tex[t].data[0] == 1 && *(int32_t*)(g_tex[t].data + 8) <= 7) { g_alias.back().second = t; break; }   // a keyed one
+        chain_on();
+        int id1 = -9, id2 = -9, id3 = -9, id4 = -9, id5 = -9;
+        uint8_t sel = 0;
+        int e = guarded([&] { ((TB_t)0x00459f80)(0, 0, 0); });
+        expect(!e, "TextureBegin", len);
+        memcpy(table_before, table_base(), (size_t)table_cap() * 0x28);
+        const uint32_t log0 = g_log.n;
+        e = guarded([&] { id1 = F_Get(name, 0x21); id2 = F_Get(name, 0x21); id5 = F_Get(upper, 0x21); id3 = F_Get(name, 0); id4 = F_Get(name, 0); });
+        expect(!e, "TextureGet ran", len);
+        expect(id1 >= 0 && id1 == id2 && id1 == id5, "a keyed name found again (any case)", len);
+        expect(id3 >= 0 && id3 != id1 && id3 == id4, "the same name with another key: its own entry, found again", len);
+        if (id1 < 0 || id3 < 0) { chain_off(); continue; }
+        TexEntry* a = entry(id1);
+        TexEntry* b = entry(id3);
+        expect(a->key == 0x21 && b->key == 0 && a->refs == 3 && b->refs == 2, "keys and counts intact", len);
+        expect(!a->loaded && !a->vid && a->sys && b->sys, "loaded / vid / sys intact", len);
+        expect(entry_bytes_same(table_before, table_base(), id1, id3), "no other entry touched", len);
+        expect(memchr(a->name, 0, 16) != 0, "the 16-byte field terminated", len);
+        if (len < 16) expect(!strcmp(a->name, name), "a short name stored as the original stores it", len);
+        else expect(a->name[0] == 1, "a long name's mark in the field", len);
+        expect(log_has(log0, 'RGET', 0, name), "the resource asked for by the full name", len);
+        e = guarded([&] { sel = F_Select(id1); });
+        expect(!e && sel == 1 && a->loaded && a->vid, "TextureSelect loads the video copy (no crash)", len);
+        // TextureRestoreAll(1) and a de-rez reload by the full name
+        uint32_t log1 = g_log.n;
+        e = guarded([&] { F_RestoreAll(1); });
+        expect(!e && log_has(log1, 'RGET', 0, name) && !log_has_fmt(log1, 'LREP', 0x004f3f40), "TextureRestoreAll(1) reloads the full name", len);
+        log1 = g_log.n;
+        G8(X_DERES) = 1;
+        e = guarded([&] { F_BeginFrame(); });
+        expect(!e && log_has(log1, 'RGET', 0, name) && !log_has_fmt(log1, 'LREP', 0x004f3f40) && entry(id1)->sys, "a de-rez reloads the full name", len);
+        // TextureCreate over the same name panics with it (cut to 128 for the log); TextureDestroy's report
+        char cut[0x88];
+        const char* rep_name = name;
+        if (len > 0x80) { memcpy(cut, name, 0x80); memcpy(cut + 0x80, "...", 4); rep_name = cut; }
+        log1 = g_log.n;
+        e = guarded([&] { F_Create(name, 0x21, 64); });
+        expect(e == (int)PANIC_CODE && log_has(log1, 'PANC', 0x004f32a0, rep_name), "TextureCreate of an existing long name panics with it", len);
+        log1 = g_log.n;
+        e = guarded([&] { F_Destroy(id3); });
+        expect(e == (int)PANIC_CODE && log_has(log1, 'PANC', 0x004f32c8, rep_name), "TextureDestroy's report has the full name", len);
+        // forgotten: the entry freed, then taken by a short name, then a long one again
+        e = guarded([&] { for (int k = 0; k < 4; k++) F_Forget(id1); });   // (3 gets and TextureCreate's count)
+        expect(!e && !entry(id1)->in_use, "TextureForget frees it", len);
+        int id6 = -9, id7 = -9, id8 = -9;
+        e = guarded([&] { id6 = F_Get("grey.tex", 7); id7 = F_Get(name, 0x21); id8 = F_Get(name, 0x21); });
+        expect(!e && id6 == id1 && id7 >= 0 && id7 == id8 && !strcmp(entry(id6)->name, "grey.tex"), "the entry reused by a short name, the long one again", len);
+        // TextureEnd reports every entry by its full name
+        log1 = g_log.n;
+        e = guarded([&] { F_End(); });
+        expect(!e && log_has(log1, 'LREP', 0x004f3278, rep_name), "TextureEnd reports the full name", len);
+        chain_off();
+    }
+    // keyed copies of a 16-character name (a car's damage copies: key 0, car + 1, car + 0x20)
+    clean_world(m1);
+    g_alias.clear();
+    g_alias.push_back({"willysjeep11.tex", 0});
+    chain_on();
+    int k0 = -9, k1 = -9, k2 = -9, j0 = -9, j1 = -9, j2 = -9;
+    int e = guarded([&] {
+        ((TB_t)0x00459f80)(0, 0, 0);
+        k0 = F_Get("willysjeep11.tex", 0); k1 = F_Get("willysjeep11.tex", 1); k2 = F_Get("willysjeep11.tex", 0x21);
+        j0 = F_Get("willysjeep11.tex", 0); j1 = F_Get("WillysJeep11.tex", 1); j2 = F_Get("willysjeep11.tex", 0x21);
+    });
+    expect(!e && k0 >= 0 && k1 >= 0 && k2 >= 0 && k0 != k1 && k1 != k2 && k0 != k2 && j0 == k0 && j1 == k1 && j2 == k2,
+           "willysjeep11.tex: three keyed copies, each found again", 16);
+    chain_off();
+}
+
+// an entry without a system copy (its surface couldn't be made): no texture, where the original crashed
+static void fix_null_sys(bool m1) {
+    for (int pass = 0; pass < 2; pass++) {              // 0: the original (crashes), 1: the fixed rewrites
+        clean_world(m1);
+        int id = -9, other = -9;
+        int e = guarded([&] { ((TB_t)0x00459f80)(0, 0, 0); other = F_Get("grey.tex", 0); });
+        g_script.create_fail = 1;                       // the next CreateSurface fails
+        hdr()->n_create = 0;
+        e = guarded([&] { id = F_Get("sky1.tex", 3); });
+        g_script.create_fail = 0;
+        if (e || id < 0 || entry(id)->sys) { expect(false, "set-up: a texture whose surface failed", 0); continue; }
+        if (pass) chain_on();
+        uint8_t sel = 9, alpha = 9, grabbed = 9;
+        int size = -9;
+        const int32_t grab0 = GI(X_GRAB_ID);
+        const int e1 = guarded([&] { sel = F_Select(id); });
+        const int e2 = guarded([&] { alpha = F_HasAlpha(id); });
+        const int e3 = guarded([&] { size = F_GetSize(id); });
+        const int e4 = guarded([&] { F_Blit(id, other, 0, 0, 0x3f800000, 0x3f800000); F_Blit(other, id, 0, 0, 0x3f800000, 0x3f800000); });
+        const int e5 = guarded([&] { F_ABlit("effects.tex", id); });
+        const int e6 = guarded([&] { grabbed = F_Grab(id, AR(A_ARGS + 0x100)); });
+        if (pass) {
+            chain_off();
+            expect(!e1 && sel == 0 && !G8(X_DERES), "TextureSelect: 0, no de-rez", 0);
+            expect(!e2 && alpha == 0, "TextureHasAlpha: 0", 0);
+            expect(!e3 && size == 4, "TextureGetSize: 4", 0);
+            expect(!e4, "TextureBlit: nothing", 0);
+            expect(!e5, "TextureAlphaBlit: nothing", 0);
+            expect(!e6 && grabbed == 0 && GI(X_GRAB_ID) == grab0, "TextureGrab: 0, no grab", 0);
+        } else {
+            expect(e1 && e2 && e3 && e4 && e5 && e6, "the original crashes in each", 0);
+        }
+    }
+}
+#endif
+
 // ---- the 16-character name bug, on the original and the rewrite --------------------------------------------------------
 struct DemoOut { int id1 = -9, id2 = -9, id3 = -9, sel = -9; uint32_t key = 0, loaded = 0, sys = 0, vid = 0; const char* fault = ""; };
 static void demo_run(int pass, char* p, DemoOut& o) {
     unsigned cw;
     __asm fninit
     _controlfp_s(&cw, _PC_24, _MCW_PC);
+    if (pass) chain_on();                               // the rewrite: every function of the group rewritten
     __try {
         ((TB_t)0x00459f80)(0, 0, 0);
-        TG_t get = pass ? (TG_t)&TextureGet_rw : (TG_t)0x0045a0c0;
-        TS_t select = pass ? (TS_t)&TextureSelect_rw : (TS_t)0x0045a4e0;
+        TG_t get = (TG_t)0x0045a0c0;
+        TS_t select = (TS_t)0x0045a4e0;
         o.id1 = get(p, 0x21);
         o.key = (uint32_t)entry(o.id1)->key;
         o.loaded = entry(o.id1)->loaded;
@@ -1133,11 +1370,13 @@ static void demo_run(int pass, char* p, DemoOut& o) {
         o.sel = select(o.id1);
         o.fault = "";
     } __except (fault_filter(GetExceptionInformation())) {}
+    if (pass) chain_off();
     __asm fninit
     _controlfp_s(&cw, _PC_53, _MCW_PC);
 }
 static void name_bug_demo() {
-    printf("-- tc_add's name copy (FIX CANDIDATE): TextureGet / TextureSelect with long names, stock table --\n");
+    printf("-- tc_add's name copy: TextureGet / TextureSelect with long names, stock table (%s) --\n",
+           k_ordinary ? "the rewrite with its fix" : "the rewrite as the original");
     for (int pass = 0; pass < 2; pass++) {
         const char* who = pass ? "rewrite " : "original";
         for (int len = 15; len <= 30; len++) {
@@ -1288,12 +1527,17 @@ int main(int argc, char** argv) {
     printf("%zu rewrites registered\n", regs.size());
 
     name_bug_demo();
+#ifdef FIX_TESTS
+    for (int m1 = 0; m1 < 2; m1++) { fix_names(m1 != 0); fix_null_sys(m1 != 0); }
+    printf("fixes: %d expectations, %d failed\n", g_fix_checks, g_fix_fail);
+    g_alias.clear();
+#endif
 
     static Footprint fp;
     static Snap before, after;
     const size_t NR = regs.size();
     std::vector<int> per(NR), per_bad(NR), per_fault(NR), per_ro(NR);
-    int stack_canvas = 0;
+    int stack_canvas = 0, fix_skipped = 0;
     GetCurrentThreadStackLimits(&g_stack_lo, &g_stack_hi);
     int differ = 0, faults = 0, fault_both = 0, fp_bad = 0, replay_only = 0, setup_bad = 0, chains = 0, m1_worlds = 0, unmasked = 0;
     long long checks = 0;
@@ -1310,6 +1554,7 @@ int main(int argc, char** argv) {
         m1_worlds += g_m1_on;
         gen_args(r);
         random_script();
+        if (k_ordinary && fix_case(r)) { fix_skipped++; continue; }
         g_pc = chance(50) ? _PC_24 : chance(50) ? _PC_53 : _PC_64;
         g_unmask = chance(30);
         unmasked += g_unmask;
@@ -1443,7 +1688,11 @@ int main(int argc, char** argv) {
     printf("panics (LogPanic, worlds by message):");
     for (auto& pn : g_panics) { char txt[64]; printf(" [%s] %d;", panic_text(pn.first, txt), pn.second); }
     printf("\n");
+    if (k_ordinary) printf("(ordinary rounds: names of 15 characters or fewer; %d calls on an entry without a system copy left out)\n", fix_skipped);
     printf("per function (checks / differing / faulted-or-panicked / replay-only):\n");
     for (size_t i = 0; i < NR; i++) printf("  %-48s %6d / %d / %d / %d\n", regs[i]->name, per[i], per_bad[i], per_fault[i], per_ro[i]);
+#ifdef FIX_TESTS
+    if (g_fix_fail) return 1;
+#endif
     return differ || fp_bad ? 1 : 0;
 }

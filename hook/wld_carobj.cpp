@@ -1093,6 +1093,15 @@ static void fp_ghost_update_message(Footprint& f, CarObject* self, Edx, const ui
 }
 PORT_FN(0x0046cd50, "GhostCarObject::UpdateMessage", GhostCarObject_UpdateMessage, fp_ghost_update_message)
 
+// the skin texture's name as a C string: the field holds up to 16 characters, unterminated at 16 (see the FIX in
+// load_car_models); the original reads the field itself
+static const char* skin_name(CarObject* self, char (&buf)[17]) {
+    if (!VP_FIX) return self->skin;
+    memcpy(buf, self->skin, 16);
+    buf[16] = 0;
+    return buf;
+}
+
 // ==== CarObject::load_car_models (0x46c300) ======================================================================
 // "<name>L.tab" (the LOD rows: distance, faces or 'x', "spec" / "alpha"); "<name>.car/cockpit.tab", when there is
 // one: the cockpit models, two needles, the cockpit's rows 1-3 and the needles' angles (rows 4, 5: -deg -> rad,
@@ -1150,6 +1159,21 @@ static void __fastcall CarObject_load_car_models(CarObject* self, Edx, const cha
     if (!ResourceExists(path)) game_sprintf(path, (const char*)0x004f4fd8);              // "brakelt.mod"
     self->brakelight = mrModelLoad(path);
     self->diskglow = mrModelLoad((const char*)0x004f4fe4);                              // "diskglow.mod"
+    // FIX: with an 11-character car name (the longest whose models' names fit 16), "<car>1.tex" and
+    // "~<car>.tex" are 16 characters, and their terminator landed past the 16-byte skin field (and past
+    // remap_skin's, by the strcpy below). The next field then overwrote it, and the skin's name ran on into
+    // it: InitTextures asked for "willysjeep11.tex" plus whatever followed. The name is built apart and the
+    // fields take at most 16 bytes; everything that reads them gets a terminated copy (skin_name). The
+    // remap entry reads a full 16-byte name as 16 characters (gx_model).
+    if (VP_FIX) {
+        char skin[0x40];
+        WorldGetCarTexture(skin, name, paint);
+        if (!ResourceExists(skin)) game_sprintf(skin, (const char*)0x004f4ff4, name);   // "%s1.tex"
+        const size_t n = strlen(skin) < 16 ? strlen(skin) + 1 : 16;   // the original's bytes when it fits
+        memcpy(self->skin, skin, n);
+        memcpy(self->remap_skin, skin, n);
+        game_sprintf(self->remap_name, (const char*)0x004f4ffc, name);                   // "%s.tex"
+    } else {
     WorldGetCarTexture(self->skin, name, paint);
     if (!ResourceExists(self->skin)) game_sprintf(self->skin, (const char*)0x004f4ff4, name);   // "%s1.tex"
     game_sprintf(self->remap_name, (const char*)0x004f4ffc, name);                       // "%s.tex"
@@ -1160,10 +1184,14 @@ static void __fastcall CarObject_load_car_models(CarObject* self, Edx, const cha
         while (s[n]) n++;
         memmove(d, s, n + 1);
     }
+    }
     self->remap_car = self->index + 1;
     self->remap_tex = &self->skin_tex;
     self->skin_tex = -1;
-    self->src_tex = gxGetTexture(self->skin, 0);
+    {
+        char skin[17];
+        self->src_tex = gxGetTexture(skin_name(self, skin), 0);
+    }
     self->shadow_model = 0;
     game_sprintf(shadow, (const char*)0x004f5004, name);                                 // "%ss.mod"
     if (high && ResourceExists(shadow)) self->shadow_model = mrModelLoadRemap(shadow, self->remap_name, 1);
@@ -1196,7 +1224,8 @@ static void __fastcall CarObject_InitTextures(CarObject* self, Edx) {
     game_sprintf(name, (const char*)0x004f5084, info + 0x12);                            // "%sd.tex"
     if (!ResourceExists(name)) game_sprintf(name, (const char*)0x004f508c);              // "damage.tex"
     if (WorldGameOptions()[0x24]) {
-        const int tex = gxGetTexture(self->skin, self->index + 0x20);
+        char skin[17];
+        const int tex = gxGetTexture(skin_name(self, skin), self->index + 0x20);
         self->damage_tex = tex;
         gxAlphaBlitTexture(name, tex);
     }
