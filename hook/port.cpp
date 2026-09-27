@@ -625,14 +625,16 @@ void shadow_finish(PortFn* f, const void* ret, size_t n) {
                 uint16_t m = 0;
                 if (r[at] == OUT_COM && len >= 2) memcpy(&m, &r[at + 7], 2);
                 const char* nm = r[at] == OUT_COM && g_state && g_state->record_name ? g_state->record_name(m) : 0;
-                if (!nm) nm = r[at] == OUT_ADD_EVENT ? "a replay event" : r[at] == OUT_COM ? "a renderer call" : "a crash sound";
+                if (!nm) nm = r[at] == OUT_ADD_EVENT ? "a replay event"
+                            : r[at] == OUT_COM ? (m >= 0x7100 && m < 0x7180 ? "a DirectSound call" : "a renderer call")
+                                               : "a crash sound";
                 _snprintf(call, sizeof call, ", in output %u (%s)", (unsigned)nth, nm);
                 call[sizeof call - 1] = 0;
                 break;
             }
             at += 7 + len;
         }
-        _snprintf(where, sizeof where, "its outputs (sounds, replay events, OpenGL calls): %u bytes of calls vs %u, first differing at byte %u%s",
+        _snprintf(where, sizeof where, "its outputs (sounds, replay events, OpenGL and DirectSound calls): %u bytes of calls vs %u, first differing at byte %u%s",
                   (unsigned)a.size(), (unsigned)b.size(), (unsigned)k, call);
         where[sizeof where - 1] = 0;
         differs = true;
