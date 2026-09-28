@@ -447,6 +447,12 @@ bool platform_plans_gl(const char* ini) {
     return GetPrivateProfileIntA("platform", "sdl", 0, ini) && _stricmp(renderer, "gl") == 0 && LoadLibraryA("SDL2.dll");
 }
 
+bool platform_plans_sdl_audio(const char* ini) {
+    char audio[16];
+    GetPrivateProfileStringA("platform", "audio", "dsound", audio, sizeof audio, ini);
+    return GetPrivateProfileIntA("platform", "sdl", 0, ini) && _stricmp(audio, "sdl") == 0 && LoadLibraryA("SDL2.dll");
+}
+
 void platform_install(const char* build) {
     char ini[MAX_PATH];
     HMODULE self = 0;
@@ -547,5 +553,8 @@ void platform_install(const char* build) {
              "default=original for dd.obj's functions, or fix what the log says above");
     char audio[16];
     GetPrivateProfileStringA("platform", "audio", "dsound", audio, sizeof audio, ini);
-    if (_stricmp(audio, "sdl") == 0) audio_install();            // M2 stage 3: SDL audio in place of DirectSound
+    const bool sdl_audio = _stricmp(audio, "sdl") == 0 && audio_install();   // M2 stage 3: SDL audio in place of DirectSound
+    if (!sdl_audio && platform_plans_sdl_audio(ini))
+        logf("platform: the SDL audio isn't on after all, but the wave.obj rewrites expect it: set [port] "
+             "default=original for wave.obj's functions, or fix what the log says above");
 }

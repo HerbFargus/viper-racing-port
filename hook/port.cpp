@@ -695,10 +695,14 @@ void port_install(const char* ini) {
     // the dd.obj rewrites work on the OpenGL renderer's objects: with the game's own DirectDraw they stay original
     const bool gl = platform_plans_gl(ini);
     int kept_for_ddraw = 0;
+    // and the wave.obj rewrites on the SDL audio core's: with the game's own DirectSound they stay original
+    const bool sdl_audio = platform_plans_sdl_audio(ini);
+    int kept_for_dsound = 0;
     for (PortFn* f : registry()) {
         GetPrivateProfileStringA("port", f->name, "", buf, sizeof buf, ini);
         f->mode = buf[0] ? parse_mode(buf, dflt) : dflt;
         if (f->needs_renderer && !gl && f->mode != PORT_ORIGINAL) { f->mode = PORT_ORIGINAL; kept_for_ddraw++; continue; }
+        if (f->needs_audio && !sdl_audio && f->mode != PORT_ORIGINAL) { f->mode = PORT_ORIGINAL; kept_for_dsound++; continue; }
         for (const char* n : k_always_new)
             if (!strcmp(f->name, n) && f->mode != PORT_NEW) {
                 logf("port: %s stays new (it carries M1's texture lift)", f->name);
@@ -743,6 +747,9 @@ void port_install(const char* ini) {
     if (kept_for_ddraw)
         logf("port: %d dd.obj rewrites stay original: they need the OpenGL renderer ([platform] sdl=1, renderer=gl)",
              kept_for_ddraw);
+    if (kept_for_dsound)
+        logf("port: %d wave.obj rewrites stay original: they need the SDL audio ([platform] sdl=1, audio=sdl)",
+             kept_for_dsound);
     for (PortFn* f : registry())
         if (f->mode == PORT_SHADOW && f->orig) { g_shadow_on = true; install_outputs(); break; }
 }

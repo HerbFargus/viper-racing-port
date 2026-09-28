@@ -21,9 +21,10 @@
 // nothing is added), then clamped out (fastout: >> 8 to S16; fastout_8: + 0x800000 >> 16 to U8).
 //
 // Faithful (docs/PORTING.md): every call in the original's order with its arguments -- game functions by their v1.0
-// address (this group's own too, so a hooked rewrite runs), virtual calls through the vtable, DirectSound through the
-// object's vtable slots as the original makes them (the DLL's emulation, hook/dsound_sdl.cpp, answers them), the game's
-// CRT (strncmp, atexit) at its own address, ftol as x87_ftol. Floats the original moves with integer instructions
+// address (this group's own too, so a hooked rewrite runs), virtual calls through the vtable, DirectSound as the audio
+// core's functions (hook/audio_core.h, step S2: each the call the original makes through the object's vtable slot, with
+// its arguments, on the same object -- the core's handles are the COM facade's objects), the game's CRT (strncmp,
+// atexit) at its own address, ftol as x87_ftol. Floats the original moves with integer instructions
 // (MixerSetVolume, SetVolume / SetFrequency / SetPanning, the effects volume handed to MixerSetVolume) are taken and
 // copied as bits; compares done on a float's bits stay on the bits. Globals are read and written through volatile at
 // the points the original touches them.
@@ -56,9 +57,15 @@
 // draws a random number.
 //
 // Shadow contract (dsound_sdl.cpp): GetStatus / GetCurrentPosition / GetCaps / Lock are inputs, Play / Stop / SetFormat
-// / Unlock / Restore outputs. SoftMixer::Update locks (WaveGrab), mixes into the locked memory and unlocks
-// (WaveRelease) inside one call: its footprint can't name the locked memory (Lock hands it out during the call), so
-// that memory is left to the Unlock record's hash of the bytes written (both passes' Locks hand out the same pointers).
+// / Unlock / Restore outputs, recorded by the audio core whichever way the call comes (the original's pass through the
+// COM facade, the rewrite's directly), so the two passes' records compare as before. SoftMixer::Update locks
+// (WaveGrab), mixes into the locked memory and unlocks (WaveRelease) inside one call: its footprint can't name the
+// locked memory (Lock hands it out during the call), so that memory is left to the Unlock record's hash of the bytes
+// written (both passes' Locks hand out the same pointers).
+//
+// Step S2 (PORT_FN_AUDIO): WaveBegin, create_primary_buffer, create_secondary_buffer, WaveEnd, WaveGrab and WaveRelease
+// call the audio core, so they need the SDL audio ([platform] sdl=1, audio=sdl): with the game's own DirectSound they
+// stay original (port_install). setup_wf and max_data_from_cursors don't touch DirectSound.
 //
 // Not rewritten (too short to hook: the jump is 5 bytes): NullMixer::GetCaps (lea eax,[ecx+4]; ret -- 4 bytes),
 // NullMixer::IsNullMixer / Begin, IMixer::IsNullMixer, SoftSound::Ok / Can3D (mov al,1 or xor al,al; ret -- 3 bytes),
@@ -74,6 +81,7 @@
 #include "viperport.h"
 #include "port.h"
 #include "x87.h"
+#include "audio_core.h"
 
 namespace {
 
@@ -88,8 +96,6 @@ typedef int Edx;                                    // the unused edx of a __thi
 #define SFN(T, a) ((T)(uintptr_t)(a))
 // a virtual call through the object's vtable (byte offset), __thiscall received as __fastcall
 #define SVF(obj, off, R, ...) ((R(__fastcall*)(void*, Edx, ##__VA_ARGS__))((*(void* const* const*)(obj))[(off) / 4]))
-// a COM method (vtable slot), __stdcall with the object first
-#define SCOM(obj, slot, R, ...) ((R(__stdcall*)(void*, ##__VA_ARGS__))((*(void* const* const*)(obj))[slot]))
 
 static __forceinline float Fb(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 
@@ -224,7 +230,6 @@ typedef void(__cdecl* Void_t)();
 #define ScanHit_o SFN(uint8_t(__cdecl*)(uint32_t), 0x00413100)        // unsigned char: the low byte counts
 #define ScanDown_o SFN(uint8_t(__cdecl*)(uint32_t), 0x004130e0)
 #define dsounderr2str_o SFN(const char*(__cdecl*)(int32_t), 0x004756b0)
-#define DirectSoundCreate_o SFN(int32_t(__stdcall*)(void*, void**, void*), 0x004cccec)   // the import thunk
 #define directsound_create_mixers_o SFN(Void_t, 0x00476750)
 #define MultiEnter_o SFN(void(__cdecl*)(int32_t, const char*, int32_t), 0x00415180)
 #define MultiLeave_o SFN(void(__cdecl*)(int32_t, const char*, int32_t), 0x004151d0)
@@ -259,21 +264,19 @@ typedef void(__cdecl* Void_t)();
 #define fastout_o SFN(void(__cdecl*)(void*, void*, int32_t), 0x00477140)
 #define fastout_8_o SFN(void(__cdecl*)(void*, void*, int32_t), 0x00477190)
 
-// IDirectSound / IDirectSoundBuffer vtable slots
-enum { DS_RELEASE = 2, DS_CREATEBUFFER = 3, DS_GETCAPS = 4, DS_SETCOOP = 6 };
-enum {
-    DSB_RELEASE = 2, DSB_GETCAPS = 3, DSB_GETPOS = 4, DSB_GETSTATUS = 9, DSB_LOCK = 11, DSB_PLAY = 12, DSB_SETFORMAT = 14,
-    DSB_STOP = 18, DSB_UNLOCK = 19, DSB_RESTORE = 20,
-};
-static __forceinline int32_t buf_play(void* b) { return SCOM(b, DSB_PLAY, int32_t, uint32_t, uint32_t, uint32_t)(b, 0, 0, 1); }
-static __forceinline int32_t buf_restore(void* b) { return SCOM(b, DSB_RESTORE, int32_t)(b); }
-static __forceinline int32_t buf_lock(void* b, uint32_t at, uint32_t n) {
-    return SCOM(b, DSB_LOCK, int32_t, uint32_t, uint32_t, void*, void*, void*, void*, uint32_t)(
-        b, at, n, (void*)(uintptr_t)W_P1, (void*)(uintptr_t)W_N1, (void*)(uintptr_t)W_P2, (void*)(uintptr_t)W_N2, 0);
+// DirectSound: the audio core (audio_core.h; M3 step S2), called directly -- its handles are the COM objects the
+// original code calls through their vtables (the facade in dsound_sdl.cpp), so W_DS / W_BUF hold the same objects
+// whichever code made them. Each call is the one the original makes through the vtable slot, with its arguments.
+#define DEV(a) ((audio::Device)(uintptr_t)(a))              // W_DS's value as the core's handle
+#define BUF(a) ((audio::Buffer)(uintptr_t)(a))              // W_BUF's
+static __forceinline int32_t buf_play(audio::Buffer b) { return audio::play(b, 0, 0, 1); }
+static __forceinline int32_t buf_restore(audio::Buffer b) { return audio::restore(b); }
+static __forceinline int32_t buf_lock(audio::Buffer b, uint32_t at, uint32_t n) {
+    return audio::lock(b, at, n, (void**)(uintptr_t)W_P1, (unsigned long*)(uintptr_t)W_N1, (void**)(uintptr_t)W_P2,
+                       (unsigned long*)(uintptr_t)W_N2, 0);
 }
-static __forceinline int32_t buf_unlock(void* b) {
-    return SCOM(b, DSB_UNLOCK, int32_t, uint32_t, uint32_t, uint32_t, uint32_t)(b, SG32(W_P1), SG32(W_N1), SG32(W_P2),
-                                                                                SG32(W_N2));
+static __forceinline int32_t buf_unlock(audio::Buffer b) {
+    return audio::unlock(b, (void*)(uintptr_t)SG32(W_P1), SG32(W_N1), (void*)(uintptr_t)SG32(W_P2), SG32(W_N2));
 }
 #define PTR(a) ((void*)(uintptr_t)(a))
 
@@ -1141,7 +1144,8 @@ static void __cdecl wave_E2_rw() { SFN(Void_t, 0x00476830)(); }
 PORT_FN(0x00476820, "$E2(wave.obj)", wave_E2_rw, fp_static_init)
 
 // WaveBegin(format, channels): the WAVEFORMATEX cleared, DirectSoundCreate, then the primary buffer, else the
-// secondary, else the DirectSound object released
+// secondary, else the DirectSound object released. DirectSoundCreate is the audio core's (the original calls the
+// DSOUND import, which audio_install points at the same core)
 static uint8_t __cdecl WaveBegin_rw(int32_t fmt, int32_t ch) {
     TaskSleep_o(100);
     SG32(W_WFX) = 0;
@@ -1150,7 +1154,7 @@ static uint8_t __cdecl WaveBegin_rw(int32_t fmt, int32_t ch) {
     SG32(W_AVG) = 0;
     SG32(W_ALIGN) = 0;
     SG16(W_WFX + 0x10) = 0;
-    const int32_t hr = DirectSoundCreate_o(0, (void**)PTR(W_DS), 0);
+    const int32_t hr = audio::create((audio::Device*)PTR(W_DS));
     if (hr) {
         LogReport_o(SS(0x004f640c), dsounderr2str_o(hr));             // "WaveBegin(): DirectSoundCreate fails! (%s)"
         return 0;
@@ -1166,13 +1170,12 @@ static uint8_t __cdecl WaveBegin_rw(int32_t fmt, int32_t ch) {
         return 1;
     }
     LogReport_o(SS(0x004f63e4), fmt, ch);                              // "WaveBegin(): No secondary in fmt %d:%d"
-    void* ds = PTR(SG32(W_DS));
-    SCOM(ds, DS_RELEASE, uint32_t)(ds);
+    audio::release(DEV(SG32(W_DS)));
     SG32(W_DS) = 0;
     return 0;
 }
 static void fp_wave_begin(Footprint& f, int32_t, int32_t) { f.replay_only = "it creates the DirectSound objects"; }
-PORT_FN(0x00476840, "WaveBegin", WaveBegin_rw, fp_wave_begin)
+PORT_FN_AUDIO(0x00476840, "WaveBegin", WaveBegin_rw, fp_wave_begin)
 
 struct DsCaps { uint32_t w[0x18]; };               // DSCAPS (0x60): dwSize, dwFlags ...
 struct DsBufDesc { uint32_t size, flags, bytes, reserved, wfx; };   // DSBUFFERDESC (DirectX 5, 0x14)
@@ -1182,16 +1185,14 @@ struct DsBufCaps { uint32_t size, flags, bytes, unlock_rate, cpu; };   // DSBCAP
 // (DSCAPS_PRIMARY16BIT / 8BIT), then SetFormat, its size, and Play (looping)
 static void* __cdecl create_primary_buffer_rw(int32_t fmt, int32_t ch) {
     void* hwnd = Win32GetWindow_o();
-    void* ds = PTR(SG32(W_DS));
-    if (SCOM(ds, DS_SETCOOP, int32_t, void*, uint32_t)(ds, hwnd, 4)) {
+    if (audio::set_cooperative_level(DEV(SG32(W_DS)), hwnd, 4)) {
         LogReport_o(SS(0x004f6540));                                    // "Wave: Couldn't get write primary access"
         return 0;
     }
     volatile DsCaps caps;
     for (int i = 0; i < 0x18; i++) caps.w[i] = 0;
     caps.w[0] = 0x60;
-    ds = PTR(SG32(W_DS));
-    if (SCOM(ds, DS_GETCAPS, int32_t, volatile DsCaps*)(ds, &caps)) {
+    if (audio::device_caps(DEV(SG32(W_DS)), (_DSCAPS*)&caps)) {
         LogReport_o(SS(0x004f651c));                                    // "Wave: Couldn't get DirectSound caps"
         return 0;
     }
@@ -1203,8 +1204,7 @@ static void* __cdecl create_primary_buffer_rw(int32_t fmt, int32_t ch) {
     d.bytes = 0;
     d.wfx = 0;
     buf = 0;
-    ds = PTR(SG32(W_DS));
-    int32_t hr = SCOM(ds, DS_CREATEBUFFER, int32_t, volatile DsBufDesc*, void* volatile*, void*)(ds, &d, &buf, 0);
+    int32_t hr = audio::create_buffer(DEV(SG32(W_DS)), (const _DSBUFFERDESC*)&d, (audio::Buffer*)&buf);
     if (hr) {
         LogReport_o(SS(0x004f6500), dsounderr2str_o(hr));             // "Wave: CreateSoundBuffer: %s"
         return 0;
@@ -1226,15 +1226,13 @@ static void* __cdecl create_primary_buffer_rw(int32_t fmt, int32_t ch) {
         ok = false;
     }
     if (ok) {
-        void* b = buf;
-        if (SCOM(b, DSB_SETFORMAT, int32_t, void*)(b, PTR(W_WFX)) == 0) {
+        if (audio::set_format(BUF(buf), (const tWAVEFORMATEX*)PTR(W_WFX)) == 0) {
             volatile DsBufCaps bc;
             bc.size = 0; bc.flags = 0; bc.bytes = 0; bc.unlock_rate = 0; bc.cpu = 0;
             bc.size = 0x14;
-            b = buf;
-            SCOM(b, DSB_GETCAPS, int32_t, volatile DsBufCaps*)(b, &bc);
+            audio::buffer_caps(BUF(buf), (_DSBCAPS*)&bc);
             const uint32_t size = bc.bytes;
-            b = buf;
+            const audio::Buffer b = BUF(buf);
             SG32(W_SIZE) = size;
             hr = buf_play(b);
             if (hr) LogReport_o(SS(0x004f64a8), dsounderr2str_o(hr));    // "Wave: Initial call to Play() failed (%s)"
@@ -1243,12 +1241,11 @@ static void* __cdecl create_primary_buffer_rw(int32_t fmt, int32_t ch) {
         }
     }
     LogReport_o(SS(0x004f64d4));                                        // "Wave: Couldn't set primary buffer format!"
-    void* b = buf;
-    SCOM(b, DSB_RELEASE, uint32_t)(b);
+    audio::release(BUF(buf));
     return 0;
 }
 static void fp_create_primary(Footprint& f, int32_t, int32_t) { f.replay_only = "it creates the primary buffer"; }
-PORT_FN(0x00476930, "create_primary_buffer", create_primary_buffer_rw, fp_create_primary)
+PORT_FN_AUDIO(0x00476930, "create_primary_buffer", create_primary_buffer_rw, fp_create_primary)
 
 // setup_wf: PCM; stereo only for channels == 1; formats 0 / 2 11025 Hz, else 22050; formats 0 / 1 8-bit, else 16
 static void __cdecl setup_wf_rw(int32_t fmt, int32_t ch) {
@@ -1265,8 +1262,7 @@ PORT_FN(0x00476b80, "setup_wf", setup_wf_rw, fp_setup_wf)
 // the fallback: a 16 KB software secondary buffer in the format (DSSCL_EXCLUSIVE), its size, Play (looping)
 static void* __cdecl create_secondary_buffer_rw(int32_t fmt, int32_t ch) {
     void* hwnd = Win32GetWindow_o();
-    void* ds = PTR(SG32(W_DS));
-    if (SCOM(ds, DS_SETCOOP, int32_t, void*, uint32_t)(ds, hwnd, 3)) {
+    if (audio::set_cooperative_level(DEV(SG32(W_DS)), hwnd, 3)) {
         LogReport_o(SS(0x004f6584));                                    // "Wave: Couldn't get write primary access"
         return 0;
     }
@@ -1278,41 +1274,38 @@ static void* __cdecl create_secondary_buffer_rw(int32_t fmt, int32_t ch) {
     setup_wf_o(fmt, ch);
     void* volatile buf;
     buf = 0;
-    ds = PTR(SG32(W_DS));
+    const audio::Device ds = DEV(SG32(W_DS));
     d.wfx = W_WFX;
-    const int32_t hr = SCOM(ds, DS_CREATEBUFFER, int32_t, volatile DsBufDesc*, void* volatile*, void*)(ds, &d, &buf, 0);
+    const int32_t hr = audio::create_buffer(ds, (const _DSBUFFERDESC*)&d, (audio::Buffer*)&buf);
     if (hr) {
         LogReport_o(SS(0x004f6568), dsounderr2str_o(hr));             // "Wave: CreateSoundBuffer: %s"
         return 0;
     }
     volatile DsBufCaps bc;
     bc.size = 0; bc.flags = 0; bc.bytes = 0; bc.unlock_rate = 0; bc.cpu = 0;
-    void* b = buf;
+    audio::Buffer b = BUF(buf);
     bc.size = 0x14;
-    SCOM(b, DSB_GETCAPS, int32_t, volatile DsBufCaps*)(b, &bc);
+    audio::buffer_caps(b, (_DSBCAPS*)&bc);
     const uint32_t size = bc.bytes;
-    b = buf;
+    b = BUF(buf);
     SG32(W_SIZE) = size;
     buf_play(b);
     SG32(W_POS) = 0;
     return buf;
 }
 static void fp_create_secondary(Footprint& f, int32_t, int32_t) { f.replay_only = "it creates the secondary buffer"; }
-PORT_FN(0x00476c20, "create_secondary_buffer", create_secondary_buffer_rw, fp_create_secondary)
+PORT_FN_AUDIO(0x00476c20, "create_secondary_buffer", create_secondary_buffer_rw, fp_create_secondary)
 
 // WaveEnd: Stop, release the buffer and DirectSound (the buffer's pointer stays), sleep 250 ms
 static void __cdecl WaveEnd_rw() {
-    void* b = PTR(SG32(W_BUF));
-    SCOM(b, DSB_STOP, int32_t)(b);
-    b = PTR(SG32(W_BUF));
-    SCOM(b, DSB_RELEASE, uint32_t)(b);
-    void* ds = PTR(SG32(W_DS));
-    SCOM(ds, DS_RELEASE, uint32_t)(ds);
+    audio::stop(BUF(SG32(W_BUF)));
+    audio::release(BUF(SG32(W_BUF)));
+    audio::release(DEV(SG32(W_DS)));
     SG32(W_DS) = 0;
     TaskSleep_o(0xfa);
 }
 static void fp_wave_end(Footprint& f) { f.replay_only = "it releases the DirectSound objects"; }
-PORT_FN(0x00476d30, "WaveEnd", WaveEnd_rw, fp_wave_end)
+PORT_FN_AUDIO(0x00476d30, "WaveEnd", WaveEnd_rw, fp_wave_end)
 
 // WaveGrab: lock the part of the buffer to write next. S = the buffer's size, pos = the write offset, T = 2 * (bytes a
 // second / 50) = 40 ms. Play again if it stopped; the cursors (failing: Restore, Play, no lock); resync -> pos = write.
@@ -1323,17 +1316,15 @@ PORT_FN(0x00476d30, "WaveEnd", WaveEnd_rw, fp_wave_end)
 // Lock(pos, n): BUFFERLOST -> Restore (failing: no lock), Play, resync, Lock(pos, T) again; any error -> resync, 0.
 // Locked: the four results handed out, pos = the second length when it wrapped, else pos + the first (so pos can be S).
 // FIX CANDIDATE: pos == S asks Lock for an offset of exactly the buffer's size (real DirectSound: DSERR_INVALIDPARAM,
-// which WaveGrab turns into a resync and a silent tick, no crash). Not fixed: the port always runs on its emulation
-// (hook/dsound_sdl.cpp: DirectSoundCreate is pointed there), whose Lock takes the offset modulo the size -- 0, the
-// ring's start, where the next write belongs -- so it neither fails nor misplaces anything.
+// which WaveGrab turns into a resync and a silent tick, no crash). Not fixed: this rewrite runs only on the audio core
+// (PORT_FN_AUDIO: with the game's own DirectSound it stays original), whose lock takes the offset modulo the size --
+// 0, the ring's start, where the next write belongs -- so it neither fails nor misplaces anything.
 static uint8_t __cdecl WaveGrab_rw(uint8_t** p1, uint32_t* n1, uint8_t** p2, uint32_t* n2) {
     volatile uint32_t status;
-    void* b = PTR(SG32(W_BUF));
-    if (SCOM(b, DSB_GETSTATUS, int32_t, volatile uint32_t*)(b, &status) == 0 && !(status & 1)) buf_play(PTR(SG32(W_BUF)));
+    if (audio::status(BUF(SG32(W_BUF)), (unsigned long*)&status) == 0 && !(status & 1)) buf_play(BUF(SG32(W_BUF)));
     volatile uint32_t play, write;
-    b = PTR(SG32(W_BUF));
-    if (SCOM(b, DSB_GETPOS, int32_t, volatile uint32_t*, volatile uint32_t*)(b, &play, &write)) {
-        if (buf_restore(PTR(SG32(W_BUF))) == 0) buf_play(PTR(SG32(W_BUF)));
+    if (audio::position(BUF(SG32(W_BUF)), (unsigned long*)&play, (unsigned long*)&write)) {
+        if (buf_restore(BUF(SG32(W_BUF))) == 0) buf_play(BUF(SG32(W_BUF)));
         return 0;
     }
     if (SG8(W_RESYNC)) {
@@ -1371,15 +1362,15 @@ static uint8_t __cdecl WaveGrab_rw(uint8_t** p1, uint32_t* n1, uint8_t** p2, uin
         n = T;
         SG32(W_POS) = write;
     }
-    int32_t hr = buf_lock(PTR(SG32(W_BUF)), SG32(W_POS), n);
+    int32_t hr = buf_lock(BUF(SG32(W_BUF)), SG32(W_POS), n);
     if ((uint32_t)hr == DSERR_BUFFERLOST) {
-        hr = buf_restore(PTR(SG32(W_BUF)));
+        hr = buf_restore(BUF(SG32(W_BUF)));
         if (hr) goto fail;
-        buf_play(PTR(SG32(W_BUF)));
+        buf_play(BUF(SG32(W_BUF)));
         SG8(W_RESYNC) = 1;
         {
             const uint32_t pos = SG32(W_POS);
-            hr = buf_lock(PTR(SG32(W_BUF)), pos, T);
+            hr = buf_lock(BUF(SG32(W_BUF)), pos, T);
         }
         if (hr == 0) LogReport_o(SS(0x004f65ac));                        // "wave: relocked!"
         else LogReport_o(SS(0x004f65bc), dsounderr2str_o(hr));         // "wave: ReLock fails (%s)"
@@ -1411,7 +1402,7 @@ static void fp_wave_grab(Footprint& f, uint8_t** p1, uint32_t* n1, uint8_t** p2,
     f.add(p2, 4, "second pointer");
     f.add(n2, 4, "second length");
 }
-PORT_FN(0x00476d70, "WaveGrab", WaveGrab_rw, fp_wave_grab)
+PORT_FN_AUDIO(0x00476d70, "WaveGrab", WaveGrab_rw, fp_wave_grab)
 
 // the bytes from the write cursor round to the play cursor: play - write, + S when write >= play (S when equal)
 static uint32_t __cdecl max_data_from_cursors_rw(uint32_t write, uint32_t play) {
@@ -1422,13 +1413,13 @@ static void fp_max_data(Footprint&, uint32_t, uint32_t) {}
 PORT_FN(0x00476ff0, "max_data_from_cursors", max_data_from_cursors_rw, fp_max_data)
 
 static void __cdecl WaveRelease_rw() {
-    if ((uint32_t)buf_unlock(PTR(SG32(W_BUF))) == DSERR_BUFFERLOST) {
-        buf_restore(PTR(SG32(W_BUF)));
-        buf_unlock(PTR(SG32(W_BUF)));
+    if ((uint32_t)buf_unlock(BUF(SG32(W_BUF))) == DSERR_BUFFERLOST) {
+        buf_restore(BUF(SG32(W_BUF)));
+        buf_unlock(BUF(SG32(W_BUF)));
     }
 }
-static void fp_wave_release(Footprint&) {}          // Unlock (and Restore): outputs, recorded by the emulation
-PORT_FN(0x00477010, "WaveRelease", WaveRelease_rw, fp_wave_release)
+static void fp_wave_release(Footprint&) {}          // Unlock (and Restore): outputs, recorded by the audio core
+PORT_FN_AUDIO(0x00477010, "WaveRelease", WaveRelease_rw, fp_wave_release)
 
 // ======================================================================================================================
 // fastmix.obj (hand-written assembler in the original: plain 32-bit integer loops)
@@ -1543,5 +1534,6 @@ PORT_FN(0x00477190, "fastout_8", fastout_8_rw, fp_fastout_8)
 #undef SS
 #undef SFN
 #undef SVF
-#undef SCOM
 #undef PTR
+#undef DEV
+#undef BUF

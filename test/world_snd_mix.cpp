@@ -21,6 +21,13 @@
 // Restore, Release), each call logged with its arguments (structures by content, the Unlock with a hash of the bytes
 // it releases), each answer scripted: cursors anywhere in the ring, failures, DSERR_BUFFERLOST, Lock's two behaviours
 // at the ring's end (real DirectSound: an offset of exactly the size is DSERR_INVALIDPARAM; the emulation wraps it).
+// wave.obj's rewrites (step S2) call the audio core (hook/audio_core.h) instead of the vtables: the harness implements
+// the core over the SAME fakes -- a handle is the fake object (its vtable is checked, so a bad handle faults as a call
+// through it would), each core function runs that object's fake method directly, DirectSoundCreate's stub for
+// audio::create -- so both ways log to the one op log, and the original (through the fake COM) and the rewrite
+// (through the core) are compared on the op sequence, the answers, the statics and the ring's bytes as before. Each
+// check also counts which way every DirectSound op came: none through the core in an original's pass, and in a
+// chain's rewrite pass (every rewrite hooked) every one through the core, none through a vtable.
 // BagBase, Xlator, dsounderr2str, strncmp and the CRT's ftol run from the image.
 //
 // Each check runs the original, keeps the arena, the image statics and the log, restores them, runs the rewrite and
@@ -59,6 +66,7 @@ static const bool k_ordinary = false;
 #else
 static const bool k_ordinary = true;        // the random rounds keep to inputs the fixes don't change
 #endif
+#define VP_PORT_NEEDS_AUDIO(NEW)          // PORT_FN_AUDIO: no PortFn to mark here (ChainReg below replaces PORT_FN)
 #include "../hook/port.h"
 
 struct ChainReg {
@@ -601,6 +609,49 @@ static long __stdcall st_b_unlock(FakeCom* self, void* p1, uint32_t n1, void* p2
 static long __stdcall st_b_restore(FakeCom* self) { const uint32_t hr = ds_hr(); logn(L_B_RESTORE, self->id, hr); return (long)hr; }
 static void __cdecl st_com_bad() { logn(L_COM_BAD); RaiseException(BAD_CODE, 0, 0, 0); }
 
+// ---- the audio core (hook/audio_core.h) over the same fakes -------------------------------------------------------------
+// the rewrites' way in: a handle is the fake object (as the real core's handle is its COM object); its vtable is read and
+// must be of the kind -- a null or wild handle faults on that read as the original's call through it faults
+static long g_core_calls[2];                        // DirectSound ops that came through the core, by pass
+static long g_core_total, g_com_total_new;          // over all checks: rewrite passes' ops through the core / a vtable
+static FakeCom* core_obj(void* h, void** vtbl) {
+    FakeCom* o = (FakeCom*)h;
+    if (o->vtbl != vtbl) st_com_bad();
+    g_core_calls[g_pass]++;
+    return o;
+}
+namespace audio {
+long create(Device* out) { g_core_calls[g_pass]++; return st_ds_create(0, (FakeCom**)out, 0); }
+long set_cooperative_level(Device ds, void* hwnd, unsigned long level) { return st_ds_coop(core_obj(ds, g_ds_vtbl), hwnd, level); }
+long device_caps(Device ds, _DSCAPS* caps) { return st_ds_getcaps(core_obj(ds, g_ds_vtbl), (uint32_t*)caps); }
+long create_buffer(Device ds, const _DSBUFFERDESC* desc, Buffer* out) {
+    return st_ds_createbuf(core_obj(ds, g_ds_vtbl), (const uint32_t*)desc, (FakeCom**)out, 0);
+}
+unsigned long release(Device ds) { return st_release(core_obj(ds, g_ds_vtbl)); }
+long set_format(Buffer b, const tWAVEFORMATEX* f) { return st_b_setformat(core_obj(b, g_buf_vtbl), f); }
+long buffer_caps(Buffer b, _DSBCAPS* caps) { return st_b_getcaps(core_obj(b, g_buf_vtbl), (uint32_t*)caps); }
+long play(Buffer b, unsigned long r1, unsigned long prio, unsigned long flags) { return st_b_play(core_obj(b, g_buf_vtbl), r1, prio, flags); }
+long stop(Buffer b) { return st_b_stop(core_obj(b, g_buf_vtbl)); }
+long status(Buffer b, unsigned long* s) { return st_b_status(core_obj(b, g_buf_vtbl), (uint32_t*)s); }
+long restore(Buffer b) { return st_b_restore(core_obj(b, g_buf_vtbl)); }
+long position(Buffer b, unsigned long* play, unsigned long* write) {
+    return st_b_getpos(core_obj(b, g_buf_vtbl), (uint32_t*)play, (uint32_t*)write);
+}
+long lock(Buffer b, unsigned long offset, unsigned long bytes, void** p1, unsigned long* n1, void** p2, unsigned long* n2,
+          unsigned long flags) {
+    return st_b_lock(core_obj(b, g_buf_vtbl), offset, bytes, p1, (uint32_t*)n1, p2, (uint32_t*)n2, flags);
+}
+long unlock(Buffer b, void* p1, unsigned long n1, void* p2, unsigned long n2) { return st_b_unlock(core_obj(b, g_buf_vtbl), p1, n1, p2, n2); }
+unsigned long release(Buffer b) { return st_release(core_obj(b, g_buf_vtbl)); }
+}  // namespace audio
+// the DirectSound ops a pass logged (the fakes' calls, whichever way they came)
+static long ds_ops(int pass) {
+    const int n = g_nlog[pass] < LOGN ? g_nlog[pass] : LOGN;
+    long k = 0;
+    for (int i = 0; i < n; i++) k += g_log[pass][i].kind >= L_DS_CREATE && g_log[pass][i].kind <= L_B_RESTORE;
+    return k;
+}
+
 // a fake IMixer for MixerAddMixer (its methods __thiscall: received as __fastcall)
 static void* g_mx_vtbl[8];
 static const char* __fastcall st_mx_name(FakeCom* self, Edx) {
@@ -847,6 +898,7 @@ template <typename Run, typename Fp> static void check(const char* fname, Run ru
     // the original
     fpu_mode(pc, unmask);
     g_pass = 0; g_nlog[0] = 0; g_si = 0; g_next_buf = 0;
+    g_core_calls[0] = g_core_calls[1] = 0;
     auto r0 = [&]() { return run(true); };
     auto r1 = [&]() { return run(false); };
     stack_fill(pat);
@@ -867,6 +919,19 @@ template <typename Run, typename Fp> static void check(const char* fname, Run ru
     const uint32_t fcode1 = g_fault_code;
     if (g_chain) chain_unpatch();
     fpu_reset();
+    {
+        // which way the DirectSound ops came: the original's never through the core; a chain's rewrite pass all of them
+        const long ops1 = ds_ops(1);
+        g_core_total += g_core_calls[1];
+        g_com_total_new += ops1 - g_core_calls[1];
+        const bool logs_whole = g_nlog[0] <= LOGN && g_nlog[1] <= LOGN;
+        if (logs_whole && (g_core_calls[0] || (g_chain && g_core_calls[1] != ops1))) {
+            g_mismatch_total++;
+            if (st.fails++ < 4)
+                printf("PATH %s (episode %d, %s): the original's pass made %ld DirectSound ops through the core; the rewrite's "
+                       "%ld of %ld\n", name.c_str(), g_eno, g_phase, g_core_calls[0], g_core_calls[1], ops1);
+        }
+    }
     if (fo == 1) st.panics++;
     if (fo == 2 && fcode0 == 0xC0000005 && fat0 >= 0x477090 && fat0 < 0x477100) g_cov[C_mix_overread_fault]++;
     if (fo == 2 || fn == 2) {
@@ -1943,6 +2008,8 @@ int main(int argc, char** argv) {
     }
     printf("%d episodes, %ld checks; %d of %d functions differ or escape their footprint; %d rewrites never checked\n", episodes, calls,
            failed, (int)g_stats.size(), unchecked);
+    printf("the rewrites' DirectSound ops: %ld through the audio core, %ld through a vtable (isolated checks: the group's other "
+           "functions run as the originals)\n", g_core_total, g_com_total_new);
     printf("covered:");
     for (int i = 0; i < NCOV; i++) printf("%s %s %ld", i ? "," : "", k_cov_names[i], g_cov[i]);
     printf("\n");

@@ -98,10 +98,19 @@ That is the whole physics and AI code, apart from the debug screens' drawing.
   shadow check every OpenGL call is recorded (`gl_table`) and compared, with the renderer's state, so
   each frame's drawing is checked against the original's, call by call. `test/world_gx_dd.cpp` checks
   the wrappers offline against the originals on the same renderer.
+- **The sound** (`hook/snd_*.cpp`, 264 more): the sound objects, the sound manager (voices, 3D
+  priority, the listener) and sound resources (`snd_mgr`); the engine and tyre sounds (`snd_car`); and
+  the software mixer, its inner mixing loops and the streaming to the sound card (`snd_mix`). They mix
+  on the physics thread, as the original's did. The streaming (wave.obj) writes straight into the SDL
+  audio core (`audio_core.h`); the original code and the race.bin builds reach the same core through the
+  DirectSound facade (`dsound_sdl`), on the same objects. A shadow check records every call to the core,
+  including a hash of the mixed audio written, and compares them. The hardware DirectSound mixer the
+  game ships (ds.obj) is never used by any build and isn't ported.
 
 Then a chosen set of the original's bugs is fixed, always on: the AI crash (a car losing its place on
 its racing line), degenerate racing lines, a ground-contact divide by zero, vrmod's obstacle wake, a single race on a
-track with no AI racing line (it runs without AI cars instead of crashing), and
+track with no AI racing line (it runs without AI cars instead of crashing), sound crashes (Doppler at
+the speed of sound, no sound device, mod sounds and engine files), and
 buffer overruns that long mod-car, driver and track names could trigger. A fix only changes what happens
 where the original would crash, hang or overrun, so a race replays identically on the original code
 until one of those comes up. The AI crash is the one that comes up in ordinary racing (after the
@@ -139,7 +148,7 @@ main thread's buffers left out.
   `phys_*.cpp` (the rewritten physics),
   `replay.cpp` (the race recorder), `platform.cpp` (window and input), `gl_core.cpp` (the OpenGL
   renderer, every GL call through `gl_table.cpp`), `ddraw_gl.cpp` (its DirectDraw / Direct3D facade),
-  `dsound_sdl.cpp` (audio); `build.bat` builds it (Visual Studio Build Tools,
+  `dsound_sdl.cpp` (the audio core and its DirectSound facade); `build.bat` builds it (Visual Studio Build Tools,
   SDL2 2.32 in `../sdl2`).
 - `tools/` — the analysis: linker-map extraction, the function inventory, cross-build matching
   (`match_builds.py`, `propagate.py`, `port_sites.py`), type recovery for Ghidra (`recover_types.py`,

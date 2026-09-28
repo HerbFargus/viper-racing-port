@@ -5,14 +5,18 @@
 // included, and streams the result into ONE looping 22050 Hz stereo buffer from its 16 ms background
 // thread. So DirectSound here is a ring buffer the game writes ahead of an SDL audio callback that plays it:
 //
-//   CreateSoundBuffer   the primary (DSSCL_WRITEPRIMARY + SetFormat) or the 16 KB fallback secondary
-//   Play / Stop         open / pause the SDL device at the buffer's format (SDL converts to the card's)
-//   GetCurrentPosition  play = what the callback has consumed; write = play + ~10 ms, frame-aligned --
+//   create_buffer       the primary (DSSCL_WRITEPRIMARY + SetFormat) or the 16 KB fallback secondary
+//   play / stop         open / pause the SDL device at the buffer's format (SDL converts to the card's)
+//   position            play = what the callback has consumed; write = play + ~10 ms, frame-aligned --
 //                       the game's WaveGrab needs write strictly ahead of play and under its 40 ms target
-//   Lock / Unlock       plain pointers into the ring (two when it wraps); an offset of exactly the size
+//   lock / unlock       plain pointers into the ring (two when it wraps); an offset of exactly the size
 //                       wraps to 0 instead of failing (a failed Lock cuts every one-shot sound)
 //
-// race.exe's DSOUND.dll!DirectSoundCreate import is pointed here (build-agnostic, like the renderer).
+// M3 step S2: the audio core. Every operation the game uses is a plain function (audio_core.h, namespace audio),
+// which wave.obj's rewrites (snd_mix.cpp) call directly. The COM objects below are a facade over the same core: each
+// method the game uses is one call into it, and a core handle is the facade object itself, so the original code (the
+// race.bin builds, `original` mode, a shadow check's original pass) and the rewrites share the same objects.
+// race.exe's DSOUND.dll!DirectSoundCreate import is pointed at the facade (build-agnostic, like the renderer).
 // Returning an error from DirectSoundCreate would just make the game silent (its NullMixer).
 //
 // Shadow checks (port.h): the sound code runs on the physics thread, and a check sees DirectSound the way the
@@ -21,7 +25,9 @@
 // Play, Stop, SetFormat, SetCurrentPosition, SetVolume / SetPan / SetFrequency, Restore) is an OUTPUT: recorded in
 // both passes and compared, made in the original's only, its result handed on like an input. Unlock records a hash
 // of the bytes written since the Lock, so the mixed audio itself is compared. Creating and releasing objects isn't
-// checked (the functions that do are replay_only).
+// checked (the functions that do are replay_only). The recording is done by the core, so a call that comes through
+// COM and the same call made directly leave byte-identical records: the same method id (DSREC_BUFFER / DSREC_DEVICE
+// + the vtable slot), the same object (the handle is the COM object), the same argument bytes.
 #define _CRT_SECURE_NO_WARNINGS
 #include "ds5.h"
 #include "com_dsound.h"
@@ -32,6 +38,7 @@
 #include "SDL.h"
 #include "viperport.h"
 #include "port.h"
+#include "audio_core.h"
 
 void com_unsupported(const char* method);
 
@@ -57,7 +64,8 @@ HRESULT result(bool skipped, HRESULT hr) {
 
 const DWORD RING = 16384;                                        // bytes, the size the game's fallback asks for
 
-struct Buffer : Base_IDirectSoundBuffer {
+// a buffer: the core's object and its COM face
+struct SdlBuffer : Base_IDirectSoundBuffer {
     LONG refs = 1;
     bool primary = false;
     WAVEFORMATEX wfx = {};
@@ -68,18 +76,18 @@ struct Buffer : Base_IDirectSoundBuffer {
     uint32_t lead = 0;                                           // write cursor distance ahead of play
     bool global = false;                                         // DSBCAPS_GLOBALFOCUS: heard while switched away
 
-    Buffer(bool is_primary, const WAVEFORMATEX* f) : primary(is_primary) {
+    SdlBuffer(bool is_primary, const WAVEFORMATEX* f) : primary(is_primary) {
         if (f) wfx = *f;
         else wfx = {WAVE_FORMAT_PCM, 2, 22050, 22050 * 4, 4, 16, 0};
         ring.assign(RING, silence());
     }
-    ~Buffer() { close(); }
+    ~SdlBuffer() { close(); }
 
     uint8_t silence() const { return wfx.wBitsPerSample == 8 ? 0x80 : 0; }
     uint32_t align() const { return wfx.nBlockAlign ? wfx.nBlockAlign : 4; }
 
     static void SDLCALL callback(void* self, Uint8* out, int len) {
-        Buffer* b = (Buffer*)self;
+        SdlBuffer* b = (SdlBuffer*)self;
         uint32_t size = (uint32_t)b->ring.size(), p = b->play.load();
         uint8_t fill = b->silence();
         for (int done = 0; done < len;) {
@@ -121,101 +129,23 @@ struct Buffer : Base_IDirectSoundBuffer {
         if (dev) SDL_CloseAudioDevice(dev), dev = 0;
         playing = false;
     }
-
-    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
-    ULONG STDMETHODCALLTYPE Release() override { LONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
-
-    HRESULT STDMETHODCALLTYPE GetCaps(LPDSBCAPS c) override {
-        DWORD size = c->dwSize ? c->dwSize : sizeof *c;
-        if (size > sizeof(DSBCAPS)) size = sizeof(DSBCAPS);
-        if (fed(*c)) return DS_OK;
-        memset(c, 0, size);
-        c->dwSize = size;
-        c->dwFlags = primary ? DSBCAPS_PRIMARYBUFFER : DSBCAPS_LOCSOFTWARE;
-        c->dwBufferBytes = (DWORD)ring.size();
-        saw(*c);
-        return DS_OK;
-    }
-    HRESULT STDMETHODCALLTYPE SetFormat(LPCWAVEFORMATEX f) override {
-        WAVEFORMATEX a = {};
-        if (f) a = *f;
-        bool skip = effect(DSREC_BUFFER + 14, this, &a, sizeof a);
-        return result(skip, skip ? DS_OK : set_format(f));
-    }
-    HRESULT set_format(LPCWAVEFORMATEX f) {
+    HRESULT apply_format(LPCWAVEFORMATEX f) {
         if (!f || f->wFormatTag != WAVE_FORMAT_PCM || (f->wBitsPerSample != 8 && f->wBitsPerSample != 16)) return DSERR_BADFORMAT;
         bool was = playing;
         close();
         wfx = *f;
         ring.assign(RING / align() * align(), silence());
         play = 0;
-        if (was) play_now();
+        if (was) start();
         return DS_OK;
     }
-    HRESULT STDMETHODCALLTYPE GetFormat(LPWAVEFORMATEX f, DWORD size, LPDWORD written) override {
-        struct { WAVEFORMATEX f; DWORD written; } r = {wfx, sizeof(WAVEFORMATEX)};
-        if (!fed(r)) saw(r);
-        if (f && size >= sizeof(WAVEFORMATEX)) *f = r.f;
-        if (written) *written = r.written;
-        return DS_OK;
-    }
-    HRESULT STDMETHODCALLTYPE Play(DWORD r1, DWORD prio, DWORD flags) override {
-        DWORD a[3] = {r1, prio, flags};
-        bool skip = effect(DSREC_BUFFER + 12, this, a, sizeof a);
-        return result(skip, skip ? DS_OK : play_now());
-    }
-    HRESULT play_now() {
+    HRESULT start() {
         if (!open()) return DSERR_GENERIC;
         playing = true;
         SDL_PauseAudioDevice(dev, 0);
         return DS_OK;
     }
-    HRESULT STDMETHODCALLTYPE Stop() override {
-        bool skip = effect(DSREC_BUFFER + 18, this, 0, 0);
-        if (!skip) {
-            if (dev) SDL_PauseAudioDevice(dev, 1);
-            playing = false;
-        }
-        return result(skip, DS_OK);
-    }
-    HRESULT STDMETHODCALLTYPE GetStatus(LPDWORD s) override {
-        DWORD v = playing ? DSBSTATUS_PLAYING | DSBSTATUS_LOOPING : 0;
-        if (!fed(v)) saw(v);
-        *s = v;
-        return DS_OK;
-    }
-    HRESULT STDMETHODCALLTYPE Restore() override { return result(effect(DSREC_BUFFER + 20, this, 0, 0), DS_OK); }
-    HRESULT STDMETHODCALLTYPE GetCurrentPosition(LPDWORD p, LPDWORD w) override {
-        DWORD r[2];
-        if (!fed(r)) {
-            uint32_t size = (uint32_t)ring.size(), at = play.load();
-            r[0] = at;
-            r[1] = (at + (lead ? lead : align())) % size;
-            saw(r);
-        }
-        if (p) *p = r[0];
-        if (w) *w = r[1];
-        return DS_OK;
-    }
-    HRESULT STDMETHODCALLTYPE SetCurrentPosition(DWORD at) override {
-        bool skip = effect(DSREC_BUFFER + 13, this, &at, 4);
-        if (!skip) play = (at % ring.size()) / align() * align();
-        return result(skip, DS_OK);
-    }
-
-    HRESULT STDMETHODCALLTYPE Lock(DWORD offset, DWORD bytes, LPVOID* p1, LPDWORD n1, LPVOID* p2, LPDWORD n2, DWORD flags) override {
-        struct { LPVOID p1; DWORD n1; LPVOID p2; DWORD n2; } r;
-        if (!fed(r)) {
-            lock(offset, bytes, &r.p1, &r.n1, &r.p2, &r.n2, flags);
-            saw(r);
-        }
-        *p1 = r.p1;
-        *n1 = r.n1;
-        if (p2) *p2 = r.p2;
-        if (n2) *n2 = r.n2;
-        return DS_OK;
-    }
-    void lock(DWORD offset, DWORD bytes, LPVOID* p1, LPDWORD n1, LPVOID* p2, LPDWORD n2, DWORD flags) {
+    void lock_ring(DWORD offset, DWORD bytes, LPVOID* p1, LPDWORD n1, LPVOID* p2, LPDWORD n2, DWORD flags) {
         uint32_t size = (uint32_t)ring.size();
         if (flags & DSBLOCK_FROMWRITECURSOR) offset = (play.load() + (lead ? lead : align())) % size;
         if (flags & DSBLOCK_ENTIREBUFFER) bytes = size;
@@ -227,52 +157,66 @@ struct Buffer : Base_IDirectSoundBuffer {
         *p2 = first < bytes ? &ring[0] : 0;
         *n2 = first < bytes ? bytes - first : 0;
     }
-    // what's compared is the bytes written since the Lock (hashed; the pointers are the same in both passes)
-    HRESULT STDMETHODCALLTYPE Unlock(LPVOID p1, DWORD n1, LPVOID p2, DWORD n2) override {
-        if (!shadow_com_phase()) return DS_OK;
-        DWORD a[4] = {(DWORD)(uintptr_t)p1, n1, (DWORD)(uintptr_t)p2, n2};
-        uint64_t h = 1469598103934665603ull;
-        for (DWORD i = 0; p1 && i < n1; i++) h = (h ^ ((const uint8_t*)p1)[i]) * 1099511628211ull;
-        for (DWORD i = 0; p2 && i < n2; i++) h = (h ^ ((const uint8_t*)p2)[i]) * 1099511628211ull;
-        return result(effect(DSREC_BUFFER + 19, this, a, sizeof a, &h, sizeof h), DS_OK);
-    }
 
-    // the game never sets these on its one stream (its mixer does volume, pan and pitch itself)
+    // ---- COM: the game's calls are the core's ----
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
+    ULONG STDMETHODCALLTYPE Release() override { return audio::release(this); }
+    HRESULT STDMETHODCALLTYPE GetCaps(LPDSBCAPS c) override { return audio::buffer_caps(this, c); }
+    HRESULT STDMETHODCALLTYPE SetFormat(LPCWAVEFORMATEX f) override { return audio::set_format(this, f); }
+    HRESULT STDMETHODCALLTYPE Play(DWORD r1, DWORD prio, DWORD flags) override { return audio::play(this, r1, prio, flags); }
+    HRESULT STDMETHODCALLTYPE Stop() override { return audio::stop(this); }
+    HRESULT STDMETHODCALLTYPE GetStatus(LPDWORD s) override { return audio::status(this, s); }
+    HRESULT STDMETHODCALLTYPE Restore() override { return audio::restore(this); }
+    HRESULT STDMETHODCALLTYPE GetCurrentPosition(LPDWORD p, LPDWORD w) override { return audio::position(this, p, w); }
+    HRESULT STDMETHODCALLTYPE Lock(DWORD offset, DWORD bytes, LPVOID* p1, LPDWORD n1, LPVOID* p2, LPDWORD n2, DWORD flags) override {
+        return audio::lock(this, offset, bytes, p1, n1, p2, n2, flags);
+    }
+    HRESULT STDMETHODCALLTYPE Unlock(LPVOID p1, DWORD n1, LPVOID p2, DWORD n2) override { return audio::unlock(this, p1, n1, p2, n2); }
+
+    // ---- COM only: the game never calls these (its mixer does volume, pan and pitch itself) ----
+    HRESULT STDMETHODCALLTYPE GetFormat(LPWAVEFORMATEX f, DWORD size, LPDWORD written) override {
+        struct { WAVEFORMATEX f; DWORD written; } r = {wfx, sizeof(WAVEFORMATEX)};
+        if (!fed(r)) saw(r);
+        if (f && size >= sizeof(WAVEFORMATEX)) *f = r.f;
+        if (written) *written = r.written;
+        return DS_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetCurrentPosition(DWORD at) override {
+        bool skip = effect(DSREC_BUFFER + 13, this, &at, 4);
+        if (!skip) play = (at % ring.size()) / align() * align();
+        return result(skip, DS_OK);
+    }
     HRESULT STDMETHODCALLTYPE SetVolume(LONG v) override { return result(effect(DSREC_BUFFER + 15, this, &v, 4), DS_OK); }
     HRESULT STDMETHODCALLTYPE SetPan(LONG v) override { return result(effect(DSREC_BUFFER + 16, this, &v, 4), DS_OK); }
     HRESULT STDMETHODCALLTYPE SetFrequency(DWORD v) override { return result(effect(DSREC_BUFFER + 17, this, &v, 4), DS_OK); }
 };
 
-struct DirectSound : Base_IDirectSound {
+// the device: the core's object and its COM face
+struct SdlDevice : Base_IDirectSound {
     LONG refs = 1;
     ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
-    ULONG STDMETHODCALLTYPE Release() override { LONG n = InterlockedDecrement(&refs); if (!n) delete this; return n; }
-    HRESULT STDMETHODCALLTYPE SetCooperativeLevel(HWND, DWORD) override { return DS_OK; }
-    HRESULT STDMETHODCALLTYPE GetCaps(LPDSCAPS c) override {
-        DWORD size = c->dwSize ? c->dwSize : sizeof *c;
-        if (size > sizeof(DSCAPS)) size = sizeof(DSCAPS);
-        if (fed(*c)) return DS_OK;
-        memset(c, 0, size);
-        c->dwSize = size;
-        c->dwFlags = DSCAPS_PRIMARYMONO | DSCAPS_PRIMARYSTEREO | DSCAPS_PRIMARY8BIT | DSCAPS_PRIMARY16BIT |
-                     DSCAPS_CONTINUOUSRATE | DSCAPS_EMULDRIVER;
-        c->dwMinSecondarySampleRate = 100, c->dwMaxSecondarySampleRate = 100000;
-        c->dwPrimaryBuffers = 1;
-        saw(*c);
-        return DS_OK;
+    ULONG STDMETHODCALLTYPE Release() override { return audio::release(this); }
+    HRESULT STDMETHODCALLTYPE SetCooperativeLevel(HWND hwnd, DWORD level) override {
+        return audio::set_cooperative_level(this, hwnd, level);
     }
+    HRESULT STDMETHODCALLTYPE GetCaps(LPDSCAPS c) override { return audio::device_caps(this, c); }
     HRESULT STDMETHODCALLTYPE CreateSoundBuffer(LPCDSBUFFERDESC d, LPDIRECTSOUNDBUFFER* out, LPUNKNOWN) override {
-        // the game passes the DirectX 5 DSBUFFERDESC (0x14 bytes, no 3D algorithm GUID)
-        bool primary = (d->dwFlags & DSBCAPS_PRIMARYBUFFER) != 0;
-        if (!primary && d->lpwfxFormat && d->lpwfxFormat->wFormatTag != WAVE_FORMAT_PCM) return DSERR_BADFORMAT;
-        Buffer* b = new Buffer(primary, primary ? 0 : d->lpwfxFormat);
-        b->global = !primary && (d->dwFlags & DSBCAPS_GLOBALFOCUS);
-        *out = b;
-        return DS_OK;
+        return audio::create_buffer(this, d, out);
     }
 };
 
-HRESULT WINAPI emu_DirectSoundCreate(LPGUID, LPDIRECTSOUND* out, LPUNKNOWN) {
+// a handle is the object (single inheritance: the same address)
+SdlBuffer* obj(audio::Buffer b) { return static_cast<SdlBuffer*>(b); }
+SdlDevice* obj(audio::Device ds) { return static_cast<SdlDevice*>(ds); }
+
+HRESULT WINAPI emu_DirectSoundCreate(LPGUID, LPDIRECTSOUND* out, LPUNKNOWN) { return audio::create(out); }
+
+}  // namespace
+
+// ---- the audio core (audio_core.h) --------------------------------------------------------------------------------
+namespace audio {
+
+long create(Device* out) {
     static bool started;
     if (!started) {
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
@@ -282,11 +226,139 @@ HRESULT WINAPI emu_DirectSoundCreate(LPGUID, LPDIRECTSOUND* out, LPUNKNOWN) {
         }
         started = true;
     }
-    *out = new DirectSound;
+    *out = new SdlDevice;
     return DS_OK;
 }
 
-}  // namespace
+long set_cooperative_level(Device, void*, unsigned long) { return DS_OK; }
+
+long device_caps(Device, _DSCAPS* c) {
+    DWORD size = c->dwSize ? c->dwSize : sizeof *c;
+    if (size > sizeof(DSCAPS)) size = sizeof(DSCAPS);
+    if (fed(*c)) return DS_OK;
+    memset(c, 0, size);
+    c->dwSize = size;
+    c->dwFlags = DSCAPS_PRIMARYMONO | DSCAPS_PRIMARYSTEREO | DSCAPS_PRIMARY8BIT | DSCAPS_PRIMARY16BIT |
+                 DSCAPS_CONTINUOUSRATE | DSCAPS_EMULDRIVER;
+    c->dwMinSecondarySampleRate = 100, c->dwMaxSecondarySampleRate = 100000;
+    c->dwPrimaryBuffers = 1;
+    saw(*c);
+    return DS_OK;
+}
+
+long create_buffer(Device, const _DSBUFFERDESC* d, Buffer* out) {
+    // the game passes the DirectX 5 DSBUFFERDESC (0x14 bytes, no 3D algorithm GUID)
+    bool primary = (d->dwFlags & DSBCAPS_PRIMARYBUFFER) != 0;
+    if (!primary && d->lpwfxFormat && d->lpwfxFormat->wFormatTag != WAVE_FORMAT_PCM) return DSERR_BADFORMAT;
+    SdlBuffer* b = new SdlBuffer(primary, primary ? 0 : d->lpwfxFormat);
+    b->global = !primary && (d->dwFlags & DSBCAPS_GLOBALFOCUS);
+    *out = b;
+    return DS_OK;
+}
+
+unsigned long release(Device ds) {
+    SdlDevice* o = obj(ds);
+    LONG n = InterlockedDecrement(&o->refs);
+    if (!n) delete o;
+    return n;
+}
+
+long set_format(Buffer b, const tWAVEFORMATEX* f) {
+    SdlBuffer* o = obj(b);
+    WAVEFORMATEX a = {};
+    if (f) a = *f;
+    bool skip = effect(DSREC_BUFFER + 14, o, &a, sizeof a);
+    return result(skip, skip ? DS_OK : o->apply_format(f));
+}
+
+long buffer_caps(Buffer b, _DSBCAPS* c) {
+    SdlBuffer* o = obj(b);
+    DWORD size = c->dwSize ? c->dwSize : sizeof *c;
+    if (size > sizeof(DSBCAPS)) size = sizeof(DSBCAPS);
+    if (fed(*c)) return DS_OK;
+    memset(c, 0, size);
+    c->dwSize = size;
+    c->dwFlags = o->primary ? DSBCAPS_PRIMARYBUFFER : DSBCAPS_LOCSOFTWARE;
+    c->dwBufferBytes = (DWORD)o->ring.size();
+    saw(*c);
+    return DS_OK;
+}
+
+long play(Buffer b, unsigned long r1, unsigned long prio, unsigned long flags) {
+    SdlBuffer* o = obj(b);
+    DWORD a[3] = {r1, prio, flags};
+    bool skip = effect(DSREC_BUFFER + 12, o, a, sizeof a);
+    return result(skip, skip ? DS_OK : o->start());
+}
+
+long stop(Buffer b) {
+    SdlBuffer* o = obj(b);
+    bool skip = effect(DSREC_BUFFER + 18, o, 0, 0);
+    if (!skip) {
+        if (o->dev) SDL_PauseAudioDevice(o->dev, 1);
+        o->playing = false;
+    }
+    return result(skip, DS_OK);
+}
+
+long status(Buffer b, unsigned long* s) {
+    SdlBuffer* o = obj(b);
+    DWORD v = o->playing ? DSBSTATUS_PLAYING | DSBSTATUS_LOOPING : 0;
+    if (!fed(v)) saw(v);
+    *s = v;
+    return DS_OK;
+}
+
+long restore(Buffer b) { return result(effect(DSREC_BUFFER + 20, obj(b), 0, 0), DS_OK); }
+
+long position(Buffer b, unsigned long* p, unsigned long* w) {
+    SdlBuffer* o = obj(b);
+    DWORD r[2];
+    if (!fed(r)) {
+        uint32_t size = (uint32_t)o->ring.size(), at = o->play.load();
+        r[0] = at;
+        r[1] = (at + (o->lead ? o->lead : o->align())) % size;
+        saw(r);
+    }
+    if (p) *p = r[0];
+    if (w) *w = r[1];
+    return DS_OK;
+}
+
+long lock(Buffer b, unsigned long offset, unsigned long bytes, void** p1, unsigned long* n1, void** p2,
+          unsigned long* n2, unsigned long flags) {
+    SdlBuffer* o = obj(b);
+    struct { LPVOID p1; DWORD n1; LPVOID p2; DWORD n2; } r;
+    if (!fed(r)) {
+        o->lock_ring(offset, bytes, &r.p1, &r.n1, &r.p2, &r.n2, flags);
+        saw(r);
+    }
+    *p1 = r.p1;
+    *n1 = r.n1;
+    if (p2) *p2 = r.p2;
+    if (n2) *n2 = r.n2;
+    return DS_OK;
+}
+
+// what's compared is the bytes written since the Lock (hashed; the pointers are the same in both passes)
+long unlock(Buffer b, void* p1, unsigned long n1, void* p2, unsigned long n2) {
+    SdlBuffer* o = obj(b);
+    if (!shadow_com_phase()) return DS_OK;
+    DWORD a[4] = {(DWORD)(uintptr_t)p1, n1, (DWORD)(uintptr_t)p2, n2};
+    uint64_t h = 1469598103934665603ull;
+    for (DWORD i = 0; p1 && i < n1; i++) h = (h ^ ((const uint8_t*)p1)[i]) * 1099511628211ull;
+    for (DWORD i = 0; p2 && i < n2; i++) h = (h ^ ((const uint8_t*)p2)[i]) * 1099511628211ull;
+    return result(effect(DSREC_BUFFER + 19, o, a, sizeof a, &h, sizeof h), DS_OK);
+}
+
+unsigned long release(Buffer b) {
+    SdlBuffer* o = obj(b);
+    LONG n = InterlockedDecrement(&o->refs);
+    if (!n) delete o;
+    return n;
+}
+
+}  // namespace audio
 
 bool audio_install() {
     if (!patch_import("DSOUND.dll", "DirectSoundCreate", (void*)emu_DirectSoundCreate)) {

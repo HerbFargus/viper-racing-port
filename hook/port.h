@@ -84,6 +84,7 @@ struct PortFn {
     int budget_tick = -1, budget_used = 0;         // shadow_per_tick bookkeeping
     bool patched = false;                          // the installed function isn't stock v1.0: left original
     bool needs_renderer = false;                   // calls the OpenGL renderer directly (gx_dd.cpp): original without it
+    bool needs_audio = false;                      // calls the SDL audio core directly (snd_mix.cpp's wave.obj): likewise
     PortFn(uint32_t v, const char* nm, void* r, void* s, const uint8_t* op = 0, uint8_t ol = 0);
 };
 
@@ -195,6 +196,17 @@ VP_SHADOW_CC(__stdcall)
 #endif
 #endif
 #define PORT_FN_GL(V10, NAME, NEW, FP) PORT_FN(V10, NAME, NEW, FP) VP_PORT_NEEDS_RENDERER(NEW)
+// PORT_FN_AUDIO: a rewrite that calls the SDL audio core directly (audio_core.h); with the game's own DirectSound it
+// stays original (port_install). A harness defines VP_PORT_NEEDS_AUDIO(NEW) as nothing. The fuzzer doesn't register
+// them at all: it runs pure rewrites only, and these call the audio core, which isn't linked into it.
+#ifndef VP_PORT_NEEDS_AUDIO
+#define VP_PORT_NEEDS_AUDIO(NEW) namespace { const bool VP_CAT(needs_audio_, NEW) = (VP_CAT(port_, NEW).needs_audio = true); }
+#endif
+#ifdef VP_FUZZ
+#define PORT_FN_AUDIO(V10, NAME, NEW, FP)
+#else
+#define PORT_FN_AUDIO(V10, NAME, NEW, FP) PORT_FN(V10, NAME, NEW, FP) VP_PORT_NEEDS_AUDIO(NEW)
+#endif
 
 // ---- the framework ----------------------------------------------------------------------------------------
 void port_check_stock();                       // before anything is patched: find non-stock functions
