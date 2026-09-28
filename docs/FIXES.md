@@ -333,10 +333,11 @@ translation, or the command line.
   32-byte texts. A long enough translation ran the first two into the translations after them, and the third into the car
   list's pointer, so the car choosers then read the car names from wherever the text pointed. Each keeps its first 31
   characters.
-- The car list holds 32 cars of 31 characters, neither checked. A longer name ran into the next car's entry (both names
-  came out wrong), and a 33rd car ran off the end of the list's memory. Such a car is now left out, so the car choosers
-  don't show it; cut, its name would no longer find its files. With more than 32 cars, the ones kept are the first 32 the
-  Cars folder lists. (The menus look "viper" up by name: if it isn't among them they stop with "Can't find car viper".)
+- The car list holds 32 cars of 31 characters, neither checked. A longer name ran into the next car's entry (both
+  names came out wrong), and a 33rd car ran off the end of the list's memory. Such a car is now left out, so the Hacks
+  screen's Vehicle list (the only place to change cars) doesn't show it; cut, its name would no longer find its files.
+  With more than 32 cars, the ones kept are the first 32 the Cars folder lists. (The menus look "viper" up by name: if
+  it isn't among them they stop with "Can't find car viper".)
 - The starting grid built each car's model name ("<car>3.mod") and its paint job's texture name ("~<car>.tex") in 32 bytes
   each, so a car name of 27 or more characters overran the stack; both have room now. It then wrote "<car>.tex" and the
   texture's name into the model's remap entry, 16 bytes each, with no limit: from a car name of 12 characters (11 for

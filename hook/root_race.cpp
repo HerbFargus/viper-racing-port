@@ -241,9 +241,9 @@ static void __cdecl RaceBegin_c() {
             *(volatile char*)ccall<char*>(uit::F_strchr, (const char*)s, 0x2e) = 0;
             // FIX: the list holds 32 names of 31 characters (MemAlloc(0x400)), neither checked: a longer name ran into the
             // next entry (and was cut there by the next car's name), and a 33rd car ran off the heap block. Such a car is
-            // left out of the list, so the car choosers don't show it. (Cut, its name would no longer open its files --
-            // "<car>.car", "<car>.cf" --, which fails worse.) The cars kept are the first 32 the folder lists, sorted as
-            // before. Any other car goes in as before.
+            // left out of the list, so the Hacks screen's Vehicle list (the only place to change cars) doesn't show it.
+            // (Cut, its name would no longer open its files -- "<car>.car", "<car>.cf" --, which fails worse.) The cars
+            // kept are the first 32 the folder lists, sorted as before. Any other car goes in as before.
             if (VP_FIX && (UI_G32(S_CARLIST_N) >= 0x20 || ui_strnlen(s, 0x1f) > 0x1f)) continue;
             const uint32_t n = crt_strlen(s) + 1;
             crt_copy(UI_GP(char, S_CARLIST) + ((uint32_t)UI_G32(S_CARLIST_N) << 5), s, n);
