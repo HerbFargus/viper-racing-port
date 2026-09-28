@@ -33,9 +33,9 @@ static size_t g_tramp_used;
 
 static void* make_trampoline(const Prologue& p) {
     if (p.rel == -2) return 0;                                    // branches in its first bytes (see below)
-    // 32 bytes each, room for every hooked address (prologues.inc) and the harness's own detours; a full page is
-    // logged by the caller, never silent
-    enum { TRAMP_BYTES = 32 * 8192 };
+    // 32 bytes each, room for every function in race.exe (10,219 in the inventory) and the harness's own detours;
+    // a full page is logged by the caller, never silent
+    enum { TRAMP_BYTES = 32 * 16384 };
     if (!g_tramp_page) g_tramp_page = (uint8_t*)VirtualAlloc(0, TRAMP_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!g_tramp_page || g_tramp_used + 32 > TRAMP_BYTES) return 0;
     uint8_t* t = g_tramp_page + g_tramp_used;

@@ -4,6 +4,7 @@
     python tools/gen_leftovers.py --lib ui [--list]     one stage's library -> its own file (STAGES)
     python tools/gen_leftovers.py --lib menu [--list]
     python tools/gen_leftovers.py --lib root [--list]
+    python tools/gen_leftovers.py --lib career [--list]  (U4: libraries career, paintkit and intro, one file)
 
 M3 UI stage, step U0. The libraries whose stages are done -- physics, world, gx, ai, kernel, useful, state, sound --
 still hold functions no hook/*.cpp registers: the $E static initialisers, empty virtual stubs, compiler-generated
@@ -19,6 +20,7 @@ Shapes (the whole body, to its `ret`, plus the linker's padding):
     mov ecx, C ; jmp T                       a tail call to a static's constructor (__thiscall, no arguments)
     mov dword [A], imm32 / mov byte [A], imm8 / xor eax, eax / mov eax, [A] / mov [A], eax
                                              stores (eax tracked: zero or a loaded value)
+    mov ecx, [A] / mov [A], ecx              the same through ecx (U4: paintkit.obj's $E56)
     [push imm]* ; mov ecx, C ; [push imm]* ; call F      a static's constructor (__thiscall, checked against the map)
     push esi ; push edi ; ... ; pop edi ; pop esi        around array-constructor loops:
       mov edi, BASE ; mov esi, N ; L: mov ecx, edi ; add edi, STRIDE ; call F ; dec esi ; jns L   (N + 1 calls)
@@ -41,7 +43,11 @@ mrace / mmixer only -- the other groups write their objects' by hand, and mmulti
 stage). U3, the root library: the $E of all fourteen object files; stubs of the HUD group's six (dash, gxdash, countdwn,
 escape, splash, hack) only -- main, race, prerace, postrace, version, replay and ghost are written by hand. One more stub
 shape there: a `local static destructor helper' thunk (the atexit entry of a function-local
-static Xlator, whose destructor is empty) that is a bare `ret`: a __cdecl void(void).
+static Xlator, whose destructor is empty) that is a bare `ret`: a __cdecl void(void). U4, the career, the paint kit and
+the intro (libraries career, paintkit and intro, one stage, `--lib career`, into hook/career_leftover.cpp): the $E of all
+thirteen object files (career's nine, paintkit.obj, tga.obj, intro's credits.obj and intro.obj); stubs, deleting
+destructors and destructor helpers of group A's seven (career, chooser, events, postseas, ranking, season, testing) only
+-- upgrade.obj, both credits.obj, intro.obj, paintkit.obj and tga.obj are written by hand in groups B and C's files.
 
 Left out on purpose (listed with --list): ds.obj / ds3d_x.obj except dsounderr2str (the dead hardware DirectSound
 mixer), M2's SDL platform functions (platform.cpp detours them), WinMain (the main-loop stage).
@@ -75,10 +81,19 @@ STAGES = {
     "root": ("root_leftover.cpp", "M3 UI stage, step U3: the $E static initialisers of all fourteen root object files (library\n"
                                   "// `root`, game.obj's included), and the stubs of dash.obj, gxdash.obj, countdwn.obj, escape.obj,\n"
                                   "// splash.obj and hack.obj", "hook/root_*.cpp", "test/world_root_hud.cpp"),
+    "career": ("career_leftover.cpp", "M3 UI stage, step U4: the $E static initialisers of all thirteen object files of the\n"
+                                      "// career, the paint kit and the intro (libraries `career`, `paintkit`, `intro`), and the\n"
+                                      "// stubs, deleting destructors and destructor helpers of career.obj, chooser.obj, events.obj,\n"
+                                      "// postseas.obj, ranking.obj, season.obj and testing.obj",
+               "hook/career_*.cpp, hook/paint_*.cpp", "test/world_career.cpp"),
 }
+# --lib: the libraries a stage covers (absent: the one it's named after)
+STAGE_LIBS = {"career": ("career", "paintkit", "intro")}
 # --lib: the objects whose stubs and deleting destructors a stage generates (absent: all of them); elsewhere only $E
 STAGE_FULL = {"menu": ("moptions.obj", "mrace.obj", "mmixer.obj"),
-              "root": ("dash.obj", "gxdash.obj", "countdwn.obj", "escape.obj", "splash.obj", "hack.obj")}
+              "root": ("dash.obj", "gxdash.obj", "countdwn.obj", "escape.obj", "splash.obj", "hack.obj"),
+              "career": ("career.obj", "chooser.obj", "events.obj", "postseas.obj", "ranking.obj", "season.obj",
+                         "testing.obj")}
 GENERATED = ["krn_leftover.cpp"] + [s[0] for s in STAGES.values()]
 DEAD_OBJECTS = ("ds.obj", "ds3d_x.obj")                  # the hardware DirectSound mixer: dead in every build
 DEAD_KEEP = {0x004756B0}                                  # dsounderr2str: live (wave.obj's error paths), by hand
@@ -241,6 +256,7 @@ def parse_e(img: Image, inv: dict, va: int, size: int, obj: str) -> tuple[list[s
         i = 2
     eax: str | None = None                                    # what eax holds: "0" or a local's name
     ecx: int | None = None
+    ecxv: str | None = None                                   # what ecx holds, loaded by mov ecx, [A]: a local's name
     pushes: list[int] = []
     nload = 0
     while True:
@@ -270,6 +286,18 @@ def parse_e(img: Image, inv: dict, va: int, size: int, obj: str) -> tuple[list[s
             a = struct.unpack_from("<I", code, i + 1)[0]
             lines.append(f"LO_G32(0x{a:08x}) = {eax if eax != '0' else '0u'};")
             i += 5
+        elif code[i:i + 2] == b"\x8B\x0D":                     # mov ecx, [A]
+            a = struct.unpack_from("<I", code, i + 2)[0]
+            nload += 1
+            ecxv, ecx = f"v{nload}", None
+            lines.append(f"const uint32_t {ecxv} = LO_G32(0x{a:08x});")
+            i += 6
+        elif code[i:i + 2] == b"\x89\x0D":                     # mov [A], ecx
+            if ecxv is None:
+                raise Refused("stores ecx without knowing it")
+            a = struct.unpack_from("<I", code, i + 2)[0]
+            lines.append(f"LO_G32(0x{a:08x}) = {ecxv};")
+            i += 6
         elif b == 0x68:                                        # push imm32
             pushes.append(struct.unpack_from("<I", code, i + 1)[0])
             i += 5
@@ -277,7 +305,7 @@ def parse_e(img: Image, inv: dict, va: int, size: int, obj: str) -> tuple[list[s
             pushes.append(struct.unpack_from("<b", code, i + 1)[0] & 0xFFFFFFFF)
             i += 2
         elif b == 0xB9:                                        # mov ecx, C
-            ecx = struct.unpack_from("<I", code, i + 1)[0]
+            ecx, ecxv = struct.unpack_from("<I", code, i + 1)[0], None
             i += 5
         elif b == 0xE8:                                        # call F: a static's constructor
             f = rel32(code, i, va)
@@ -289,7 +317,7 @@ def parse_e(img: Image, inv: dict, va: int, size: int, obj: str) -> tuple[list[s
             td = f"LoCtor{len(args)}_t"
             types.add(td)
             lines.append(f"LO_FN({td}, 0x{f:08x})({', '.join([f'(void*)0x{ecx:08x}u', '0'] + args)});    // {short_name(sig['name'])}")
-            ecx, pushes, eax = None, [], None
+            ecx, pushes, eax, ecxv = None, [], None, None
             i += 5
         elif saved and b == 0xBF and code[i + 5] == 0xBE:      # an array-constructor loop
             base, n = struct.unpack_from("<I", code, i + 1)[0], struct.unpack_from("<I", code, i + 6)[0]
@@ -320,7 +348,7 @@ def parse_e(img: Image, inv: dict, va: int, size: int, obj: str) -> tuple[list[s
             types.add("LoCtor0_t")
             lines.append(f"for (uint32_t p = 0x{base:08x}u, n = 0; n <= {n}u; n++, p += 0x{stride:x}u)    // {n + 1} x {short_name(sig['name'])}")
             lines.append(f"    LO_FN(LoCtor0_t, 0x{f:08x})((void*)p, 0);")
-            eax, ecx = None, None
+            eax, ecx, ecxv = None, None, None
             i = j
         elif saved and code[i:i + 3] == b"\x5F\x5E\xC3":         # pop edi ; pop esi ; ret
             i += 3
@@ -547,7 +575,7 @@ def main() -> int:
         if stage not in STAGES:
             print(f"--lib: one of {', '.join(STAGES)}")
             return 2
-        LIBS, TARGET = (stage,), HOOK / STAGES[stage][0]
+        LIBS, TARGET = STAGE_LIBS.get(stage, (stage,)), HOOK / STAGES[stage][0]
     img = Image()
     rows = list(csv.DictReader(open(OUT / "inventory.csv", encoding="utf-8")))
     inv = {int(r["va"], 16): r for r in rows}
