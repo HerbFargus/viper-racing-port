@@ -8,6 +8,7 @@
 //        /Fo<dir>\ /Fe<dir>\world_career.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_career.exe [rounds] [seed]          (VP_TRACE=1: one line per function; VP_ONLY=text: those only;
 //          VP_DEBUG_WORLD=1: the world and every fault's registers; VP_DEBUG_LOG=1: each round's first logged words)
+//     (and with /DVP_CAREER_FIXES: the fix build, below)
 //
 // Loads out\race_v10.exe at 0x400000 the way test/world_root_race.cpp does (a child process with the range reserved) and
 // includes the three files with PORT_FN redefined to list each function (its v1.0 address, the rewrite, its calling
@@ -50,6 +51,18 @@
 // calls it through the vtable, zeroes the control's texts first (the screens add their stack CareerStatus before its texts
 // are formatted -- stack garbage, which the rewrites' frames can't reproduce; see hook_status_added). VP_COVER=1 prints,
 // per modal function, how often each round reached the deep callees (the races, the career file, the dialog boxes).
+//
+// Built with /DVP_CAREER_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Career").
+// Every function is still compared as above, with the rounds that reach a fixed case kept out of the comparison and
+// counted (per function, listed), the rewrite still run on each and required to return cleanly (or to fault just where
+// the original does, on the round's own damage -- a null season drawn under the dialog, say): create_cb's where the
+// default name's translation is over 15 characters (the stubs' "A longer translation": the original leaves the name
+// unterminated when no player_name is saved). No other fixed case is in the random world's reach (user directories of
+// 2..60 characters, translations, track and driver names of 20 at most). Then
+// directed_fix_tests: for each fix, the bad case run on the rewrite alone -- no fault, the bytes popped and ebx / esi /
+// edi / ebp kept, nothing written outside what it may write (the memory around it compared; for the dialogs, what the
+// frame held after the name), and the result the fix promises -- and its boundary case (the longest input that fits) on
+// both, compared bit for bit. Without it (VP_FAITHFUL) every rewrite must match its original bit for bit.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -65,7 +78,12 @@
 #include <string>
 #include <vector>
 
+#ifndef VP_CAREER_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#define CAREER_FIXES 0
+#else
+#define CAREER_FIXES 1
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------------
@@ -1408,6 +1426,583 @@ static bool is_season_end(const char* nm) {
     return false;
 }
 
+// ---- the fix build: rounds kept out of the comparison ------------------------------------------------------------------------
+// (before the original runs) create_cb with a default name's translation over 15 characters: the fixed copy stops at the
+// 16-byte name, where the original's ran on (left unterminated when no saved name replaces it). Every way the Xlator can be
+// found (built fresh or stale, or not built) gives xl_text of its key.
+static bool fx_pre_case(const Ent& f, const uint32_t*) {
+    if (!strcmp(f.name, "create_cb")) return strlen(xl_text(0x004ffb3c)) > 15;      // Career:DefaultPlayerName
+    return false;
+}
+
+#if CAREER_FIXES
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+// The rewrite alone (the original would overrun there -- this program's stack or the game's statics among what it would
+// take), from the pristine world with the case set up: it must return cleanly (no fault, the bytes popped, ebx / esi / edi /
+// ebp kept), write nothing outside what it may (every other byte of .data/.bss/.idata and the arena compared with before)
+// and give what the fix promises. Each fix's boundary case (the longest input that fits) runs on the original and the
+// rewrite from the same state and must give the same memory, call logs and result.
+static int g_fx_bad, g_fx_n, g_fx_same_n;
+static const Ent& fx_fn(const char* name) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, name)) return g_fns[i];
+    printf("  fix test: %s isn't listed\n", name);
+    fflush(stdout);
+    ExitProcess(4);
+}
+struct Span { const void* p; uint32_t n; };
+static uint32_t fx_outside_in(const Mem& before, bool (*in)(const uint8_t*, const void*), const void* ctx) {
+    for (uint32_t i = 0; i < DATA_BYTES; i++)
+        if (before.data[i] != DATA[i] && !in(DATA + i, ctx)) return 0x004e1000 + i;
+    for (uint32_t i = 0; i < IDATA_BYTES; i++)
+        if (before.idata[i] != IDATA[i] && !in(IDATA + i, ctx)) return 0x005d7000 + i;
+    for (uint32_t i = sizeof(HState); i < ARENA_BYTES; i++)
+        if (before.arena[i] != g_arena[i] && !in(g_arena + i, ctx)) return U(g_arena + i);
+    return 0;
+}
+// the first byte that changed since `before` outside the spans (the stubs' state block aside); 0 if none
+static uint32_t fx_outside(const Mem& before, std::initializer_list<Span> ok) {
+    struct C { const Span* b; const Span* e; } c = {ok.begin(), ok.end()};
+    return fx_outside_in(before, [](const uint8_t* q, const void* x) {
+        const C* c = (const C*)x;
+        for (const Span* sp = c->b; sp != c->e; sp++)
+            if (q >= (const uint8_t*)sp->p && q < (const uint8_t*)sp->p + sp->n) return true;
+        return false;
+    }, &c);
+}
+// ... outside the function's footprint
+static uint32_t fx_outside_fp(const Mem& before, const Footprint& fp) {
+    return fx_outside_in(before, [](const uint8_t* q, const void* x) {
+        const Footprint* fp = (const Footprint*)x;
+        for (int k = 0; k < fp->n; k++)
+            if (q >= (const uint8_t*)fp->r[k].p && q < (const uint8_t*)fp->r[k].p + fp->r[k].n) return true;
+        return false;
+    }, &fp);
+}
+static Result fx_run(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w) {
+    uint32_t words[72] = {};
+    int i = 0;
+    for (uint32_t x : w) words[i++] = x;
+    g_pc = _PC_53;
+    return run(f, rewrite, words);
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0, uint32_t where = 0) {
+    g_fx_n++;
+    if (ok) return;
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, popped %u, ebx esi edi ebp %08x %08x %08x %08x)", r->fault, r->code, r->eip, r->pops, r->regs[0],
+                  r->regs[1], r->regs[2], r->regs[3]);
+    if (where) printf(" (wrote %08x)", where);
+    printf("\n");
+}
+static bool fx_logged(uint32_t tag) {
+    for (uint32_t i = 0; i < g_log.n && i < LOG_MAX; i++)
+        if (g_log.w[i] == tag) return true;
+    return false;
+}
+static CallLog g_fx_log;
+// the original and the rewrite from the same state: the rewrite clean; the same return, memory and call logs
+static void fx_same(const Ent& f, std::initializer_list<uint32_t> w, const char* what) {
+    g_fx_same_n++;
+    mem_save(g_snap);
+    const Result ro = fx_run(f, false, w);
+    mem_save(g_after);
+    memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+    mem_load(g_snap);
+    const Result rn = fx_run(f, true, w);
+    char m[256];
+    sprintf(m, "%s: a clean return", what);
+    fx_check(fx_clean(f, rn), m, &rn);
+    sprintf(m, "%s: the original's result, bit for bit", what);
+    const uint32_t where = mem_diff(g_after);
+    const bool same = !ro.fault && where == 0 && ro.ret == rn.ret && g_log.n == g_fx_log.n &&
+                      !memcmp(g_log.w, g_fx_log.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+    fx_check(same, m, &ro, where);
+}
+// a callee replaced for a test (a jump to a recorder), put back after
+struct FxPatch {
+    uint32_t at;
+    uint8_t b[5];
+    FxPatch(uint32_t a, void* to) : at(a) { memcpy(b, (const void*)(uintptr_t)a, 5); patch_jmp(a, to); }
+    ~FxPatch() { memcpy((void*)(uintptr_t)at, b, 5); }
+};
+// the recorders: FileCreate failing for an empty name (as CreateFileA does); the dialogs answering g_fx_dialog; the
+// options' player_name read recording the buffer it's given (and writing nothing); GetTrackName answering g_fx_track
+static int32_t __cdecl fx_FileCreate(const char* name) { L('FCRT'); LS(name); return readable(name, 1) && name[0] ? 0x0f11e1 : 0; }
+static int32_t g_fx_dialog;
+static uint32_t g_fx_dlg_off;                               // (the dialog's caller's frame: 0x200 bytes from the UIDialog + this)
+static uint8_t g_fx_dlg[0x200];
+static int32_t __cdecl fx_UIDoDialog(const void* d, int32_t, int32_t, int32_t, int32_t, uint8_t) {
+    L('DLG '); L(P(d));
+    if (g_fx_dlg_off && readable((const uint8_t*)d + g_fx_dlg_off, 0x200)) memcpy(g_fx_dlg, (const uint8_t*)d + g_fx_dlg_off, 0x200);
+    return g_fx_dialog;
+}
+// UIStyleDraw: each text drawn recorded
+static std::vector<std::string> g_fx_draws;
+static void __cdecl fx_UIStyleDraw(int32_t style, int32_t x, int32_t y, const char* s, uint32_t fl) {
+    L('SDRW'); L((uint32_t)style); L((uint32_t)x); L((uint32_t)y); LS(s); L(fl);
+    g_fx_draws.push_back(readable(s, 1) ? std::string(s, strnlen(s, 0x2000)) : std::string("?"));
+}
+static uint8_t g_fx_opts[0x40];
+static int g_fx_opts_n;
+static void __cdecl fx_OptionsGetS(const char* sec, const char* key, char* out, int32_t n) {
+    L('OPTS'); LS(sec); LS(key); L((uint32_t)n);
+    if (readable(out, 0x40)) memcpy(g_fx_opts, out, 0x40);
+    g_fx_opts_n++;
+}
+static const char* g_fx_track;
+static const char* __cdecl fx_GetTrackName(int32_t i) { L('GTRN'); L((uint32_t)i); return g_fx_track; }
+// the tests' world: pristine, every function-local Xlator built (fresh), the statics the code follows, the stubs' defaults
+static void fx_reset() {
+    mem_load(g_pristine);
+    g_xl_seed = 0;
+    UI_GP(gxCanvas, S_GX_CANVAS) = W.screen;
+    UI_GP(WidgetWindow, S_ACTIVE) = W.win;
+    UI_GU32(S_DIALOG_IDLE) = 0;
+    UI_G8(S_EXIT) = 0;
+    UI_GF(S_UI_DT) = 0.05f;
+    UI_GP(void, S_CURSOR) = 0;
+    UI_G32(S_MOUSE_X) = 320; UI_G32(S_MOUSE_Y) = 240;
+    UI_GU32(S_LOUNGE) = U(g_lounge_obj);
+    UI_GP(uint8_t, S_SEASON) = g_season;
+    for (auto& x : k_xl) {
+        UI_G8(x[0]) = (uint8_t)(UI_G8(x[0]) | x[1]);
+        UI_GU32(x[2]) = x[3];
+        UI_GU32(x[2] + 4) = U(xl_text(x[3]));
+        UI_GU32(x[2] + 8) = UI_GU32(S_XLATOR_COOKIE);
+    }
+    HS->time = 1000; HS->frames = 0; HS->frame_limit = 40; HS->grab_fail_at = -1;
+    HS->mouse_x = 320; HS->mouse_y = 240;
+    HS->script_n = HS->script_pos = 0;
+    HS->rs = 0x1234567;
+    for (int i = 0; i < 8; i++) HS->scan_mask[i] = 0;
+    HS->prerace_calls = 0; HS->prerace_end = 2;
+    HS->opt_mask = 0;
+    for (int i = 0; i < 8; i++) HS->opt_val[i] = 1;
+    HS->userdir_len = 20;
+    HS->file_open_fail = 0; HS->file_create_fail = 0; HS->file_pos = 0; HS->file_img = 0;
+    HS->res_fail = 0;
+    HS->track_count = 9;
+    g_fx_dialog = -1;
+    g_fx_dlg_off = 0;
+    g_fx_track = "uptown";
+}
+static char g_fx_s[8][0x1000];
+// a string of n c's and then tail (in one of eight buffers of this program's)
+static const char* mk(int k, char c, int n, const char* tail = "") {
+    memset(g_fx_s[k], c, (size_t)n);
+    strcpy(g_fx_s[k] + n, tail);
+    return g_fx_s[k];
+}
+// s's first n characters
+static std::string first(const char* s, size_t n) { return std::string(s, strnlen(s, n)); }
+
+static int directed_fix_tests() {
+    Result r;
+    uint32_t o;
+    char m[512];
+    static Footprint fp;
+    auto footprint = [&](const Ent& f, std::initializer_list<uint32_t> w) {
+        uint32_t words[72] = {};
+        int i = 0;
+        for (uint32_t x : w) words[i++] = x;
+        fp.n = 0; fp.replay_only = 0; fp.pure = false;
+        f.fp(fp, words);
+    };
+    char* const fname = (char*)(uintptr_t)S_FILENAME;
+
+    // ---- 1. get_career_filename: a long user directory ----
+    {
+        const Ent& f = fx_fn("get_career_filename");
+        struct { int32_t dir, slot; } cases[] = {{246, 7}, {254, 0}, {245, -1}};   // (the stub's longest directory is 254)
+        for (auto& c : cases) {
+            fx_reset();
+            HS->userdir_len = c.dir;
+            memset(fname, 0x5a, 0x108);
+            mem_save(g_snap);
+            r = fx_run(f, true, {(uint32_t)c.slot});
+            sprintf(m, "get_career_filename, a %d-character user directory, slot %d: a clean return, its buffer", c.dir, c.slot);
+            fx_check(fx_clean(f, r) && r.ret == S_FILENAME, m, &r);
+            sprintf(m, "get_career_filename, a %d-character user directory, slot %d: the name \"\"", c.dir, c.slot);
+            fx_check(fname[0] == 0, m);
+            o = fx_outside(g_snap, {{fname, 1}});
+            sprintf(m, "get_career_filename, a %d-character user directory, slot %d: nothing written but the name's terminator", c.dir, c.slot);
+            fx_check(o == 0, m, 0, o);
+        }
+        // the boundaries: names of 263 characters
+        fx_reset();
+        HS->userdir_len = 245;
+        fx_same(f, {7}, "get_career_filename, a 245-character user directory, slot 7 (a name of 263 characters)");
+        fx_reset();
+        HS->userdir_len = 244;
+        fx_same(f, {(uint32_t)-1}, "get_career_filename, a 244-character user directory, slot -1 (a name of 263 characters)");
+    }
+
+    // ---- 2. career_save: a long user directory (get_career_filename's rewrite called, FileCreate failing for "") ----
+    {
+        const Ent& f = fx_fn("career_save");
+        FxPatch gcf(F_get_career_filename, (void*)&career_main::get_career_filename_c);
+        FxPatch fc(F_FileCreate, (void*)&fx_FileCreate);
+        fx_reset();
+        HS->userdir_len = 254;
+        mem_save(g_snap);
+        r = fx_run(f, true, {3, S_INFO});
+        fx_check(fx_clean(f, r), "career_save, a 254-character user directory: a clean return", &r);
+        fx_check(!fx_logged('FMKD'), "career_save, a 254-character user directory: no directory made");
+        fx_check(fx_logged('FCRT') && fx_logged('LOGR') && !fx_logged('FWRT'),
+                 "career_save, a 254-character user directory: the file not made (\"\"), reported, nothing written");
+        o = fx_outside(g_snap, {{fname, 0x108}});
+        fx_check(o == 0, "career_save, a 254-character user directory: nothing written but the file name's buffer", 0, o);
+        // the boundaries: the longest directory that's made (its file's name then too long: ""), and the longest that saves
+        fx_reset();
+        HS->userdir_len = 253;
+        fx_same(f, {3, S_INFO}, "career_save, a 253-character user directory (\"<dir>career\" of 259; the file's name \"\")");
+        fx_check(fx_logged('FMKD') && !fx_logged('FWRT'), "career_save, a 253-character user directory: the directory made, no file");
+        fx_reset();
+        HS->userdir_len = 245;
+        fx_same(f, {3, S_INFO}, "career_save, a 245-character user directory (the file's name of 263)");
+        fx_check(fx_logged('FWRT'), "career_save, a 245-character user directory: the career written");
+    }
+
+    // ---- 3. set_class: a long class name ----
+    {
+        const Ent& f = fx_fn("set_class");
+        static const uint32_t k_class_xl[4] = {0x005d0038, 0x005cfe28, 0x005cf068, 0x005cf6f0};
+        for (int n : {48, 2000}) {
+            fx_reset();
+            const char* cn = mk(0, 'c', n);
+            for (uint32_t a : k_class_xl) UI_GU32(a + 4) = U(cn);
+            mem_save(g_snap);
+            r = fx_run(f, true, {2});
+            sprintf(m, "set_class, a %d-character class name: a clean return", n);
+            fx_check(fx_clean(f, r), m, &r);
+            sprintf(m, "set_class, a %d-character class name: its first 47 characters", n);
+            fx_check(first(cn, 47) == std::string((const char*)(uintptr_t)S_CLASS_NAME), m);
+            o = fx_outside(g_snap, {{(void*)(uintptr_t)S_CLASS, 4}, {(void*)(uintptr_t)S_SEASON, 4}, {(void*)(uintptr_t)S_CLASS_NAME, 0x30}});
+            sprintf(m, "set_class, a %d-character class name: nothing written but the class, the season and the name (the saved "
+                       "CareerInfo untouched)", n);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_reset();
+        for (uint32_t a : k_class_xl) UI_GU32(a + 4) = U(mk(0, 'c', 47));
+        fx_same(f, {2}, "set_class, a 47-character class name");
+    }
+
+    // ---- 4. CareerStatus::Callback: a long week line ----
+    {
+        const Ent& f = fx_fn("CareerStatus::Callback");
+        CareerStatus* st = W.status;
+        struct { int n; int32_t week; } cases[] = {{62, 5}, {55, 999999999}, {300, -7}};
+        for (auto& c : cases) {
+            fx_reset();
+            const char* wk = mk(0, 'w', c.n);
+            UI_GU32(0x005d0024) = U(wk);
+            CA_G32(S_WEEK) = c.week;
+            CA_G32(S_FUNDS) = 12345;
+            CA_G32(S_SEASONS) = 2;
+            memset((void*)st->week, 0x5a, 0xc0);
+            footprint(f, {U(st), 0, 0, 0});
+            mem_save(g_snap);
+            r = fx_run(f, true, {U(st), 0, 0, 0});
+            sprintf(m, "CareerStatus::Callback, a %d-character translation, week %d: a clean return", c.n, c.week + 1);
+            fx_check(fx_clean(f, r), m, &r);
+            char e[0x200];
+            sprintf(e, "%s %d", wk, c.week + 1);
+            sprintf(m, "CareerStatus::Callback, a %d-character translation, week %d: the line's first 63 characters, the funds and "
+                       "season lines as formatted", c.n, c.week + 1);
+            fx_check(first(e, 63) == std::string(st->week) && !strcmp(st->funds, "$12345") && !strcmp(st->season, "3"), m);
+            o = fx_outside_fp(g_snap, fp);
+            sprintf(m, "CareerStatus::Callback, a %d-character translation: nothing written outside its texts", c.n);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_reset();
+        UI_GU32(0x005d0024) = U(mk(0, 'w', 61));
+        CA_G32(S_WEEK) = 5;
+        fx_same(f, {U(st), 0, 0, 0}, "CareerStatus::Callback, a 61-character translation and week 6 (a line of 63)");
+    }
+
+    // ---- 5. create_cb: a long default name (no player_name saved; the dialog answered Create) ----
+    {
+        const Ent& f = fx_fn("create_cb");
+        FxPatch dlg(uit::F_UIDoDialog, (void*)&fx_UIDoDialog);
+        FxPatch opt(F_OptionsGetS, (void*)&fx_OptionsGetS);
+        for (int n : {16, 40, 700}) {
+            fx_reset();
+            const char* dn = mk(0, 'd', n);
+            UI_GU32(0x005d006c) = U(dn);
+            CA_G32(S_CH_SLOT) = 3;
+            uint8_t* slot = (uint8_t*)(uintptr_t)(S_CH_INFOS + 3 * S_INFO_SIZE);
+            g_fx_dialog = -2;
+            g_fx_opts_n = 0;
+            mem_save(g_snap);
+            r = fx_run(f, true, {0});
+            sprintf(m, "create_cb, a %d-character default name: a clean return, Create", n);
+            fx_check(fx_clean(f, r) && r.ret == 1, m, &r);
+            bool after = true;                                      // what the frame held after the name: the stack's fill
+            for (int k = 16; k < 0x40; k++) after &= g_fx_opts[k] == 0xcd;
+            sprintf(m, "create_cb, a %d-character default name: the name field holds its first 15 characters, nothing after it written", n);
+            fx_check(g_fx_opts_n == 1 && first((const char*)g_fx_opts, 16) == first(dn, 15) && g_fx_opts[15] == 0 && after, m);
+            sprintf(m, "create_cb, a %d-character default name: the new career named with its first 15 characters", n);
+            fx_check(first((const char*)slot, 16) == first(dn, 15), m);
+            o = fx_outside(g_snap, {{slot, S_INFO_SIZE}, {fname, 0x108}});
+            sprintf(m, "create_cb, a %d-character default name: nothing written but the slot's career and the file's name", n);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_reset();
+        UI_GU32(0x005d006c) = U(mk(0, 'd', 15));
+        CA_G32(S_CH_SLOT) = 3;
+        g_fx_dialog = -2;
+        fx_same(f, {0}, "create_cb, a 15-character default name, Create");
+    }
+
+    // ---- 6. testing_menu: a long track name (the dialog answered Test) ----
+    {
+        const Ent& f = fx_fn("testing_menu");
+        FxPatch dlg(uit::F_UIDoDialog, (void*)&fx_UIDoDialog);
+        FxPatch gtn(F_GetTrackName, (void*)&fx_GetTrackName);
+        char* tb = W.track_buf;
+        uint8_t* rev = W.flags + 8;
+        for (int n : {32, 300}) {
+            fx_reset();
+            g_fx_track = mk(0, 't', n);
+            g_fx_dialog = -2;
+            CA_G32(S_TS_TRACK) = 2;
+            CA_G8(S_TS_REVERSED) = 1;
+            memset(tb, 0x5a, 0x40);
+            *rev = 0;
+            mem_save(g_snap);
+            r = fx_run(f, true, {U(tb), U(rev)});
+            sprintf(m, "testing_menu, a %d-character track name, Test: a clean return, as Back (0)", n);
+            fx_check(fx_clean(f, r) && r.ret == 0, m, &r);
+            bool untouched = true;
+            for (int k = 0; k < 0x40; k++) untouched &= (uint8_t)tb[k] == 0x5a;
+            sprintf(m, "testing_menu, a %d-character track name: the caller's buffer untouched", n);
+            fx_check(untouched, m);
+            o = fx_outside(g_snap, {{rev, 1}, {g_arena + A_HEAP, ARENA_BYTES - A_HEAP}});
+            sprintf(m, "testing_menu, a %d-character track name: nothing written but the reversed flag and the heap (its list)", n);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_reset();
+        g_fx_track = mk(0, 't', 31);
+        g_fx_dialog = -2;
+        memset(tb, 0x5a, 0x40);
+        fx_same(f, {U(tb), U(rev)}, "testing_menu, a 31-character track name, Test");
+        fx_check(first(tb, 0x40) == std::string(31, 't'), "testing_menu, a 31-character track name: copied");
+    }
+
+    // ---- 7. do_race: a long track name ----
+    {
+        const Ent& f = fx_fn("do_race");
+        for (int n : {32, 300}) {
+            fx_reset();
+            const char* t = mk(0, 't', n);
+            mem_save(g_snap);
+            r = fx_run(f, true, {U(t), 1});
+            sprintf(m, "do_race, a %d-character track name: a clean return, no race (nothing called)", n);
+            fx_check(fx_clean(f, r) && g_log.n == 0, m, &r);
+            o = fx_outside(g_snap, {});
+            sprintf(m, "do_race, a %d-character track name: nothing written", n);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_reset();
+        fx_same(f, {U(mk(0, 't', 31)), 1}, "do_race, a 31-character track name");
+        fx_check(fx_logged('LDRC') && fx_logged('PRDO'), "do_race, a 31-character track name: the race loaded, the pre-race screen run");
+    }
+
+
+    // ---- 10. TrackImage::Draw: a long track name (its picture) ----
+    {
+        const Ent& f = fx_fn("TrackImage::Draw");
+        FxPatch gtn(F_GetTrackName, (void*)&fx_GetTrackName);
+        const std::initializer_list<uint32_t> args = {U(W.track_image), 0, U(W.screen)};
+        for (int n : {76, 300}) {
+            fx_reset();
+            g_fx_track = mk(0, 't', n);
+            mem_save(g_snap);
+            r = fx_run(f, true, args);
+            sprintf(m, "TrackImage::Draw, a %d-character track name: a clean return, no picture loaded or drawn", n);
+            fx_check(fx_clean(f, r) && !fx_logged('GSTP') && !fx_logged('DSTP'), m, &r);
+            o = fx_outside(g_snap, {{(void*)(uintptr_t)S_GX_CANVAS, 4}});
+            sprintf(m, "TrackImage::Draw, a %d-character track name: nothing written but the current canvas", n);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_reset();
+        g_fx_track = mk(0, 't', 75);
+        fx_same(f, args, "TrackImage::Draw, a 75-character track name (\"<name>.stp\" of 79)");
+        fx_check(fx_logged('GSTP') && fx_logged('DSTP'), "TrackImage::Draw, a 75-character track name: its picture loaded and drawn");
+    }
+
+    // ---- 11. EventsDo: long Season / Week translations (the dialog answered at once; its frame's two texts recorded) ----
+    {
+        const Ent& f = fx_fn("EventsDo");
+        FxPatch dlg(uit::F_UIDoDialog, (void*)&fx_UIDoDialog);
+        uint8_t* inf = (uint8_t*)(uintptr_t)S_INFO;
+        for (int n : {254, 600}) {
+            fx_reset();
+            const char* se = mk(0, 's', n);
+            const char* wk = mk(1, 'w', n + 7);
+            UI_GU32(0x005d35a4) = U(se);
+            UI_GU32(0x005d35c4) = U(wk);
+            *(int32_t*)(inf + 0x11c) = 0;
+            *(int32_t*)(inf + 0x120) = 41;
+            g_fx_dialog = -1;
+            g_fx_dlg_off = 0x224;                                // the UIDialog at +0xc: the texts at +0x230, +0x330
+            mem_save(g_snap);
+            r = fx_run(f, true, {});
+            sprintf(m, "EventsDo, %d- and %d-character translations: a clean return", n, n + 7);
+            fx_check(fx_clean(f, r) && r.ret == 0, m, &r);
+            char e0[0x400], e1[0x400];
+            sprintf(e0, "%s %d", wk, 42);
+            sprintf(e1, "%s %d", se, 1);
+            sprintf(m, "EventsDo, %d- and %d-character translations: each text its first 255 characters", n, n + 7);
+            fx_check(first((const char*)g_fx_dlg, 0x100) == first(e0, 255) && first((const char*)g_fx_dlg + 0x100, 0x100) == first(e1, 255), m);
+            o = fx_outside(g_snap, {{(void*)(uintptr_t)0x005790c0, 0x620}, {g_arena + A_HEAP, ARENA_BYTES - A_HEAP}});   // (the ui
+            // library's style table and its state before it: the SeasonViewer's two dynamic styles added and removed)
+            sprintf(m, "EventsDo, %d- and %d-character translations: nothing written but the styles and the heap", n, n + 7);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_reset();
+        UI_GU32(0x005d35a4) = U(mk(0, 's', 253));
+        UI_GU32(0x005d35c4) = U(mk(1, 'w', 252));
+        *(int32_t*)(inf + 0x11c) = 0;
+        *(int32_t*)(inf + 0x120) = 41;
+        g_fx_dialog = -2;
+        g_fx_dlg_off = 0x224;
+        fx_same(f, {}, "EventsDo, texts of 255 characters");
+    }
+
+    // ---- 12. SeasonViewer::Draw: long Laps / Pts translations (the drawn texts recorded) ----
+    {
+        const Ent& f = fx_fn("SeasonViewer::Draw");
+        FxPatch sd(uit::F_UIStyleDraw, (void*)&fx_UIStyleDraw);
+        const std::initializer_list<uint32_t> args = {U(W.season_view), 0, U(W.screen)};
+        uint8_t* inf = (uint8_t*)(uintptr_t)S_INFO;
+        auto setup = [&](const char* laps, const char* pts) {
+            fx_reset();
+            *(int32_t*)g_season = 3;
+            for (int e = 0; e < 3; e++) {
+                uint8_t* ev = g_season + 0x24 + 0x58 * e;
+                strcpy((char*)ev, "uptown");
+                *(int32_t*)(ev + 0x14) = 5;
+                for (int k = 0; k < 8; k++) { *(int32_t*)(ev + 0x18 + 4 * k) = 1000; *(int32_t*)(ev + 0x38 + 4 * k) = 10 - k; }
+            }
+            *(int32_t*)(inf + 0x128) = 2;
+            for (int e = 0; e < 3; e++) *(int32_t*)(inf + 0x530 + 4 * e) = 1;
+            UI_GU32(0x005d5d94) = U(laps);
+            UI_GU32(0x005d5db4) = U(pts);
+            g_fx_draws.clear();
+        };
+        for (int n : {254, 600}) {
+            const char* la = mk(0, 'l', n);
+            const char* pt = mk(1, 'p', n + 3);
+            setup(la, pt);
+            mem_save(g_snap);
+            r = fx_run(f, true, args);
+            sprintf(m, "SeasonViewer::Draw, %d- and %d-character translations: a clean return", n, n + 3);
+            fx_check(fx_clean(f, r), m, &r);
+            int laps_n = 0, pts_n = 0;
+            bool ok = true;
+            for (auto& d : g_fx_draws) {                             // (the formatted ones: "<n> <unit>"; the headers are
+                if (d.size() < 3 || d[0] < '0' || d[0] > '9') continue;   // drawn from the translations themselves)
+                ok &= d.size() <= 255;
+                if (d[0] == '5' && d[2] == 'l') { laps_n++; ok &= d == first((std::string("5 ") + la).c_str(), 255); }
+                if (d.back() == 'p') pts_n++;
+            }
+            sprintf(m, "SeasonViewer::Draw, %d- and %d-character translations: every \"<n> <unit>\" 255 characters at most, "
+                       "\"5 <Laps>\" cut (%d laps, %d points texts)", n, n + 3, laps_n, pts_n);
+            fx_check(ok && laps_n == 3 && pts_n == 3, m);
+            o = fx_outside(g_snap, {{(void*)(uintptr_t)S_GX_CANVAS, 4}});
+            sprintf(m, "SeasonViewer::Draw, %d- and %d-character translations: nothing written but the current canvas", n, n + 3);
+            fx_check(o == 0, m, 0, o);
+        }
+        setup(mk(0, 'l', 253), "Pts");
+        fx_same(f, args, "SeasonViewer::Draw, a laps text of 255 characters");
+    }
+
+    // ---- 13. StandingsViewer::Draw: a long Pts translation ----
+    {
+        const Ent& f = fx_fn("StandingsViewer::Draw");
+        FxPatch sd(uit::F_UIStyleDraw, (void*)&fx_UIStyleDraw);
+        const std::initializer_list<uint32_t> args = {U(W.standings), 0, U(W.screen)};
+        uint8_t* inf = (uint8_t*)(uintptr_t)S_INFO;
+        auto setup = [&](const char* pts) {
+            fx_reset();
+            for (int d = 0; d < 8; d++) {
+                *(int32_t*)(inf + 0x170 + 0x88 * d) = d;
+                *(int32_t*)(inf + 0x170 + 0x88 * d + 4) = 7;
+            }
+            UI_GU32(0x005d5d44) = U(pts);
+            g_fx_draws.clear();
+        };
+        for (int n : {254, 600}) {
+            const char* pt = mk(0, 'p', n);
+            setup(pt);
+            mem_save(g_snap);
+            r = fx_run(f, true, args);
+            sprintf(m, "StandingsViewer::Draw, a %d-character translation: a clean return", n);
+            fx_check(fx_clean(f, r), m, &r);
+            const std::string e = first((std::string("7 ") + pt).c_str(), 255);
+            int k = 0;
+            for (auto& d : g_fx_draws) k += d == e;
+            sprintf(m, "StandingsViewer::Draw, a %d-character translation: the eight \"7 <Pts>\" texts cut to 255 characters (%d)", n, k);
+            fx_check(k == 8, m);
+            o = fx_outside(g_snap, {{(void*)(uintptr_t)S_GX_CANVAS, 4}});
+            sprintf(m, "StandingsViewer::Draw, a %d-character translation: nothing written but the current canvas", n);
+            fx_check(o == 0, m, 0, o);
+        }
+        setup(mk(0, 'p', 253));
+        fx_same(f, args, "StandingsViewer::Draw, texts of 255 characters");
+    }
+
+    // ---- 14. driver_compare: drivers' names of 256 or more characters (the points and results equal) ----
+    {
+        const Ent& f = fx_fn("driver_compare");
+        uint8_t* inf = (uint8_t*)(uintptr_t)S_INFO;
+        struct { int na, nb; char ta, tb; int want; } cases[] = {
+            {300, 300, 'a', 'b', -1}, {300, 20, 'b', 'a', 1}, {20, 600, 'a', 'a', -1}, {400, 400, 'c', 'c', 0},
+        };
+        for (auto& c : cases) {
+            fx_reset();
+            for (int d = 0; d < 2; d++) {
+                *(int32_t*)(inf + 0x170 + 0x88 * d + 4) = 9;
+                for (int k = 0; k < 32; k++) *(int32_t*)(inf + 0x170 + 0x88 * d + 8 + 4 * k) = 3;
+            }
+            char ta[2] = {c.ta, 0}, tb[2] = {c.tb, 0};
+            *(uint32_t*)(g_drivers + 0x210) = U(mk(0, 'n', c.na, ta));
+            *(uint32_t*)(g_drivers + 0x220 + 0x210) = U(mk(1, 'n', c.nb, tb));
+            W.ints[0] = 0;
+            W.ints[1] = 1;
+            mem_save(g_snap);
+            r = fx_run(f, true, {U(&W.ints[0]), U(&W.ints[1])});
+            sprintf(m, "driver_compare, names of %d and %d characters: a clean return, %d (the whole names compared)", c.na + 1,
+                    c.nb + 1, c.want);
+            fx_check(fx_clean(f, r) && (int32_t)r.ret == c.want, m, &r);
+            o = fx_outside(g_snap, {});
+            sprintf(m, "driver_compare, names of %d and %d characters: nothing written", c.na + 1, c.nb + 1);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_reset();
+        for (int d = 0; d < 2; d++) {
+            *(int32_t*)(inf + 0x170 + 0x88 * d + 4) = 9;
+            for (int k = 0; k < 32; k++) *(int32_t*)(inf + 0x170 + 0x88 * d + 8 + 4 * k) = 3;
+        }
+        *(uint32_t*)(g_drivers + 0x210) = U(mk(0, 'n', 254, "b"));
+        *(uint32_t*)(g_drivers + 0x220 + 0x210) = U(mk(1, 'n', 254, "a"));
+        W.ints[0] = 0;
+        W.ints[1] = 1;
+        fx_same(f, {U(&W.ints[0]), U(&W.ints[1])}, "driver_compare, names of 255 characters");
+    }
+
+    printf("the fix build: %d directed checks (%d boundary cases on both), %d failed\n", g_fx_n, g_fx_same_n, g_fx_bad);
+    return g_fx_bad;
+}
+#endif
+
 // ---- main -----------------------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -1513,13 +2108,14 @@ int main(int argc, char** argv) {
     long long checks = 0, poisoned_checks = 0, log_words = 0;
     int differ = 0, fp_bad = 0, faults = 0, pure_n = 0, replay_n = 0, changed_fns = 0, still_fns = 0, bad_fns = 0;
     long long both_fault = 0;
+    int fixed_rounds = 0, fixed_bad = 0;                           // (the fix build: rounds kept out, a fixed case)
     for (int fi = 0; fi < g_nfns; fi++) {
         const Ent& f = g_fns[fi];
         if (only && !strstr(f.name, only)) continue;
         bool fn_bad = false, fn_changed = false;
         memset(cover_hits, 0, sizeof cover_hits);
         cover_rounds = 0;
-        int fn_faults = 0, fn_checks = 0, fn_fpck = 0;
+        int fn_faults = 0, fn_checks = 0, fn_fpck = 0, fn_fixed = 0;
         const bool modal = is_modal(f.name);
         int nr = modal ? rounds : rounds * 10;
         if (is_season_end(f.name)) nr *= 4;
@@ -1538,6 +2134,25 @@ int main(int argc, char** argv) {
             fp.n = 0; fp.replay_only = 0; fp.pure = false;
             f.fp(fp, words);
             mem_save(g_snap);
+            const bool pre_fixed = CAREER_FIXES && fx_pre_case(f, words);
+#if CAREER_FIXES
+            if (pre_fixed) {                                        // a fixed case: the rewrite clean (or faulting only
+                const Result rx = run(f, false, words);             // where the original does, on the round's own
+                mem_load(g_snap);                                   // damage: a null season drawn, say)
+                const Result rf = run(f, true, words);
+                fixed_rounds++;
+                fn_fixed++;
+                if (rd == 0) { pure_n += fp.pure; replay_n += fp.replay_only != 0; }
+                if (rf.fault && !(rx.fault && rx.code == rf.code && rx.eip == rf.eip)) {
+                    printf("  %08x %s: round %d, a fixed case: the rewrite faulted (%08x at %08x)\n", f.v10, f.name, rd, rf.code, rf.eip);
+                    fixed_bad++;
+                    fn_bad = true;
+                }
+                continue;
+            }
+#else
+            (void)pre_fixed;
+#endif
             const Result ro = run(f, false, words);
             const bool changed = mem_diff(g_snap) != 0;
             fn_changed |= changed;
@@ -1642,6 +2257,8 @@ int main(int argc, char** argv) {
         if (trace)
             printf("%08x %-52s %s%s (%d checks, %d with the footprint checked, %d faulted)\n", f.v10, f.name, fn_bad ? "BAD" : "ok",
                    fn_changed ? "" : " (never changed memory)", fn_checks, fn_fpck, fn_faults);
+        if (fn_fixed) printf("  %08x %s: %d rounds reached a fixed case (kept out of the comparison; the rewrite clean in each, or faulting just where the original did)\n", f.v10,
+                             f.name, fn_fixed);
         if (differ >= 40) { printf("stopping after 40 differences\n"); break; }
     }
     mem_load(g_pristine);
@@ -1650,5 +2267,13 @@ int main(int argc, char** argv) {
            "%d functions bad\n", g_nfns, pure_n, replay_n, g_nfns - pure_n - replay_n, dup, checks, poisoned_checks, log_words, differ,
            fp_bad, faults, both_fault, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
-    return differ || fp_bad || dup ? 1 : 0;
+    int fix_bad = 0;
+#if CAREER_FIXES
+    printf("the fix build: %d rounds reached a fixed case (kept out of the comparison), %d where the rewrite faulted\n", fixed_rounds,
+           fixed_bad);
+    if (!only) fix_bad = directed_fix_tests();
+#else
+    (void)fixed_rounds; (void)fixed_bad;
+#endif
+    return differ || fp_bad || dup || fix_bad || fixed_bad ? 1 : 0;
 }

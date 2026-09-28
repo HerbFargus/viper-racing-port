@@ -25,15 +25,18 @@
 // loaded and freed; notifications), refresh (reads the career files), TrackImage::Draw (loads a stamp), and the money and
 // splash callbacks that run the credits or a dialog.
 //
-// FIX CANDIDATEs (left faithful, marked in place; "ordinary play" = the stock game, English): create_cb copies the
-// translated default player name into a 16-byte local (a translation of 16+ characters runs over the UIDialog, which is
-// written after it -- harmless below ~590 characters); SeasonViewer::Draw indexes the purse and the place names by the
-// player's place unchecked (a damaged career file); testing_menu copies the track's name into TestingDo's 32-byte buffer
-// unbounded (a tracks.tab name of 32+ characters overruns TestingDo's frame; not with the stock tracks), and do_race into
-// the World's 32 bytes likewise; EventsDo, testing_menu, PostSeasonDo and RankingDo add their CareerStatus before its texts
-// are formatted (career_main.cpp: its StaticTexts copy stack garbage, every time; harmless unless it runs 256+ bytes);
-// testing_menu's list's change count is uninitialised (harmless). CareerChooser lists slot 1 twice (a second radio button
-// on top of the first: harmless).
+// Fixes (// FIX:, docs/FIXES.md "Career"; none reached with the stock game and English text): create_cb cuts the default
+// player name (a translation) to its 16-byte buffer; testing_menu doesn't test a track whose name (tracks.tab's) is too
+// long for TestingDo's 32-byte buffer (Test leaves as Back does), and do_race doesn't race one too long for the World's 32
+// bytes (it returns at once); TrackImage::Draw doesn't load a track's picture whose name (76+ characters) doesn't fit its
+// 0x50 bytes; EventsDo's two texts, SeasonViewer::Draw's and StandingsViewer::Draw's "<n> <unit>" texts keep to their
+// 0x100 bytes (255 characters of a long translation). Every other input gives the original's bits.
+//
+// FIX CANDIDATEs (left faithful, marked in place; "ordinary play" = the stock game, English): SeasonViewer::Draw indexes
+// the purse and the place names by the player's place unchecked (a damaged career file); EventsDo, testing_menu,
+// PostSeasonDo and RankingDo add their CareerStatus before its texts are formatted (career_main.cpp: its StaticTexts copy
+// stack garbage, every time; harmless unless it runs 256+ bytes); testing_menu's list's change count is uninitialised
+// (harmless). CareerChooser lists slot 1 twice (a second radio button on top of the first: harmless).
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -176,8 +179,11 @@ static uint8_t __cdecl delete_cb_c(int32_t) {
 PORT_FN(0x004beec0, "delete_cb(chooser.obj)", delete_cb_c, fp_screen_i)
 
 // create_cb: the new career's dialog; Create with a name: the slot's CareerInfo made and saved
-// FIX CANDIDATE: the translated default name is copied into a 16-byte local unbounded (a 16+ character translation runs
-// over the UIDialog, which is written after it; harmless below ~590 characters). Not with the stock text.
+// FIX: the default name (Career:DefaultPlayerName's translation) was copied into the frame's 16-byte name unbounded. A
+// translation over 15 characters ran into the dialog and its items, which are built over it afterwards, so with no saved
+// player_name to replace it the name was left unterminated: the name field showed the dialog's bytes after it, and Create
+// saved them into the new career's name; about 600 characters reached the return address. It's cut to 15 characters, as
+// the main menu's default name is (menu_race.cpp). One that fits is copied as before.
 static uint8_t __cdecl create_cb_c(int32_t) {
     alignas(8) uint8_t F[0x26c];                                    // sub esp, 0x25c; 4 pushes
     // F+0x13 damage (u8), +0x14 realism, +0x18 the name (0x10), +0x28 the UIDialog, +0x3c the items
@@ -192,7 +198,8 @@ static uint8_t __cdecl create_cb_c(int32_t) {
     ca_xl_once(0x005d00b0, 0x80, 0x005d0080, 0x004ffb64, 0x004bf640);  // Career:Damage
     CA_W(F, 0x14) = 1;
     CA_B(F, 0x13) = 1;
-    crt_strcpy((char*)(F + 0x18), CA_CP(ca_xlate(0x005d0068)));
+    if (VP_FIX) ui_copy_bounded((char*)(F + 0x18), CA_CP(ca_xlate(0x005d0068)), 0x10);      // (FIX: above)
+    else crt_strcpy((char*)(F + 0x18), CA_CP(ca_xlate(0x005d0068)));
     ccall<void>(F_OptionsGetS, *(const char* const volatile*)(uintptr_t)0x004dfa58, CA_CP(0x004ffb74), (char*)(F + 0x18), 0xd);
     {
         const char* game = *(const char* const volatile*)(uintptr_t)0x004dfa5c;
@@ -377,6 +384,7 @@ PORT_FN(0x004bfcc0, "CareerBlurb::Callback", CareerBlurb_Callback, fp_CareerBlur
 // events.obj
 // =========================================================================================================================
 // FIX CANDIDATE: its CareerStatus is added before its texts are formatted (career_main.cpp, career_menu).
+// (FIX: its two texts, below.)
 static uint8_t __cdecl EventsDo_c() {
     alignas(8) uint8_t F[0x430];                                    // sub esp, 0x424; 3 pushes
     // F+0xc the UIDialog, +0x20 the items, +0x138 the SeasonViewer, +0x158 the CareerStatus, +0x230 / +0x330 two texts
@@ -387,15 +395,23 @@ static uint8_t __cdecl EventsDo_c() {
     ca_xl_once(0x005d360c, 0x02, 0x005d35a0, 0x004ffcf0, 0x004c0460);  // Career:Summary:Season
     ca_xl_once(0x005d360c, 0x04, 0x005d35c0, 0x004ffd08, 0x004c0450);  // Career:Summary:Week
     ca_xl_once(0x005d360c, 0x08, 0x005d3610, 0x004ffd1c, 0x004c0440);  // Career:Events:Enter
+    // FIX: "<Season> <n>" and "<Week> <n>" (Career:Summary's translations) were formatted into two 0x100-byte texts of the
+    // frame unbounded, the second of them the frame's last bytes, so a translation of about 250 characters ran
+    // over the saved registers and the return address. Each keeps its first 255 characters (nothing reads them). A text
+    // that fits is formatted as before.
     ca_xlate(0x005d35a0);
     {
         const int32_t n = I32(info(), 0x11c) + 1;
-        SPRINTF((char*)(F + 0x330), CA_CP(0x004ffd30), UI_GP(const char, 0x005d35a4), n);   // "%s %d"
+        const char* s = UI_GP(const char, 0x005d35a4);
+        if (VP_FIX && ca_sd_long(s, n, 0x100)) ca_fix_sd((char*)(F + 0x330), 0x100, 0x004ffd30, s, n, false);
+        else SPRINTF((char*)(F + 0x330), CA_CP(0x004ffd30), s, n);                             // "%s %d"
     }
     ca_xlate(0x005d35c0);
     {
         const int32_t n = I32(info(), 0x120) + 1;
-        SPRINTF((char*)(F + 0x230), CA_CP(0x004ffd38), UI_GP(const char, 0x005d35c4), n);
+        const char* s = UI_GP(const char, 0x005d35c4);
+        if (VP_FIX && ca_sd_long(s, n, 0x100)) ca_fix_sd((char*)(F + 0x230), 0x100, 0x004ffd38, s, n, false);
+        else SPRINTF((char*)(F + 0x230), CA_CP(0x004ffd38), s, n);
     }
     put14(F, 0x20, 0x17, 0, 0, 0, 0, 0, 0x004e4db8, 0, CA_A(F, 0x158), 0);                   // the CareerStatus
     put14(F, 0x58, 0x17, 0, 0x32, 0x78, 0x208, 0x122, 0x004e4db8, 0, CA_A(F, 0x138), 0);      // the SeasonViewer
@@ -439,6 +455,13 @@ PORT_FN(0x004c0570, "SeasonViewer::Callback", SeasonViewer_Callback, fp_dirty<Tw
 // player's purse, place and points; then the totals
 // FIX CANDIDATE: the player's place (from the career file) indexes the purse (from 1) and the place names unchecked (a
 // damaged career file reads past them). Not in ordinary play.
+// FIX: SeasonViewer::Draw formats "<n> <Laps>" and "<n> <Pts>" (Career:Season's translations) into the frame's last 0x100
+// bytes (+0x88), and a translation of about 250 characters ran over its saved registers and return address. The text
+// keeps its first 255 characters (it's only drawn). One that fits is formatted as before.
+static __forceinline void season_text(uint8_t* F, int32_t n, const char* s) {
+    if (VP_FIX && ca_sd_long(s, n, 0x100)) ca_fix_sd((char*)(F + 0x88), 0x100, 0x004ffd68, s, n, true);
+    else SPRINTF((char*)(F + 0x88), CA_CP(0x004ffd68), n, s);                                 // "%d %s"
+}
 static const uint32_t k_xl_season[7] = {0x005d5d90, 0x005d5db0, 0x005d5da0, 0x005d5d50, 0x005d5d60, 0x005d5d70, 0x005d5d80};
 static void __fastcall SeasonViewer_Draw(TwoStyles* self, Edx, gxCanvas* c) {
     alignas(8) uint8_t F[0x188];                                    // sub esp, 0x178; 4 pushes
@@ -503,7 +526,7 @@ static void __fastcall SeasonViewer_Draw(TwoStyles* self, Edx, gxCanvas* c) {
                 style_draw(self->style, (int32_t)CA_W(F, 0x1c), y, ca_u(name), fl);
             }
             ca_xlate(0x005d5d90);
-            SPRINTF((char*)(F + 0x88), CA_CP(0x004ffd68), I32(CA_W(F, 0x18), 0x14), UI_GP(const char, 0x005d5d94));   // "%d %s"
+            season_text(F, I32(CA_W(F, 0x18), 0x14), UI_GP(const char, 0x005d5d94));        // FIX: (season_text) "%d %s"
             style_draw(self->style, (int32_t)CA_W(F, 0x40), y, CA_A(F, 0x88), fl);
             if (I32(info(), 0x128) > (int32_t)CA_W(F, 0x14)) {       // run: the player's purse, place, points
                 const int32_t place = *(volatile int32_t*)(info() + CA_W(F, 0x30) + 0x530);
@@ -521,7 +544,7 @@ static void __fastcall SeasonViewer_Draw(TwoStyles* self, Edx, gxCanvas* c) {
                 }
                 CA_W(F, 0x3c) = CA_W(F, 0x3c) + (uint32_t)pts;
                 ca_xlate(0x005d5db0);
-                SPRINTF((char*)(F + 0x88), CA_CP(0x004ffd68), pts, UI_GP(const char, 0x005d5db4));
+                season_text(F, pts, UI_GP(const char, 0x005d5db4));                           // FIX: (season_text)
                 style_draw(self->style2, (int32_t)CA_W(F, 0x24), y, CA_A(F, 0x88), 0);
             }
             y += 0x14;
@@ -541,7 +564,7 @@ static void __fastcall SeasonViewer_Draw(TwoStyles* self, Edx, gxCanvas* c) {
     ccall<void>(F_LocaleMoney, (char*)(F + 0x88), (int32_t)CA_W(F, 0x38), 0);
     style_draw(self->style2, (int32_t)CA_W(F, 0x20), y, CA_A(F, 0x88), 0);
     ca_xlate(0x005d5db0);
-    SPRINTF((char*)(F + 0x88), CA_CP(0x004ffd68), (int32_t)CA_W(F, 0x3c), UI_GP(const char, 0x005d5db4));
+    season_text(F, (int32_t)CA_W(F, 0x3c), UI_GP(const char, 0x005d5db4));                   // FIX: (season_text)
     style_draw(self->style2, (int32_t)CA_W(F, 0x24), y, CA_A(F, 0x88), 0);
 }
 static void fp_SeasonViewer_Draw(Footprint& f, TwoStyles*, Edx, gxCanvas* c) {
@@ -608,9 +631,14 @@ static __declspec(naked) void __cdecl TestingDo_c() {
 PORT_FN(0x004c0e70, "TestingDo", TestingDo_c, fp_screen)
 
 // do_race: a practice race on the track, the career's car and class
-// FIX CANDIDATE: the track's name is copied into the World's 32 bytes unbounded (a 32+ character tracks.tab name).
+// FIX: the track's name was copied into the World's 32 bytes unbounded, so a name of 32 or more characters ran into its
+// cars (the car list is written over it afterwards, leaving the World's track unterminated for the race's loading). Cut,
+// the name would no longer find the track's files, and the
+// World can't hold it, so there's no race: do_race returns at once and the testing menu comes back. (testing_menu's own
+// fix already keeps such a name from reaching here.) A name that fits races as before.
 static void __cdecl do_race_c(const char* track, uint32_t rev) {
     alignas(8) uint8_t F[0xce4];                                    // sub esp, 0xcd8; 3 pushes: +0xf done (u8), +0x10 the World
+    if (VP_FIX && ca_longer(track, 0x1f)) return;
     tcall<void*>(F_World_ctor, (void*)(F + 0x10));
     crt_strcpy((char*)(F + 0x18), track);
     CA_W(F, 0xcbc) = (uint32_t)I32(info(), 0x10);                    // realism
@@ -649,10 +677,14 @@ static void __cdecl do_race_c(const char* track, uint32_t rev) {
 static void fp_do_race(Footprint& f, const char*, uint32_t) { f.replay_only = "runs a practice race (the pre-race screen, the race)"; }
 PORT_FN(0x004c0ec0, "do_race", do_race_c, fp_do_race)
 
-// FIX CANDIDATE: the track's name is copied into the caller's buffer (TestingDo's 32 bytes) unbounded (a 32+ character
-// tracks.tab name overruns TestingDo's frame). Not with the stock tracks. Also its CareerStatus is added before its texts
-// are formatted (career_main.cpp, career_menu), and its list's change count is left uninitialised (UIStringList's
-// constructor doesn't set it; the list box only compares it: harmless). Both every time the menu opens.
+// FIX: Test copied the track's name (tracks.tab's, one of its first eight rows) into the caller's buffer, TestingDo's 32
+// bytes, unbounded: a name of 32 or more characters ran over TestingDo's return address (a crash on leaving the testing
+// menu). Cut, the name would no longer find the track's files, and the World a race is loaded from holds 31 characters,
+// so such a track can't be tested: Test on it leaves the menu as Back does (back to the career's menu; the reversed flag
+// is set first, as before, and read by nothing then). A name that fits is copied as before.
+// FIX CANDIDATE: its CareerStatus is added before its texts are formatted (career_main.cpp, career_menu), and its list's
+// change count is left uninitialised (UIStringList's constructor doesn't set it; the list box only compares it:
+// harmless). Both every time the menu opens.
 static uint8_t __cdecl testing_menu_c(char* track, uint8_t* rev) {
     alignas(8) uint8_t F[0x2ac];                                    // sub esp, 0x2a4; 2 pushes
     // F+8 the UIDialog, +0x1c the tracks' list (UIStringList), +0x30 the TrackImage, +0x4c the items, +0x1d4 the CareerStatus
@@ -682,11 +714,14 @@ static uint8_t __cdecl testing_menu_c(char* track, uint8_t* rev) {
     CA_W(F, 0x18) = 0;
     if (do_dialog(F + 8, UI_G32(S_SCREEN_W), UI_G32(S_SCREEN_H)) == -2) {
         *(volatile uint8_t*)rev = CA_G8(S_TS_REVERSED);
-        crt_strcpy(track, ccall<const char*>(F_GetTrackName, CA_G32(S_TS_TRACK)));
-        CA_W(F, 0x1d4) = VT_UICustomControl;
-        CA_W(F, 0x30) = VT_UICustomControl;
-        tcall<void>(uit::F_UIStringList_dtor, (void*)(F + 0x1c));
-        return 1;
+        const char* name = ccall<const char*>(F_GetTrackName, CA_G32(S_TS_TRACK));
+        if (!(VP_FIX && ca_longer(name, 0x1f))) {                    // (FIX: above; too long: as Back, below)
+            crt_strcpy(track, name);
+            CA_W(F, 0x1d4) = VT_UICustomControl;
+            CA_W(F, 0x30) = VT_UICustomControl;
+            tcall<void>(uit::F_UIStringList_dtor, (void*)(F + 0x1c));
+            return 1;
+        }
     }
     CA_W(F, 0x1d4) = VT_UICustomControl;
     CA_W(F, 0x30) = VT_UICustomControl;
@@ -703,10 +738,17 @@ PORT_FN(0x004c1510, "TrackImage::Create", TrackImage_Create, fp_notes0<TrackImag
 static void __fastcall TrackImage_Callback(TrackImage* self, Edx, int32_t, const void*) { tcall<void>(F_UICC_Dirty, self); }
 PORT_FN(0x004c1520, "TrackImage::Callback", TrackImage_Callback, fp_dirty<TrackImage>)
 
+// FIX: "<track>.stp" (tracks.tab's name) was formatted into 0x50 bytes of the frame unbounded, so a name of 76 or more
+// characters ran over the saved registers and the return address. Cut, the name would no longer be the track's picture
+// (U2's track viewer cuts it, finding no picture), so a picture whose name doesn't fit isn't loaded or drawn: the testing
+// menu shows no picture for that track, as for any track without one (gxGetStamp finds none; drawing none draws
+// nothing). A name that fits is loaded and drawn as before.
 static void __fastcall TrackImage_Draw(TrackImage* self, Edx, gxCanvas* c) {
     alignas(8) uint8_t F[0x58];                                     // sub esp, 0x50; 2 pushes: +8 the stamp's name
     ccall<gxCanvas*>(uit::F_gxSetCanvas, c);
-    SPRINTF((char*)(F + 8), CA_CP(0x004ffee8), ccall<const char*>(F_GetTrackName, *(const volatile int32_t*)self->track));   // "%s.stp"
+    const char* tn = ccall<const char*>(F_GetTrackName, *(const volatile int32_t*)self->track);
+    if (VP_FIX && ca_longer(tn, 0x4b)) return;                      // (FIX: above) 75 + ".stp" + 0 = 0x50
+    SPRINTF((char*)(F + 8), CA_CP(0x004ffee8), tn);                // "%s.stp"
     void* st = ccall<void*>(uit::F_gxGetStamp, (const char*)(F + 8));
     ccall<void>(uit::F_gxDrawStamp, (const void*)st, self->x, self->y, 0, (const void*)0);
     ccall<void>(uit::F_gxForgetStamp, st);
@@ -904,8 +946,13 @@ static void __fastcall StandingsViewer_Draw(TwoStyles* self, Edx, gxCanvas* c) {
             style_draw(self->style, (int32_t)CA_W(F, 0x10) + 0x37, y, ca_u(name), fl);
             ca_xlate(0x005d5d40);
             {
+                // FIX: "<points> <Pts>" (Career:Standings:PointsAbbreviated's translation) went into the frame's last
+                // 0x100 bytes unbounded: a translation of about 250 characters ran over the saved registers and the
+                // return address. The text keeps its first 255 characters (it's only drawn); one that fits is as before.
                 const char* ab = UI_GP(const char, 0x005d5d44);
-                SPRINTF((char*)(F + 0x20), CA_CP(0x004ffd68), I32(CA_W(F, 0x1c), 4), ab);       // "%d %s"
+                const int32_t pts = I32(CA_W(F, 0x1c), 4);
+                if (VP_FIX && ca_sd_long(ab, pts, 0x100)) ca_fix_sd((char*)(F + 0x20), 0x100, 0x004ffd68, ab, pts, true);
+                else SPRINTF((char*)(F + 0x20), CA_CP(0x004ffd68), pts, ab);                     // "%d %s"
             }
             {
                 const int32_t yy = y;

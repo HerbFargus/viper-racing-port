@@ -6,12 +6,13 @@
 //        /Fo<dir>\ /Fe<dir>\world_career_shop.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_career_shop.exe [rounds] [seed]        (VP_TRACE=1: one line per function; VP_ONLY=text: those only;
 //          VP_DEBUG_WORLD=1: every fault's registers; VP_DEBUG_LOG=1: each round's first logged words)
+//     (and with /DVP_CAREER_FIXES: the fix build, below)
 //
 // Built as test/world_root_race.cpp is (its loader, raw call, memory comparison and stubs are copied here; the stack is
 // filled after the _controlfp_s calls): out\race_v10.exe loaded at 0x400000 in a child process with the range reserved,
 // the two rewrite files included with PORT_FN redefined to list each function (its v1.0 address, the rewrite, its calling
-// convention -- __cdecl, __thiscall as __fastcall --, stack arguments and return, its footprint). VP_FAITHFUL (the files
-// have no fixes).
+// convention -- __cdecl, __thiscall as __fastcall --, stack arguments and return, its footprint). VP_FAITHFUL
+// (career_credits.cpp has no fixes; career_shop.cpp's are on in the fix build, below).
 //
 // The world. Once: the $E static initialisers of libraries ui, menu, root, career and intro (their Xlators, colours,
 // tables), the game's UIBegin; a locale; a CareerInfo at its own address (0x5cf078) and a season; the car's upgrade set
@@ -51,6 +52,17 @@
 // UIRemoveStyle), UICustomControl's AddNotification / Dirty / AddItems, UIDialogItem's and Xlator's constructors,
 // gxSetClip / gxRestoreClip, group A's CareerStatus (in the shop's dialogs), and every function of this group (each
 // rewrite is checked against its original with the same callees).
+//
+// Built with /DVP_CAREER_FIXES, career_shop.cpp's fixes are on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Career"). Every
+// function is still compared as above, with the rounds that reach a fixed case kept out of the comparison and counted
+// (the rewrite still run on each and required to return cleanly, or to fault just where the original does):
+// UpgradeSummary::Draw's where the original's sprintf printed an engine or weight line past its 0x50 bytes (the stub knows
+// the two formats; the random car file's figures reach it: a float's 39 digits). No other fixed case is in the random
+// world's reach (upgrade names of 63 characters at most, sets of 40 at most, translated names of 24 and translations of
+// 29, descriptions of 272). Then directed_fix_tests: for each fix, the bad case run on the
+// rewrite alone -- no fault, the bytes popped and ebx / esi / edi / ebp kept, nothing written outside what it may write
+// (the memory around it compared), and the result the fix promises -- and its boundary case (the longest input that fits)
+// on both, compared bit for bit. Without it (VP_FAITHFUL) every rewrite must match its original bit for bit.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -65,7 +77,12 @@
 #include <string>
 #include <vector>
 
+#ifndef VP_CAREER_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#define CAREER_FIXES 0
+#else
+#define CAREER_FIXES 1
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------------
@@ -535,6 +552,8 @@ static int __cdecl stub_tolower(int c) { L('TLOW'); L((uint32_t)c); return (c >=
 static int32_t __cdecl stub_FileOpen(const char* name) { L('FOPN'); LS(name); return 0; }
 static void __cdecl stub_FileClose(int32_t* fd) { L('FCLS'); L((uint32_t)*fd); *fd = 0; }
 static uint8_t __cdecl stub_ClipboardGetText(char* buf, int n) { L('CLIP'); if (n > 0) buf[0] = 0; return 0; }
+// the fix build: whether the original's sprintf printed one of UpgradeSummary::Draw's lines past its 0x50 bytes
+static bool g_overran;
 // sprintf: the arguments logged; a %s it can't read printed as "?" (both passes print the same); the result logged
 static int __cdecl stub_sprintf(char* buf, const char* fmt, ...) {
     L('SPRF'); L(P(buf)); LS(fmt);
@@ -559,6 +578,7 @@ static int __cdecl stub_sprintf(char* buf, const char* fmt, ...) {
     }
     for (int i = 0; i < nw && i < 16; i++) L(on_stack(w[i]) ? 'STAK' : w[i]);
     const int r = vsprintf(buf, fmt, (va_list)w);
+    if ((fmt == (const char*)0x00500710 || fmt == (const char*)0x00500704) && r > 0x4f) g_overran = true;
     LS(buf);
     return r;
 }
@@ -1216,6 +1236,419 @@ static bool is_modal(const char* nm) {
     return false;
 }
 
+#if CAREER_FIXES
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+// The rewrite alone (the original would overrun there -- this program's stack or the game's statics among what it would
+// take), from the pristine world with the case set up: it must return cleanly (no fault, the bytes popped, ebx / esi / edi /
+// ebp kept), write nothing outside what it may (every other byte of .data/.bss/.idata and the arena compared with before)
+// and give what the fix promises. Each fix's boundary case (the longest input that fits) runs on the original and the
+// rewrite from the same state and must give the same memory, call logs and result.
+static int g_fx_bad, g_fx_n, g_fx_same_n;
+static const Ent& fx_fn(const char* name) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, name)) return g_fns[i];
+    printf("  fix test: %s isn't listed\n", name);
+    fflush(stdout);
+    ExitProcess(4);
+}
+struct Span { const void* p; uint32_t n; };
+// the first byte that changed since `before` outside the spans (the stubs' state block aside); 0 if none
+static uint32_t fx_outside(const Mem& before, std::initializer_list<Span> ok) {
+    auto in = [&](const uint8_t* q) {
+        for (const Span& sp : ok)
+            if (q >= (const uint8_t*)sp.p && q < (const uint8_t*)sp.p + sp.n) return true;
+        return false;
+    };
+    for (uint32_t i = 0; i < DATA_BYTES; i++)
+        if (before.data[i] != DATA[i] && !in(DATA + i)) return 0x004e1000 + i;
+    for (uint32_t i = 0; i < IDATA_BYTES; i++)
+        if (before.idata[i] != IDATA[i] && !in(IDATA + i)) return 0x005d7000 + i;
+    for (uint32_t i = sizeof(HState); i < ARENA_BYTES; i++)
+        if (before.arena[i] != g_arena[i] && !in(g_arena + i)) return U(g_arena + i);
+    return 0;
+}
+static Result fx_run(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w) {
+    uint32_t words[72] = {};
+    int i = 0;
+    for (uint32_t x : w) words[i++] = x;
+    g_pc = _PC_53;
+    return run(f, rewrite, words);
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0, uint32_t where = 0) {
+    g_fx_n++;
+    if (ok) return;
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, popped %u, ebx esi edi ebp %08x %08x %08x %08x)", r->fault, r->code, r->eip, r->pops, r->regs[0],
+                  r->regs[1], r->regs[2], r->regs[3]);
+    if (where) printf(" (wrote %08x)", where);
+    printf("\n");
+}
+static CallLog g_fx_log;
+// the original and the rewrite from the same state: the rewrite clean; the same return, memory and call logs
+static void fx_same(const Ent& f, std::initializer_list<uint32_t> w, const char* what) {
+    g_fx_same_n++;
+    mem_save(g_snap);
+    const Result ro = fx_run(f, false, w);
+    mem_save(g_after);
+    memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+    mem_load(g_snap);
+    const Result rn = fx_run(f, true, w);
+    char m[256];
+    sprintf(m, "%s: a clean return", what);
+    fx_check(fx_clean(f, rn), m, &rn);
+    sprintf(m, "%s: the original's result, bit for bit", what);
+    const uint32_t where = mem_diff(g_after);
+    const bool same = !ro.fault && where == 0 && ro.ret == rn.ret && g_log.n == g_fx_log.n &&
+                      !memcmp(g_log.w, g_fx_log.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+    fx_check(same, m, &ro, where);
+}
+// a callee replaced for a test (a jump to a recorder), put back after
+struct FxPatch {
+    uint32_t at;
+    uint8_t b[5];
+    FxPatch(uint32_t a, void* to) : at(a) { memcpy(b, (const void*)(uintptr_t)a, 5); patch_jmp(a, to); }
+    ~FxPatch() { memcpy((void*)(uintptr_t)at, b, 5); }
+};
+// the recorders: Xlate's keys (each answered "xlated"), UIDoOkBox's title and message
+static std::vector<std::string> g_fx_keys;
+static const char* __cdecl fx_Xlate(const char* key) {
+    L('XLTE'); LS(key);
+    g_fx_keys.push_back(readable(key, 1) ? std::string(key, strnlen(key, 0x1000)) : std::string("?"));
+    return "xlated";
+}
+static uint32_t g_fx_dlg_off;                               // (the dialog's caller's frame: 0x200 bytes from the UIDialog + this)
+static uint8_t g_fx_dlg[0x200];
+static int32_t __cdecl fx_UIDoDialog(const void* d, int32_t, int32_t, int32_t, int32_t, int32_t) {
+    L('DLG '); L(P(d));
+    if (g_fx_dlg_off && readable((const uint8_t*)d + g_fx_dlg_off, 0x200)) memcpy(g_fx_dlg, (const uint8_t*)d + g_fx_dlg_off, 0x200);
+    return -1;
+}
+// UIStyleDraw: each text drawn recorded, with its style
+static std::vector<std::string> g_fx_draws;
+static std::vector<int32_t> g_fx_draw_style;
+static void __cdecl fx_UIStyleDraw(int32_t style, int32_t x, int32_t y, const char* s, uint32_t fl) {
+    L('SDRW'); L((uint32_t)style); L((uint32_t)x); L((uint32_t)y); LS(s); L(fl);
+    g_fx_draws.push_back(readable(s, 1) ? std::string(s, strnlen(s, 0x2000)) : std::string("?"));
+    g_fx_draw_style.push_back(style);
+}
+// CarFileLoad: the car's data zeroed but for the figures the summary shows (power, its rpm, torque, its rpm, weight)
+static float g_fx_cd[5];
+static uint8_t __cdecl fx_CarFileLoad(uint8_t* cd, const void*, const char* name, const uint8_t*) {
+    L('CFLD'); LS(name);
+    memset(cd, 0, 0x1e0);
+    memcpy(cd + 0x6c, &g_fx_cd[0], 4); memcpy(cd + 0x74, &g_fx_cd[1], 4); memcpy(cd + 0x68, &g_fx_cd[2], 4);
+    memcpy(cd + 0x70, &g_fx_cd[3], 4); memcpy(cd + 0x8, &g_fx_cd[4], 4);
+    return 1;
+}
+static std::string g_fx_box_title, g_fx_box_msg;
+static int g_fx_box_n;
+static void __cdecl fx_UIDoOkBox(const char* t, const char* msg) {
+    L('OKBX'); LS(t); LS(msg);
+    g_fx_box_title = readable(t, 1) ? std::string(t, strnlen(t, 0x1000)) : std::string("?");
+    g_fx_box_msg = readable(msg, 1) ? std::string(msg, strnlen(msg, 0x1000)) : std::string("?");
+    g_fx_box_n++;
+}
+// the tests' world: pristine, every function-local and file-scope Xlator built (fresh), the statics the code follows
+static void fx_reset() {
+    mem_load(g_pristine);
+    g_xl_seed = 0;
+    UI_GP(gxCanvas, S_GX_CANVAS) = W.screen;
+    UI_GP(WidgetWindow, S_ACTIVE) = W.win;
+    UI_GU32(S_DIALOG_IDLE) = 0;
+    UI_G8(S_EXIT) = 0;
+    UI_GF(S_UI_DT) = 0.05f;
+    UI_GP(void, S_CURSOR) = 0;
+    UI_G32(S_MOUSE_X) = 320; UI_G32(S_MOUSE_Y) = 240;
+    UI_GP(uint8_t, 0x00509354) = W.locale;
+    UI_GP(CshUpgradeSet, S_UPGRADE_SET) = W.set;
+    UI_GP(uint8_t, S_SEASON) = W.season;
+    for (auto& x : k_xl) {
+        UI_G8(x[0]) = (uint8_t)(UI_G8(x[0]) | x[1]);
+        set_xl(x[2], x[3], true);
+    }
+    for (auto& x : k_xl_file) set_xl(x[0], x[1], true);
+    UI_G8(S_CLASS_XL_GUARD) = 0x0f;
+    HS->time = 1000; HS->frames = 0; HS->frame_limit = 40; HS->grab_fail_at = -1;
+    HS->mouse_x = 320; HS->mouse_y = 240;
+    HS->script_n = HS->script_pos = 0;
+    HS->rs = 0x1234567;
+    HS->test_mode = 0; HS->rand_calls = 0; HS->cf_load_ok = 1; HS->time_step = 16;
+    g_fx_keys.clear();
+    g_fx_box_n = 0;
+    g_fx_dlg_off = 0;
+    g_fx_draws.clear();
+    g_fx_draw_style.clear();
+}
+static char g_fx_s[8][0x2000];
+// a string of n c's and then tail (in one of eight buffers of this program's)
+static const char* mk(int k, char c, int n, const char* tail = "") {
+    memset(g_fx_s[k], c, (size_t)n);
+    strcpy(g_fx_s[k] + n, tail);
+    return g_fx_s[k];
+}
+// s's first n characters
+static std::string first(const char* s, size_t n) { return std::string(s, strnlen(s, n)); }
+
+static int directed_fix_tests() {
+    Result r;
+    uint32_t o;
+    char m[512];
+
+    // ---- 8. get_upgrade_names: a long upgrade name; a set of more than 256 ----
+    {
+        const Ent& f = fx_fn("get_upgrade_names");
+        FxPatch xl(F_Xlate, (void*)&fx_Xlate);
+        // (the set's entries are read for their names alone: a name of this program's stands in for a CarUpgrade)
+        static uint32_t set3[4];
+        for (int n : {242, 600}) {
+            fx_reset();
+            const char* nm = mk(0, 'u', n);
+            set3[0] = 3; set3[1] = U(W.set->items[0]); set3[2] = U(nm); set3[3] = U(W.set->items[1]);
+            UI_GU32(S_UPGRADE_SET) = U(set3);
+            mem_save(g_snap);
+            r = fx_run(f, true, {});
+            sprintf(m, "get_upgrade_names, a %d-character upgrade name: a clean return", n);
+            fx_check(fx_clean(f, r), m, &r);
+            const std::string cut = first(nm, 241);
+            sprintf(m, "get_upgrade_names, a %d-character upgrade name: its keys hold its first 241 characters (255 in all)", n);
+            fx_check(g_fx_keys.size() == 6 && g_fx_keys[2] == "Upgrades:" + cut + ":Name" && g_fx_keys[3] == "Upgrades:" + cut + ":Desc" &&
+                         g_fx_keys[2].size() == 255 && g_fx_keys[0] == "Upgrades:Stock:Name", m);
+            bool tab = true;
+            for (uint32_t k = 0; k < 3; k++)
+                tab &= !strcmp(UI_GP(const char, S_UP_NAMES + 4u * k), "xlated") && !strcmp(UI_GP(const char, S_UP_DESCS + 4u * k), "xlated");
+            sprintf(m, "get_upgrade_names, a %d-character upgrade name: the three entries translated", n);
+            fx_check(tab, m);
+            o = fx_outside(g_snap, {{(void*)(uintptr_t)S_UP_NAMES, 12}, {(void*)(uintptr_t)S_UP_DESCS, 12}});
+            sprintf(m, "get_upgrade_names, a %d-character upgrade name: nothing written outside the tables' three entries", n);
+            fx_check(o == 0, m, 0, o);
+        }
+        // a set of 300: the first 256 translated, nothing past the tables (their colours and Xlators after them)
+        static uint32_t big[1 + 300];
+        big[0] = 300;
+        for (int i = 0; i < 300; i++) big[1 + i] = U(W.set->items[i % W.nupg]);
+        fx_reset();
+        UI_GU32(S_UPGRADE_SET) = U(big);
+        for (uint32_t k = 0; k < 256; k++) { UI_GU32(S_UP_NAMES + 4u * k) = 0; UI_GU32(S_UP_DESCS + 4u * k) = 0; }
+        mem_save(g_snap);
+        r = fx_run(f, true, {});
+        fx_check(fx_clean(f, r), "get_upgrade_names, a set of 300: a clean return", &r);
+        bool all = g_fx_keys.size() == 512;
+        for (uint32_t k = 0; all && k < 256; k++) all = UI_GU32(S_UP_NAMES + 4u * k) != 0 && UI_GU32(S_UP_DESCS + 4u * k) != 0;
+        sprintf(m, "get_upgrade_names, a set of 300: the first 256 translated (%u keys)", (unsigned)g_fx_keys.size());
+        fx_check(all, m);
+        o = fx_outside(g_snap, {{(void*)(uintptr_t)S_UP_NAMES, 0x400}, {(void*)(uintptr_t)S_UP_DESCS, 0x400}});
+        fx_check(o == 0, "get_upgrade_names, a set of 300: nothing written outside the two tables", 0, o);
+        // the boundaries: a 241-character name (keys of 255); a set of 256 (the tables full)
+        fx_reset();
+        set3[0] = 3; set3[1] = U(W.set->items[0]); set3[2] = U(mk(0, 'u', 241)); set3[3] = U(W.set->items[1]);
+        UI_GU32(S_UPGRADE_SET) = U(set3);
+        fx_same(f, {}, "get_upgrade_names, a 241-character upgrade name (keys of 255)");
+        fx_reset();
+        big[0] = 256;
+        UI_GU32(S_UPGRADE_SET) = U(big);
+        fx_same(f, {}, "get_upgrade_names, a set of 256");
+    }
+
+    // ---- 9. UpgradeCatalog::MouseUp: a long "requires" message ----
+    {
+        const Ent& f = fx_fn("UpgradeCatalog::MouseUp");
+        FxPatch ok(F_UIDoOkBox, (void*)&fx_UIDoOkBox);
+        UpgradeCatalog* c = W.catalog;
+        // the click: the catalog's item 0, upgrade 1, allowed in the class, requiring upgrade 2, neither bought
+        auto setup = [&](const char* req_name, const char* msg) {
+            fx_reset();
+            c->x = 0; c->y = 0; c->w = 500; c->h = 400; c->axis.pos = 0; c->count = 1; c->index[0] = 1; c->pressed = 1; c->hot = -1;
+            CshUpgrade* u1 = W.set->items[1];
+            u1->req_class = 0;
+            strcpy(u1->requires, W.upg_names[2]);
+            W.set->count = W.nupg;
+            uint8_t* info = (uint8_t*)(uintptr_t)S_INFO;
+            info[0x1c + 1] = 0;
+            info[0x1c + 2] = 0;
+            *(int32_t*)(info + 0x124) = 1;
+            UI_GP(const char, S_UP_NAMES + 4) = "the upgrade";
+            UI_GP(const char, S_UP_NAMES + 8) = req_name;
+            UI_GU32(0x005d5cd4) = U(msg);                        // Upgrade:OtherUpgradeRequiredDialog:Message's text
+        };
+        struct { int a, b; } cases[] = {{200, 100}, {300, 20}, {10, 400}, {900, 900}};
+        for (auto& k : cases) {
+            const char* rn = mk(0, 'r', k.a);
+            const char* msg = mk(1, 'm', k.b);
+            setup(rn, msg);
+            mem_save(g_snap);
+            r = fx_run(f, true, {U(c), 0, 10, 10});
+            sprintf(m, "UpgradeCatalog::MouseUp, a %d-character upgrade name and a %d-character message: a clean return", k.a, k.b);
+            fx_check(fx_clean(f, r), m, &r);
+            const std::string e = std::string(rn) + " " + msg;
+            sprintf(m, "UpgradeCatalog::MouseUp, %d and %d characters: the box's message is their first 255 characters", k.a, k.b);
+            fx_check(g_fx_box_n == 1 && g_fx_box_title == "the upgrade" && g_fx_box_msg == e.substr(0, 255), m);
+            o = fx_outside(g_snap, {{c, (uint32_t)sizeof(UpgradeCatalog)}});
+            sprintf(m, "UpgradeCatalog::MouseUp, %d and %d characters: nothing written outside the catalog", k.a, k.b);
+            fx_check(o == 0, m, 0, o);
+        }
+        // the boundary: 150 + 1 + 104 = 255
+        setup(mk(0, 'r', 150), mk(1, 'm', 104));
+        fx_same(f, {U(c), 0, 10, 10}, "UpgradeCatalog::MouseUp, a message of 255 characters");
+        fx_check(g_fx_box_n == 2 && g_fx_box_msg.size() == 255, "UpgradeCatalog::MouseUp, a message of 255 characters: shown whole");
+    }
+
+
+    // ---- 10. UpgradeDo: a long Upgrade:Purchased (the dialog answered at once; its frame's copy recorded) ----
+    {
+        const Ent& f = fx_fn("UpgradeDo");
+        FxPatch dlg(F_UIDoDialog, (void*)&fx_UIDoDialog);
+        const uint8_t* ups = (const uint8_t*)(uintptr_t)S_UPGRADES;
+        for (int n : {256, 700}) {
+            fx_reset();
+            const char* t = mk(0, 'b', n);
+            UI_GU32(0x005d3cfc) = U(t);
+            g_fx_dlg_off = 0x36c;                                // the UIDialog at +8: the copy at +0x374, the snapshot at +0x474
+            mem_save(g_snap);
+            r = fx_run(f, true, {});
+            sprintf(m, "UpgradeDo, a %d-character Upgrade:Purchased: a clean return", n);
+            fx_check(fx_clean(f, r), m, &r);
+            sprintf(m, "UpgradeDo, a %d-character Upgrade:Purchased: its first 255 characters copied, the upgrades' snapshot after "
+                       "it intact", n);
+            fx_check(first((const char*)g_fx_dlg, 0x100) == first(t, 255) && !memcmp(g_fx_dlg + 0x100, ups, 0x100), m);
+            o = fx_outside(g_snap, {{(void*)(uintptr_t)S_UP_NAMES, 0x400}, {(void*)(uintptr_t)S_UP_DESCS, 0x400}});
+            sprintf(m, "UpgradeDo, a %d-character Upgrade:Purchased: nothing written but the translations' tables", n);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_reset();
+        UI_GU32(0x005d3cfc) = U(mk(0, 'b', 255));
+        g_fx_dlg_off = 0x36c;
+        fx_same(f, {}, "UpgradeDo, a 255-character Upgrade:Purchased");
+    }
+
+    // ---- 11. UpgradeSummary::Draw: long engine / weight lines (the car file's figures set; the drawn texts recorded) ----
+    {
+        const Ent& f = fx_fn("UpgradeSummary::Draw");
+        FxPatch cf(F_CarFileLoad, (void*)&fx_CarFileLoad);
+        FxPatch sd(F_UIStyleDraw, (void*)&fx_UIStyleDraw);
+        const std::initializer_list<uint32_t> args = {U(W.summary), 0, U(W.screen)};
+        const float big = 3.4028235e38f;
+        struct { const char* pw; const char* wt; float p, prpm, t, trpm, w; const char* what; } cases[] = {
+            {"Pw", "Wt", big, big, 400.0f, 4000.0f, 3000.0f, "a float's 39 digits for the power and its rpm"},
+            {0, "Wt", 450.0f, 5200.0f, 400.0f, 4000.0f, 3000.0f, "a 100-character power translation"},
+            {"Pw", 0, 450.0f, 5200.0f, 400.0f, big, big, "the torque's rpm and a weight of 39 digits, a 60-character weight translation"},
+        };
+        for (auto& c : cases) {
+            fx_reset();
+            const char* pw = c.pw ? c.pw : mk(0, 'P', 100);
+            const char* wt = c.wt ? c.wt : mk(1, 'W', 60);
+            UI_GU32(0x005d3804) = U(pw); UI_GU32(0x005d382c) = U("Tq"); UI_GU32(0x005d37f4) = U("hp");
+            UI_GU32(0x005d3794) = U("lb-ft"); UI_GU32(0x005d3cd4) = U("rpm"); UI_GU32(0x005d374c) = U(wt);
+            g_fx_cd[0] = c.p; g_fx_cd[1] = c.prpm; g_fx_cd[2] = c.t; g_fx_cd[3] = c.trpm; g_fx_cd[4] = c.w;
+            mem_save(g_snap);
+            r = fx_run(f, true, args);
+            sprintf(m, "UpgradeSummary::Draw, %s: a clean return", c.what);
+            fx_check(fx_clean(f, r), m, &r);
+            char e[3][0x400];
+            sprintf(e[0], "%s %1.0f %s @ %1.0f %s", pw, (double)c.p, "hp", (double)c.prpm, "rpm");
+            sprintf(e[1], "%s %1.0f %s @ %1.0f %s", "Tq", (double)c.t, "lb-ft", (double)c.trpm, "rpm");
+            const float kf = *(const float*)(uintptr_t)0x004dfc64;
+            sprintf(e[2], "%s %1.0f %s", wt, ((double)c.w * (double)kf) * (double)1.0f, "lb");
+            for (int k = 0; k < 3; k++) {
+                bool found = false;
+                for (auto& d : g_fx_draws) found |= d == first(e[k], 79);
+                sprintf(m, "UpgradeSummary::Draw, %s: line %d is the first 79 characters of \"%.50s...\" (%u)", c.what, k, e[k],
+                        (unsigned)strlen(e[k]));
+                fx_check(found, m);
+            }
+            o = fx_outside(g_snap, {{(void*)(uintptr_t)S_GX_CANVAS, 4}});
+            sprintf(m, "UpgradeSummary::Draw, %s: nothing written but the current canvas", c.what);
+            fx_check(o == 0, m, 0, o);
+        }
+        // the boundary: a power line of 79 characters ("<61> 450 hp @ 5200 rpm")
+        fx_reset();
+        UI_GU32(0x005d3804) = U(mk(0, 'P', 61)); UI_GU32(0x005d382c) = U("Tq"); UI_GU32(0x005d37f4) = U("hp");
+        UI_GU32(0x005d3794) = U("lb-ft"); UI_GU32(0x005d3cd4) = U("rpm"); UI_GU32(0x005d374c) = U("Wt");
+        g_fx_cd[0] = 450.0f; g_fx_cd[1] = 5200.0f; g_fx_cd[2] = 400.0f; g_fx_cd[3] = 4000.0f; g_fx_cd[4] = 3000.0f;
+        fx_same(f, args, "UpgradeSummary::Draw, a power line of 79 characters");
+    }
+
+    // ---- 12. UpgradeCatalog::Draw: a long description and long lines (the drawn texts recorded) ----
+    {
+        const Ent& f = fx_fn("UpgradeCatalog::Draw");
+        FxPatch sd(F_UIStyleDraw, (void*)&fx_UIStyleDraw);
+        UpgradeCatalog* c = W.catalog;
+        const std::initializer_list<uint32_t> args = {U(c), 0, U(W.screen)};
+        static char desc[0x1100];
+        auto words = [](int n) {
+            for (int i = 0; i < n; i++) desc[i] = i % 6 == 5 ? ' ' : (char)('a' + i % 23);
+            desc[n] = 0;
+            return (const char*)desc;
+        };
+        auto setup = [&](bool allowed, const char* d, const char* price, const char* cls, const char* avail, const char* req,
+                         const char* rn) {
+            fx_reset();
+            c->x = 0; c->y = 0; c->w = 500; c->h = 400; c->axis.pos = 0; c->count = 1; c->index[0] = 1; c->stamps[0] = 0;
+            c->hot = -1; c->pressed = 0;
+            CshUpgrade* u1 = W.set->items[1];
+            u1->req_class = allowed ? 0 : 9;
+            u1->price = 1234;
+            strcpy(u1->requires, W.upg_names[2]);
+            W.set->count = W.nupg;
+            uint8_t* info = (uint8_t*)(uintptr_t)S_INFO;
+            info[0x1c + 1] = 0;
+            *(int32_t*)(info + 0x124) = 1;
+            UI_GP(const char, S_UP_NAMES + 4) = "the upgrade";
+            UI_GP(const char, S_UP_NAMES + 8) = rn;
+            UI_GP(const char, S_UP_DESCS + 4) = d;
+            UI_GU32(0x005d5c74) = U(price); UI_GU32(0x005d5c84) = U(cls); UI_GU32(0x005d5ca4) = U(avail); UI_GU32(0x005d5cb4) = U(req);
+        };
+        for (int allowed = 0; allowed < 2; allowed++) {
+            const char* d = words(4095);
+            const char* pr = mk(0, 'p', 5000);
+            const char* cl = mk(1, 'k', 5000);
+            const char* av = mk(2, 'a', 5000);
+            const char* rq = mk(3, 'q', 5000);
+            const char* rn = mk(4, 'n', 5000);
+            setup(allowed != 0, d, pr, cl, av, rq, rn);
+            mem_save(g_snap);
+            r = fx_run(f, true, args);
+            const char* what = allowed ? "allowed" : "not allowed";
+            sprintf(m, "UpgradeCatalog::Draw, a 4095-character description and 5000-character translations (%s): a clean return", what);
+            fx_check(fx_clean(f, r), m, &r);
+            const std::string e_price = first((std::string(pr) + ": $1234").c_str(), 4095);
+            const std::string e_state = allowed ? first(av, 4095) : first((std::string("Rookie ") + cl).c_str(), 4095);
+            const std::string e_req = first((std::string(rq) + " " + rn).c_str(), 4095);
+            bool fd = false, fp_ = false, fs = false, fr = false;
+            for (size_t k = 0; k < g_fx_draws.size(); k++) {
+                const std::string& t = g_fx_draws[k];
+                if (g_fx_draw_style[k] == 0x13 && t.size() == 4095) {  // the description, wrapped (spaces to newlines) whole
+                    bool same = true;
+                    for (size_t i = 0; i < t.size() && same; i++) same = t[i] == d[i] || (d[i] == ' ' && t[i] == '\n');
+                    fd |= same;
+                }
+                fp_ |= t == e_price;
+                fs |= t == e_state;
+                fr |= t == e_req;
+            }
+            sprintf(m, "UpgradeCatalog::Draw (%s): the description drawn whole, the price, state and requirement lines their first "
+                       "4095 characters (%d %d %d %d)", what, fd, fp_, fs, fr);
+            fx_check(fd && fp_ && fs && fr, m);
+            o = fx_outside(g_snap, {{(void*)(uintptr_t)S_GX_CANVAS, 4}, {(void*)(uintptr_t)S_MONEY, 0x40}});
+            sprintf(m, "UpgradeCatalog::Draw (%s): nothing written but the current canvas and the money text", what);
+            fx_check(o == 0, m, 0, o);
+        }
+        // the boundaries, at the original's own 2 KB: a description and lines of 2047 characters
+        for (int allowed = 0; allowed < 2; allowed++) {
+            setup(allowed != 0, words(2047), mk(0, 'p', 2040), mk(1, 'k', 2040), mk(2, 'a', 2047), mk(3, 'q', 1000), mk(4, 'n', 1046));
+            fx_same(f, args, allowed ? "UpgradeCatalog::Draw, texts of 2047 characters (allowed)" : "UpgradeCatalog::Draw, texts of 2047 characters (not allowed)");
+        }
+    }
+
+    printf("the fix build: %d directed checks (%d boundary cases on both), %d failed\n", g_fx_n, g_fx_same_n, g_fx_bad);
+    return g_fx_bad;
+}
+#endif
+
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
@@ -1296,11 +1729,12 @@ int main(int argc, char** argv) {
     long long checks = 0, poisoned_checks = 0, log_words = 0;
     int differ = 0, fp_bad = 0, faults = 0, pure_n = 0, replay_n = 0, changed_fns = 0, still_fns = 0, bad_fns = 0;
     long long both_fault = 0, fp_checked = 0;
+    int fixed_rounds = 0, fixed_bad = 0;                           // (the fix build: rounds kept out, a fixed case)
     for (int fi = 0; fi < g_nfns; fi++) {
         const Ent& f = g_fns[fi];
         if (only && !strstr(f.name, only)) continue;
         bool fn_bad = false, fn_changed = false;
-        int fn_faults = 0, fn_checks = 0, fn_fpck = 0;
+        int fn_faults = 0, fn_checks = 0, fn_fpck = 0, fn_fixed = 0;
         int cover[N_COVER] = {};
         const int nr = is_modal(f.name) ? rounds : rounds * 10;
         for (int rd = 0; rd < nr && !fn_bad; rd++) {
@@ -1316,7 +1750,23 @@ int main(int argc, char** argv) {
             fp.n = 0; fp.replay_only = 0; fp.pure = false;
             f.fp(fp, words);
             mem_save(g_snap);
+            g_overran = false;
             const Result ro = run(f, false, words);
+#if CAREER_FIXES
+            if (g_overran && !strcmp(f.name, "UpgradeSummary::Draw")) {   // a fixed case: the rewrite clean (or faulting
+                mem_load(g_snap);                                          // just where the original did)
+                const Result rf = run(f, true, words);
+                fixed_rounds++;
+                fn_fixed++;
+                if (rd == 0) { pure_n += fp.pure; replay_n += fp.replay_only != 0; }
+                if (rf.fault && !(ro.fault && ro.code == rf.code && ro.eip == rf.eip)) {
+                    printf("  %08x %s: round %d, a fixed case: the rewrite faulted (%08x at %08x)\n", f.v10, f.name, rd, rf.code, rf.eip);
+                    fixed_bad++;
+                    fn_bad = true;
+                }
+                continue;
+            }
+#endif
             const bool changed = mem_diff(g_snap) != 0;
             fn_changed |= changed;
             if (!fp.replay_only && !ro.fault) {
@@ -1407,6 +1857,8 @@ int main(int argc, char** argv) {
                     printf(" %c%c%c%c %d", (char)(k_cover[c] >> 24), (char)(k_cover[c] >> 16), (char)(k_cover[c] >> 8), (char)k_cover[c], cover[c]);
             printf("\n");
         }
+        if (fn_fixed) printf("  %08x %s: %d rounds reached a fixed case (kept out of the comparison; the rewrite clean in each, or "
+                             "faulting just where the original did)\n", f.v10, f.name, fn_fixed);
         if (differ >= 40) { printf("stopping after 40 differences\n"); break; }
     }
     mem_load(g_pristine);
@@ -1415,5 +1867,14 @@ int main(int argc, char** argv) {
            "(%lld in both, the same way); %d functions bad\n", g_nfns, pure_n, replay_n, g_nfns - pure_n - replay_n, dup, checks,
            poisoned_checks, fp_checked, log_words, differ, fp_bad, faults, both_fault, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
-    return differ || fp_bad || dup ? 1 : 0;
+    int fix_bad = 0;
+#if CAREER_FIXES
+    printf("the fix build: %d rounds reached a fixed case (kept out of the comparison), %d where the rewrite faulted\n", fixed_rounds,
+           fixed_bad);
+    if (!only) fix_bad = directed_fix_tests();
+#endif
+#if !CAREER_FIXES
+    (void)fixed_rounds; (void)fixed_bad;
+#endif
+    return differ || fp_bad || dup || fix_bad || fixed_bad ? 1 : 0;
 }

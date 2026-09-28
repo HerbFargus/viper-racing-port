@@ -22,13 +22,18 @@
 // number), undo_cb (the painting's three canvases), flip / mirror (the cut brush), zoom_cb (the zoom and the scroll
 // axes), make_mip (its output).
 //
-// FIX CANDIDATEs (left faithful, marked in place): paint_begin copies the car's name into its 32-byte static unbounded
-// (a name of 32 or more characters runs over the brush number and on); default_cb formats "<car>.cvs" into 0x20 bytes
-// (28 or more characters); decal_cb reads decals.tab into a viewer of 64 sets with no bound (65 or more rows overrun
-// the frame), divides by each set's decal count (a 0 faults) and shows the set last shown whether or not the table still
-// has it (DecalViewer::Create); the save paths are formatted into 0x104 bytes (a user
-// folder of ~240 characters); PaintKitInstallPaintJobs formats car names into 0x20 bytes (26 or more characters). No
-// ordinary play reaches any of them: the car list's names are short, decals.tab has a few rows with counts.
+// Fixes (// FIX:, docs/FIXES.md "Paint kit"; none reached with the stock cars and a game folder of ordinary length):
+// PaintKitDo doesn't open the paint kit on a car whose name is over 31 characters, and paint_begin keeps the name to its
+// 32-byte static; default_cb's "<car>.cvs" and PaintKitInstallPaintJobs' "<car>.cvs" / "~<car>.tex" have room for any
+// such name; a path ("<user directory>paint\<car>.cvs" and the rest) too long for the game's 0x104-byte buffers isn't
+// built or used -- the save and the installer's .tex files are skipped and logged, as a failed write is, export and
+// import answer with their error boxes; decal_cb's translation key for a decals.tab name of 238 or more characters is cut
+// to fit its 0x100 bytes (no translation: the set shows "?!?"). Every other input gives the original's bits.
+//
+// FIX CANDIDATEs (left faithful, marked in place): decal_cb reads decals.tab into a viewer of 64 sets with no bound (65
+// or more rows overrun the frame), divides by each set's decal count (a 0 faults) and shows the set last shown whether
+// or not the table still has it (DecalViewer::Create). No ordinary play reaches any of them: decals.tab has a few rows
+// with counts.
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -86,7 +91,18 @@ static void fp_modal_i(Footprint& f, int32_t) { f.replay_only = "runs a dialog (
 // =================================================================================================================================
 // PaintKitDo, paint_begin, paint_end
 // =================================================================================================================================
+// FIX: the car's name is kept in a 32-byte static (paint_begin), and every file the paint kit opens or writes is named
+// from it ("<car>.car", "<car>.tex", "<car>0.mod", "paint\<car>.cvs", "<car>.cvs"): a name over 31 characters overran the
+// static (the brush number and the paint kit's other statics after it), and cut it would name none of the car's files --
+// its painting would be saved under another name. The root's car list holds names of 31 at most (RaceBegin's FIX), so
+// only another caller could pass one; the paint kit isn't opened for it (the log says so) and the caller carries on as
+// after a paint kit closed. Any other name opens it as before.
+static const char k_fix_long_car[] = "PaintKitDo: the car's name is too long for the paint kit: %.40s...";
 static void __cdecl PaintKitDo_n(const char* car, int32_t paint) {
+    if (VP_FIX && pk_len(car, PK_CAR_MAX) > PK_CAR_MAX) {
+        UI_LogReport(k_fix_long_car, car);
+        return;
+    }
     ccall<void>(F_paint_begin, car);
     ccall<void>(F_paint_main, paint);
     ccall<void>(F_paint_end, car);
@@ -97,9 +113,11 @@ PORT_FN(0x004c62d0, "PaintKitDo", PaintKitDo_n, fp_PaintKitDo)
 // paint_begin: the car's name kept (is it the viper?), its texture made, its resources and model loaded, the camera
 static void __cdecl paint_begin_n(const char* car) {
     char buf[0x104];
-    // FIX CANDIDATE: the name copied into its 0x20-byte static unbounded -- 32 characters or more run over the brush
-    // number (0x500980) and the rest of the paint kit's statics (the car list's names are short: ordinary play can't)
-    crt_strcpy((char*)PK_P(S_CAR), car);
+    // FIX: the name was copied into its 0x20-byte static unbounded -- 32 characters or more ran over the brush number
+    // (0x500980) and the rest of the paint kit's statics. It keeps its first 31 characters. (PaintKitDo, its one caller,
+    // doesn't come here with a longer name: cut, it would name none of the car's files.) One that fits is copied as before.
+    if (VP_FIX) uit::ui_copy_bounded((char*)PK_P(S_CAR), car, PK_CAR_MAX + 1);
+    else crt_strcpy((char*)PK_P(S_CAR), car);
     UI_G8(S_IS_VIPER) = (uint8_t)(ccall<int>(F_stricmp, PK_CP(S_CAR), PK_CP(0x005009dc)) == 0 ? 1 : 0);    // "viper"
     UI_sprintf(buf, PK_CP(0x005009e4), PK_CP(S_CAR));                                                    // "%s.tex"
     UI_G32(S_TEXTURE) = ccall<int32_t>(F_gxCreateTexture, (char*)buf, (int32_t)0, (int32_t)0x100);
@@ -276,13 +294,39 @@ static __forceinline void save_painting(SaveFrame& fr) {
     }
     g->dirty = 0;
     cc_dirty(g);
-    UI_sprintf(fr.path, PK_CP(0x00500e10), user_dir());                                    // "%spaint"
-    ccall<uint8_t>(F_FileCreateDirectory, (const char*)fr.path);
-    // FIX CANDIDATE: the paths are formatted into 0x104 bytes unbounded (a user folder of ~240 characters; the game takes
-    // at most 200)
+    // FIX: the paths were formatted into the frame's 0x104 bytes unbounded: a user directory of about 240 characters (the
+    // DLL's is at most 200, "<game folder>\Config\"; a longer game folder keeps the original's literal) ran over the
+    // frame. A path too long for them isn't built: the paint folder isn't made (its own path too long), and the save stops
+    // as when the painting can't be written -- "Can't create <path>" in the log (cut to what the log takes), the painting
+    // still marked changed, no .tex written (back, answered yes, then leaves as after a failed write). (The .tex path is
+    // shorter than the .cvs one, so it always fits when that did.) A path that fits is built as before.
+    {
+        const char* u = user_dir();
+        if (!(VP_FIX && pk_path_too_long(u, 5))) {
+            UI_sprintf(fr.path, PK_CP(0x00500e10), u);                                     // "%spaint"
+            ccall<uint8_t>(F_FileCreateDirectory, (const char*)fr.path);
+        }
+    }
     const int32_t paint = g->paint;
-    if (UI_G8(S_IS_VIPER) != 0) UI_sprintf(fr.path, PK_CP(0x00500d6c), user_dir(), paint);           // "%spaint\\paint%d.cvs"
-    else UI_sprintf(fr.path, PK_CP(0x00500d5c), user_dir(), PK_CP(S_CAR));                            // "%spaint\\%s.cvs"
+    if (UI_G8(S_IS_VIPER) != 0) {
+        const char* u = user_dir();
+        if (VP_FIX && pk_path_too_long(u, 15 + pk_dec_len(paint))) {                   // FIX: (above)
+            char rest[0x20];
+            UI_sprintf(rest, PK_CP(0x00500d6c), PK_CP(S_EMPTY), paint);
+            pk_log_path(S_CANT_CREATE_SAVE, u, rest);
+            return;
+        }
+        UI_sprintf(fr.path, PK_CP(0x00500d6c), u, paint);                                  // "%spaint\\paint%d.cvs"
+    } else {
+        const char* u = user_dir();
+        if (VP_FIX && pk_path_too_long(u, 10 + pk_len(PK_CP(S_CAR), PK_PATH_MAX))) {    // FIX: (above)
+            char rest[0x60], cut[0x41];
+            UI_sprintf(rest, PK_CP(0x00500d5c), PK_CP(S_EMPTY), pk_cut(PK_CP(S_CAR), cut));
+            pk_log_path(S_CANT_CREATE_SAVE, u, rest);
+            return;
+        }
+        UI_sprintf(fr.path, PK_CP(0x00500d5c), u, PK_CP(S_CAR));                           // "%spaint\\%s.cvs"
+    }
     if (!ccall<uint8_t>(F_gxCanvasWrite, &g->canvas, (const char*)fr.path)) {
         UI_LogReport(PK_CP(0x00500de4), (const char*)fr.path);                            // "Can't create %s"
         return;
@@ -327,18 +371,22 @@ PORT_FN(0x004c7060, "exit_cb", exit_cb_n, fp_modal_i)
 
 // default_cb: "restore the default?" -- the car's own painting (as PaintKitCanvas::Default, inlined)
 static uint8_t __cdecl default_cb_n(int32_t) {
-    char buf[0x20];
+    char buf[VP_FIX ? 0x40 : 0x20];                                                         // FIX: below
     pk_xl_once(S_DEFAULT_ONCE, 1, 0x005d4358, 0x00500b94, 0x004c7620);                    // "Titles:RestoreDefault"
     pk_xl_once(S_DEFAULT_ONCE, 2, 0x005d42a8, 0x00500bac, 0x004c7610);                    // "PaintKit:AreYouSure"
     const char* q = xlate(0x005d42a8);
     const char* t = xlate(0x005d4358);
     if (!ccall<uint8_t>(F_UIDoYesNoBox, t, q, (const void*)0)) return 0;
     PaintKitCanvas* g = pk_g();
-    // FIX CANDIDATE: the name formatted into 0x20 bytes (the frame's return address right after them): a car name of
-    // 28 characters or more (as PaintKitCanvas::Default)
+    // FIX: "<car>.cvs" went into 0x20 bytes of the frame (its return address right after them): a car name of 28 to 31
+    // characters (S_CAR holds 31) overran it. The name has 0x40 bytes now, room for it whole -- cut, it would name another
+    // painting or none. A name too long even for them (S_CAR unterminated, a damaged static) is taken as a car with no
+    // default painting: the painting is cleared, as for any such car. (As PaintKitCanvas::Default.)
+    bool named = true;
     if (UI_G8(S_IS_VIPER) != 0) UI_sprintf(buf, PK_CP(0x00500da4), g->paint);              // "paint%d.cvs"
+    else if (VP_FIX && pk_len(PK_CP(S_CAR), sizeof buf - 5) > sizeof buf - 5) named = false;
     else UI_sprintf(buf, PK_CP(0x00500d9c), PK_CP(S_CAR));                                // "%s.cvs"
-    if (ccall<uint8_t>(F_ResourceExists, (const char*)buf)) {
+    if (named && ccall<uint8_t>(F_ResourceExists, (const char*)buf)) {
         gxCanvas* c = ccall<gxCanvas*>(F_gxCanvasGet, (const char*)buf);
         set_canvas(&g->canvas);
         ccall<void>(F_gxClear, UI_GU32(S_CLEAR));
@@ -677,7 +725,18 @@ static uint8_t __cdecl decal_cb_n(int32_t) {
             // FIX CANDIDATE: a set of 0 decals (a damaged decals.tab) divides by zero
             s->h = s->canvas->h / s->count;
             const char* e = ccall<const char*>(F_StringTableGetEntry, (const void*)st, row, (int32_t)1);
-            UI_sprintf(fr.buf, PK_CP(0x00500e18), e);                                        // "Paintkit:DecalSet:%s"
+            // FIX: the set's key, "Paintkit:DecalSet:<column 1>", went into the frame's 0x100 bytes unbounded: a decals.tab
+            // name of 238 or more characters (a mod's) ran over the decal viewer after it. Such a name is cut to its
+            // first 216 characters, a key of 234: no language file has it, so Xlate gives its "?!?" and the picker's
+            // title shows that (its "Can't XLAT" warning, with the key, still fits a log line). A name that fits (a null
+            // one too) is formatted as before.
+            if (VP_FIX && e && pk_len(e, 0xed) > 0xed) {
+                char cut[0xd9];
+                uit::ui_copy_bounded(cut, e, sizeof cut);
+                UI_sprintf(fr.buf, PK_CP(0x00500e18), (const char*)cut);                     // "Paintkit:DecalSet:%s"
+            } else {
+                UI_sprintf(fr.buf, PK_CP(0x00500e18), e);                                    // "Paintkit:DecalSet:%s"
+            }
             s->name = ccall<const char*>(F_Xlate, (const char*)fr.buf);
         } while (v->count > i);
     }
@@ -755,8 +814,17 @@ static void __cdecl PaintKitInstallPaintJobs_n() {
         ccall<void>(F_gxAllocCanvas, &fr.tex, (int32_t)0x100, (int32_t)0x100, (int32_t)4);
         set_canvas(&fr.tex);
         paste(&fr.cv, 0, 0);
-        UI_sprintf(fr.buf, PK_CP(0x00500cdc), user_dir(), i);                               // "%spaint%d.tex"
-        ccall<uint8_t>(F_write_tex, &fr.tex, (const char*)fr.buf);
+        {
+            const char* u = user_dir();
+            if (VP_FIX && pk_path_too_long(u, 9 + pk_dec_len(i))) {                    // FIX: (below)
+                char rest[0x20];
+                UI_sprintf(rest, PK_CP(0x00500cdc), PK_CP(S_EMPTY), i);
+                pk_log_path(S_CANT_CREATE_TEX, u, rest);
+            } else {
+                UI_sprintf(fr.buf, PK_CP(0x00500cdc), u, i);                               // "%spaint%d.tex"
+                ccall<uint8_t>(F_write_tex, &fr.tex, (const char*)fr.buf);
+            }
+        }
         ccall<void>(F_gxFreeCanvas, &fr.tex);
         ccall<void>(F_gxCanvasForget, c);
     }
@@ -764,18 +832,44 @@ static void __cdecl PaintKitInstallPaintJobs_n() {
     if (ccall<int32_t>(F_GetMaxCarFileNames) > 0) {
         do {
             const char* car = ccall<const char*>(F_GetCarFileName, k);
-            // FIX CANDIDATE: the car's name formatted into 0x20 bytes: "<car>.cvs" / "~<car>.tex" of 26 or more characters
-            // run over (the car list's names are short: ordinary play can't)
-            UI_sprintf(fr.cvs, PK_CP(0x00500cec), car);                                     // "%s.cvs"
-            if (ccall<uint8_t>(F_ResourceExists, (const char*)fr.cvs)) {
-                UI_sprintf(fr.tilde, PK_CP(0x00500cf4), car);                               // "~%s.tex"
-                if (!ccall<uint8_t>(F_ResourceExists, (const char*)fr.tilde)) {
-                    gxCanvas* c = ccall<gxCanvas*>(F_gxCanvasGet, (const char*)fr.cvs);
+            // FIX: "<car>.cvs" and "~<car>.tex" went into 0x20 bytes of the frame each, one after the other and then the
+            // path's buffer: a car name of 27 (28 for the .cvs) to 31 characters (the car list's most) ran each into the
+            // next, so "~<car>.tex" then wrote over the .cvs name's end and the painting was fetched by a name run on into
+            // the texture's. Such a name is built in 0x40 bytes of the rewrite's instead, whole -- cut, it would name
+            // another car's files. A name longer still (a damaged car list) is passed over, as a car with no painting is.
+            // A name that fits is built where it was.
+            char* cvs = fr.cvs;
+            char* tilde = fr.tilde;
+            char big_cvs[0x40], big_tilde[0x40];
+            if (VP_FIX && pk_len(car, 0x1a) > 0x1a) {
+                if (pk_len(car, 0x3a) > 0x3a) {
+                    k++;
+                    continue;
+                }
+                cvs = big_cvs;
+                tilde = big_tilde;
+            }
+            UI_sprintf(cvs, PK_CP(0x00500cec), car);                                        // "%s.cvs"
+            if (ccall<uint8_t>(F_ResourceExists, (const char*)cvs)) {
+                UI_sprintf(tilde, PK_CP(0x00500cf4), car);                                  // "~%s.tex"
+                if (!ccall<uint8_t>(F_ResourceExists, (const char*)tilde)) {
+                    gxCanvas* c = ccall<gxCanvas*>(F_gxCanvasGet, (const char*)cvs);
                     ccall<void>(F_gxAllocCanvas, &fr.tex, (int32_t)0x100, (int32_t)0x100, (int32_t)4);
                     set_canvas(&fr.tex);
                     paste(c, 0, 0);
-                    UI_sprintf(fr.buf, PK_CP(0x00500cfc), user_dir(), car);                  // "%s%s.tex"
-                    ccall<uint8_t>(F_write_tex, &fr.tex, (const char*)fr.buf);
+                    // FIX: "<user directory><car>.tex" (and the viper's "<user directory>paint<n>.tex" above) went into
+                    // the frame's 0x104 bytes unbounded (a user directory of about 250 characters). A path too long for
+                    // them isn't built: the texture isn't written, and the log says so as write_tex does for a file it
+                    // can't create ("Can't create <path>", cut). A path that fits is built as before.
+                    const char* u = user_dir();
+                    if (VP_FIX && pk_path_too_long(u, 4 + pk_len(car, PK_PATH_MAX))) {
+                        char rest[0x50], cut[0x41];
+                        UI_sprintf(rest, PK_CP(0x00500cfc), PK_CP(S_EMPTY), pk_cut(car, cut));
+                        pk_log_path(S_CANT_CREATE_TEX, u, rest);
+                    } else {
+                        UI_sprintf(fr.buf, PK_CP(0x00500cfc), u, car);                     // "%s%s.tex"
+                        ccall<uint8_t>(F_write_tex, &fr.tex, (const char*)fr.buf);
+                    }
                     ccall<void>(F_gxFreeCanvas, &fr.tex);
                     ccall<void>(F_gxCanvasForget, c);
                 }
@@ -883,9 +977,15 @@ static uint8_t __cdecl export_cb_n(int32_t) {
     PaintKitCanvas* g = pk_g();
     pk_xl_once(S_EXPORT_ONCE, 1, 0x005d5df0, 0x00500e84, 0x004cbd10);                     // "PaintKit:Export"
     pk_xl_once(S_EXPORT_ONCE, 2, 0x005d5de0, 0x00500e6c, 0x004cbd00);                     // "PaintKit:ExportError"
+    // FIX: "<user directory>paint\paint.tga" went into the frame's 0x104 bytes unbounded (a user directory of about 245
+    // characters). A path too long for them isn't built, and the export fails as when the file can't be written: the
+    // error box. (The viper's mask is still pasted, as before a failed write.) A path that fits is built as before.
+    bool too_long = false;
     {
         const int32_t paint = g->paint;
-        UI_sprintf(buf, PK_CP(0x00500e58), user_dir(), paint);                            // "%spaint\\paint.tga" (the number unused)
+        const char* u = user_dir();
+        too_long = VP_FIX && pk_path_too_long(u, 15);
+        if (!too_long) UI_sprintf(buf, PK_CP(0x00500e58), u, paint);                      // "%spaint\\paint.tga" (the number unused)
     }
     gxCanvas* const cv = &g->canvas;
     set_canvas(cv);
@@ -894,7 +994,7 @@ static uint8_t __cdecl export_cb_n(int32_t) {
         paste_alpha(m, 0, 0);
         ccall<void>(F_gxCanvasForget, m);
     }
-    if (!ccall<uint8_t>(F_WriteTGA, cv, (const char*)buf)) {
+    if (too_long || !ccall<uint8_t>(F_WriteTGA, cv, (const char*)buf)) {
         const char* e = xlate(0x005d5de0);
         const char* t = xlate(0x005d5df0);
         ccall<void>(F_UIDoOkBox, t, e);
@@ -909,14 +1009,19 @@ static uint8_t __cdecl import_cb_n(int32_t) {
     PaintKitCanvas* g = pk_g();
     pk_xl_once(S_IMPORT_ONCE, 1, 0x005d5dd0, 0x00500eac, 0x004cbd30);                     // "PaintKit:Import"
     pk_xl_once(S_IMPORT_ONCE, 2, 0x005d5dc0, 0x00500e94, 0x004cbd20);                     // "PaintKit:ImportError"
+    // FIX: (as export_cb) a path too long for the 0x104 bytes isn't built, and the import fails as when the file can't be
+    // read: the error box, the painting saved for undo and marked changed first, as before a failed read.
+    bool too_long = false;
     {
         const int32_t paint = g->paint;
-        UI_sprintf(buf, PK_CP(0x00500e58), user_dir(), paint);                            // "%spaint\\paint.tga"
+        const char* u = user_dir();
+        too_long = VP_FIX && pk_path_too_long(u, 15);
+        if (!too_long) UI_sprintf(buf, PK_CP(0x00500e58), u, paint);                      // "%spaint\\paint.tga"
     }
     set_canvas(&g->undo);
     paste(&g->canvas, 0, 0);
     g->modified = 1;
-    if (ccall<uint8_t>(F_ReadTGA, &g->canvas, (const char*)buf)) {
+    if (!too_long && ccall<uint8_t>(F_ReadTGA, &g->canvas, (const char*)buf)) {
         dirty_all(g);
         g->modified = 1;
         return 0;

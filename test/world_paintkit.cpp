@@ -6,11 +6,11 @@
 //        /Fo<dir>\ /Fe<dir>\world_paintkit.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86 /STACK:0x800000
 //   run:   world_paintkit.exe [rounds] [seed]          (VP_TRACE=1: one line per function; VP_ONLY=text: those only;
 //          VP_DEBUG_WORLD=1: the world's objects and every fault's registers)
+//     (and with /DVP_PAINT_FIXES: the fix build, below)
 //
 // Loads out\race_v10.exe at 0x400000 the way test/world_menu_view.cpp does (a child process with the range reserved) and
 // includes the three rewrite files with PORT_FN redefined to list each function (its v1.0 address, the rewrite, its calling
-// convention, stack arguments and return, its footprint). VP_FAITHFUL: the rewrites exactly as the originals (the paint kit
-// has no fixes: its FIX CANDIDATEs are left faithful).
+// convention, stack arguments and return, its footprint). VP_FAITHFUL: the rewrites exactly as the originals.
 //
 // The world. Once: the $E static initialisers of libraries ui and paintkit (their Xlators, colours), the game's UIBegin
 // (the styles); a car list for the root's GetCarFileName / GetMaxCarFileNames (the originals run); the car "viper"; then the
@@ -49,6 +49,18 @@
 // UICustomControl::Dirty / AddNotification / AddItems, gxSetClip / gxRestoreClip, the matrix functions, GetCarFileName /
 // GetMaxCarFileNames, and every function of this group (each rewrite is checked against its original with the same
 // callees).
+//
+// Built with /DVP_PAINT_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Paint kit").
+// Every function is still compared as above; a round that reaches a fixed case -- a car name over 31 characters handed to
+// PaintKitDo or paint_begin, S_CAR (or a car list name) too long for the original's 0x20-byte names, a path too long for
+// the 0x104-byte buffers, a decal set's name of 256 or more characters (or one that can't be read to its end) shown by
+// DecalViewer, a decals.tab name of 238 or more characters read by decal_cb -- is kept out of the comparison and counted, the rewrite still run on it and required to return cleanly.
+// (The random states never make one: the cars are short, the user directory 22 characters, the sets' names short.) Then
+// directed_fix_tests: for each fix, the bad case run on the rewrite alone -- no fault, the bytes popped and ebx / esi /
+// edi / ebp kept, nothing written outside what it may write (every other byte of .data/.bss/.idata and the arena compared
+// with before), and the result the fix promises (the names the stubs are handed, the log's text, the buffer's bytes) --
+// and its boundary case (the longest input that fits) on both, compared bit for bit. Without it (VP_FAITHFUL) every
+// rewrite must match its original bit for bit.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -57,12 +69,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
+#ifndef VP_PAINT_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#define PAINT_FIXES 0
+#else
+#define PAINT_FIXES 1               // the fix build (above)
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------------
@@ -297,6 +315,20 @@ static bool in_arena(const void* p, uint32_t n) {
     return a >= (uintptr_t)g_arena && e <= (uint64_t)(uintptr_t)g_arena + ARENA_BYTES;
 }
 static uint32_t P(const void* p) { return on_stack((uint32_t)(uintptr_t)p) ? 'STAK' : (uint32_t)(uintptr_t)p; }
+// (the fix tests: the names and texts the stubs are handed, recorded while g_fx_rec is on)
+struct FxNote { uint32_t tag; char s[0x400]; };
+static FxNote g_fx_notes[96];
+static int g_fx_nn;
+static bool g_fx_rec;
+static void fx_note(uint32_t tag, const char* s) {
+    if (!g_fx_rec || g_fx_nn >= 96) return;
+    FxNote& r = g_fx_notes[g_fx_nn++];
+    r.tag = tag;
+    int i = 0;
+    if (s && readable(s, 1))
+        for (; i < 0x3ff && readable(s + i, 1) && s[i]; i++) r.s[i] = s[i];
+    r.s[i] = 0;
+}
 static void LS(const char* s, int max = 0x400) {
     if (!s || !readable(s, 1)) { L('BADS'); L((uint32_t)(uintptr_t)s); return; }
     uint32_t w = 0;
@@ -363,7 +395,19 @@ static void L_va(const char* fmt, const uint32_t* w) {
     }
     for (int i = 0; i < nw && i < 16; i++) L(on_stack(w[i]) ? 'STAK' : w[i]);
 }
-static void __cdecl stub_LogReport(const char* fmt, ...) { L('LOGR'); va_list ap; va_start(ap, fmt); L_va(fmt, (const uint32_t*)ap); va_end(ap); }
+static void __cdecl stub_LogReport(const char* fmt, ...) {
+    L('LOGR');
+    va_list ap;
+    va_start(ap, fmt);
+    L_va(fmt, (const uint32_t*)ap);
+    if (g_fx_rec && fmt && readable(fmt, 1)) {                     // (the fix tests: the message as the game would print it)
+        static char m[0x800];
+        _vsnprintf(m, sizeof m - 1, fmt, ap);
+        m[sizeof m - 1] = 0;
+        fx_note('LOGR', m);
+    }
+    va_end(ap);
+}
 static void __cdecl stub_LogPanic(const char* fmt, ...) { L('PANC'); va_list ap; va_start(ap, fmt); L_va(fmt, (const uint32_t*)ap); va_end(ap); }
 static int __cdecl stub_SingleBegin(const char* s) { L('SBEG'); LS(s); return 0x5151; }
 static void __cdecl stub_SingleEnd(int h, const char*, int) { L('SEND'); L((uint32_t)h); }
@@ -575,6 +619,7 @@ static void __cdecl stub_mrEndFrame() { L('MREF'); }
 // the resource canvases (gxCanvasGet): one per name, made on first use in the heap, sized by the name
 static gxCanvas* __cdecl stub_gxCanvasGet(const char* name) {
     L('CGET'); LS(name);
+    fx_note('CGET', name);
     const uint32_t h = hash_str(name);
     // a name's canvas: brushes small squares, the colour bar 50 x 162, the shading and mask 256 x 256, decals 32 wide
     int32_t w = 16 + (int32_t)(h % 48), hh = 16 + (int32_t)((h >> 8) % 48);
@@ -592,9 +637,13 @@ static gxCanvas* __cdecl stub_gxCanvasGet(const char* name) {
     return c;
 }
 static void __cdecl stub_gxCanvasForget(gxCanvas* c) { L('CFGT'); L(P(c)); }
-static uint8_t __cdecl stub_gxCanvasRead(gxCanvas* c, const char* name) { L('CRD '); L(P(c)); LS(name); return (uint8_t)HS->canvas_read_ok; }
-static uint8_t __cdecl stub_gxCanvasWrite(const gxCanvas* c, const char* name) { L('CWR '); L(P(c)); LS(name); return (uint8_t)HS->canvas_write_ok; }
-static int32_t __cdecl stub_gxCreateTexture(const char* name, int32_t a, int32_t b) { L('CTEX'); LS(name); L((uint32_t)a); L((uint32_t)b); return 0x70 + HS->tex_next++; }
+static uint8_t __cdecl stub_gxCanvasRead(gxCanvas* c, const char* name) { L('CRD '); L(P(c)); LS(name); fx_note('CRD ', name); return (uint8_t)HS->canvas_read_ok; }
+static uint8_t __cdecl stub_gxCanvasWrite(const gxCanvas* c, const char* name) { L('CWR '); L(P(c)); LS(name); fx_note('CWR ', name); return (uint8_t)HS->canvas_write_ok; }
+static int32_t __cdecl stub_gxCreateTexture(const char* name, int32_t a, int32_t b) {
+    L('CTEX'); LS(name); L((uint32_t)a); L((uint32_t)b);
+    fx_note('CTEX', name);
+    return 0x70 + HS->tex_next++;
+}
 static void __cdecl stub_gxDestroyTexture(int32_t t) { L('DTEX'); L((uint32_t)t); }
 static uint8_t __cdecl stub_gxGrabTexture(int32_t t, gxCanvas* c) {
     L('GTEX'); L((uint32_t)t); L(P(c));
@@ -614,7 +663,7 @@ static void __cdecl stub_mrPopState() { L('MRPO'); }
 static void __cdecl stub_mrEnable(int32_t f) { L('MREN'); L((uint32_t)f); }
 static void __cdecl stub_mrModelEnvMap(uint8_t on) { L('MREM'); L(on); }
 static void __cdecl stub_mrModelDraw(int32_t m, const void* fr) { L('MRDR'); L((uint32_t)m); L_block(fr, 12); }
-static int32_t __cdecl stub_mrModelLoad(const char* name) { L('MRLD'); LS(name); return 0x300 + HS->model_next++; }
+static int32_t __cdecl stub_mrModelLoad(const char* name) { L('MRLD'); LS(name); fx_note('MRLD', name); return 0x300 + HS->model_next++; }
 static void __cdecl stub_mrModelUnload(int32_t m) { L('MRUL'); L((uint32_t)m); }
 
 // ---- stubs: text, files, resources ------------------------------------------------------------------------------------------------
@@ -631,7 +680,7 @@ static void __fastcall stub_xlate(uint32_t* xl, int) {
     xl[1] = (uint32_t)(uintptr_t)xl_text(xl[0]);
     xl[2] = UI_GU32(S_XLATOR_COOKIE);
 }
-static const char* __cdecl stub_Xlate(const char* s) { L('XLTE'); LS(s); return k_xl_text[hash_str(s) % 16]; }
+static const char* __cdecl stub_Xlate(const char* s) { L('XLTE'); LS(s); fx_note('XLTE', s); return k_xl_text[hash_str(s) % 16]; }
 static int __cdecl stub_sprintf(char* buf, const char* fmt, ...) {
     L('SPRF'); L(P(buf)); LS(fmt);
     va_list ap;
@@ -651,6 +700,7 @@ static int __cdecl stub_sprintf(char* buf, const char* fmt, ...) {
     const int r = vsprintf(buf, fmt, ap);
     va_end(ap);
     LS(buf);
+    fx_note('SPRF', buf);
     return r;
 }
 static void __cdecl stub_LocaleConvertNumeric(char* s) { L('LCNV'); LS(s); }
@@ -668,8 +718,8 @@ static void __cdecl stub_FileFindClose(void* h) { L('FFC '); L((uint32_t)(uintpt
 static uint8_t __cdecl stub_ClipboardGetText(char* buf, int n) { L('CLIP'); if (n > 0) buf[0] = 0; return 0; }
 // the files: handles by the round; writes logged by their bytes' hash; reads a TGA header (matching the canvas, or with
 // one field off) and rows of a pattern
-static int32_t __cdecl stub_FileCreate(const char* name) { L('FCRE'); LS(name); return HS->file_ok ? 0x1234 : 0; }
-static int32_t __cdecl stub_FileOpen(const char* name) { L('FOPN'); LS(name); return HS->file_ok ? 0x2345 : 0; }
+static int32_t __cdecl stub_FileCreate(const char* name) { L('FCRE'); LS(name); fx_note('FCRE', name); return HS->file_ok ? 0x1234 : 0; }
+static int32_t __cdecl stub_FileOpen(const char* name) { L('FOPN'); LS(name); fx_note('FOPN', name); return HS->file_ok ? 0x2345 : 0; }
 static void __cdecl stub_FileClose(int32_t* fd) { L('FCLS'); L((uint32_t)*fd); *fd = 0; }
 static uint8_t __cdecl stub_FileWrite(int32_t fd, const void* p, int32_t n) {
     L('FWRT'); L((uint32_t)fd); L((uint32_t)n); L(hash_bytes(p, (uint32_t)(n > 0 ? n : 0)));
@@ -700,22 +750,25 @@ static uint8_t __cdecl stub_FileReadExact(int32_t fd, void* p, int32_t n) {
     for (int32_t i = 0; i < n; i++) b[i] = (uint8_t)((i * 37) ^ HS->reads ^ (int32_t)HS->pix_seed);
     return 1;
 }
-static uint8_t __cdecl stub_FileCreateDirectory(const char* name) { L('FCDR'); LS(name); return 1; }
-static char g_user_dir[64] = "C:\\Games\\Viper\\Config\\";
+static uint8_t __cdecl stub_FileCreateDirectory(const char* name) { L('FCDR'); LS(name); fx_note('FCDR', name); return 1; }
+static char g_user_dir[0x104] = "C:\\Games\\Viper\\Config\\";          // (the game's is 0x104 bytes)
 static const char* __cdecl stub_Win32GetUserDirectory() { L('UDIR'); return g_user_dir; }
 static uint8_t __cdecl stub_ResourceExists(const char* name) {
     L('REXI'); LS(name);
+    fx_note('REXI', name);
     const uint32_t h = hash_str(name) ^ HS->res_mask;
     return (uint8_t)((h >> 3) % 5 != 0);                           // (4 in 5 exist)
 }
-static void __cdecl stub_ResourceSetMustLoad(const char* s) { L('RSML'); LS(s); }
+static void __cdecl stub_ResourceSetMustLoad(const char* s) { L('RSML'); LS(s); fx_note('RSML', s); }
 static void __cdecl stub_ResourceSetUnload(const char* s) { L('RSUL'); LS(s); }
 static uint8_t g_table[4];
 static void* __cdecl stub_StringTableGet(const char* name) { L('STGT'); LS(name); return g_table; }
 static int32_t __cdecl stub_StringTableNumRows(const void* t) { L('STNR'); L(P(t)); return HS->rows; }
 static char g_entries[8][2][24];
+static const char* g_fx_entry1;                                    // (the fix tests: every row's column 1)
 static const char* __cdecl stub_StringTableGetEntry(const void* t, int32_t row, int32_t col) {
     L('STEN'); L(P(t)); L((uint32_t)row); L((uint32_t)col);
+    if (col == 1 && g_fx_entry1) return g_fx_entry1;
     char* e = g_entries[(uint32_t)row & 7][col & 1];
     if (col == 0) sprintf(e, "%d", HS->counts[(uint32_t)row & 7]);
     else sprintf(e, "Set%d", row);
@@ -1348,6 +1401,611 @@ static bool is_modal(const char* nm) {
     return false;
 }
 
+#if PAINT_FIXES
+// ---- the fix build: rounds kept out of the comparison ------------------------------------------------------------------------
+// s's length, looking at most max + 1 characters; ~0 if it can't be read to its end (or that far)
+static uint32_t fx_len(const char* s, uint32_t max) {
+    for (uint32_t i = 0; i <= max; i++) {
+        if (!readable(s + i, 1)) return ~0u;
+        if (!s[i]) return i;
+    }
+    return max + 1;
+}
+static uint32_t fx_dec_len(int32_t v) { char t[16]; return (uint32_t)sprintf(t, "%d", v); }
+// (before the original runs) a round that reaches a fixed case, where the original would overrun (or the fix gives up)
+static bool fx_pre_case(const Ent& f, const uint32_t* w) {
+    const char* nm = f.name;
+    const uint32_t* a = f.fast ? w + 2 : w;
+    const uint32_t ud = fx_len(g_user_dir, 0x103), car = fx_len(PK_CP(S_CAR), 0x103);
+    const bool viper = UI_G8(S_IS_VIPER) != 0;
+    auto path_long = [&](uint32_t tail) { return ud == ~0u || ud + tail > 0x103; };
+    if (!strcmp(nm, "PaintKitDo") || !strcmp(nm, "paint_begin")) return fx_len((const char*)(uintptr_t)a[0], 0x1f) > 0x1f;
+    if (!strcmp(nm, "PaintKitCanvas::Default") || !strcmp(nm, "default_cb")) return !viper && car > 0x1b;
+    if (!strcmp(nm, "PaintKitCanvas::PaintKitCanvas"))
+        return viper ? path_long(15 + fx_dec_len((int32_t)a[0])) : car == ~0u || path_long(10 + car);
+    if (!strcmp(nm, "save_cb") || !strcmp(nm, "exit_cb")) {
+        const PaintKitCanvas* g = UI_GP(PaintKitCanvas, S_CANVAS);
+        const int32_t paint = g && readable(g, sizeof *g) ? g->paint : 0;
+        return path_long(5) || (viper ? path_long(15 + fx_dec_len(paint)) : car == ~0u || path_long(10 + car));
+    }
+    if (!strcmp(nm, "export_cb") || !strcmp(nm, "import_cb")) return path_long(15);
+    if (!strcmp(nm, "decal_cb")) return g_fx_entry1 && fx_len(g_fx_entry1, 0xed) > 0xed;   // (the stub's names: "Set<n>")
+    if (!strcmp(nm, "PaintKitInstallPaintJobs")) {
+        if (path_long(10)) return true;
+        const char* list = UI_GP(const char, 0x00504340);
+        const int32_t n = UI_G32(0x00504344);
+        for (int32_t k = 0; k < n && k < 64; k++) {
+            const uint32_t c = fx_len(list + 32 * k, 0x103);
+            if (c == ~0u || c > 0x1a || path_long(4 + c)) return true;
+        }
+        return false;
+    }
+    if (!strcmp(nm, "DecalViewer::NextSet") || !strcmp(nm, "DecalViewer::PrevSet") || !strcmp(nm, "DecalViewer::Create")) {
+        const DecalViewer* v = !strcmp(nm, "DecalViewer::Create") ? (const DecalViewer*)(uintptr_t)w[0] : UI_GP(DecalViewer, S_DECAL_VIEWER);
+        if (!v || !readable(v, sizeof *v)) return false;
+        int32_t k = UI_G32(S_DECAL_SET);
+        if (!strcmp(nm, "DecalViewer::NextSet")) { k = (int32_t)((uint32_t)k + 1); if (!(v->count > k)) k = 0; }
+        if (!strcmp(nm, "DecalViewer::PrevSet")) { k = (int32_t)((uint32_t)k - 1); if (k < 0) k = (int32_t)((uint32_t)v->count - 1); }
+        const DecalSet* s = &v->sets[k];
+        if (!readable(s, sizeof *s)) return false;                   // (both fault reading the set)
+        const char* name = s->name;
+        if (!readable(name, 1)) return false;                        // (both fault on its first byte)
+        return fx_len(name, 0xff) > 0xff;
+    }
+    return false;
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+// The rewrite alone (the original would overrun there -- this program's stack or the paint kit's statics among what it would
+// take), from the pristine world with the case set up: it must return cleanly (no fault, the bytes popped, ebx / esi / edi /
+// ebp kept), write nothing outside what it may (every other byte of .data/.bss/.idata and the arena compared with before)
+// and give what the fix promises. Each fix's boundary case (the longest input that fits) runs on the original and the
+// rewrite from the same state and must give the same memory, call logs and result.
+static int g_fx_bad, g_fx_n, g_fx_same_n;
+static const Ent& fx_fn(const char* name) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, name)) return g_fns[i];
+    printf("  fix test: %s isn't listed\n", name);
+    fflush(stdout);
+    ExitProcess(4);
+}
+struct Span { const void* p; uint32_t n; };
+// the first byte that changed since `before` outside the spans (the stubs' state block aside); 0 if none
+static uint32_t fx_outside(const Mem& before, std::initializer_list<Span> ok) {
+    auto in = [&](const uint8_t* q) {
+        for (const Span& sp : ok)
+            if (q >= (const uint8_t*)sp.p && q < (const uint8_t*)sp.p + sp.n) return true;
+        return false;
+    };
+    for (uint32_t i = 0; i < DATA_BYTES; i++)
+        if (before.data[i] != DATA[i] && !in(DATA + i)) return 0x004e1000 + i;
+    for (uint32_t i = 0; i < IDATA_BYTES; i++)
+        if (before.idata[i] != IDATA[i] && !in(IDATA + i)) return 0x005d7000 + i;
+    for (uint32_t i = sizeof(HState); i < ARENA_BYTES; i++)
+        if (before.arena[i] != g_arena[i] && !in(g_arena + i)) return U(g_arena + i);
+    return 0;
+}
+static Result fx_run(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w) {
+    uint32_t words[72] = {};
+    int i = 0;
+    for (uint32_t x : w) words[i++] = x;
+    g_pc = _PC_53;
+    return run(f, rewrite, words);
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0, uint32_t where = 0) {
+    g_fx_n++;
+    if (ok) return;
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, popped %u, ebx esi edi ebp %08x %08x %08x %08x)", r->fault, r->code, r->eip, r->pops, r->regs[0],
+                  r->regs[1], r->regs[2], r->regs[3]);
+    if (where) printf(" (wrote %08x)", where);
+    printf("\n");
+}
+static bool fx_logged(uint32_t tag) {
+    for (uint32_t i = 0; i < g_log.n && i < LOG_MAX; i++)
+        if (g_log.w[i] == tag) return true;
+    return false;
+}
+static const FxNote* fx_note_of(uint32_t tag, int nth = 0) {
+    for (int i = 0; i < g_fx_nn; i++)
+        if (g_fx_notes[i].tag == tag && nth-- == 0) return &g_fx_notes[i];
+    return 0;
+}
+static int fx_notes(uint32_t tag) {
+    int n = 0;
+    for (int i = 0; i < g_fx_nn; i++) n += g_fx_notes[i].tag == tag;
+    return n;
+}
+static bool fx_noted(uint32_t tag, const char* s) {
+    for (int i = 0; i < g_fx_nn; i++)
+        if (g_fx_notes[i].tag == tag && !strcmp(g_fx_notes[i].s, s)) return true;
+    return false;
+}
+static CallLog g_fx_log;
+// the original and the rewrite from the same state: the rewrite clean; the same return, memory and call logs
+static void fx_same(const Ent& f, std::initializer_list<uint32_t> w, const char* what) {
+    g_fx_same_n++;
+    mem_save(g_snap);
+    const Result ro = fx_run(f, false, w);
+    mem_save(g_after);
+    memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+    mem_load(g_snap);
+    const Result rn = fx_run(f, true, w);
+    char m[256];
+    sprintf(m, "%s: a clean return", what);
+    fx_check(fx_clean(f, rn), m, &rn);
+    sprintf(m, "%s: the original's result, bit for bit", what);
+    const uint32_t where = mem_diff(g_after);
+    const bool same = !ro.fault && where == 0 && ro.ret == rn.ret && g_log.n == g_fx_log.n &&
+                      !memcmp(g_log.w, g_fx_log.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+    fx_check(same, m, &ro, where);
+}
+// a function of the game patched to a stub for a test (the box a callback opens), put back after
+struct FxPatch {
+    uint32_t at;
+    uint8_t old[5];
+    FxPatch(uint32_t a, void* to) : at(a) { memcpy(old, (void*)(uintptr_t)a, 5); patch_jmp(a, to); }
+    ~FxPatch() { memcpy((void*)(uintptr_t)at, old, 5); }
+};
+static uint8_t __cdecl stub_fx_yes(const char* t, const char* q, const void*) { L('YES '); LS(t); LS(q); return 1; }
+static void __cdecl stub_fx_okbox(const char* t, const char* e) { L('OKBX'); LS(t); LS(e); }
+
+static const char k_fx_ud[] = "C:\\Games\\Viper\\Config\\";
+// the tests' world: pristine; the stubs answering plainly; the viper in the paint kit, the user directory as ever
+static void fx_reset() {
+    mem_load(g_pristine);
+    strcpy(g_user_dir, k_fx_ud);
+    HS->time = 0; HS->frames = 0; HS->frame_limit = 40; HS->script_n = HS->script_pos = 0;
+    HS->res_mask = 0; HS->scan = 0; HS->tex_ok = 1; HS->file_ok = 1; HS->writes = 0; HS->write_fail_at = -1; HS->reads = 0;
+    HS->read_fail_at = -1; HS->hdr_w = 256; HS->hdr_h = 256; HS->hdr_bad = 0; HS->canvas_read_ok = 0; HS->canvas_write_ok = 1;
+    UI_GP(PaintKitCanvas, S_CANVAS) = W.g;
+    UI_GP(gxCanvas, S_GX_CANVAS) = W.screen;
+    UI_GP(WidgetWindow, S_ACTIVE) = W.win;
+    UI_GP(DecalViewer, S_DECAL_VIEWER) = W.decal;
+    strcpy((char*)PK_P(S_CAR), "viper");
+    UI_G8(S_IS_VIPER) = 1;
+    W.g->modified = 1;
+    W.g->paint = 3;
+    g_fx_nn = 0;
+}
+// a name of n characters (k picks the buffer): letters, from `first`
+static char g_fx_str[6][0x200];
+static const char* fx_str(int k, int n, char first = 'a') {
+    char* s = g_fx_str[k];
+    for (int i = 0; i < n && i < 0x1ff; i++) s[i] = (char)(first + i % 26);
+    s[n < 0x1ff ? n : 0x1ff] = 0;
+    return s;
+}
+// a user directory of n characters ("C:\uuu...\")
+static void fx_user_dir(int n) {
+    strcpy(g_user_dir, "C:\\");
+    for (int i = 3; i < n - 1; i++) g_user_dir[i] = 'u';
+    g_user_dir[n - 1] = '\\';
+    g_user_dir[n] = 0;
+}
+static std::string fx_cat(const char* a, const char* b, const char* c = "") { return std::string(a) + b + c; }
+// does the ResourceExists stub say `name` exists, with this mask?
+static bool fx_exists(const char* name, uint32_t mask) {
+    static char t[0x400];                                        // (hash_str reads only memory readable() knows)
+    strncpy(t, name, sizeof t - 1);
+    return ((hash_str(t) ^ mask) >> 3) % 5 != 0;
+}
+// a mask for which each name exists (`want` true) or not
+static uint32_t fx_mask(std::initializer_list<std::pair<std::string, bool>> want) {
+    for (uint32_t m = 1; m < 1000000; m++) {
+        bool ok = true;
+        for (auto& p : want) ok &= fx_exists(p.first.c_str(), m) == p.second;
+        if (ok) return m;
+    }
+    printf("  fix test: no resource mask found\n");
+    return 0;
+}
+static uint8_t* heap_end() { return g_arena + HS->heap_next; }
+// "Can't create " and the path's first characters: the log line a skipped path gives (within LogReport's 0x100 bytes)
+static bool fx_cant_create(const FxNote* l, const std::string& path) {
+    if (!l || strncmp(l->s, "Can't create ", 13) || strlen(l->s) >= 0xff) return false;
+    const size_t n = strlen(l->s + 13);
+    return n == (path.size() < 200 ? path.size() : 200) && !strncmp(l->s + 13, path.c_str(), n);
+}
+
+static int directed_fix_tests() {
+    char m[512];
+    const Span gx = {PK_P(S_GX_CANVAS), 4};
+    // ---- 1. PaintKitDo: a car name over 31 characters -- the paint kit isn't opened ----
+    {
+        const Ent& f = fx_fn("PaintKitDo");
+        for (int n : {32, 300}) {
+            fx_reset();
+            const char* car = fx_str(0, n);
+            mem_save(g_snap);
+            g_fx_rec = true;
+            const Result r = fx_run(f, true, {U(car), 3});
+            g_fx_rec = false;
+            sprintf(m, "PaintKitDo, a car name of %d characters: a clean return", n);
+            fx_check(fx_clean(f, r), m, &r);
+            const uint32_t o = fx_outside(g_snap, {});
+            sprintf(m, "PaintKitDo, a car name of %d characters: nothing written", n);
+            fx_check(o == 0, m, 0, o);
+            sprintf(m, "PaintKitDo, a car name of %d characters: the paint kit not opened (no load, no texture, no dialog)", n);
+            fx_check(!fx_logged('RSML') && !fx_logged('CTEX') && !fx_logged('MRLD') && !fx_logged('TIME') && !fx_logged('SPRF'), m);
+            const FxNote* l = fx_note_of('LOGR');
+            sprintf(m, "PaintKitDo, a car name of %d characters: logged, within LogReport's 0x100 bytes (\"%s\")", n, l ? l->s : "");
+            fx_check(l && strstr(l->s, "too long") && strstr(l->s, std::string(car, n < 40 ? n : 40).c_str()) && strlen(l->s) < 0xff, m);
+        }
+        fx_reset();
+        HS->canvas_read_ok = 1;                                     // (the painting read: the original Default not run)
+        fx_same(f, {U(fx_str(0, 31)), 3}, "PaintKitDo, a car name of 31 characters");
+        fx_reset();
+        fx_same(f, {U("viper"), 3}, "PaintKitDo, the viper");
+    }
+    // ---- 1. paint_begin: the name keeps to S_CAR's 32 bytes ----
+    {
+        const Ent& f = fx_fn("paint_begin");
+        for (int n : {32, 33, 300}) {
+            fx_reset();
+            const char* car = fx_str(0, n);
+            mem_save(g_snap);
+            g_fx_rec = true;
+            const Result r = fx_run(f, true, {U(car)});
+            g_fx_rec = false;
+            sprintf(m, "paint_begin, a car name of %d characters: a clean return", n);
+            fx_check(fx_clean(f, r), m, &r);
+            const uint32_t o = fx_outside(g_snap, {{PK_P(S_CAR), 0x20}, {PK_P(S_IS_VIPER), 1}, {PK_P(S_TEXTURE), 4}, {PK_P(S_MODEL), 4},
+                                                   {PK_P(S_CAMERA), 0x30}});
+            sprintf(m, "paint_begin, a car name of %d characters: nothing written past S_CAR's 32 bytes (the brush number on)", n);
+            fx_check(o == 0, m, 0, o);
+            const std::string cut = std::string(car, 31);
+            sprintf(m, "paint_begin, a car name of %d characters: S_CAR holds its first 31, terminated; the names built from it", n);
+            fx_check(!memcmp(PK_P(S_CAR), car, 31) && UI_G8(S_CAR + 31) == 0 && fx_noted('CTEX', (cut + ".tex").c_str()) &&
+                         fx_noted('RSML', (cut + ".car").c_str()) && fx_noted('MRLD', (cut + "0.mod").c_str()),
+                     m);
+        }
+        fx_reset();
+        fx_same(f, {U(fx_str(0, 31))}, "paint_begin, a car name of 31 characters");
+    }
+    // ---- 2 / 4. PaintKitCanvas::Default and default_cb: "<car>.cvs" whole ----
+    {
+        const Ent& fd = fx_fn("PaintKitCanvas::Default");
+        const Ent& fc = fx_fn("default_cb");
+        for (int which = 0; which < 2; which++) {
+            const Ent& f = which ? fc : fd;
+            FxPatch yes(F_UIDoYesNoBox, (void*)&stub_fx_yes);
+            for (int n : {28, 31}) {
+                fx_reset();
+                const char* car = fx_str(0, n);
+                strcpy((char*)PK_P(S_CAR), car);
+                UI_G8(S_IS_VIPER) = 0;
+                const std::string cvs = fx_cat(car, ".cvs");
+                HS->res_mask = fx_mask({{cvs, true}});
+                uint8_t* heap = heap_end();
+                mem_save(g_snap);
+                g_fx_rec = true;
+                const Result r = which ? fx_run(f, true, {0}) : fx_run(f, true, {U(W.g), 0});
+                g_fx_rec = false;
+                sprintf(m, "%s, a car name of %d characters: a clean return", f.name, n);
+                fx_check(fx_clean(f, r), m, &r);
+                const uint32_t o = fx_outside(g_snap, {{W.g, sizeof(PaintKitCanvas)}, {W.g->widget, sizeof(CustomWidget)}, gx,
+                                                       {heap, (uint32_t)(g_arena + ARENA_BYTES - heap)}, {PK_P(S_DEFAULT_ONCE), 1},
+                                                       {PK_P(0x005d4358), 0xc}, {PK_P(0x005d42a8), 0xc}});
+                sprintf(m, "%s, a car name of %d characters: nothing written outside the canvas, its widget and the heap", f.name, n);
+                fx_check(o == 0, m, 0, o);
+                sprintf(m, "%s, a car name of %d characters: the painting looked up and fetched as \"%s\"", f.name, n, cvs.c_str());
+                fx_check(fx_noted('REXI', cvs.c_str()) && fx_noted('CGET', cvs.c_str()) && W.g->modified == 1, m);
+            }
+            // S_CAR unterminated (a damaged static): no name, the painting cleared
+            {
+                fx_reset();
+                memset(PK_P(S_CAR), 'x', 0x40);
+                UI_G8(S_IS_VIPER) = 0;
+                uint8_t* heap = heap_end();
+                mem_save(g_snap);
+                g_fx_rec = true;
+                const Result r = which ? fx_run(f, true, {0}) : fx_run(f, true, {U(W.g), 0});
+                g_fx_rec = false;
+                sprintf(m, "%s, S_CAR run on for 64 bytes: a clean return", f.name);
+                fx_check(fx_clean(f, r), m, &r);
+                const uint32_t o = fx_outside(g_snap, {{W.g, sizeof(PaintKitCanvas)}, {W.g->widget, sizeof(CustomWidget)}, gx,
+                                                       {heap, (uint32_t)(g_arena + ARENA_BYTES - heap)}, {PK_P(S_DEFAULT_ONCE), 1},
+                                                       {PK_P(0x005d4358), 0xc}, {PK_P(0x005d42a8), 0xc}});
+                sprintf(m, "%s, S_CAR run on for 64 bytes: nothing written outside the canvas, its widget and the heap", f.name);
+                fx_check(o == 0, m, 0, o);
+                sprintf(m, "%s, S_CAR run on for 64 bytes: no painting looked up, the painting cleared", f.name);
+                fx_check(!fx_logged('REXI') && !fx_logged('CGET') && fx_logged('CLR ') && W.g->modified == 1, m);
+            }
+            for (int n : {27, 5}) {
+                fx_reset();
+                strcpy((char*)PK_P(S_CAR), fx_str(0, n));
+                UI_G8(S_IS_VIPER) = 0;
+                HS->res_mask = fx_mask({{fx_cat(fx_str(0, n), ".cvs"), true}});
+                sprintf(m, "%s, a car name of %d characters", f.name, n);
+                if (which) fx_same(f, {0}, m);
+                else fx_same(f, {U(W.g), 0}, m);
+            }
+            fx_reset();
+            if (which) fx_same(f, {0}, "default_cb, the viper");
+            else fx_same(f, {U(W.g), 0}, "PaintKitCanvas::Default, the viper");
+        }
+    }
+    // ---- 3 / 5. PaintKitInstallPaintJobs: "<car>.cvs" / "~<car>.tex" whole; paths too long skipped ----
+    {
+        const Ent& f = fx_fn("PaintKitInstallPaintJobs");
+        char* list = W.carlist;
+        auto set_list = [&](std::initializer_list<const char*> cars) {
+            int k = 0;
+            for (const char* c : cars) { memset(list + 32 * k, 0, 32); strcpy(list + 32 * k, c); k++; }
+            UI_G32(0x00504344) = k;
+        };
+        {
+            fx_reset();
+            const std::string c31 = fx_str(0, 31), c27 = fx_str(1, 27, 'k');
+            set_list({"viper", c31.c_str(), c27.c_str(), "cobra"});
+            HS->res_mask = fx_mask({{"~paint0.tex", false}, {c31 + ".cvs", true}, {"~" + c31 + ".tex", false}, {c27 + ".cvs", true},
+                                    {"~" + c27 + ".tex", false}});
+            uint8_t* heap = heap_end();
+            mem_save(g_snap);
+            g_fx_rec = true;
+            const Result r = fx_run(f, true, {});
+            g_fx_rec = false;
+            fx_check(fx_clean(f, r), "PaintKitInstallPaintJobs, cars of 31 and 27 characters: a clean return", &r);
+            const uint32_t o = fx_outside(g_snap, {gx, {heap, (uint32_t)(g_arena + ARENA_BYTES - heap)}});
+            fx_check(o == 0, "PaintKitInstallPaintJobs, cars of 31 and 27 characters: nothing written but the heap", 0, o);
+            for (const std::string* c : {&c31, &c27}) {
+                sprintf(m, "PaintKitInstallPaintJobs, a car of %u characters: \"<car>.cvs\" fetched, \"~<car>.tex\" looked up, the "
+                           "texture written to the user directory, all whole", (unsigned)c->size());
+                fx_check(fx_noted('REXI', (*c + ".cvs").c_str()) && fx_noted('CGET', (*c + ".cvs").c_str()) &&
+                             fx_noted('REXI', ("~" + *c + ".tex").c_str()) && fx_noted('FCRE', fx_cat(k_fx_ud, c->c_str(), ".tex").c_str()),
+                         m);
+            }
+        }
+        {   // a car list name run on past 58 characters (a damaged list): passed over
+            fx_reset();
+            char* e = list + 32;
+            set_list({"viper", "cobra", "gts"});
+            memset(e, 'z', 64);                                        // (entries 1 and 2 run together, then "gts"'s)
+            HS->res_mask = fx_mask({{"~paint0.tex", false}, {"viper.cvs", true}, {"~viper.tex", false}});
+            uint8_t* heap = heap_end();
+            mem_save(g_snap);
+            g_fx_rec = true;
+            const Result r = fx_run(f, true, {});
+            g_fx_rec = false;
+            fx_check(fx_clean(f, r), "PaintKitInstallPaintJobs, a car list name of 64+ characters: a clean return", &r);
+            const uint32_t o = fx_outside(g_snap, {gx, {heap, (uint32_t)(g_arena + ARENA_BYTES - heap)}});
+            fx_check(o == 0, "PaintKitInstallPaintJobs, a car list name of 64+ characters: nothing written but the heap", 0, o);
+            bool none = true;
+            for (int i = 0; i < g_fx_nn; i++) none &= strstr(g_fx_notes[i].s, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz") == 0;
+            fx_check(none && fx_noted('FCRE', fx_cat(k_fx_ud, "viper", ".tex").c_str()),
+                     "PaintKitInstallPaintJobs, a car list name of 64+ characters: passed over, the other cars installed");
+        }
+        {   // the user directory too long for the paths
+            fx_reset();
+            fx_user_dir(252);
+            set_list({"viper", "cobra"});
+            HS->res_mask = fx_mask({{"~paint0.tex", false}, {"~paint5.tex", false}, {"cobra.cvs", true}, {"~cobra.tex", false}});
+            uint8_t* heap = heap_end();
+            mem_save(g_snap);
+            g_fx_rec = true;
+            const Result r = fx_run(f, true, {});
+            g_fx_rec = false;
+            fx_check(fx_clean(f, r), "PaintKitInstallPaintJobs, a user directory of 252 characters: a clean return", &r);
+            const uint32_t o = fx_outside(g_snap, {gx, {heap, (uint32_t)(g_arena + ARENA_BYTES - heap)}});
+            fx_check(o == 0, "PaintKitInstallPaintJobs, a user directory of 252 characters: nothing written but the heap", 0, o);
+            bool logs = fx_notes('LOGR') >= 3;
+            for (int i = 0; i < g_fx_nn; i++)
+                if (g_fx_notes[i].tag == 'LOGR' && strcmp(g_fx_notes[i].s, "Installing paint jobs..."))
+                    logs &= fx_cant_create(&g_fx_notes[i], std::string(g_user_dir) + (strstr(g_fx_notes[i].s, "cobra") ? "cobra.tex" : "paint"));
+            fx_check(!fx_logged('FCRE') && logs && fx_note_of('LOGR') && fx_cant_create(fx_note_of('LOGR', 1), fx_cat(g_user_dir, "paint0.tex")),
+                     "PaintKitInstallPaintJobs, a user directory of 252 characters: no texture written, each logged (\"Can't create "
+                     "<path>\", cut)");
+            // (the log line's path: "Can't create " and the directory and "paint0.tex", cut to 200 characters)
+        }
+        {
+            fx_reset();
+            set_list({"viper", fx_str(0, 26), "cobra"});
+            HS->res_mask = fx_mask({{"~paint0.tex", false}, {fx_cat(fx_str(0, 26), ".cvs"), true}, {fx_cat("~", fx_str(0, 26), ".tex"), false}});
+            fx_same(f, {}, "PaintKitInstallPaintJobs, cars of 26 characters and less");
+            fx_reset();
+            fx_user_dir(249);
+            set_list({"viper", "cobra", "gts", "zr1", "rt10"});
+            HS->res_mask = fx_mask({{"~paint0.tex", false}, {"~paint8.tex", false}, {"cobra.cvs", true}, {"~cobra.tex", false}});
+            fx_same(f, {}, "PaintKitInstallPaintJobs, a user directory of 249 characters (paths of 259)");
+        }
+    }
+    // ---- 5. save_cb: paths too long for the 0x104 bytes -- the save skipped and logged ----
+    {
+        const Ent& f = fx_fn("save_cb");
+        struct { int ud; bool viper; bool dir; } cases[] = {{250, false, true}, {258, false, false}, {250, true, true}, {258, true, false}};
+        for (auto& c : cases) {
+            fx_reset();
+            fx_user_dir(c.ud);
+            strcpy((char*)PK_P(S_CAR), "cobra");
+            UI_G8(S_IS_VIPER) = c.viper ? 1 : 0;
+            W.g->modified = 1;
+            uint8_t* heap = heap_end();
+            mem_save(g_snap);
+            g_fx_rec = true;
+            const Result r = fx_run(f, true, {0});
+            g_fx_rec = false;
+            sprintf(m, "save_cb, %s, a user directory of %d characters: a clean return", c.viper ? "the viper" : "cobra", c.ud);
+            fx_check(fx_clean(f, r), m, &r);
+            const uint32_t o = fx_outside(g_snap, {{W.g, sizeof(PaintKitCanvas)}, {W.g->widget, sizeof(CustomWidget)}, gx,
+                                                   {heap, (uint32_t)(g_arena + ARENA_BYTES - heap)}});
+            sprintf(m, "save_cb, %s, a user directory of %d characters: nothing written outside the canvas and its widget",
+                    c.viper ? "the viper" : "cobra", c.ud);
+            fx_check(o == 0, m, 0, o);
+            const std::string path = std::string(g_user_dir) + (c.viper ? "paint\\paint3.cvs" : "paint\\cobra.cvs");
+            sprintf(m, "save_cb, %s, a user directory of %d characters: the folder %s, nothing written, the painting still changed, "
+                       "\"Can't create <path>\" logged",
+                    c.viper ? "the viper" : "cobra", c.ud, c.dir ? "made" : "not made (too long too)");
+            fx_check((c.dir ? fx_noted('FCDR', fx_cat(g_user_dir, "paint").c_str()) : !fx_logged('FCDR')) && !fx_logged('CWR ') &&
+                         !fx_logged('FCRE') && W.g->modified == 1 && fx_notes('LOGR') == 1 && fx_cant_create(fx_note_of('LOGR'), path),
+                     m);
+        }
+        for (int viper = 0; viper < 2; viper++) {
+            fx_reset();
+            fx_user_dir(viper ? 243 : 244);
+            strcpy((char*)PK_P(S_CAR), "cobra");
+            UI_G8(S_IS_VIPER) = (uint8_t)viper;
+            fx_same(f, {0}, viper ? "save_cb, the viper, a path of 259 characters" : "save_cb, cobra, a path of 259 characters");
+        }
+    }
+    // ---- 5. export_cb / import_cb: the path too long -- their error boxes ----
+    {
+        FxPatch box(F_UIDoOkBox, (void*)&stub_fx_okbox);
+        for (int imp = 0; imp < 2; imp++) {
+            const Ent& f = fx_fn(imp ? "import_cb" : "export_cb");
+            fx_reset();
+            fx_user_dir(250);
+            W.g->modified = 0;
+            uint8_t* heap = heap_end();
+            mem_save(g_snap);
+            g_fx_rec = true;
+            const Result r = fx_run(f, true, {0});
+            g_fx_rec = false;
+            sprintf(m, "%s, a user directory of 250 characters: a clean return", f.name);
+            fx_check(fx_clean(f, r), m, &r);
+            const uint32_t o = fx_outside(g_snap, {{W.g, sizeof(PaintKitCanvas)}, gx, {heap, (uint32_t)(g_arena + ARENA_BYTES - heap)},
+                                                   {PK_P(imp ? S_IMPORT_ONCE : S_EXPORT_ONCE), 1},
+                                                   {PK_P(imp ? 0x005d5dd0 : 0x005d5df0), 0xc}, {PK_P(imp ? 0x005d5dc0 : 0x005d5de0), 0xc}});
+            sprintf(m, "%s, a user directory of 250 characters: nothing written outside the canvas", f.name);
+            fx_check(o == 0, m, 0, o);
+            sprintf(m, "%s, a user directory of 250 characters: no file opened, the error box shown%s", f.name,
+                    imp ? ", the painting saved for undo and marked changed" : "");
+            fx_check(!fx_logged('FCRE') && !fx_logged('FOPN') && fx_logged('OKBX') && (!imp || (fx_logged('PAST') && W.g->modified == 1)), m);
+            fx_reset();
+            fx_user_dir(244);
+            sprintf(m, "%s, a path of 259 characters", f.name);
+            fx_same(f, {0}, m);
+        }
+    }
+    // ---- 5. PaintKitCanvas::PaintKitCanvas: the painting's path too long -- the default painting ----
+    {
+        const Ent& f = fx_fn("PaintKitCanvas::PaintKitCanvas");
+        for (int viper = 0; viper < 2; viper++) {
+            fx_reset();
+            fx_user_dir(250);
+            strcpy((char*)PK_P(S_CAR), "cobra");
+            UI_G8(S_IS_VIPER) = (uint8_t)viper;
+            HS->canvas_read_ok = 1;
+            memset(W.scratch, 0, 0x1000);
+            uint8_t* heap = heap_end();
+            mem_save(g_snap);
+            g_fx_rec = true;
+            const Result r = fx_run(f, true, {U(W.scratch), 0, 3});
+            g_fx_rec = false;
+            sprintf(m, "PaintKitCanvas::PaintKitCanvas, %s, a user directory of 250 characters: a clean return", viper ? "the viper" : "cobra");
+            fx_check(fx_clean(f, r), m, &r);
+            const uint32_t o = fx_outside(g_snap, {{W.scratch, 0x1000}, gx, {heap, (uint32_t)(g_arena + ARENA_BYTES - heap)},
+                                                   {PK_P(0x00500960), 0x44}, {PK_P(0x005d4260), 0x1ba0}});
+            sprintf(m, "PaintKitCanvas::PaintKitCanvas, %s, a user directory of 250 characters: nothing written outside the object, "
+                       "the paint kit's statics and the heap", viper ? "the viper" : "cobra");
+            fx_check(o == 0, m, 0, o);
+            const char* cvs = viper ? "paint3.cvs" : "cobra.cvs";
+            sprintf(m, "PaintKitCanvas::PaintKitCanvas, %s, a user directory of 250 characters: no painting read, the default one (%s) "
+                       "looked up", viper ? "the viper" : "cobra", cvs);
+            fx_check(!fx_logged('CRD ') && fx_noted('REXI', cvs), m);
+        }
+        for (int viper = 0; viper < 2; viper++) {
+            fx_reset();
+            fx_user_dir(viper ? 243 : 244);
+            strcpy((char*)PK_P(S_CAR), "cobra");
+            UI_G8(S_IS_VIPER) = (uint8_t)viper;
+            memset(W.scratch, 0, 0x1000);
+            fx_same(f, {U(W.scratch), 0, 3}, viper ? "PaintKitCanvas::PaintKitCanvas, the viper, a path of 259 characters"
+                                                  : "PaintKitCanvas::PaintKitCanvas, cobra, a path of 259 characters");
+        }
+    }
+    // ---- 6. DecalViewer: a set's name of 256 or more characters -- its first 255 ----
+    {
+        static char longname[0x200], fits[0x100];
+        for (int i = 0; i < 0x1ff; i++) longname[i] = (char)('A' + i % 26);
+        longname[0x1ff] = 0;
+        memcpy(fits, longname, 0xff);
+        fits[0xff] = 0;
+        const char* const fns[] = {"DecalViewer::NextSet", "DecalViewer::PrevSet", "DecalViewer::Create"};
+        for (const char* fn : fns) {
+            const Ent& f = fx_fn(fn);
+            const bool create = !strcmp(fn, "DecalViewer::Create");
+            const int32_t before = !strcmp(fn, "DecalViewer::NextSet") ? 2 : !strcmp(fn, "DecalViewer::PrevSet") ? 4 : 3;
+            for (const char* nm : {(const char*)longname, (const char*)fits}) {
+                fx_reset();
+                W.decal->count = 8;
+                W.decal->sets[3].name = nm;
+                UI_G32(S_DECAL_SET) = before;
+                W.decal->drag = 0x5a;
+                W.decal->_821[0] = 0x11; W.decal->_821[1] = 0x22; W.decal->_821[2] = 0x33;
+                if (nm == fits) {
+                    sprintf(m, "%s, a set name of 255 characters", fn);
+                    if (create) fx_same(f, {U(W.decal), 0}, m);
+                    else fx_same(f, {0}, m);
+                    continue;
+                }
+                uint8_t* heap = heap_end();
+                mem_save(g_snap);
+                const Result r = create ? fx_run(f, true, {U(W.decal), 0}) : fx_run(f, true, {0});
+                sprintf(m, "%s, a set name of 511 characters: a clean return", fn);
+                fx_check(fx_clean(f, r), m, &r);
+                const uint32_t o = fx_outside(g_snap, {{W.decal, sizeof(DecalViewer)}, {W.decal->widget, sizeof(CustomWidget)},
+                                                       {PK_P(S_DECAL_SET), 4}, {heap, (uint32_t)(g_arena + ARENA_BYTES - heap)}});
+                sprintf(m, "%s, a set name of 511 characters: nothing written outside the viewer", fn);
+                fx_check(o == 0, m, 0, o);
+                sprintf(m, "%s, a set name of 511 characters: the title holds its first 255, terminated; the drag flag and the bytes "
+                           "after it untouched", fn);
+                fx_check(UI_G32(S_DECAL_SET) == 3 && !memcmp(W.decal->name, longname, 0xff) && W.decal->name[0xff] == 0 &&
+                             W.decal->drag == 0x5a && W.decal->_821[0] == 0x11 && W.decal->_821[1] == 0x22 && W.decal->_821[2] == 0x33,
+                         m);
+            }
+        }
+    }
+    // ---- 7. decal_cb: a decals.tab name of 238 or more characters -- its key cut, no translation ----
+    {
+        const Ent& f = fx_fn("decal_cb");
+        static char longe[0x200], fits[0x100];
+        for (int i = 0; i < 0x1ff; i++) longe[i] = (char)('a' + i % 26);
+        longe[0x1ff] = 0;
+        memcpy(fits, longe, 0xed);
+        fits[0xed] = 0;
+        for (int n : {238, 511}) {
+            fx_reset();
+            HS->rows = 2;
+            char save = longe[n];
+            longe[n] = 0;
+            g_fx_entry1 = longe;
+            mem_save(g_snap);
+            g_fx_rec = true;
+            const Result r = fx_run(f, true, {0});
+            g_fx_rec = false;
+            g_fx_entry1 = 0;
+            longe[n] = save;
+            sprintf(m, "decal_cb, a decals.tab name of %d characters: a clean return", n);
+            fx_check(fx_clean(f, r), m, &r);
+            const std::string key = std::string("Paintkit:DecalSet:") + std::string(longe, 216);
+            bool keys = fx_notes('XLTE') == 2;
+            for (int i = 0; i < g_fx_nn; i++)
+                if (g_fx_notes[i].tag == 'XLTE') keys &= g_fx_notes[i].s == key;
+            bool within = true;                                      // (every text the game's sprintf made: in its buffer)
+            for (int i = 0; i < g_fx_nn; i++)
+                if (g_fx_notes[i].tag == 'SPRF') within &= strlen(g_fx_notes[i].s) < 0x100;
+            sprintf(m, "decal_cb, a decals.tab name of %d characters: each set's key cut to 234 characters (the name's first 216), "
+                       "nothing formatted past 255, and \"WARNING: Can't XLAT <key>\" would fit a log line", n);
+            fx_check(keys && within && 20 + key.size() < 0xff, m);
+        }
+        fx_reset();
+        HS->rows = 2;
+        g_fx_entry1 = fits;
+        fx_same(f, {0}, "decal_cb, a decals.tab name of 237 characters (a key of 255)");
+        g_fx_entry1 = 0;
+    }
+    fx_reset();
+    printf("fix tests: %d checks (%d run on both, compared bit for bit), %d failed\n", g_fx_n, g_fx_same_n, g_fx_bad);
+    return g_fx_bad;
+}
+#endif
+
 // ---- main -----------------------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -1447,11 +2105,12 @@ int main(int argc, char** argv) {
     long long checks = 0, poisoned_checks = 0, log_words = 0;
     int differ = 0, fp_bad = 0, faults = 0, pure_n = 0, replay_n = 0, changed_fns = 0, still_fns = 0, bad_fns = 0, skipped = 0;
     long long both_fault = 0, fp_checks = 0;
+    int fixed_rounds = 0, fixed_bad = 0;                           // (the fix build: rounds kept out, a fixed case)
     for (int fi = 0; fi < g_nfns; fi++) {
         const Ent& f = g_fns[fi];
         if (only && !strstr(f.name, only)) continue;
         bool fn_bad = false, fn_changed = false;
-        int fn_faults = 0, fn_checks = 0, fn_fpck = 0;
+        int fn_faults = 0, fn_checks = 0, fn_fpck = 0, fn_fixed = 0;
         long long fn_words = 0;
         const int nr = is_modal(f.name) ? rounds : rounds * 10;
         for (int rd = 0; rd < nr && !fn_bad; rd++) {
@@ -1467,6 +2126,20 @@ int main(int argc, char** argv) {
             fp.n = 0; fp.replay_only = 0; fp.pure = false;
             f.fp(fp, words);
             mem_save(g_snap);
+#if PAINT_FIXES
+            if (fx_pre_case(f, words)) {                           // a fixed case: the rewrite alone, a clean return
+                const Result rn = run(f, true, words);
+                fixed_rounds++;
+                fn_fixed++;
+                if (!fx_clean(f, rn)) {
+                    printf("  FIXED CASE %08x %s (round %d): the rewrite didn't return cleanly (fault %d %08x at %08x)\n", f.v10,
+                           f.name, rd, rn.fault, rn.code, rn.eip);
+                    fixed_bad++;
+                    fn_bad = true;
+                }
+                continue;
+            }
+#endif
             const Result ro = run(f, false, words);
             const bool changed = mem_diff(g_snap) != 0;
             fn_changed |= changed;
@@ -1536,9 +2209,9 @@ int main(int argc, char** argv) {
         bad_fns += fn_bad;
         (fn_changed ? changed_fns : still_fns)++;
         if (trace)
-            printf("%08x %-58s %s%s (%d checks, %d with the footprint checked, %d faulted, %lld words logged a check)\n", f.v10, f.name,
-                   fn_bad ? "BAD" : "ok", fn_changed ? "" : " (never changed memory)", fn_checks, fn_fpck, fn_faults,
-                   fn_checks ? fn_words / fn_checks : 0);
+            printf("%08x %-58s %s%s (%d checks, %d with the footprint checked, %d faulted, %lld words logged a check, %d kept out: a"
+                   " fixed case)\n", f.v10, f.name, fn_bad ? "BAD" : "ok", fn_changed ? "" : " (never changed memory)", fn_checks, fn_fpck,
+                   fn_faults, fn_checks ? fn_words / fn_checks : 0, fn_fixed);
         if (differ >= 40) { printf("stopping after 40 differences\n"); break; }
     }
     mem_load(g_pristine);
@@ -1547,5 +2220,13 @@ int main(int argc, char** argv) {
            "both, the same way), %d skipped; %d functions bad\n", g_nfns, pure_n, replay_n, g_nfns - pure_n - replay_n, dup, checks,
            poisoned_checks, fp_checks, log_words, differ, fp_bad, faults, both_fault, skipped, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
+#if PAINT_FIXES
+    printf("the fix build: %d rounds reached a fixed case (kept out of the comparison; the rewrite returned cleanly on %d)\n",
+           fixed_rounds, fixed_rounds - fixed_bad);
+    const int fx_bad = directed_fix_tests();
+    mem_load(g_pristine);
+    return differ || fp_bad || dup || fixed_bad || fx_bad ? 1 : 0;
+#else
     return differ || fp_bad || dup ? 1 : 0;
+#endif
 }

@@ -359,6 +359,106 @@ The command line (the programmers' switches; the game as installed is started wi
   given no frame. The words are measured as the game's sscanf reads them (checked against it on 5,000 random command
   lines); a command line whose words fit is read by sscanf as before.
 
+## Career
+
+The career, its screens and the upgrade shop (hook/career_main.cpp, career_screens.cpp, career_shop.cpp). None of these
+come up with the stock game, English text and the game in a normal folder; they are a long translation, a mod track's long
+name, a modded upgrade set (viper.ugs) or a very long user directory.
+
+- The career files: "<user directory>career\career<slot>.dat" was built in a 264-byte buffer with no limit, so a user
+  directory of 246 or more characters ran it into the translations after it. Cut, the name would no longer be the
+  career's file (and past MAX_PATH no file can be opened by it anyway), so such a name is given as empty: the slots can't be
+  read (the chooser lists them as empty), made or deleted. Saving then fails the way any save the game can't make does: it
+  logs "Can't create career file" and the "saved" box still shows. Saving also built "<user directory>career" in 260 bytes of
+  its stack; a directory of 254 or more characters isn't made. Neither comes up with the port's user directory (race.exe's
+  folder's Config\, used only when it's 200 characters or less) or the original's short literal; they guard a patched one.
+- The class's name (Career:ClassName's translation) was copied into a 48-byte static with no limit. A translation of 48 or
+  more characters ran into the copy of the career the game keeps to tell whether it has changed, so leaving the career's
+  menu asked to save a career that hadn't changed; about 1,700 characters ran on into the translations after it. It keeps
+  47 characters. Nothing shows that copy (the screens translate the class themselves) and it isn't saved, so nothing else
+  changes.
+- The career screens' week line ("<Week> <n>") was formatted into 64 bytes. A translation of about 60 characters ran over the
+  funds line, so the screens showed the week's tail where the funds go, then over the season's, then out of the control
+  into the screen's stack. It keeps 63 characters.
+- The new career's dialog starts the name from Career:DefaultPlayerName's translation, copied into 16 bytes with no limit.
+  A translation over 15 characters, with no player name saved to replace it, left the name running into the dialog's own
+  data: the name field showed stray characters after it and Create saved them into the career's name (about 600
+  characters reached the return address). The default is cut to 15 characters, as the main menu's is.
+- Testing: Test copied the track's name (tracks.tab's, from its first eight rows) into 32 bytes of the caller's stack with no
+  limit, so a name of 32 or more characters ran over its return address; the practice race then copied it into the race's
+  32-byte track the same way. Cut, the name would no longer find the track's files, and no race can hold it, so Test on such
+  a track leaves the testing menu as Back does, and the practice race, given one, doesn't start (the testing menu comes
+  back). A mod that replaces a stock track keeps the stock name, so this needs an edited table.
+- The upgrade shop, with a modded or damaged viper.ugs: each upgrade's translation keys ("Upgrades:<name>:Name" and
+  ":Desc") were built in 256 bytes of the stack, so a name of 242 or more characters overran it. The name is cut to 241
+  characters for its keys, which then match no translation, so the shop shows the upgrade as "?!?", as it shows any
+  untranslated one. The two tables of translations hold 256 upgrades, and a longer set wrote past them over the shop's
+  colours and translations; only the first 256 are translated. (The career's record of what's bought holds 256 as well,
+  so a longer set still doesn't work in the shop.)
+- The shop's "requires" box ("<required upgrade> <message>", two translations) was built in 256 bytes of the stack, and
+  over 255 characters it overran them. The message keeps its first 255 characters.
+- The testing menu's picture of the selected track ("<track>.stp") was named in 80 bytes of the stack, so a track name of
+  76 or more characters ran over its return address. Cut, the name would no longer be the track's picture, so such a
+  picture isn't loaded: the menu shows none for that track, as for any track without one. (The track viewer, under
+  "Menus", cuts the name instead and finds no picture; the player sees the same.)
+- The career screens' numbered texts: the season's and week's lines of the events screen ("<Season> <n>", "<Week> <n>"),
+  the calendar's laps and points ("<n> <Laps>", "<n> <Pts>") and the standings' points were each formatted into the last
+  256 bytes of their screen's or control's stack, so a translation of about 250 characters ran over the return address.
+  Each keeps its first 255 characters.
+- The standings are sorted by points, then results, then the drivers' names, each name copied into 256 bytes of the stack
+  first. A name of 256 or more characters (a modded drivers.res) ran over the other name and then the return address.
+  Such a name is now compared where it is, which gives the order the copy would have given.
+- The upgrade shop: its copy of Upgrade:Purchased's translation went into 256 bytes of the stack with no limit, running
+  over the upgrades' snapshot after it from 256 characters and over the return address from 512; it keeps 255 characters
+  (nothing reads it). The car summary's engine lines ("<Power> <n> <unit> @ <n> <rpm>", the torque's) and weight line were
+  formatted into 80 bytes with the car's figures right after them. A longer line (translations of about 65 characters in
+  all, or a car file with absurd figures: a float prints up to 39 digits) ran over those figures, so the torque and weight
+  shown were read back out of the text, and a long enough one over the return address. Each line keeps its first 79
+  characters, and the figures are the car's.
+- The upgrade catalogue word-wraps each upgrade's description (its translation) into a text buffer that was 2 KB, and the
+  word wrap copies the whole description (up to 4095 characters since its own fix, under "Menus"), so a description of
+  2-4 KB ran over the stack. The buffer is now 4 KB, so a description is wrapped and shown whole up to 4095 characters.
+  The item's other lines (the price, the class it needs, available or purchased, what it requires: translations) are
+  built in the same buffer and keep their first 4095 characters.
+
+## Paint kit
+
+The paint kit (hook/paint_kit.cpp, paint_main.cpp). None of these come up with the stock cars, English text and a game
+folder of ordinary length; they are a mod car with a long name, a long translation, or a user directory far longer than
+the DLL makes (it is at most 200 characters, `<game folder>\Config\`).
+
+- The paint kit keeps the car's name in a 32-byte static, and names every file it opens or writes from it ("<car>.car",
+  "<car>.tex", "<car>0.mod", "paint\<car>.cvs", "<car>.cvs"). A name of 32 or more characters overran the static, over the
+  brush number and the paint kit's other statics; cut, it would name none of the car's files, and the painting would be
+  saved under another car's name. The car list holds names of 31 at most (see "Race front end"), so no menu passes a
+  longer one; if another caller does, the paint kit isn't opened (the log says why) and the caller carries on as after the
+  paint kit closed. The static itself keeps at most 31 characters. A name that fits opens the paint kit as before.
+- Default (restore the car's own painting, and the painting shown when the player has saved none) built "<car>.cvs" in 32
+  bytes of its stack, so a car name of 28 to 31 characters overran its return address. The name has room now and is used
+  whole, so such a car gets its own default painting. A name too long even for that (only a damaged static) is treated as
+  a car with no default painting: the painting is cleared.
+- At start-up the paint kit makes a texture ("~<car>.tex") for each car that has a painting and no texture. It built
+  "<car>.cvs" and "~<car>.tex" in 32 bytes each, one after the other, so a car name of 27 to 31 characters ran each name
+  into the next: the texture's name overwrote the end of the painting's, and the painting was fetched by a name that ran on
+  into the texture's. Both names are now built whole, and such a car gets its texture. A car list name longer than 58
+  characters (only a damaged list) is skipped, as a car with no painting is.
+- The paths under the user directory ("paint\<car>.cvs" or "paint\paint<n>.cvs" read and saved, "<car>.tex" or
+  "paint<n>.tex" saved and installed, "paint\paint.tga" exported and imported) were built in 260-byte buffers with no
+  limit, so a user directory of about 240 characters overran the stack. A path too long for its buffer is no longer built,
+  and each use fails the way it already fails when a file can't be opened. The painting isn't read, so the car's default
+  painting is shown. The save stops with "Can't create <path>" in the log (the path cut to what a log line holds), and the
+  painting is still marked changed (Back, answered Yes, then leaves as after any failed save). The paint folder isn't made
+  if its own path is too long. The start-up textures aren't written and are logged the same way. Export and import show
+  their error boxes. A path that fits is built as before.
+- The decal picker's title is the set's name (a translation), copied into the picker's 256 bytes with no limit. A
+  translation of 256 or more characters ran over the picker's own fields and on past it. The title keeps its first 255
+  characters.
+- The decal picker looks each set's name up as "Paintkit:DecalSet:<name>" (the name from decals.tab), built in 256 bytes
+  of its stack with no limit. A decals.tab name of 238 or more characters (a mod's) ran over the picker. Such a name is
+  cut to its first 216 characters. No language file has the cut key, so the set's title shows the game's "?!?" for a
+  missing translation, and the "Can't XLAT" warning with the key still fits a log line. A name that fits is looked up as
+  before.
+
 ## Limits lifted
 
 Like M1's limits, these move a table into the DLL for the original code and the rewrites alike, so
@@ -390,8 +490,8 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
 - Menus: a menu's custom controls (the options panels, the car and track choosers, the garage, the career
   and paint screens) get their width and height where the toolkit's own layout expects a right and bottom
   edge. Every control reads them as a width and height, so it's as the game was written, and stays. The
-  upgrade catalogue (career) word-wraps an upgrade's description into a 2 KB buffer of its own, so a
-  description of 2-4 KB still overruns it until the career stage's rewrite grows the buffer.
+  upgrade catalogue's own buffer, 2 KB in the original, is grown to 4 KB by the career's rewrite (under
+  "Career"), so every word-wrapped text now fits its buffer.
 - Menus, names no stock or known mod file has: the garage builds its setup files' paths in 256 bytes, and
   the car viewer names a car's resource set ("<car>.car") in 32, so a car name of about 235 characters,
   or of 28 to 31 for the viewer, still overruns; the choosers copy a car's or track's friendly name into
@@ -409,3 +509,22 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
   1e25) and indexes the gear names by the gear (-1..7) unchecked; the escape menus' selection, a splash's timeout, a
   replay graph narrower than 4 pixels and clear_rect's rectangle are only ever given values in range. All are as the game
   has them.
+- Career, what a player doesn't meet (damaged career or season files, a missing season, values the game never makes): the
+  class indexes the awards, and the driver map and the event index the drivers' results and the race's cars, all
+  unchecked (a damaged career file, a season of more than 32 events); the season's calendar indexes its purses and place
+  names by a place from the file unchecked; a race's winnings read the entry before the results when no car is the player's
+  (the driver map always holds the player); a season that can't be loaded is read through 0; the career log formats into
+  1 KB (its longest line is far shorter); an upgrade page holds 64 items (the shop's own lists have 4 to 10), and a right
+  click in test mode reads an item's upgrade before checking the item (the control's rectangle keeps it in range). Left
+  as harmless: each career screen adds its status control before formatting its texts, so for a moment its lines copy
+  whatever the stack held (the first update replaces them before anything is drawn); the chooser lists slot 1 twice (a
+  second button on the first); the testing menu's list starts with an uninitialised change count (the list box only
+  watches it change).
+- Paint kit, what a player doesn't meet (damaged files, values the buttons never set, out of memory): a tool number outside
+  0..8 (a panic, then a call through a null tool) and a brush number outside 0..4 (read past the brush table) are only set
+  in range by the radio buttons and the selection tool; the templates are indexed by the template shown unchecked (no
+  templates found); decals.tab is read with no bound on its rows (65 or more overrun the picker) and a set of 0 decals, or
+  decals 0 wide or high, divide by zero; the set shown is kept from the last time and not checked against the sets read (a
+  shorter decals.tab); the TGA export and import don't check their buffer's allocation and take a canvas's rows as one run
+  (every canvas the paint kit gives them is). The brush line is offset by half the brush's width, not its height; the
+  brushes are square, so it draws as the game always drew. All are as the game has them.

@@ -33,11 +33,17 @@
 // it toggles), MouseUp otherwise (the catalog), UpgradeCatalog::Draw (its canvas, the current canvas, the Xlators, the
 // money buffer, CareerGetClassName's Xlators).
 //
-// FIX CANDIDATEs (left faithful, marked in place): get_upgrade_names' 0x100-byte name buffer and its two 256-entry tables
-// (a car's upgrade set with a name over 239 characters, or more than 256 upgrades: a damaged or modded viper.ugs), a
-// catalog of more than 64 items (the lists are the code's own: 4 to 10), MouseRDown reading an item's index before it
-// checks the item (only a hot item far outside the list, which the control's own rectangle rules out), MouseUp's
-// 0x100-byte message (a requirement's translated name and message over 254 characters).
+// Fixes (// FIX:, docs/FIXES.md "Career"; none reached with the stock game and English text): get_upgrade_names cuts an
+// upgrade's name to 241 characters for its keys (the 0x100-byte key buffer) and translates at most 256 upgrades (its two
+// tables' size): a modded or damaged viper.ugs; MouseUp keeps the "requires" message to its 0x100 bytes (255 characters of
+// the two translations); UpgradeDo keeps its copy of Upgrade:Purchased to its 0x100 bytes; UpgradeSummary::Draw keeps its
+// engine and weight lines to their 0x50 bytes (79 characters: long translations, absurd car figures); UpgradeCatalog::Draw
+// has a 4 KB text buffer (a description is wrapped whole up to 4095 characters) and keeps its other lines to it. Every
+// other input gives the original's bits.
+//
+// FIX CANDIDATEs (left faithful, marked in place): a catalog of more than 64 items (the lists are the code's own: 4 to 10),
+// MouseRDown reading an item's index before it checks the item (only a hot item far outside the list, which the control's
+// own rectangle rules out).
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -97,7 +103,11 @@ static void __cdecl UpgradeDo_n() {
     cs_xl_once(S_DO_ONCE2, 0x01, 0x005d3810, 0x005002c4, 0x004c30d0);   // Upgrade:Paint
     cs_xl_once(S_DO_ONCE2, 0x02, 0x005d3c98, 0x005002d4, 0x004c30c0);   // Upgrade:Wheels
     cs_xl_once(S_DO_ONCE2, 0x04, 0x005d3ce0, 0x005002e4, 0x004c30b0);   // UI:Back
-    crt_strcpy((char*)(F + 0x374), CS_CP(cs_xlate(0x005d3cf8)));
+    // FIX: Upgrade:Purchased's translation was copied into 0x100 bytes of the frame unbounded: one of 256 or more
+    // characters ran over the snapshot of the upgrades after it, and one of 512 or more over the frame's saved registers and
+    // return address. It keeps its first 255 characters (nothing reads the copy). One that fits is copied as before.
+    if (VP_FIX) ui_copy_bounded((char*)(F + 0x374), CS_CP(cs_xlate(0x005d3cf8)), 0x100);
+    else crt_strcpy((char*)(F + 0x374), CS_CP(cs_xlate(0x005d3cf8)));
     cs_item14(F + 0x1c, 0x17, 0, 0, 0, 0, 0, 0x004e4db8u, 0, CS_A(F, 0x29c), 0);
     CS_W(F, 0x2b0) = 0;                                          // the career status's widget, the summary's
     CS_W(F, 0x298) = 0;
@@ -131,6 +141,22 @@ static void fp_give_money(Footprint& f, int32_t) { fp_funds(f); }
 PORT_FN(0x004c3090, "give_money", give_money_n, fp_give_money)
 
 // every upgrade's translated name and description (the set's entry i into the tables' entry i)
+// FIX: two overruns a modded or damaged upgrade set (viper.ugs) reaches. The keys "Upgrades:<name>:Name" / ":Desc" were
+// formatted into 0x100 bytes of the stack unbounded, so a name of 242 or more characters ran over the frame; such a name
+// is cut to 241 characters for its keys, which then match no translation (the shop shows the upgrade as the game shows
+// any untranslated one, "?!?"). And the two tables hold 256 entries, filled for every upgrade in the set, so a set of more
+// than 256 wrote past them over the shop's colours and Xlators; only the first 256 are translated. (The career's bought
+// flags hold 256 as well, and the shop's lists read both by the upgrade's index, so a set that long still isn't usable.)
+// A set of 256 or fewer with names that fit is translated as before.
+static __declspec(noinline) void fix_upgrade_key(char* buf, uint32_t fmt, const char* name) {
+    char c[0xf2];
+    ui_copy_bounded(c, name, sizeof c);
+    UI_sprintf(buf, CS_CP(fmt), (const char*)c);
+}
+static __forceinline void upgrade_key(char* buf, uint32_t fmt, const char* name) {
+    if (VP_FIX && ui_strnlen(name, 0xf1) > 0xf1) fix_upgrade_key(buf, fmt, name);    // (FIX: above) 14 + 241 = 255
+    else UI_sprintf(buf, CS_CP(fmt), name);
+}
 static void __cdecl get_upgrade_names_n() {
     char buf[0x100];
     int32_t i = 0;
@@ -138,17 +164,14 @@ static void __cdecl get_upgrade_names_n() {
         uint32_t e = 0;
         do {
             e += 4;
-            // FIX CANDIDATE: the name is formatted into 0x100 bytes unbounded (a name over 239 characters overruns the
-            // stack), and the tables hold 256 (a set of more than 256 writes past them); only a damaged or modded
-            // upgrade set has either
             const uint8_t* s = (const uint8_t*)cs_set();
             i++;
-            UI_sprintf(buf, CS_CP(0x005002f8), *(const volatile uint32_t*)(s + e));       // "Upgrades:%s:Name"
+            upgrade_key(buf, 0x005002f8, *(const char* const volatile*)(s + e));         // "Upgrades:%s:Name"
             UI_GU32(0x005d3d7cu + e) = ccall<uint32_t>(F_Xlate, (const char*)buf);
             s = (const uint8_t*)cs_set();
-            UI_sprintf(buf, CS_CP(0x0050030c), *(const volatile uint32_t*)(s + e));       // "Upgrades:%s:Desc"
+            upgrade_key(buf, 0x0050030c, *(const char* const volatile*)(s + e));         // "Upgrades:%s:Desc"
             UI_GU32(0x005d3864u + e) = ccall<uint32_t>(F_Xlate, (const char*)buf);
-        } while (cs_set()->count > i);
+        } while (cs_set()->count > i && !(VP_FIX && i >= 0x100));                        // (FIX: above) 256 at most
     }
 }
 static void fp_get_upgrade_names_f(Footprint& f) {
@@ -338,6 +361,29 @@ static __forceinline void summary_title(const SumState& s, uint32_t xl) {
     const uint32_t t = cs_xlate(xl);
     ccall<void>(F_UIStyleDraw, (int32_t)0xc, s.x0, s.y, CS_CP(t), (uint32_t)0);
 }
+// FIX: UpgradeSummary::Draw formats the engine's two lines ("<Power> <n> <unit> @ <n> <rpm>", the torque's) and the weight's
+// ("<Weight> <n> <unit>": translations and the car file's figures) into 0x50 bytes of its frame, with the car's data right
+// after them. Longer, a line ran over the data: the torque's figures and the weight, read afterwards, came out of the text
+// (translations totalling about 65 characters with the stock figures, or a car file with absurd ones: a float's 39 digits);
+// long enough, over the frame's saved registers and return address. A line that may be longer than 79 characters (a
+// bound: each translation's length, and 17 characters a number below 1e15 in size, else 320) is formatted by the game's
+// sprintf in a buffer of the rewrite's (each translation cut to 255 characters) and its first 79 characters kept; one
+// that fits gives the same bytes. Every other line is formatted in place as before.
+static __forceinline uint32_t fix_f0_len(double v) { return v > -1e15 && v < 1e15 ? 17u : 320u; }   // (NaN: 320)
+static __forceinline const char* fix_cut255(const char* s, char* buf) {
+    if (ui_strnlen(s, 0xff) <= 0xff) return s;
+    ui_copy_bounded(buf, s, 0x100);
+    return buf;
+}
+static __declspec(noinline) void fix_summary_text(char* dst, uint32_t fmt, const char* a, double x, const char* b, double y,
+                                                  const char* c) {
+    char ca[0x100], cb[0x100], cc[0x100], t[0x600];
+    a = fix_cut255(a, ca);
+    b = fix_cut255(b, cb);
+    if (c) UI_sprintf(t, CS_CP(fmt), a, x, b, y, fix_cut255(c, cc));
+    else UI_sprintf(t, CS_CP(fmt), a, x, b);
+    ui_copy_bounded(dst, t, 0x50);
+}
 // "%s %1.0f %s @ %1.0f %s": a figure and the rpm it peaks at, the numbers as the locale writes them
 static __forceinline void summary_peak(uint8_t* F, uint32_t xl_what, uint32_t xl_unit, uint32_t val_off, uint32_t rpm_off) {
     cs_xlate(0x005d3cd0);
@@ -346,8 +392,12 @@ static __forceinline void summary_peak(uint8_t* F, uint32_t xl_what, uint32_t xl
     char* buf = (char*)(F + 0x38);
     const double rpm = (double)*(const volatile float*)(F + rpm_off);
     const double val = (double)*(const volatile float*)(F + val_off);
-    UI_sprintf(buf, CS_CP(0x00500710), UI_GP(const char, xl_what + 4), val, UI_GP(const char, xl_unit + 4), rpm,
-               UI_GP(const char, 0x005d3cd4));
+    const char* what = UI_GP(const char, xl_what + 4);
+    const char* unit = UI_GP(const char, xl_unit + 4);
+    const char* rpms = UI_GP(const char, 0x005d3cd4);
+    if (VP_FIX && ui_strnlen(what, 0xff) + ui_strnlen(unit, 0xff) + ui_strnlen(rpms, 0xff) + 6 + fix_f0_len(val) + fix_f0_len(rpm) > 0x4f)
+        fix_summary_text(buf, 0x00500710, what, val, unit, rpm, rpms);                    // (FIX: above)
+    else UI_sprintf(buf, CS_CP(0x00500710), what, val, unit, rpm, rpms);
     ccall<void>(F_LocaleConvertNumeric, buf);
 }
 // the frame (esp after the prologue): +0x10 y, +0x14 n, +0x18 x1, +0x24 x0, +0x30 x2, +0x38 the text (0x50), +0x88 the
@@ -389,8 +439,11 @@ static void __fastcall UpgradeSummary_Draw_n(UICustomControl* self, Edx, gxCanva
         const uint8_t* loc = UI_GP(const uint8_t, 0x00509354);
         const volatile float* kf = (const volatile float*)(uintptr_t)0x004dfc64;
         const double wgt = ((double)*(const volatile float*)(F + 0x90) * (double)*kf) * (double)*(const volatile float*)(loc + 0x34);
-        UI_sprintf((char*)(F + 0x38), CS_CP(0x00500704), UI_GP(const char, 0x005d374c), wgt,
-                   *(const char* const volatile*)(loc + 0x30));
+        const char* what = UI_GP(const char, 0x005d374c);
+        const char* unit = *(const char* const volatile*)(loc + 0x30);
+        if (VP_FIX && ui_strnlen(what, 0xff) + ui_strnlen(unit, 0xff) + 2 + fix_f0_len(wgt) > 0x4f)   // (FIX: summary_peak's)
+            fix_summary_text((char*)(F + 0x38), 0x00500704, what, wgt, unit, 0.0, 0);
+        else UI_sprintf((char*)(F + 0x38), CS_CP(0x00500704), what, wgt, unit);
     }
     ccall<void>(F_LocaleConvertNumeric, (char*)(F + 0x38));
     ccall<void>(F_UIStyleDraw, (int32_t)0x12, s.x1, s.y, (const char*)(F + 0x38), (uint32_t)0);
@@ -589,6 +642,15 @@ static void fp_UpgradeCatalog_MouseRDown(Footprint& f, UpgradeCatalog* self, Edx
 }
 PORT_FN(0x004c45c0, "UpgradeCatalog::MouseRDown", UpgradeCatalog_MouseRDown_n, fp_UpgradeCatalog_MouseRDown)
 
+// FIX helper (MouseUp): "%s %s" with each text's first 255 characters, in a buffer of the rewrite's, and its first 255
+// characters into the box's 0x100 bytes
+static __declspec(noinline) void fix_required_text(char* dst, const char* a, const char* b) {
+    char ca[0x100], cb[0x100], t[0x202];
+    ui_copy_bounded(ca, a, sizeof ca);
+    ui_copy_bounded(cb, b, sizeof cb);
+    UI_sprintf(t, CS_CP(0x00500780), (const char*)ca, (const char*)cb);                     // "%s %s"
+    ui_copy_bounded(dst, t, 0x100);
+}
 // a click on an item not yet bought: not allowed in this class, another upgrade needed first, or bought (a yes / no box
 // and the funds checked); pressed is cleared, except where the item is already bought or a box explained why not
 static void __fastcall UpgradeCatalog_MouseUp_n(UpgradeCatalog* self, Edx, int32_t x, int32_t y) {
@@ -618,9 +680,12 @@ static void __fastcall UpgradeCatalog_MouseUp_n(UpgradeCatalog* self, Edx, int32
             cs_xl_once(S_UP_ONCE, 2, 0x005d5cd0, 0x00500788, 0x004c4ed0);      // Upgrade:OtherUpgradeRequiredDialog:Message
             const uint32_t t = cs_xlate(0x005d5cd0);
             char buf[0x100];
-            // FIX CANDIDATE: the required upgrade's name and the message go into 0x100 bytes unbounded (translations
-            // over 254 characters in all)
-            UI_sprintf(buf, CS_CP(0x00500780), UI_GP(const char, 0x005d3d80u + ((uint32_t)missing << 2)), CS_CP(t));
+            // FIX: "<required upgrade> <message>" (two translations) went into 0x100 bytes of the stack unbounded, so
+            // together over 254 characters they ran over the frame. The box's text keeps its first 255 characters; one
+            // that fits is formatted as before.
+            const char* rn = UI_GP(const char, 0x005d3d80u + ((uint32_t)missing << 2));
+            if (VP_FIX && ui_strnlen(rn, 0xff) + 1 + ui_strnlen(CS_CP(t), 0xff) > 0xff) fix_required_text(buf, rn, CS_CP(t));
+            else UI_sprintf(buf, CS_CP(0x00500780), rn, CS_CP(t));                          // "%s %s"
             ccall<void>(F_UIDoOkBox, UI_GP(const char, 0x005d3d80u + k4), (const char*)buf);
             return;
         }
@@ -658,8 +723,33 @@ PORT_FN(0x004c4640, "UpgradeCatalog::MouseUp", UpgradeCatalog_MouseUp_n, fp_Upgr
 
 // each item (from the scroll position, 95 apart): the hot one's frame, its picture, name, description (word-wrapped to
 // 250), price, state and requirement; separators between them. Style bit 1: not allowed in this class, 2: not bought
+// FIX: an item's description (its Upgrades:<name>:Desc translation) is word-wrapped into the text buffer, 2 KB of the frame
+// in the original, and UIStyleWordWrap copies it whole (its own fix now cuts it at 4095 characters, the size of the long
+// dialogs' buffers), so a description over 2,047 characters ran over the frame. The buffer is 4 KB in the rewrite (its own
+// frame: nothing else reads it), so a description is wrapped and drawn whole up to 4095 characters, as docs/FIXES.md's
+// "Menus" section said the career's rewrite would do. The item's other lines ("<Price>: <money>", "<class> <Class>",
+// "<Available>", "<Requires> <upgrade>": translations) go into the same buffer, so a line over 4095 characters keeps
+// its first 4095 (fix_join). Every text that fits is as before.
+static __declspec(noinline) void fix_join(char* dst, uint32_t size, const char* a, const char* sep, const char* b) {
+    uint32_t n = ui_strnlen(a, size - 1);
+    if (n > size - 1) n = size - 1;
+    crt_copy(dst, a, n);
+    for (const char* p = sep; *p && n < size - 1; p++) dst[n++] = *p;
+    if (b) {
+        uint32_t m = ui_strnlen(b, size - 1 - n);
+        if (m > size - 1 - n) m = size - 1 - n;
+        crt_copy(dst + n, b, m);
+        n += m;
+    }
+    *(volatile char*)(dst + n) = 0;
+}
+// does "<a><sep><b>" pass `size` - 1 characters?
+static __forceinline bool fix_join_long(const char* a, uint32_t sep, const char* b, uint32_t size) {
+    return ui_strnlen(a, size - 1) + sep + (b ? ui_strnlen(b, size - 1) : 0u) > size - 1;
+}
 static void __fastcall UpgradeCatalog_Draw_n(UpgradeCatalog* self, Edx, gxCanvas* c) {
-    char buf[0x800];
+    char buf[VP_FIX ? 0x1000 : 0x800];                             // (FIX: above)
+    const uint32_t bn = (uint32_t)sizeof buf;
     cs_xl_once(S_DRAW_ONCE, 0x01, 0x005d5c70, 0x0050082c, 0x004c4ea0);    // Upgrade:Price
     cs_xl_once(S_DRAW_ONCE, 0x02, 0x005d5c90, 0x00500818, 0x004c4e90);    // Upgrade:Purchased
     cs_xl_once(S_DRAW_ONCE, 0x04, 0x005d5ca0, 0x00500804, 0x004c4e80);    // Upgrade:Available
@@ -693,19 +783,23 @@ static void __fastcall UpgradeCatalog_Draw_n(UpgradeCatalog* self, Edx, gxCanvas
             {
                 const int32_t price = (*(CshUpgrade* const volatile*)((const uint8_t*)cs_set() + (uint32_t)k * 4u + 4))->price;
                 const char* m = ccall<const char*>(F_money_string, price);
-                UI_sprintf(buf, CS_CP(0x005007ec), UI_GP(const char, 0x005d5c74), m);       // "%s: %s"
+                const char* pl = UI_GP(const char, 0x005d5c74);
+                if (VP_FIX && fix_join_long(pl, 2, m, bn)) fix_join(buf, bn, pl, ": ", m);   // (FIX: above)
+                else UI_sprintf(buf, CS_CP(0x005007ec), pl, m);                             // "%s: %s"
             }
             ccall<void>(F_UIStyleDraw, (int32_t)0xc, xt, top + 0x12, (const char*)buf, st);
             if (!allowed && !bought) {
                 const uint32_t t = cs_xlate(0x005d5c80);
                 const int32_t cls = (*(CshUpgrade* const volatile*)((const uint8_t*)cs_set() + (uint32_t)k * 4u + 4))->req_class - 1;
                 const char* cn = ccall<const char*>(F_CareerGetClassName, cls);
-                UI_sprintf(buf, CS_CP(0x00500780), cn, CS_CP(t));                          // "%s %s"
+                if (VP_FIX && fix_join_long(cn, 1, CS_CP(t), bn)) fix_join(buf, bn, cn, " ", CS_CP(t));   // (FIX: above)
+                else UI_sprintf(buf, CS_CP(0x00500780), cn, CS_CP(t));                     // "%s %s"
             } else {
                 if (*(const volatile uint8_t*)(cs_info() + k + 0x1c) == 0) st |= 2;
                 if (allowed) {
                     const uint32_t t = *(const volatile uint8_t*)(cs_info() + k + 0x1c) ? cs_xlate(0x005d5c90) : cs_xlate(0x005d5ca0);
-                    UI_sprintf(buf, CS_CP(0x004e59ac), CS_CP(t));                          // "%s"
+                    if (VP_FIX && fix_join_long(CS_CP(t), 0, 0, bn)) fix_join(buf, bn, CS_CP(t), "", 0);   // (FIX: above)
+                    else UI_sprintf(buf, CS_CP(0x004e59ac), CS_CP(t));                     // "%s"
                 } else {
                     crt_strcpy(buf, CS_CP(0x005007e0));                                     // "Illegal!!"
                 }
@@ -716,7 +810,10 @@ static void __fastcall UpgradeCatalog_Draw_n(UpgradeCatalog* self, Edx, gxCanvas
                 cs_xl_once(S_DRAW_ONCE, 0x10, 0x005d5cb0, 0x005007c8, 0x004c4e60);    // Upgrade:RequiresPrefix
                 const int32_t r = find_upgrade(req);
                 const uint32_t t = cs_xlate(0x005d5cb0);
-                UI_sprintf(buf, CS_CP(0x00500780), CS_CP(t), UI_GP(const char, S_UP_NAMES + (uint32_t)r * 4u));
+                const char* rn = UI_GP(const char, S_UP_NAMES + (uint32_t)r * 4u);
+                // (FIX: above; r is -1 only after find_upgrade's panic, which stops the game: left to the original line)
+                if (VP_FIX && r >= 0 && fix_join_long(CS_CP(t), 1, rn, bn)) fix_join(buf, bn, CS_CP(t), " ", rn);
+                else UI_sprintf(buf, CS_CP(0x00500780), CS_CP(t), rn);                   // "%s %s"
                 ccall<void>(F_UIStyleDraw, (int32_t)0x12, xt, top + 0x32, (const char*)buf, st);
             }
             i++;

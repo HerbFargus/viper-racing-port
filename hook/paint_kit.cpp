@@ -26,14 +26,18 @@
 // widgets (Create, Added), draws through the 3D renderer (PaintCarViewer3D::Draw3D) or grabs the car's texture
 // (PaintKitCanvas::Update: the renderer's surfaces).
 //
+// Fixes (// FIX:, docs/FIXES.md "Paint kit"; none reached with the stock cars, English text and a game folder of ordinary
+// length): the PaintKitCanvas's "<user directory>paint\<car>.cvs" isn't built when too long for its 0x104 bytes (the
+// default painting is shown); PaintKitCanvas::Default's "<car>.cvs" has room for a 31-character car; DecalViewer's set
+// name keeps to its 0x100 bytes (a long translation). Every other input gives the original's bits.
+//
 // FIX CANDIDATEs (left faithful, marked in place): a tool number outside 0..8 panics and calls through a null tool (the
 // radio buttons set only 1..8); a brush number outside 0..4 reads outside the brush table (only the radio buttons set
 // it); BrushMode::MouseDrag's and LineMode::DrawShape's brush line offsets y by half the brush's WIDTH (the brushes are
 // square: no effect); the templates' draws index the stamps with the template shown unchecked (no templates found);
-// DecalViewer's divisions by a decal's size or count (a damaged decals.tab: 0 faults), the set shown (a static that
-// outlives the dialog) unchecked against the sets read (a decals.tab of fewer rows, or none: an unset set, a crash), and
-// its set name copied unbounded into 0x100 bytes (a long translation). None is reached in ordinary play (the stock
-// decals.tab and templates, the short translations).
+// DecalViewer's divisions by a decal's size or count (a damaged decals.tab: 0 faults) and the set shown (a static that
+// outlives the dialog) unchecked against the sets read (a decals.tab of fewer rows, or none: an unset set, a crash). None
+// is reached in ordinary play (the stock decals.tab and templates).
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -728,18 +732,23 @@ static PaintKitCanvas* __fastcall PaintKitCanvas_ctor_n(PaintKitCanvas* self, Ed
     self->overlay = ccall<gxCanvas*>(F_gxCanvasGet, PK_CP(0x00500d44));
     self->modified = 0;
     self->paint = paint;
-    // FIX CANDIDATE: the user folder and the car's name formatted into 0x104 bytes unbounded (a user folder of about
-    // 240 characters overruns the frame; the game takes at most 200)
+    // FIX: the user directory and the car's name were formatted into the frame's 0x104 bytes unbounded: a user directory
+    // of about 240 characters (the DLL's is at most 200; a longer game folder keeps the original's literal) ran over the
+    // frame. A path too long for them isn't built, and the painting isn't read -- no file of that name can be opened --:
+    // the car's default painting is shown, as when the player has saved none. A path that fits is built as before.
+    bool too_long = false;
     if (UI_G8(S_IS_VIPER) != 0) {
         const char* u = ccall<const char*>(F_Win32GetUserDirectory);
-        UI_sprintf(buf, PK_CP(0x00500d6c), u, paint);                                     // "%spaint\\paint%d.cvs"
+        too_long = VP_FIX && pk_path_too_long(u, 15 + pk_dec_len(paint));
+        if (!too_long) UI_sprintf(buf, PK_CP(0x00500d6c), u, paint);                      // "%spaint\\paint%d.cvs"
     } else {
         const char* u = ccall<const char*>(F_Win32GetUserDirectory);
-        UI_sprintf(buf, PK_CP(0x00500d5c), u, PK_CP(S_CAR));                              // "%spaint\\%s.cvs"
+        too_long = VP_FIX && pk_path_too_long(u, 10 + pk_len(PK_CP(S_CAR), PK_PATH_MAX));
+        if (!too_long) UI_sprintf(buf, PK_CP(0x00500d5c), u, PK_CP(S_CAR));               // "%spaint\\%s.cvs"
     }
     set_canvas(&self->canvas);
     ccall<void>(F_gxClear, UI_GU32(S_CLEAR));
-    if (ccall<uint8_t>(F_gxCanvasRead, &self->canvas, (const char*)buf)) {
+    if (!too_long && ccall<uint8_t>(F_gxCanvasRead, &self->canvas, (const char*)buf)) {
         tcall<void>(F_PaintKitCanvas_DirtyRect, self, (int32_t)0, (int32_t)0, (int32_t)0x100, (int32_t)0x100);
         set_canvas(&self->undo);
         paste(&self->canvas, 0, 0);
@@ -755,12 +764,16 @@ PORT_FN(0x004c8e10, "PaintKitCanvas::PaintKitCanvas", PaintKitCanvas_ctor_n, fp_
 // PaintKitCanvas::Default: the car's default painting ("<car>.cvs", a viper's "paint<n>.cvs", in the game's data) or
 // black; all of it dirty; the undo copy; modified
 static void __fastcall PaintKitCanvas_Default_n(PaintKitCanvas* self, Edx) {
-    // FIX CANDIDATE: the name formatted into 0x20 bytes (the original's frame: its return address right after them) -- a
-    // car name of 28 characters or more overruns (the car list's names are short: ordinary play can't)
-    char buf[0x20];
+    // FIX: "<car>.cvs" went into 0x20 bytes of the frame (the original's: its return address right after them), so a car
+    // name of 28 to 31 characters (S_CAR holds 31) overran it. The name has 0x40 bytes now, room for it whole -- cut, it
+    // would name another painting or none. A name too long even for them (S_CAR unterminated, a damaged static) is taken as
+    // a car with no default painting: the painting is cleared, as for any such car. A name that fits is used as before.
+    char buf[VP_FIX ? 0x40 : 0x20];
+    bool named = true;
     if (UI_G8(S_IS_VIPER) != 0) UI_sprintf(buf, PK_CP(0x00500da4), self->paint);          // "paint%d.cvs"
+    else if (VP_FIX && pk_len(PK_CP(S_CAR), sizeof buf - 5) > sizeof buf - 5) named = false;
     else UI_sprintf(buf, PK_CP(0x00500d9c), PK_CP(S_CAR));                                // "%s.cvs"
-    if (ccall<uint8_t>(F_ResourceExists, (const char*)buf)) {
+    if (named && ccall<uint8_t>(F_ResourceExists, (const char*)buf)) {
         gxCanvas* c = ccall<gxCanvas*>(F_gxCanvasGet, (const char*)buf);
         set_canvas(&self->canvas);
         ccall<void>(F_gxClear, UI_GU32(S_CLEAR));
@@ -1527,12 +1540,17 @@ PORT_FN(0x004cb7e0, "TemplatePreview::vector deleting destructor", TemplatePrevi
 // =================================================================================================================================
 // DecalViewer
 // =================================================================================================================================
+// FIX: the set's name (a translation, "Paintkit:DecalSet:<name>") was copied into the viewer's 0x100 bytes for the title
+// unbounded: one of 256 characters or more ran over the viewer's drag flag and scroll axis and on past the viewer (decal_cb's
+// frame). It keeps its first 255 characters: it is only shown. A name that fits is copied as before.
+static __forceinline void decal_name(DecalViewer* v, const DecalSet* s) {
+    if (VP_FIX) uit::ui_copy_bounded(v->name, s->name, sizeof v->name);
+    else crt_strcpy(v->name, s->name);
+}
 // the set shown: its name copied for the title, no decal picked, the scroll axis for its rows
 static __forceinline void decal_show(DecalViewer* v) {
     DecalSet* s = &v->sets[UI_G32(S_DECAL_SET)];
-    // FIX CANDIDATE: the set's name (a translation) copied into 0x100 bytes unbounded (a translation of 256 characters or
-    // more overruns into the viewer's scroll axis and past it: decal_cb's frame)
-    crt_strcpy(v->name, s->name);
+    decal_name(v, s);
     v->sel = -1;
     v->axis.total = s->rows;
     // FIX CANDIDATE: a set whose decals are 0 high (a canvas smaller than its count) divides by zero
@@ -1585,7 +1603,7 @@ static void __fastcall DecalViewer_Create_n(DecalViewer* self, Edx) {
         s->rows = iadd(s->count, isub(cols, 1)) / cols;
     }
     DecalSet* s = &self->sets[UI_G32(S_DECAL_SET)];
-    crt_strcpy(self->name, s->name);                                   // FIX CANDIDATE: unbounded (as decal_show)
+    decal_name(self, s);                                               // FIX: (decal_name) held to its 0x100 bytes
     self->sel = -1;
     const int32_t rows = s->rows;
     self->axis.total = rows;

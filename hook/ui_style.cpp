@@ -378,7 +378,7 @@ PORT_FN(0x0047fa40, "UIStyleDraw", UIStyleDraw_n, fp_UIStyleDraw)
 static void __cdecl UIStyleWordWrap_n(int32_t style, int32_t width, char* out, const char* in) {
     // FIX: the copy had no bound, so a longer text than the caller's buffer overran it: cut to 4095 characters, the
     // 4 KB of the long dialog boxes' and PreRaceDo's (track text) buffers. A text that fits is copied as before.
-    // (UpgradeCatalog::Draw's buffer is at most 2 KB: its own rewrite has to grow it.)
+    // (UpgradeCatalog::Draw's buffer, 2 KB in the original, is 4 KB in its rewrite's fix: career_shop.cpp.)
     if (VP_FIX) ui_copy_bounded(out, in, 0x1000);
     else crt_strcpy(out, in);
     volatile char* line = out;

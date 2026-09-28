@@ -199,7 +199,7 @@ enum : uint32_t { CC_Callback = 0x10, CC_MouseMove = 0x28 };
 // ---- statics (v1.0) ---------------------------------------------------------------------------------------------------------
 enum : uint32_t {
     // paintkit.obj .data
-    S_CAR = 0x00500960,              // char[0x20] the car's name (paint_begin: strcpy, no bound)
+    S_CAR = 0x00500960,              // char[0x20] the car's name (paint_begin: strcpy, no bound -- FIX: 31 characters)
     S_BRUSH = 0x00500980,            // int: the brush (1..4: brush.stp's frames; 0: the cut selection) (1)
     S_HUE_Y = 0x00500984,            // int ColorChooser::hue_y: the hue strip's mark, or -1
     S_TEMPLATE = 0x00500988,         // int: the template shown
@@ -323,5 +323,41 @@ static __forceinline void pk_item_end(void* it) { uit::crt_copy(it, PK_P(uit::S_
 static __forceinline int32_t isub(int32_t a, int32_t b) { return (int32_t)((uint32_t)a - (uint32_t)b); }
 static __forceinline int32_t iadd(int32_t a, int32_t b) { return (int32_t)((uint32_t)a + (uint32_t)b); }
 static __forceinline int32_t imul(int32_t a, int32_t b) { return (int32_t)((uint32_t)a * (uint32_t)b); }
+
+// ---- FIX helpers (docs/FIXES.md, "Paint kit") -----------------------------------------------------------------------------------
+enum : uint32_t {
+    PK_CAR_MAX = 0x1f,               // the characters a car's name may have: S_CAR's, and the root car list's (RaceBegin's FIX)
+    PK_PATH_MAX = 0x103,             // the characters a path may have: the game's 0x104-byte path buffers
+    S_CANT_CREATE_SAVE = 0x00500de4, // "Can't create %s" (save's)
+    S_CANT_CREATE_TEX = 0x00500d18,  // "Can't create %s" (write_tex's)
+};
+// the characters the game's %d prints for v (a '-' and the digits)
+static __forceinline uint32_t pk_dec_len(int32_t v) {
+    uint32_t n = v < 0 ? 2u : 1u;
+    uint32_t u = v < 0 ? 0u - (uint32_t)v : (uint32_t)v;
+    while (u >= 10u) { u /= 10u; n++; }
+    return n;
+}
+// strlen(s), counting at most `max` + 1 characters (a longer string is known to be longer than max)
+static __forceinline uint32_t pk_len(const char* s, uint32_t max) { return uit::ui_strnlen(s, max); }
+// would "<user directory>" and `tail` characters after it overrun a 0x104-byte path buffer?
+static __forceinline bool pk_path_too_long(const char* ud, uint32_t tail) { return pk_len(ud, PK_PATH_MAX) + tail > PK_PATH_MAX; }
+// the log's "Can't create %s" (the game's own text, `cant`) for a path too long to be built: the user directory, then
+// `rest` (the format's part after it, formatted by the caller with the directory ""), cut to 200 characters -- what
+// LogReport's 0x100 bytes hold with the text
+static __forceinline void pk_log_path(uint32_t cant, const char* ud, const char* rest) {
+    char m[0xc9];
+    uint32_t n = pk_len(ud, 0xc8);
+    if (n > 0xc8) n = 0xc8;
+    uit::crt_copy(m, ud, n);
+    uit::ui_copy_bounded(m + n, rest, 0xc9 - n);
+    ((uit::Log_t)(uintptr_t)F_LogReport)(PK_CP(cant), (const char*)m);
+}
+// a car's name for such a log line: as it is, or its first 0x40 characters in `buf`
+static __forceinline const char* pk_cut(const char* s, char* buf /* 0x41 */) {
+    if (pk_len(s, 0x40) <= 0x40) return s;
+    uit::ui_copy_bounded(buf, s, 0x41);
+    return buf;
+}
 
 }  // namespace pkit

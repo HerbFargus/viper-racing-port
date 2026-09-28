@@ -25,17 +25,20 @@
 // function-local Xlator the first time (atexit), and whatever runs a screen or a dialog (CareerDo, career_main, do_event,
 // career_menu and its callbacks, CareerDestroySlot) -- the session replay is their in-game check.
 //
+// Fixes (// FIX:, docs/FIXES.md "Career"; none reached with the stock game, English text and a normal user directory):
+// get_career_filename gives "" for a user directory too long for its 0x108-byte buffer (the career files then can't be
+// read or made), and career_save doesn't make a career directory too long for its 0x104 bytes; set_class keeps the class's
+// name to its 0x30-byte static (47 characters); CareerStatus::Callback keeps its week line to 63 characters;
+// driver_compare compares a driver's name of 256 or more characters (a modded drivers.res) where it is instead of copying
+// it into its frame's 0x100 bytes. Every other input gives the original's bits.
+//
 // FIX CANDIDATEs (left faithful, marked in place; "ordinary play" = the stock game, English, a normal user directory):
-// get_career_filename's 0x108-byte buffer and career_save's 0x104-byte directory name take the user directory unbounded
-// (a path of ~240 characters overruns them; not in ordinary play); CareerGiveAward indexes the awards by the class
-// unchecked (a damaged career file); do_event and sort_carlist index by the driver map and the event unchecked (a damaged
-// career file, a season of more than 32 events); credit_account reads before the Results when no car is the player's
-// (never: the map always holds 7); set_class copies the class's translated name into a 0x30-byte static (a translation of
-// 48+ characters runs into the saved CareerInfo); CareerStatus::Callback formats the translated "Week" into 0x40 bytes
-// (a translation of ~50+ characters); CareerSeasonGet reads a missing season resource through 0 (a missing file);
-// CareerLog formats into 0x400 bytes (a player name is 13 characters: not reached); career_menu's CareerStatus (as the other
-// screens') is added before its texts are formatted, its StaticTexts copying stack garbage (every time; harmless unless the
-// garbage runs 256+ bytes).
+// CareerGiveAward indexes the awards by the class unchecked (a damaged career file); do_event and sort_carlist index by
+// the driver map and the event unchecked (a damaged career file, a season of more than 32 events); credit_account reads
+// before the Results when no car is the player's (never: the map always holds 7); CareerSeasonGet reads a missing season
+// resource through 0 (a missing file); CareerLog formats into 0x400 bytes (a player name is 13 characters: not reached);
+// career_menu's CareerStatus (as the other screens') is added before its texts are formatted, its StaticTexts copying
+// stack garbage (every time; harmless unless the garbage runs 256+ bytes).
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -452,13 +455,19 @@ static void __fastcall CareerStatus_Create(CareerStatus* self, Edx) {
 static void fp_CareerStatus_Create(Footprint& f, CareerStatus*, Edx) { f.replay_only = "adds a notification (allocates)"; }
 PORT_FN(0x004bd230, "CareerStatus::Create", CareerStatus_Create, fp_CareerStatus_Create)
 
-// FIX CANDIDATE: "<Week> <n>" is formatted into the 0x40-byte week line unbounded (a translation of ~50 characters).
 static void __fastcall CareerStatus_Callback(CareerStatus* self, Edx, int32_t, const void*) {
     ccall<void>(F_LocaleMoney, (char*)self->funds, CA_G32(S_FUNDS), 0);
     ca_xl_once(0x005d002c, 0x01, 0x005d0020, 0x004ff700, 0x004bd300);  // Career:Status:Week
     ca_xlate(0x005d0020);
     const int32_t week = CA_G32(S_WEEK) + 1;
-    SPRINTF(self->week, CA_CP(0x004ff714), UI_GP(const char, 0x005d0024), week);   // "%s %d"
+    // FIX: "<Week> <n>" (Career:Status:Week's translation) was formatted into the 0x40-byte week line unbounded: a
+    // translation of about 60 characters ran over the funds line (formatted just before, so the career's menus showed the
+    // week's tail as the funds), then the season's, then past the control into the screen's frame it lives in (the
+    // CareerStatus is on each screen's stack). The line keeps its first 63 characters (the control may be the original
+    // screens', so it can't grow). A line that fits is formatted as before.
+    const char* wk = UI_GP(const char, 0x005d0024);
+    if (VP_FIX && ca_sd_long(wk, week, 0x40)) ca_fix_sd(self->week, 0x40, 0x004ff714, wk, week, false);
+    else SPRINTF(self->week, CA_CP(0x004ff714), wk, week);                                   // "%s %d"
     SPRINTF(self->season, CA_CP(0x004ff71c), CA_G32(S_SEASONS) + 1);                // "%d"
 }
 static void fp_CareerStatus_Callback(Footprint& f, CareerStatus* self, Edx, int32_t, const void*) {
@@ -546,10 +555,18 @@ static void __cdecl CareerDestroySlot_c(int32_t slot) {
 }
 PORT_FN(0x004bd640, "CareerDestroySlot", CareerDestroySlot_c, fp_screen_i)
 
-// FIX CANDIDATE: the user directory is formatted into the 0x108-byte buffer unbounded (a path of ~240 characters overruns
-// it into the Xlators after it). Not in ordinary play.
+// FIX: "<user directory>career\career<slot>.dat" was formatted into the 0x108-byte buffer unbounded, so a user directory
+// of 246 or more characters ran it into the Xlators after it. Cut, the name would no longer be the career's file (and past
+// MAX_PATH no file can be opened by it anyway), so a name that doesn't fit is given as "": the career files can't be read
+// (the chooser lists the slots empty), made (career_save reports "Can't create career file" to the log, as for any file it
+// can't make) or removed. (The port's user directory, race.exe's folder's Config\, is kept to 200 characters by the
+// kernel's fix; the original's is a short literal.) A name that fits is formatted as before.
 static const char* __cdecl get_career_filename_c(int32_t slot) {
     const char* dir = ccall<const char*>(F_Win32GetUserDirectory);
+    if (VP_FIX && ui_strnlen(dir, 0x107) + 0x11 + ca_dec_len(slot) > 0x107) {             // "career\career" ".dat": 17
+        *(volatile char*)(uintptr_t)S_FILENAME = 0;
+        return CA_CP(S_FILENAME);
+    }
     SPRINTF((char*)(uintptr_t)S_FILENAME, CA_CP(0x004ff834), dir, slot);                      // "%scareer\career%d.dat"
     return CA_CP(S_FILENAME);
 }
@@ -687,13 +704,19 @@ static uint8_t __cdecl career_load_c(int32_t slot, uint8_t* info) {
 }
 PORT_FN(0x004be080, "career_load", career_load_c, fp_slot_io)
 
-// FIX CANDIDATE: "<user directory>career" is formatted into a 0x104-byte local unbounded (a path of ~250 characters).
+// FIX: "<user directory>career" was formatted into the frame's 0x104 bytes unbounded: a user directory of 254 or more
+// characters ran it into the body's buffer after it (written afterwards, so nothing was lost; a longer directory would
+// have run on past the frame). Such a directory isn't made (at over MAX_PATH it can't be); the career's file name doesn't
+// fit get_career_filename's buffer either (its fix gives ""), so creating the file fails and the save is skipped with the
+// game's "Can't create career file" report, as for any file it can't make. A directory name that fits is made as before.
 static void __cdecl career_save_c(int32_t slot, uint8_t* info) {
     alignas(8) uint8_t F[0x794];                                    // sub esp, 0x78c; 2 pushes: +8 the file, +0xc the header,
                                                                     // +0x1c the directory, +0x120 the body
     const char* dir = ccall<const char*>(F_Win32GetUserDirectory);
-    SPRINTF((char*)(F + 0x1c), CA_CP(0x004ff9d0), dir);             // "%scareer"
-    ccall<uint8_t>(F_FileCreateDirectory, (const char*)(F + 0x1c));
+    if (!(VP_FIX && ca_longer(dir, 0x103 - 6))) {                    // (FIX: above) "career": 6
+        SPRINTF((char*)(F + 0x1c), CA_CP(0x004ff9d0), dir);         // "%scareer"
+        ccall<uint8_t>(F_FileCreateDirectory, (const char*)(F + 0x1c));
+    }
     const char* name = ccall<const char*>(F_get_career_filename, slot);
     CA_W(F, 8) = (uint32_t)ccall<int32_t>(F_FileCreate, name);
     if (CA_W(F, 8) == 0) {
@@ -740,9 +763,21 @@ static int32_t __cdecl driver_compare_c(const int32_t* pa, const int32_t* pb) {
         const int32_t rb = CA_G32(0x005cf1f0 + (uint32_t)b * 0x88u + 4u * (uint32_t)k);
         if (rb != ra) return (int32_t)((uint32_t)ra - (uint32_t)rb);
     }
-    crt_strcpy((char*)(F + 0x110), ccall<const char*>(F_CareerGetDriverName, a));
-    crt_strcpy((char*)(F + 0x10), ccall<const char*>(F_CareerGetDriverName, b));
-    return ccall<int32_t>(F_stricmp, (const char*)(F + 0x110), (const char*)(F + 0x10));
+    // FIX: the two drivers' names (the lounge's, from drivers.res, or the player's) were copied into 0x100 bytes of the frame
+    // each with no limit before being compared, so a name of 256 or more characters (a modded drivers.res) ran the first
+    // over the second and the second over the frame's saved registers and return address. Such a name isn't copied: it's
+    // compared where it is, which gives the order the copies would have given. A name that fits is copied as before.
+    const char* na = ccall<const char*>(F_CareerGetDriverName, a);
+    if (!(VP_FIX && ca_longer(na, 0xff))) {
+        crt_strcpy((char*)(F + 0x110), na);
+        na = (const char*)(F + 0x110);
+    }
+    const char* nb = ccall<const char*>(F_CareerGetDriverName, b);
+    if (!(VP_FIX && ca_longer(nb, 0xff))) {
+        crt_strcpy((char*)(F + 0x10), nb);
+        nb = (const char*)(F + 0x10);
+    }
+    return ccall<int32_t>(F_stricmp, na, nb);
 }
 static void fp_driver_compare(Footprint&, const int32_t*, const int32_t*) {}
 PORT_FN(0x004be2d0, "driver_compare", driver_compare_c, fp_driver_compare)
@@ -760,8 +795,12 @@ static uint8_t __cdecl CareerIsTestMode_c() { return (uint8_t)(crt_strcmp_ne(CA_
 PORT_FN(0x004be410, "CareerIsTestMode", CareerIsTestMode_c, fp_none)
 
 // set_class: the class, its season (season<n>.ssn), its name
-// FIX CANDIDATE: the class's translated name is copied into a 0x30-byte static (0x5cf760) unbounded (a translation of 48+
-// characters runs into the saved CareerInfo). Not with the stock text.
+// FIX: the class's name (Career:ClassName:<class>'s translation) was copied into a 0x30-byte static (0x5cf760) unbounded:
+// a translation of 48 or more characters ran into the CareerInfo's saved copy after it (0x5cf790, what back_cb compares
+// with the live one), so leaving the career's menu asked to save a career that hadn't changed; at about 1,700 characters
+// it ran past that into the Xlators. It keeps its first 47 characters. Nothing reads the copy (the screens ask
+// CareerGetClassName) and it isn't in the career file, so the cut changes nothing a player sees or saves. One that fits
+// is copied as before.
 static void __cdecl set_class_c(int32_t cls) {
     alignas(8) uint8_t F[0x28];                                     // sub esp, 0x20; 2 pushes: +8 the season's name
     CA_G32(S_CLASS) = cls;
@@ -769,7 +808,9 @@ static void __cdecl set_class_c(int32_t cls) {
     void* old = UI_GP(void, S_SEASON);
     if (old) ccall<void>(F_CareerSeasonForget, old);
     CA_GU32(S_SEASON) = ccall<uint32_t>(F_CareerSeasonGet, (const char*)(F + 8));
-    crt_strcpy((char*)(uintptr_t)S_CLASS_NAME, ccall<const char*>(F_CareerGetClassName, CA_G32(S_CLASS)));
+    const char* cn = ccall<const char*>(F_CareerGetClassName, CA_G32(S_CLASS));
+    if (VP_FIX) ui_copy_bounded((char*)(uintptr_t)S_CLASS_NAME, cn, 0x30);                  // (FIX: above)
+    else crt_strcpy((char*)(uintptr_t)S_CLASS_NAME, cn);
 }
 static void fp_set_class(Footprint& f, int32_t) { f.replay_only = "loads the class's season (a resource)"; }
 PORT_FN(0x004be450, "set_class", set_class_c, fp_set_class)

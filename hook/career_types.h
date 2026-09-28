@@ -198,4 +198,30 @@ static __forceinline uint32_t ca_xlate(uint32_t xl) {
 #define CA_B(F, off) (*(volatile uint8_t*)((F) + (off)))
 #define CA_A(F, off) ((uint32_t)(uintptr_t)((F) + (off)))
 
+// ---- the fixes' helpers (docs/PORTING.md, "Fixes"; each use is marked // FIX:) ----------------------------------------------
+// the characters the game's %d prints for v (a '-' and the digits)
+static __forceinline uint32_t ca_dec_len(int32_t v) {
+    uint32_t n = v < 0 ? 2u : 1u;
+    uint32_t u = v < 0 ? 0u - (uint32_t)v : (uint32_t)v;
+    while (u >= 10u) { u /= 10u; n++; }
+    return n;
+}
+// does s have more than max characters? (at most max + 1 bytes read)
+static __forceinline bool ca_longer(const char* s, uint32_t max) { return uit::ui_strnlen(s, max) > max; }
+// would "%s %d" / "%d %s" of s and n pass a buffer of `size` bytes?
+static __forceinline bool ca_sd_long(const char* s, int32_t n, uint32_t size) {
+    return uit::ui_strnlen(s, size - 1) + 1 + ca_dec_len(n) > size - 1;
+}
+// ... then (a buffer of at most 0x100 bytes) the text formatted by the game's sprintf with the format at `fmt`, s cut to
+// size - 1 characters, in a buffer of the rewrite's, and its first size - 1 characters kept in dst
+static __declspec(noinline) void ca_fix_sd(char* dst, uint32_t size, uint32_t fmt, const char* s, int32_t n, bool n_first) {
+    typedef int(__cdecl * Sprintf_t)(char*, const char*, ...);
+    const Sprintf_t sp = (Sprintf_t)(uintptr_t)uit::F_sprintf;
+    char c[0x100], t[0x120];
+    uit::ui_copy_bounded(c, s, size);
+    if (n_first) sp(t, CA_CP(fmt), n, (const char*)c);
+    else sp(t, CA_CP(fmt), (const char*)c, n);
+    uit::ui_copy_bounded(dst, t, size);
+}
+
 }  // namespace car
