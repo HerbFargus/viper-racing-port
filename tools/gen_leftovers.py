@@ -3,6 +3,7 @@
     python tools/gen_leftovers.py [--list]              the finished libraries -> hook/krn_leftover.cpp
     python tools/gen_leftovers.py --lib ui [--list]     one stage's library -> its own file (STAGES)
     python tools/gen_leftovers.py --lib menu [--list]
+    python tools/gen_leftovers.py --lib root [--list]
 
 M3 UI stage, step U0. The libraries whose stages are done -- physics, world, gx, ai, kernel, useful, state, sound --
 still hold functions no hook/*.cpp registers: the $E static initialisers, empty virtual stubs, compiler-generated
@@ -37,7 +38,9 @@ hand-written files), so a run for one target never changes another's output.
 A stage may name the objects whose stubs and deleting destructors it generates (STAGE_FULL); in its other objects only
 the $E initialisers are (U2, the menus: the $E of all eleven object files; stubs and deleting destructors of moptions /
 mrace / mmixer only -- the other groups write their objects' by hand, and mmulti / msched wait for the multiplayer
-stage). One more stub shape there: a `local static destructor helper' thunk (the atexit entry of a function-local
+stage). U3, the root library: the $E of all fourteen object files; stubs of the HUD group's six (dash, gxdash, countdwn,
+escape, splash, hack) only -- main, race, prerace, postrace, version, replay and ghost are written by hand. One more stub
+shape there: a `local static destructor helper' thunk (the atexit entry of a function-local
 static Xlator, whose destructor is empty) that is a bare `ret`: a __cdecl void(void).
 
 Left out on purpose (listed with --list): ds.obj / ds3d_x.obj except dsounderr2str (the dead hardware DirectSound
@@ -69,9 +72,13 @@ STAGES = {
     "menu": ("menu_leftover.cpp", "M3 UI stage, step U2: the $E static initialisers of all eleven menu object files (library\n"
                                   "// `menu`), and the stubs and deleting destructors of moptions.obj, mrace.obj and mmixer.obj",
              "hook/menu_*.cpp", "test/world_menu_options.cpp"),
+    "root": ("root_leftover.cpp", "M3 UI stage, step U3: the $E static initialisers of all fourteen root object files (library\n"
+                                  "// `root`, game.obj's included), and the stubs of dash.obj, gxdash.obj, countdwn.obj, escape.obj,\n"
+                                  "// splash.obj and hack.obj", "hook/root_*.cpp", "test/world_root_hud.cpp"),
 }
 # --lib: the objects whose stubs and deleting destructors a stage generates (absent: all of them); elsewhere only $E
-STAGE_FULL = {"menu": ("moptions.obj", "mrace.obj", "mmixer.obj")}
+STAGE_FULL = {"menu": ("moptions.obj", "mrace.obj", "mmixer.obj"),
+              "root": ("dash.obj", "gxdash.obj", "countdwn.obj", "escape.obj", "splash.obj", "hack.obj")}
 GENERATED = ["krn_leftover.cpp"] + [s[0] for s in STAGES.values()]
 DEAD_OBJECTS = ("ds.obj", "ds3d_x.obj")                  # the hardware DirectSound mixer: dead in every build
 DEAD_KEEP = {0x004756B0}                                  # dsounderr2str: live (wave.obj's error paths), by hand
