@@ -26,7 +26,26 @@
 // CRT (strncmp, atexit) at its own address, ftol as x87_ftol. Floats the original moves with integer instructions
 // (MixerSetVolume, SetVolume / SetFrequency / SetPanning, the effects volume handed to MixerSetVolume) are taken and
 // copied as bits; compares done on a float's bits stay on the bits. Globals are read and written through volatile at
-// the points the original touches them. No fixes: the fix candidates are marked (// FIX CANDIDATE:) where they happen.
+// the points the original touches them.
+//
+// Fixes (docs/PORTING.md, "Fixes"; each marked FIX:, VP_FIX; test/world_snd_mix.cpp built with /DFIX_TESTS tests them):
+//   * a sound's reads stay inside its resource: a 128-frame block past the end of the data read up to 4 KB on, which
+//     the game's own .sfx resources cover with 4096 bytes of padding (zeros after a one-shot, the start again after a
+//     loop) and a mod's resource may not. The SoftSound constructor notes how far its resource goes (its TOC entry's
+//     size, found in the resource sets); do_run mixes a block that would read past it with fastmix's own arithmetic,
+//     taking what the missing padding would hold: silence for a one-shot, the loop's start again for a loop. A block
+//     inside the resource -- every block of a stock sound -- is mixed by fastmix exactly as before.
+//   * setup_run: a loop shorter than a block's step (or of no length) stayed past its end, one length back per block,
+//     and read further on each; it now steps back into the loop (the position modulo the length; a zero-length loop
+//     to its start). A loop the original brings back in one step is unchanged.
+//   * SoftSound: a missing resource (SoundResourceGet -> 0) makes an empty, silent sound instead of a crash, and its
+//     destructor lets go of nothing.
+//   * SoftMixer::CreateSound: a sound whose allocation failed isn't added to the bag (mix_bytes read through it).
+//   * the sounds' bag is lifted M1-style: SoftMixer::Begin takes its capacity from the original's operand (0x474d79,
+//     stock 256), which M1 raises.
+// Not fixed: see the FIX CANDIDATEs left (MixerGet / SoundLocString / MixerGetQualityString: only the game's own menus
+// call them in range; the WAVEFORMATEX a SoftSound ignores; fastmix's count and WaveGrab's Lock at the ring's end, each
+// with its reason).
 //
 // Threads: SoftMixer::Update and everything under it (WaveGrab / WaveRelease, mix_bytes, setup_channel / setup_run /
 // do_run, the fast* loops) and the SoftSound methods the SoundManager calls run on the BG thread (= the physics
@@ -48,7 +67,9 @@
 // ISound's own vtable (0x4dd918) holds it, and the objects that ever carry that vtable are a SoftSound in the last
 // instruction of its destructor (its own deleting destructor frees it directly) and the dead hardware mixer's
 // DSecondarySound (never constructed).
+#include <intrin.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "viperport.h"
 #include "port.h"
@@ -205,6 +226,8 @@ typedef void(__cdecl* Void_t)();
 #define dsounderr2str_o SFN(const char*(__cdecl*)(int32_t), 0x004756b0)
 #define DirectSoundCreate_o SFN(int32_t(__stdcall*)(void*, void**, void*), 0x004cccec)   // the import thunk
 #define directsound_create_mixers_o SFN(Void_t, 0x00476750)
+#define MultiEnter_o SFN(void(__cdecl*)(int32_t, const char*, int32_t), 0x00415180)
+#define MultiLeave_o SFN(void(__cdecl*)(int32_t, const char*, int32_t), 0x004151d0)
 // this group, by address
 #define MixerSetVolume_o SFN(void(__cdecl*)(uint32_t), 0x004739e0)
 #define MixerSetQuality_o SFN(void(__cdecl*)(int32_t), 0x00473a20)
@@ -256,6 +279,97 @@ static __forceinline int32_t buf_unlock(void* b) {
 
 static void fp_static_init(Footprint& f) { f.replay_only = "a static initialiser (runs once, from the CRT's _initterm)"; }
 static void fp_none(Footprint&) {}                     // writes nothing (reads statics)
+
+// ---- fixes (docs/PORTING.md, "Fixes"): how far a sound's resource goes ------------------------------------------------
+// FIX: (do_run) a block of 128 frames reads up to 128 x the step (16 at most: 2032 samples, 4064 bytes) past its
+// position, and the end of the data is only checked between blocks, so the last block of a sound reads past the data.
+// The game's .sfx resources carry 4096 bytes after the data for it (every one of the 35 in v1.0: zeros after the 26
+// one-shots, the data's start again after the 9 loops), and the original mixes what it finds there; a mod's resource
+// without that padding was read past its end (a crash where it ended at the end of its memory, noise otherwise).
+// So each sound notes where its resource ends: the resource's TOC entry holds its payload's size (the data AND its
+// padding), found by the resource pointer in the resource sets when the sound is made. The records are DLL memory,
+// keyed by the sound; one is trusted only for the resource it was made with. A sound made by the original's constructor
+// has none and mixes as the original does. Sounds are made and mixed on both threads: a small lock.
+enum : uint32_t { R_MULTI = 0x4eae3c, R_SETS = 0x4eae40 };   // res.obj: the "Resource" Multi, the set list
+struct SndExtent { const void* sound; uint32_t res, lim; };
+static SndExtent* g_ext;
+static int g_next, g_cap_ext;
+static volatile long g_ext_lock;
+static volatile long g_ext_short;                  // a sound whose resource ends before its data does (a malformed one)
+static void ext_lock() { while (_InterlockedCompareExchange(&g_ext_lock, 1, 0)) _mm_pause(); }
+static void ext_unlock() { _InterlockedExchange(&g_ext_lock, 0); }
+// the bytes from `res` that belong to its resource (its TOC entry's size), if a set holds it. The set list and
+// the TOCs as res.obj keeps them: a node {name[16], next +0x10, toc +0x14, ..., count +0x1c}, 0x24-byte entries {...,
+// size +0x18 (bit 31: fetched), ..., data +0x20: the payload's 8-byte head, so the resource is data + 8}.
+static bool res_readable(const uint8_t* res, uint32_t* bytes) {
+    const int32_t multi = SGI32(R_MULTI);
+    if (!multi) return false;                      // (no resource system: no sets)
+    bool found = false;
+    MultiEnter_o(multi, 0, 0);
+    for (const uint8_t* n = (const uint8_t*)(uintptr_t)SG32(R_SETS); n && !found;
+         n = *(const uint8_t* const volatile*)(n + 0x10)) {
+        const uint8_t* toc = *(const uint8_t* const volatile*)(n + 0x14);
+        const uint32_t cnt = *(const volatile uint32_t*)(n + 0x1c);
+        for (uint32_t i = 0; toc && i < cnt; i++) {
+            const uint8_t* e = toc + i * 0x24;
+            if (*(const volatile uint32_t*)(e + 0x20) + 8 == (uint32_t)(uintptr_t)res) {
+                *bytes = *(const volatile uint32_t*)(e + 0x18) & 0x7fffffff;
+                found = true;
+                break;
+            }
+        }
+    }
+    MultiLeave_o(multi, 0, 0);
+    return found;
+}
+// the SoftSound constructor: its resource's end (no resource: nothing to read; one in no set: the data's end)
+static void note_extent(const void* sound, const uint8_t* res, uint32_t start, uint32_t len) {
+    uint32_t lim = start;
+    if (res) {
+        uint32_t n;
+        const uint32_t dend = start + len + len;
+        lim = res_readable(res, &n) ? (uint32_t)(uintptr_t)res + n : dend >= start ? dend : start;
+        if (lim < start || lim - start < len + len) _InterlockedExchange(&g_ext_short, 1);
+    }
+    ext_lock();
+    int i = 0;
+    while (i < g_next && g_ext[i].sound != sound) i++;           // the sound's old record (its memory reused), replaced
+    if (i == g_next) {
+        if (g_next == g_cap_ext) {
+            const int cap = g_cap_ext ? g_cap_ext * 2 : 64;
+            SndExtent* t = (SndExtent*)realloc(g_ext, cap * sizeof *t);
+            if (!t) { ext_unlock(); return; }      // (no memory: the sound mixes as the original does)
+            g_ext = t;
+            g_cap_ext = cap;
+        }
+        g_next++;
+    }
+    g_ext[i].sound = sound;
+    g_ext[i].res = (uint32_t)(uintptr_t)res;
+    g_ext[i].lim = lim;
+    ext_unlock();
+}
+static bool get_extent(const void* sound, uint32_t res, uint32_t* lim) {
+    bool found = false;
+    ext_lock();
+    for (int i = 0; i < g_next; i++)
+        if (g_ext[i].sound == sound) {
+            found = g_ext[i].res == res;
+            *lim = g_ext[i].lim;
+            break;
+        }
+    ext_unlock();
+    return found;
+}
+static void forget_extent(const void* sound) {
+    ext_lock();
+    for (int i = 0; i < g_next; i++)
+        if (g_ext[i].sound == sound) {
+            g_ext[i] = g_ext[--g_next];
+            break;
+        }
+    ext_unlock();
+}
 
 }  // namespace
 
@@ -517,13 +631,16 @@ PORT_FN(0x00474d20, "SoftMixer::SoftMixer", SoftMixer_ctor_rw, fp_softmixer_ctor
 
 // Begin: the sounds' bag, then SOUND/fidelity >= 1: 16-bit (WaveBegin(3,1)); else, or if that fails, 8-bit
 // (WaveBegin(1,1), eight_bit set). Neither: the bag is freed (the pointer stays).
+// FIX: the bag held 256 sounds, and BagBase::add LogPanic'ed ("full") on the 257th. Its capacity is the operand of
+// Begin's push (0x474d79), which M1 raises (to 1024: more than the SoundManager's 384-sound table can make); the
+// rewrite reads it there (m1_operand), so both run with M1's value, and a harness with the stock 256.
 static uint8_t __fastcall SoftMixer_Begin_rw(SoftMixerO* self, Edx) {
     volatile SoftMixerO* s = self;
     volatile int32_t fid = 1;
     OptionsGetI_o(*(const char* const volatile*)(uintptr_t)SM_SECTION, SS(0x004f5c74), (int32_t*)&fid);   // "fidelity"
     void* b = MemAlloc_o(0x14);
     if (b) {
-        Bag_ctor_o(b, 0, SS(0x004f5c8c), 0x100);                        // "SoftSound:sounds"
+        Bag_ctor_o(b, 0, SS(0x004f5c8c), (int32_t)m1_operand(0x00474d79));   // "SoftSound:sounds", 256 (M1: more)
         s->sounds = (Bag*)b;
     } else {
         s->sounds = 0;
@@ -557,12 +674,13 @@ static void __fastcall SoftMixer_End_rw(SoftMixerO* self, Edx) {
 static void fp_softmixer_end(Footprint& f, SoftMixerO*, Edx) { f.replay_only = "it releases the DirectSound objects (WaveEnd) and frees the bag"; }
 PORT_FN(0x00474e00, "SoftMixer::End", SoftMixer_End_rw, fp_softmixer_end)
 
-// FIX CANDIDATE: a failed MemAlloc adds a null sound to the bag, which mix_bytes then dereferences; a 257th sound makes
-// the bag LogPanic ("full")
+// FIX: a failed MemAlloc added a null sound to the bag, which mix_bytes then dereferenced: it isn't added (the null
+// is returned as before). (The 257th sound's LogPanic -- the bag full -- is lifted in Begin.)
 static void* __fastcall SoftMixer_CreateSound_rw(SoftMixerO* self, Edx, const char* name, int32_t) {
     void* r = 0;
     void* p = MemAlloc_o(0x40);
     if (p) r = SoftSound_ctor_o(p, 0, name, self);
+    if (VP_FIX && !r) return 0;                                         // FIX: no sound, nothing in the bag
     Bag_add_o(((volatile SoftMixerO*)self)->sounds, 0, r);
     return r;
 }
@@ -581,11 +699,13 @@ static __forceinline void* bag_item(volatile SoftMixerO* s, int32_t i) {
 static void fp_bag(Footprint& f, const Bag* b, bool sounds) {
     if (!b) return;
     f.add((void*)b, sizeof(Bag), "SoftMixer's bag");
-    const int32_t n = b->count;
+    int32_t n = b->count;
     if (n <= 0 || !b->items) return;
-    f.add(b->items, (uint32_t)(n < 0x100 ? n : 0x100) * 4, "the bag's items");
+    const int32_t cap = b->max > 0 && b->max <= 0x10000 ? b->max : 0x100;   // (256, or M1's lifted capacity)
+    if (n > cap) n = cap;
+    f.add(b->items, (uint32_t)n * 4, "the bag's items");
     if (!sounds) return;
-    for (int32_t i = 0; i < n && i < 0x100; i++)
+    for (int32_t i = 0; i < n; i++)
         if (b->items[i]) f.add(b->items[i], sizeof(SoftSoundO), "SoftSound");
 }
 
@@ -667,10 +787,12 @@ PORT_FN(0x00474f20, "SoftSound::setup_channel", setup_channel_rw, fp_softsound)
 
 // setup_run, before each 128-frame block: a playing sound at or past its end stops, or (looped) steps back by its
 // length once.
-// FIX CANDIDATE: the end is only checked between blocks, so a block reads up to 128 * ratio (<= 2048) samples past the
-// end of the data: the game's .sfx resources carry 4096 bytes of padding after the data (zeros for one-shots, the
-// start again for loops), a mod's resource without it mixes whatever follows. A loop shorter than a block's step
-// stays past its end (one length back per block) and reads further on each block; a zero-length loop never comes back.
+// FIX: the end is only checked between blocks, so a block reads up to 128 * ratio (<= 2032) samples past the end of the
+// data: the game's .sfx resources carry 4096 bytes of padding after the data (zeros for one-shots, the start again for
+// loops), a mod's resource without it mixes whatever follows (do_run's fix). And a loop shorter than a block's step
+// stayed past its end (one length back per block), reading further on each block; a zero-length loop never came back.
+// A loop that one step back leaves outside its data now steps back into it: its position modulo the length (a
+// zero-length loop: its start). One step that lands inside -- every stock loop -- is the original's.
 static void __fastcall setup_run_rw(SoftSoundO* self, Edx) {
     volatile SoftSoundO* s = self;
     if (!s->playing) return;
@@ -682,7 +804,12 @@ static void __fastcall setup_run_rw(SoftSoundO* self, Edx) {
         return;
     }
     if (s->looped) {
-        s->ch.src = cur - twice;
+        uint32_t back = cur - twice;
+        if (VP_FIX && back - s->start >= twice) {                        // FIX: still outside the loop's data
+            const uint32_t start = s->start;
+            back = twice ? start + (cur - start) % twice : start;
+        }
+        s->ch.src = back;
         return;
     }
     s->playing = 0;
@@ -690,11 +817,78 @@ static void __fastcall setup_run_rw(SoftSoundO* self, Edx) {
 }
 PORT_FN(0x00474fd0, "SoftSound::setup_run", setup_run_rw, fp_softsound)
 
+// FIX: (see setup_run and the extents above) a block whose reads would leave the sound's resource -- past its end, or
+// before its data -- is mixed by mix_past_end: fastmix's arithmetic, frame for frame, with each sample outside the
+// resource taken as the missing padding would give it (a one-shot: 0; a loop: its data from the start again). A block
+// that stays inside is fastmix's, as before; so is every block of a sound without a record (made by the original).
+static bool block_inside(const SoftSoundO* self, int32_t n, uint32_t* lim);
+static void mix_past_end(SoftSoundO* self, void* dst, int32_t n, uint32_t lim);
 static void __fastcall do_run_rw(SoftSoundO* self, Edx, void* acc, int32_t n) {
     volatile SoftSoundO* s = self;
     if (!s->playing) return;
-    if (s->muted == 0) fastmix_o(&self->ch, acc, n);
-    else nullmix_o(&self->ch, acc, n);
+    if (s->muted == 0) {
+        uint32_t lim;
+        if (VP_FIX && !block_inside(self, n, &lim)) {                     // FIX: it would read outside its resource
+            mix_past_end(self, acc, n, lim);
+            return;
+        }
+        fastmix_o(&self->ch, acc, n);
+    } else {
+        nullmix_o(&self->ch, acc, n);
+    }
+}
+// the samples a block of n frames reads: src + 2 * (pos >> 16), pos = frac + k * step for k < n. Inside the data
+// (and no resource ends before its data), or inside the resource's recorded extent, or no record: fastmix's block.
+static bool block_inside(const SoftSoundO* self, int32_t n, uint32_t* lim) {
+    const volatile SoftSoundO* s = self;
+    if (n <= 0) return true;                        // (fastmix's own count: mix_bytes passes 1..128)
+    const uint32_t src = s->ch.src, frac = s->ch.frac, step = s->ch.step, start = s->start;
+    const uint64_t last = (uint64_t)frac + (uint64_t)step * (uint32_t)(n - 1);
+    const uint64_t lo = (uint64_t)src + 2 * (uint64_t)(frac >> 16);
+    const uint64_t hi = (uint64_t)src + 2 * (last >> 16) + 2;       // (last past 32 bits: pos wraps -- not inside)
+    const bool wraps = (last >> 32) != 0;
+    if (!wraps && lo >= start && hi <= (uint64_t)start + 2 * (uint64_t)s->len && !g_ext_short) return true;
+    if (s->res) {
+        if (!get_extent(self, (uint32_t)(uintptr_t)s->res, lim)) return true;
+    } else {
+        *lim = start;                               // (no resource: nothing to read)
+    }
+    return !wraps && lo >= start && hi <= *lim;
+}
+// a sample outside [start, lim): what the padding holds -- a loop's data from the start again (if that is inside the
+// resource), else silence
+static __forceinline int32_t past_end_sample(const volatile SoftSoundO* s, uint32_t a, uint32_t lim) {
+    const uint32_t start = s->start, twice = s->len + s->len;
+    if (s->looped && twice && a >= start) {
+        const uint32_t b = start + (a - start) % twice;
+        if (b >= start && (uint64_t)b + 2 <= lim) return *(const volatile int16_t*)(uintptr_t)b;
+    }
+    return 0;
+}
+// fastmix (below), a sample at a time through the resource's bounds
+static void mix_past_end(SoftSoundO* self, void* dst, int32_t n, uint32_t lim) {
+    const volatile SoftSoundO* s = self;
+    if (SG8(F_FIRST)) SG8(F_FIRST) = 0;
+    volatile MixChannel* c = &self->ch;
+    volatile uint32_t* d = (volatile uint32_t*)dst;
+    uint32_t cnt = (uint32_t)n;
+    const uint32_t src = c->src, start = s->start;
+    uint32_t pos = c->frac;
+    uint32_t idx = pos >> 16;
+    do {
+        const uint32_t a = src + idx * 2;
+        const int32_t smp = a >= start && (uint64_t)a + 2 <= lim ? *(const volatile int16_t*)(uintptr_t)a
+                                                                : past_end_sample(s, a, lim);
+        pos += c->step;
+        const uint32_t l = (uint32_t)((int32_t)((uint32_t)c->lg * (uint32_t)smp) >> 8);
+        d[0] = d[0] + l;
+        const uint32_t r = (uint32_t)((int32_t)((uint32_t)c->rg * (uint32_t)smp) >> 8);
+        d[1] = d[1] + r;
+        idx = pos >> 16;
+        d += 2;
+    } while (--cnt);
+    c->src = src + idx * 2;
+    c->frac = pos & 0xffff;
 }
 static void fp_do_run(Footprint& f, SoftSoundO* self, Edx, void* acc, int32_t n) {
     f.add(self, sizeof(SoftSoundO), "SoftSound");
@@ -737,8 +931,13 @@ static void fp_mix_bytes(Footprint& f, SoftMixerO* self, Edx, uint8_t* dst, uint
 }
 PORT_FN(0x00475040, "SoftMixer::mix_bytes", mix_bytes_rw, fp_mix_bytes)
 
-// FIX CANDIDATE: a missing resource (SoundResourceGet -> 0) is dereferenced; a resource that isn't 16-bit mono, or not
-// 22050 Hz, is mixed as if it were (its WAVEFORMATEX is never read)
+// FIX: a missing resource (SoundResourceGet -> 0) was dereferenced: the sound is made empty (length 0; its start, as the
+// original computes it, 0x16, is never read: do_run reads nothing of a sound without a resource) -- a one-shot stops at
+// once, a loop plays silence. (SoundResourceGet LogPanics first in v1.0, so this is reached only if that returns.) And
+// the sound's resource extent is noted (see do_run).
+// FIX CANDIDATE: a resource that isn't 16-bit mono, or not 22050 Hz, is mixed as if it were (its WAVEFORMATEX is never
+// read). Not fixed: honouring it would change how the stock game sounds (its engine loops are 44.1 kHz); what is read
+// stays inside the data either way (the length is the data's bytes / 2).
 static void* __fastcall SoftSound_ctor_rw(SoftSoundO* self, Edx, const char* name, SoftMixerO* mixer) {
     volatile SoftSoundO* s = self;
     s->vtbl = PTR(0x004dd8e0);
@@ -749,11 +948,12 @@ static void* __fastcall SoftSound_ctor_rw(SoftSoundO* self, Edx, const char* nam
     s->looped = 0;
     s->muted = 0;
     s->start = (uint32_t)(uintptr_t)(res + 0x16);
-    const uint32_t bytes = *(const volatile uint32_t*)res;
+    const uint32_t bytes = VP_FIX && !res ? 0 : *(const volatile uint32_t*)res;   // FIX: (VP_FIX && !res) no resource
     s->pan = 0;
     s->len = bytes >> 1;
     s->vol = 0x3f800000;
     s->ratio = 0x3f800000;
+    if (VP_FIX) note_extent(self, res, s->start, s->len);              // FIX: where its resource ends
     return self;
 }
 static void fp_softsound_ctor(Footprint& f, SoftSoundO*, Edx, const char*, SoftMixerO*) {
@@ -765,7 +965,8 @@ static void __fastcall SoftSound_dtor_rw(SoftSoundO* self, Edx) {
     volatile SoftSoundO* s = self;
     s->vtbl = PTR(0x004dd8e0);
     SoftMixer_RemoveSound_o(s->mixer, 0, self);
-    SoundResourceForget_o(s->res);
+    if (VP_FIX) forget_extent(self);                                   // FIX: (do_run) its record goes
+    if (!VP_FIX || s->res) SoundResourceForget_o(s->res);              // FIX: no resource (SoftSound's fix): none to forget
     s->vtbl = PTR(0x004dd918);                                         // ISound's
 }
 static void fp_softsound_dtor(Footprint& f, SoftSoundO*, Edx) { f.replay_only = "it lets go of the sound's resource (SoundResourceForget)"; }
@@ -1122,7 +1323,9 @@ PORT_FN(0x00476d30, "WaveEnd", WaveEnd_rw, fp_wave_end)
 // Lock(pos, n): BUFFERLOST -> Restore (failing: no lock), Play, resync, Lock(pos, T) again; any error -> resync, 0.
 // Locked: the four results handed out, pos = the second length when it wrapped, else pos + the first (so pos can be S).
 // FIX CANDIDATE: pos == S asks Lock for an offset of exactly the buffer's size (real DirectSound: DSERR_INVALIDPARAM,
-// which WaveGrab turns into a resync and a silent tick; the emulation wraps it to 0)
+// which WaveGrab turns into a resync and a silent tick, no crash). Not fixed: the port always runs on its emulation
+// (hook/dsound_sdl.cpp: DirectSoundCreate is pointed there), whose Lock takes the offset modulo the size -- 0, the
+// ring's start, where the next write belongs -- so it neither fails nor misplaces anything.
 static uint8_t __cdecl WaveGrab_rw(uint8_t** p1, uint32_t* n1, uint8_t** p2, uint32_t* n2) {
     volatile uint32_t status;
     void* b = PTR(SG32(W_BUF));
@@ -1239,8 +1442,9 @@ PORT_FN(0x00477070, "$E2(fastmix.obj)", fastmix_E2_rw, fp_static_init)
 // acc += (lg * s) >> 8, (rg * s) >> 8 (32-bit products, arithmetic shifts, wrapping sums); then src moves on by the
 // whole samples and pos keeps its fraction. The channel's step and gains are read from memory on every frame, as the
 // original does.
-// FIX CANDIDATE: n is a do-while count: 0 (or negative) runs 2^32 (+n) frames over the accumulator (never from
-// mix_bytes, which passes 1..128)
+// FIX CANDIDATE: n is a do-while count: 0 (or negative) runs 2^32 (+n) frames over the accumulator. Not fixed: nothing
+// reaches it -- fastmix / nullmix are called only by do_run, and do_run only by mix_bytes, with 1..128 frames (no
+// sound data reaches the count).
 static void __cdecl fastmix_rw(MixChannel* ch, void* dst, int32_t n) {
     if (SG8(F_FIRST)) SG8(F_FIRST) = 0;
     volatile MixChannel* c = ch;

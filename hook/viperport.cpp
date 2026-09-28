@@ -411,6 +411,24 @@ static void relocate_graf_lists() {
     patch_fields(f, sizeof f / sizeof f[0], "the graf's facing lists, 512 / 514 -> 8192");
 }
 
+// ---- M1: the sound limits -------------------------------------------------------------------------------------------
+// SoundManager's table of every sound is one MemAlloc of 384 pointers (its constructor's push 0x600) and add_sound had
+// no bound: the 385th overran the heap. The software mixer keeps each sound's SoftSound in a bag of 256 (SoftMixer::Begin's
+// push 0x100) and the 257th panicked "full". Both sizes are raised to VP_LIFT_SOUNDS here, v1.0 only (the race.bin
+// builds keep theirs). The rewrites read the same operands (m1_operand) and use them as the capacities (snd_mgr.cpp,
+// snd_mix.cpp); past them a new sound is silent.
+static void lift_sound_limits() {
+    if (!build_is_v10()) {
+        logf("NOT lifting the sound limits: v1.0 race.exe only");
+        return;
+    }
+    Field f[] = {
+        {0x473ed0, 1, 0x600, VP_LIFT_SOUNDS * 4},              // SoundManager::SoundManager: push 0x600 (the table's size)
+        {0x474d78, 1, 0x100, VP_LIFT_SOUNDS},                  // SoftMixer::Begin: push 0x100 (the bag's capacity)
+    };
+    patch_fields(f, sizeof f / sizeof f[0], "the sounds, 384 (table) / 256 (mixer) -> 1024");
+}
+
 static int peak_textures() {                                    // entries in use at the moment
     int used = 0;
     for (int i = 0; i < TEX_TABLE; i++) used += g_tex_table[i * TEX_ENTRY] != 0;
@@ -652,6 +670,7 @@ static void install() {
     relocate_texture_table();
     relocate_res_tables();
     relocate_graf_lists();
+    lift_sound_limits();
     char ini[MAX_PATH];                         // viperport.ini, beside this DLL
     GetModuleFileNameA(g_self, ini, MAX_PATH);
     char* slash = strrchr(ini, '\\');

@@ -14,8 +14,25 @@
 // the CRT's sprintf / sscanf at their own addresses, the game's own strings. Floats the original moves with integer
 // instructions are copied as bits; values it keeps on the x87 are doubles, what it stores is a float, each such store
 // forced (st(), rule 10a: these run on the physics / BG thread, overflow and divide-by-zero unmasked); comparisons
-// keep the original's NaN result; integer compares of a float's bits are done on the bits. Bugs are kept, marked
-// `// FIX CANDIDATE:`.
+// keep the original's NaN result; integer compares of a float's bits are done on the bits.
+//
+// Fixes (docs/PORTING.md, "Fixes"; each marked FIX:, VP_FIX; test/world_snd_car.cpp built with /DVP_SND_CAR_FIXES
+// tests them). All are mod-data cases; stock data never reaches them:
+//   * EngineSoundSample::GetVolume / Update: a zero-width plateau or ramp (rpm_full == rpm_peak, rpm_on == rpm_full,
+//     rpm_peak == rpm_off) or a zero ref_rpm divided by zero, which faults on the BG thread (divide-by-zero unmasked).
+//     The division by 0 now gives what the FPU gives with that exception masked (div_masked): the same bits the
+//     original computes wherever it doesn't fault.
+//   * EngineSound::EngineSound: an .ens resource with more than 7 bands is read to its first 7 (the 8th overwrote
+//     `idle`, the 9th on ran past the object; logged once); with neither resource nor engine.txt, `count` is 0 (it was
+//     MemAlloc garbage, which Update and the destructor walked); engine.txt's uncounted last Sound3D is deleted.
+//   * EngineSound::Update: a NULL band (a missing engine<n>.sfx, engine.txt's path) is skipped where it's switched off.
+//   * EngineSound::EngineSound: "<car>e.ens" is built in a buffer long enough for any car name (27+ characters ran
+//     past the 32 bytes; harmless in the original's frame).
+//   * TireSound::Create: a failed MemAlloc of the RealTireSound no longer writes its siblings through NULL; a car
+//     index outside the table's 16 is neither read nor written (the car's sound speaks for its own wheel only); a
+//     mixer quality outside 0..2 (which read past the RealWheel table) gives no squeal (every wheel a dummy).
+//   * RealTireSound::RealTireSound: a RealWheel outside 0..3 is logged, not a panic, and its gain is 0 (silent).
+// Candidates not fixed are still marked `// FIX CANDIDATE:`.
 //
 // Threads. EngineSound::Update (from Car::UpdateCommon) and RealTireSound::Update (Wheel::UpdateCommon through the
 // TireSound's vtable) run every physics tick from update_phobs, on the BGTask timer thread -- the same thread the
@@ -56,6 +73,10 @@
 #include "port.h"
 #include "x87.h"
 
+#ifndef SND_FIX_FIRED
+#define SND_FIX_FIRED() ((void)0)                   // (the harness counts the worlds a fix changed)
+#endif
+
 #define D(x) ((double)(x))                          // a register value (x87.h)
 #define FB(b) __builtin_bit_cast(float, (uint32_t)(b))   // a float constant from its bits
 typedef int Edx;                                    // the unused edx of a __thiscall received as __fastcall
@@ -80,6 +101,18 @@ static __forceinline void st_to(float* dst, double d) {
     __asm { fld d
             mov eax, dst
             fstp dword ptr [eax] }
+}
+// FIX: num / den, where a zero den gives what the FPU gives with the divide-by-zero exception masked -- num x the
+// infinity of den's sign: a finite non-zero num gives the signed infinity, 0 the default NaN (0/0's), an infinity or a
+// NaN itself, all exactly as the division, and with no exception (an operation on an infinity is exact). The engine
+// code runs on the BG thread, where divide-by-zero is unmasked, so the original faults there instead. Every other den
+// is the original's division.
+static __forceinline double div_masked(double num, double den) {
+    if (!VP_FIX || !(den == 0.0)) return num / den;
+    SND_FIX_FIRED();
+    uint64_t b;
+    memcpy(&b, &den, 8);
+    return num * __builtin_bit_cast(double, (b & 0x8000000000000000ull) | 0x7ff0000000000000ull);
 }
 
 struct Sound3D {                                    // what this file touches (sound.obj's own layout is group A's)
@@ -238,21 +271,25 @@ PORT_FN(0x00472db0, "EngineSoundSample::EngineSoundSample", EngineSoundSample_ct
 // (and a positive NaN) the plateau's top blend with the ramp down (rpm - rpm_off) / (rpm_peak - rpm_off); negative
 // (not -0; and a negative NaN) no blend, with the ramp up (rpm - rpm_on) / (rpm_full - rpm_on); else the blend t at
 // full volume. Returns ((vol_hi - vol_lo) * blend + vol_lo) * ramp, unrounded in ST0.
-// FIX CANDIDATE: engine data with rpm_full == rpm_peak (or rpm_on == rpm_full, rpm_peak == rpm_off, on the branches
-// that use them) divides by zero -- a fault on the BG thread, where divide-by-zero is unmasked.
+// FIX: engine data with rpm_full == rpm_peak (or rpm_on == rpm_full, rpm_peak == rpm_off, on the branches that use
+// them) divided by zero -- a fault on the BG thread, where divide-by-zero is unmasked. Each division by 0 now gives
+// the masked FPU's result (div_masked), so a zero-width plateau works as the data means it (t is +-infinity: the ramp
+// up below rpm_full, the ramp down above it); a zero-width ramp is reached only with its corners out of order, and its
+// +-infinite ramp is what the original computes with the exception masked (-infinity: silent; +infinity: the mixer's
+// SetVolume takes it as 1.0).
 static double __fastcall EngineSoundSample_GetVolume(EngineSoundSample* self, Edx, float rpm) {
     if (D(self->rpm_on) > rpm) return 0.0;          // fld [0]; fcomp rpm; test ah,0x41; je
     if (!(D(self->rpm_off) > rpm)) return 0.0;      // fld [0xc]; fcomp rpm; test ah,0x41; jne
-    const float t = st((D(rpm) - self->rpm_full) / (D(self->rpm_peak) - self->rpm_full));
+    const float t = st(div_masked(D(rpm) - self->rpm_full, D(self->rpm_peak) - self->rpm_full));
     float blend, ramp;                               // [esp], [esp+4]
     put4(&ramp, 0x3f800000);
     const uint32_t tb = Ub(&t);
     if ((int32_t)tb > 0x3f800000) {
         put4(&blend, 0x3f800000);
-        ramp = st((D(rpm) - self->rpm_off) / (D(self->rpm_peak) - self->rpm_off));
+        ramp = st(div_masked(D(rpm) - self->rpm_off, D(self->rpm_peak) - self->rpm_off));
     } else if (tb > 0x80000000u) {
         put4(&blend, 0);
-        ramp = st((D(rpm) - self->rpm_on) / (D(self->rpm_full) - self->rpm_on));
+        ramp = st(div_masked(D(rpm) - self->rpm_on, D(self->rpm_full) - self->rpm_on));
     } else {
         cp4(&blend, &t);
     }
@@ -264,6 +301,9 @@ PORT_FN(0x00472df0, "EngineSoundSample::GetVolume", EngineSoundSample_GetVolume,
 // ---- EngineSoundSample::Update (0x472ed0): one band's Sound3D --------------------------------------------------------
 // volume = GetVolume(rpm) x the throttle volume: not above 0 (or NaN) and the sound is switched off. Else pitch =
 // rpm / ref_rpm, the Sound3D's volume 0.6 x volume; each written (and flagged) only where it changed.
+// FIX: a ref_rpm of 0 (engine data) divided by zero on the BG thread; it now gives the masked FPU's result
+// (div_masked): an infinite pitch, which the software mixer's SetFrequency clamps to its top (16x; -infinity, from a
+// ref_rpm of -0, to its bottom).
 static void __fastcall EngineSoundSample_Update(EngineSoundSample* self, Edx, float rpm, Sound3D* s, float volume) {
     const double v = snd_EngineSoundSample_GetVolume(self, 0, Ub(&rpm)) * D(volume);
     // fcom 0; fstp [esp+4]: an overflowing store faults at the NEXT x87 instruction, which on the switch-off path is
@@ -275,7 +315,7 @@ static void __fastcall EngineSoundSample_Update(EngineSoundSample* self, Edx, fl
         s->off = 1;
         return;
     }
-    const float pitch = st(D(rpm) / self->ref_rpm);
+    const float pitch = st(div_masked(D(rpm), D(self->ref_rpm)));
     const double v6 = D(vf) * FB(0x3f19999a);       // 0.6
     const float v6f = st(v6);                       // fcom [s+8]; fstp
     if (v6 < s->volume || v6 > s->volume) {         // test ah,0x40: differs, ordered
@@ -301,14 +341,19 @@ PORT_FN(0x00472ed0, "EngineSoundSample::Update", EngineSoundSample_Update, fp_sa
 // band, "<car><n>.sfx" or else "engine<n>.sfx", both following the car (+0x234, +0x5c), stopping at the first sound
 // that doesn't load. With neither resource, engine.txt: a line per band, up to 7, each band's "engine<n>.sfx" (no
 // idle sound).
-// FIX CANDIDATE: the resource's count is unchecked: an 8th band writes its Sound3D over `idle` and its floats over
-// band[0..6], and a 9th and more run past the 0xf8-byte object (band n at +0xd4 + 4n, sample n at +0x10 + 0x1c n).
-// FIX CANDIDATE: engine.txt missing too -- `count` is never written (the object is MemAlloc'd: garbage), and Update
-// walks that many bands.
-// FIX CANDIDATE: engine.txt's bands keep a NULL Sound3D (a missing engine<n>.sfx), which Update's switch-off
-// branches (a band another car's view uses) write through; and a band whose line fails to parse leaks its Sound3D.
-// FIX CANDIDATE (harmless): a car name of 26 characters or more overflows the 32-byte "%se.ens" buffer into the
-// next one, which is unused at that point (the frame's layout is kept, so the rewrite does the same).
+// FIX: the resource's count was unchecked: an 8th band wrote its Sound3D over `idle` and its floats over
+// band[0..6], and a 9th and more ran past the 0xf8-byte object (band n at +0xd4 + 4n, sample n at +0x10 + 0x1c n).
+// The bands live inside the object (EngineSound::Create's MemAlloc(0xf8), and every reader's fixed offsets), so the
+// limit isn't lifted: the first 7 bands are read, the rest ignored, and the log says so once.
+// FIX: engine.txt missing too -- `count` was never written (the object is MemAlloc'd: garbage), and Update and the
+// destructor walked that many bands. It is 0 now: no bands, as with an empty resource.
+// FIX: engine.txt's bands keep a NULL Sound3D (a missing engine<n>.sfx); Update's switch-off branches wrote through
+// it -- fixed there. And the loop creates band n's Sound3D before reading its line, so the band whose line is missing
+// or fails to parse (always the last, short of 7) was left uncounted: never updated, never deleted. It is deleted.
+// FIX: a car name of 27 characters or more (31 is the most Car::Setup keeps) overflowed the 32-byte "%se.ens" buffer
+// into the next one -- harmless, that one was unused at that point. The buffer holds any such name now; the resource
+// name is the same, so it's looked up (and not found) as before.
+static bool g_said_ens_bands;                       // (FIX: the band limit is logged once; DLL memory, not the game's)
 static EngineSound* __fastcall EngineSound_ctor(EngineSound* self, Edx, uint8_t* car) {
     uint8_t* sample = (uint8_t*)self + 0x10;
     for (int i = 6; i >= 0; i--) {                  // dec edi; jns: 7 samples
@@ -319,7 +364,7 @@ static EngineSound* __fastcall EngineSound_ctor(EngineSound* self, Edx, uint8_t*
     const char* name = (const char*)(car + 0x514);
     struct {                                        // the original frame's buffers, in its order ([esp+0x24..0x164))
         char b24[32];                               // engine.txt's "engine<n>.sfx"
-        char b44[32];                               // "<car>e.ens"
+        char b44[VP_FIX ? 32 + 16 : 32];            // "<car>e.ens" (FIX: room for a 31-character name + "e.ens")
         char b64[256];                              // the .sfx names; engine.txt's line
     } fr;
     self->car_index = *(const int32_t*)(car + 0x510);
@@ -357,6 +402,15 @@ static EngineSound* __fastcall EngineSound_ctor(EngineSound* self, Edx, uint8_t*
                 smp += 0x1c;
                 slot += 4;
                 n++;
+                if (VP_FIX && n == 7 && *(volatile int32_t*)res > 7) {   // FIX: the 8th and on don't fit the object
+                    SND_FIX_FIRED();
+                    if (!g_said_ens_bands) {
+                        g_said_ens_bands = true;
+                        logf("fix: engine sound: car %.31s's engine resource has %d bands; an engine holds 7, the rest are "
+                             "ignored (logged once)", name, *(volatile int32_t*)res);
+                    }
+                    break;
+                }
             } while (*(volatile int32_t*)res > n);
         }
         *(volatile int32_t*)&self->count = n;
@@ -367,6 +421,10 @@ static EngineSound* __fastcall EngineSound_ctor(EngineSound* self, Edx, uint8_t*
     int32_t fh = snd_FileOpen(SC_S(0x004f5898));    // "engine.txt"
     if (!fh) {
         snd_LogReport(SC_S(0x004f58d0), SC_S(0x004f5898));   // "Can't find %s"
+        if (VP_FIX) {                                // FIX: no bands (count was left as MemAlloc garbage)
+            SND_FIX_FIRED();
+            *(volatile int32_t*)&self->count = 0;
+        }
         return self;
     }
     int32_t n = 0;
@@ -377,9 +435,19 @@ static EngineSound* __fastcall EngineSound_ctor(EngineSound* self, Edx, uint8_t*
         *(Sound3D* volatile*)slot = snd_Sound3D_Create(fr.b24, 2, car + 0x234, car + 0x5c);
         fr.b64[0] = *(const volatile char*)SC_S(0x004f58b4);   // char line[256] = "";
         memset(fr.b64 + 1, 0, 255);
-        if (!snd_FileReadLine(fh, fr.b64, 0x100)) break;
-        if (snd_sscanf(fr.b64, SC_S(0x004f58b8), smp + 0x18, smp + 0x10, smp + 0x14, smp, smp + 4, smp + 8, smp + 0xc) != 7)
+        bool ok = snd_FileReadLine(fh, fr.b64, 0x100) != 0;
+        if (ok)
+            ok = snd_sscanf(fr.b64, SC_S(0x004f58b8), smp + 0x18, smp + 0x10, smp + 0x14, smp, smp + 4, smp + 8, smp + 0xc) == 7;
+        if (!ok) {
+            if (VP_FIX) {                            // FIX: the uncounted band's Sound3D is deleted (it leaked)
+                if (Sound3D* s = *(Sound3D* volatile*)slot) {
+                    SND_FIX_FIRED();
+                    snd_vdelete(s, 1);
+                    *(Sound3D* volatile*)slot = 0;
+                }
+            }
             break;
+        }
         smp += 0x1c;
         slot += 4;
         if (++n >= 7) break;
@@ -407,8 +475,8 @@ PORT_FN(0x00472c10, "EngineSound::~EngineSound", EngineSound_dtor, fp_engine_sou
 // The idle sound plays (volume 0.25) below 1600 RPM (by the stored RPM's bits) with the throttle under 0.1. The band
 // volume is throttle x 0.15625 + 0.09375, x 2.6666667 for the car in view, x 2.2. Band 0 is for the other cars, bands
 // 1.. for the car in view: the rest are switched off (with no NULL check, below); `stalled` switches all of them off.
-// FIX CANDIDATE: the switch-off of a band that belongs to the other view writes through its Sound3D unchecked -- a
-// NULL band (engine.txt with a missing engine<n>.sfx) faults, where the normal path checks.
+// FIX: the switch-off of a band that belongs to the other view wrote through its Sound3D unchecked -- a NULL band
+// (engine.txt with a missing engine<n>.sfx) faulted, where the normal path checks. A NULL band is skipped there too.
 static void __fastcall EngineSound_Update(EngineSound* self, Edx, uint8_t stalled) {
     if (*(volatile int32_t*)&self->count == 0) return;
     const float rpm = st(car_vfloat(self->car, 0x48));              // GetPerceivedRPM; fstp [esp+0x14]
@@ -440,7 +508,12 @@ static void __fastcall EngineSound_Update(EngineSound* self, Edx, uint8_t stalle
     uint8_t* sample = (uint8_t*)self + 0x10;
     for (int32_t i = 0; *(volatile int32_t*)&self->count > i; i++, slot += 4, sample += 0x1c) {
         if (i == 0 ? in_view : !in_view) {
-            (*(Sound3D* volatile*)slot)->off = 1;
+            Sound3D* s = *(Sound3D* volatile*)slot;
+            if (VP_FIX && !s) {                      // FIX: a NULL band has nothing to switch off
+                SND_FIX_FIRED();
+                continue;
+            }
+            s->off = 1;
             continue;
         }
         Sound3D* s = *(Sound3D* volatile*)slot;
@@ -452,8 +525,9 @@ static void __fastcall EngineSound_Update(EngineSound* self, Edx, uint8_t stalle
         snd_EngineSoundSample_Update(sample, 0, Ub(&rpm), s, Ub(&vol));
     }
 }
-// the bands' and the idle Sound3Ds: pitch, volume and flags (+4..+0x2d). A count past 7 (the resource overflow
-// above) reads `idle` and the count as bands: capped here, as phys_car_update.cpp's UpdateCommon footprint does.
+// the bands' and the idle Sound3Ds: pitch, volume and flags (+4..+0x2d). A count past 7 (the original constructor's
+// resource overflow, fixed above) reads `idle` and the count as bands: capped here, as phys_car_update.cpp's
+// UpdateCommon footprint does. (The fixed switch-off writes a subset: NULL bands are skipped.)
 static void fp_engine_sound_update(Footprint& f, EngineSound* self, Edx, uint8_t) {
     const int32_t n = self->count;
     for (int32_t i = 0; i < n && i < 7; i++)
@@ -555,20 +629,37 @@ PORT_FN(0x004731a0, "TireSound::TireSound", TireSound_ctor, fp_tire_sound_ctor)
 // medium 2 (one an axle, on wheels 1 and 3), high: the player's car 3 (every wheel), the others 2. A wheel with a
 // real sound gets it; the rest a DummyTireSound. The car's and the axle's sound take over the wheels created before it
 // (their dummies, from the table), and every wheel's sound goes in the table.
-// FIX CANDIDATE: a failed MemAlloc of the RealTireSound (RealWheel 1 or 2) writes the siblings through NULL + 0xc.
-// FIX CANDIDATE: the table has 16 cars; a car index outside 0..15 (a GhostCar's, or more cars) writes past it (into
-// the mixer's statics at 0x578a30) or before it (tiresnd.obj's colour constants). A mixer quality outside 0..2 reads
-// past the RealWheel table (0x4dd760: 0, then 0x3f333333) and past the local flag array.
+// FIX: a failed MemAlloc of the RealTireSound (RealWheel 1 or 2) wrote the siblings through NULL + 0xc. With no
+// sound there are no siblings to take over: the NULL goes in the table, as the original's does.
+// FIX: the table has 16 cars; a car index outside 0..15 wrote past it (into the mixer's statics at 0x578a30) or
+// before it (tiresnd.obj's colour constants), and read its siblings from there. Such a car's sounds are neither read
+// from nor put in the table: an axle's or the car's sound speaks for its own wheel only. Not lifted: 16 is the game's
+// car limit everywhere (PhysTaskRegisterCar's Car*[16] at 0x520c18, the car status strings, ...), so a car index past
+// 15 has already overrun those before its wheels are set up; a bigger table here alone would buy nothing.
+// FIX: a mixer quality outside 0..2 read past the RealWheel table (0x4dd760: 0, then 0x3f333333, the gains...) and
+// with that as the RealWheel past the local flag array. MixerSetQuality keeps the quality to 0..2, so only a quality
+// written some other way gets here; it now gives RealWheel 0, no squeal (every wheel a dummy) -- what the original
+// reads for quality 3 on a car not the player's, the one case past the table that didn't crash.
 static TireSound* __cdecl TireSound_Create(int car_index, int wheel, uint8_t* w, uint8_t* car) {
     const int quality = snd_MixerGetQuality();
     const uint8_t is_real[16] = {0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1};   // [RealWheel][wheel]
     const uint32_t players = snd_WorldGetPlayerCar() == car_index ? 1u : 0u;
-    const int32_t mode = *(const volatile int32_t*)(uintptr_t)(SND_REAL_WHEEL_BY_QUALITY + 4u * (players + (uint32_t)quality * 2u));
+    int32_t mode;
+    if (VP_FIX && (uint32_t)quality > 2u) {           // FIX: past the RealWheel table: no squeal
+        SND_FIX_FIRED();
+        mode = 0;
+    } else {
+        mode = *(const volatile int32_t*)(uintptr_t)(SND_REAL_WHEEL_BY_QUALITY + 4u * (players + (uint32_t)quality * 2u));
+    }
+    const bool in_table = !VP_FIX || (uint32_t)car_index < 16u;   // FIX: a car index the table has
+    if (!in_table) SND_FIX_FIRED();
     uint8_t* r;
     if (is_real[wheel + mode * 4]) {
         void* m = snd_MemAlloc(0x3c);
         r = m ? (uint8_t*)snd_RealTireSound_ctor(m, 0, car_index, wheel, w, car, mode) : 0;
-        if (mode == 1) {
+        if (VP_FIX && (!r || !in_table)) {             // FIX: no sound, or no table row: no siblings
+            if (!r && (mode == 1 ? wheel > 0 : mode == 2)) SND_FIX_FIRED();
+        } else if (mode == 1) {
             if (wheel > 0) {
                 uint32_t src = ((uint32_t)car_index << 4) + SND_TIRE_TABLE;
                 uint8_t* dst = r + 0xc;
@@ -588,7 +679,7 @@ static TireSound* __cdecl TireSound_Create(int car_index, int wheel, uint8_t* w,
             ((DummyTireSound*)m)->ok = 1;
         }
     }
-    SC_G32(SND_TIRE_TABLE + ((uint32_t)wheel + (uint32_t)car_index * 4u) * 4u) = (uint32_t)(uintptr_t)r;
+    if (in_table) SC_G32(SND_TIRE_TABLE + ((uint32_t)wheel + (uint32_t)car_index * 4u) * 4u) = (uint32_t)(uintptr_t)r;
     return (TireSound*)r;
 }
 static void fp_tire_sound_create(Footprint& f, int, int, uint8_t*, uint8_t*) {
@@ -597,8 +688,9 @@ static void fp_tire_sound_create(Footprint& f, int, int, uint8_t*, uint8_t*) {
 PORT_FN(0x004731c0, "TireSound::Create", TireSound_Create, fp_tire_sound_create)
 
 // ---- RealTireSound::RealTireSound (0x4732f0) -------------------------------------------------------------------------
-// FIX CANDIDATE: a RealWheel outside 0..3 only LogPanics (which returns in a harness; the game's ends the run) and
-// leaves the gain unset.
+// FIX: a RealWheel outside 0..3 LogPanic'd (the game's ends the run with a deliberate crash; a harness's returns and
+// leaves the gain unset: MemAlloc garbage, multiplied into the volume every tick). It is logged instead (the same
+// message, LogReport) and the gain is 0: a silent sound. TireSound::Create, the only caller, now passes 0..3 always.
 static RealTireSound* __fastcall RealTireSound_ctor(RealTireSound* self, Edx, int car_index, int wheel, uint8_t* w,
                                                     uint8_t* car, int mode) {
     snd_TireSound_ctor(self, 0, wheel, w);
@@ -608,7 +700,14 @@ static RealTireSound* __fastcall RealTireSound_ctor(RealTireSound* self, Edx, in
     case 1: put4(&self->gain, 0x3f333333); break;   // 0.7
     case 2: put4(&self->gain, 0x3f2147ae); break;   // 0.63
     case 3: put4(&self->gain, 0x3f0ccccd); break;   // 0.55
-    default: snd_LogPanic(SC_S(0x004f5900), mode);  // "RealTireSound: Lame programmer %d"
+    default:
+        if (VP_FIX) {                               // FIX: logged, not a panic; silent
+            SND_FIX_FIRED();
+            snd_LogReport(SC_S(0x004f5900), mode);
+            put4(&self->gain, 0);
+            break;
+        }
+        snd_LogPanic(SC_S(0x004f5900), mode);       // "RealTireSound: Lame programmer %d"
     }
     self->wheel_sound[0] = 0;
     self->wheel_sound[1] = 0;

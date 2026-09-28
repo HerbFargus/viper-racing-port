@@ -30,6 +30,11 @@
 // 24 or 53 bits, in 30% of the worlds with overflow and divide-by-zero unmasked and in another 10% with the
 // denormal-operand exception unmasked as well (ExceptDiv0Crashes(1), which the physics / BG thread runs with): a
 // fault must happen in both passes. Each pass starts and ends with fninit.
+//
+// Built with /DVP_SND_CAR_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"): a world where a fix
+// changed what the rewrite did is counted, not compared, every other world is compared as above, and directed tests
+// first run each fix on the input that used to fail (see directed_fix_tests). Without it (VP_FAITHFUL) the rewrites
+// must match the originals bit for bit, bugs included.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -39,7 +44,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef VP_SND_CAR_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#endif
+static int g_fix_fired;             // fix branches the rewrite took in this pass
+#define SND_FIX_FIRED() (++g_fix_fired)
 #include "../hook/port.h"
 // every PORT_FN: its address, name, rewrite and footprint, in a list
 struct SndReg {
@@ -441,6 +450,19 @@ static void random_tire_table() {
     }
 }
 
+static void build_world() {
+    memset(&g_script, 0, sizeof g_script);
+    memset(g_arena, 0, ARENA_BYTES);
+    random_car();
+    for (int i = 0; i < 16; i++) random_sound(snd(i));
+    void** svt = (void**)AR(A_SVT);
+    svt[0] = (void*)&stub_sound_vdel;
+    for (int i = 1; i < 8; i++) svt[i] = (void*)0x00000bad;
+    random_engine_sound();
+    for (int i = 0; i < 4; i++) random_wheel(wheel(i));
+    random_tire_sounds();
+}
+
 // ---- the kinds of world ------------------------------------------------------------------------------------------
 enum Kind {
     K_SAMPLE_CTOR, K_GETVOL, K_SAMPLE_UPDATE, K_ES_CTOR, K_ES_DTOR, K_ES_UPDATE,
@@ -497,6 +519,12 @@ static void random_args(Kind k) {
     case K_TS_CTOR: a.self = ts(1); rnd_bytes(a.self, 0x40); a.i0 = (int)(rnd() % 4); a.p = wheel(a.i0); break;
     case K_TS_CREATE:
         a.i0 = chance(95) ? g_car_index : (int)(rnd() % 16);
+        if (chance(4)) a.i0 = chance(50) ? 16 + (int)(rnd() % 8) : -1 - (int)(rnd() % 4);   // outside the table
+#ifdef VP_SND_CAR_FIXES
+        // a quality past the RealWheel table: the original then reads its local flag array at a float's offset (from
+        // wherever each pass's stack is), so this is for the fixed build only
+        if (chance(3)) *(int32_t*)X_QUALITY = chance(50) ? 3 + (int32_t)(rnd() % 5) : -1 - (int32_t)(rnd() % 3);
+#endif
         a.i1 = (int)(rnd() % 4);
         a.p = wheel(a.i1);
         g_script.alloc_fail = chance(3) ? 1u : 0u;
@@ -637,6 +665,7 @@ static unsigned g_pc;
 static int g_unmask;                // 0 masked; 1 overflow + divide-by-zero; 2 those and the denormal operand
 static int run_guarded(Kind k, bool rw, uint64_t* ret) {
     g_log.n = 0;
+    g_fix_fired = 0;
     g_heap = AR(A_HEAP);
     g_alloc_calls = g_create_calls = g_exists_calls = g_line_calls = g_newsnd = 0;
     unsigned cw;
@@ -662,6 +691,344 @@ static const char* where(uint32_t a, char* buf) {
     sprintf(buf, "0x%08x", a);
     return buf;
 }
+
+#ifdef VP_SND_CAR_FIXES
+// ---- the fixes, each on the input that used to fail ------------------------------------------------------------------
+// fn under the physics thread's FPU (24 bits unless pc says otherwise; unmask as run_guarded's), a fresh log and heap
+static int guarded(void (*fn)(), int unmask, unsigned pc = _PC_24) {
+    g_log.n = 0;
+    g_fix_fired = 0;
+    g_heap = AR(A_HEAP);
+    g_alloc_calls = g_create_calls = g_exists_calls = g_line_calls = g_newsnd = 0;
+    unsigned cw;
+    __asm fninit
+    _controlfp_s(&cw, _MCW_EM, _MCW_EM);
+    _controlfp_s(&cw, pc, _MCW_PC);
+    if (unmask == 1) _controlfp_s(&cw, _MCW_EM & ~(_EM_OVERFLOW | _EM_ZERODIVIDE), _MCW_EM);
+    if (unmask == 2) _controlfp_s(&cw, _MCW_EM & ~(_EM_OVERFLOW | _EM_ZERODIVIDE | _EM_DENORMAL), _MCW_EM);
+    int fault = 0;
+    __try {
+        fn();
+        __asm fwait
+    } __except (EXCEPTION_EXECUTE_HANDLER) { fault = 1; }
+    __asm fninit
+    _controlfp_s(&cw, _MCW_EM, _MCW_EM);
+    _controlfp_s(&cw, _PC_53, _MCW_PC);
+    return fault;
+}
+static int count_tag(uint32_t tag) { int n = 0; for (uint32_t i = 0; i < g_log.n && i < LOG_MAX; i++) n += g_log.w[i] == tag; return n; }
+static void set_sample(uint8_t* p, float on, float full, float peak, float off, float lo, float hi, float ref) {
+    float* f = (float*)p;
+    f[0] = on; f[1] = full; f[2] = peak; f[3] = off; f[4] = lo; f[5] = hi; f[6] = ref;
+}
+// the pass's results, kept
+struct Pass { int fault; uint8_t* arena; uint8_t* data; CallLog* log; uint64_t ret; };
+static Pass g_po, g_pn;
+static void keep(Pass& p, int fault) {
+    p.fault = fault;
+    memcpy(p.arena, g_arena, ARENA_BYTES);
+    memcpy(p.data, DATA, DATA_BYTES);
+    *p.log = g_log;
+}
+static void restore() { memcpy(g_arena, g_arena_snap, ARENA_BYTES); memcpy(DATA, g_data_snap, DATA_BYTES); }
+static void snapshot() { memcpy(g_arena_snap, g_arena, ARENA_BYTES); memcpy(g_data_snap, DATA, DATA_BYTES); }
+// the original, then (from the same world) the rewrite
+static void both(void (*orig)(), void (*rw)(), int unmask, unsigned pc = _PC_24) {
+    snapshot();
+    keep(g_po, guarded(orig, unmask, pc));
+    restore();
+    keep(g_pn, guarded(rw, unmask, pc));
+}
+static bool same_logs(const CallLog& a, const CallLog& b) {
+    return a.n == b.n && !memcmp(a.w, b.w, 4 * (a.n < LOG_MAX ? a.n : LOG_MAX));
+}
+
+static float g_t_rpm, g_t_vol;
+static double g_t_ret;
+static int g_t_i0, g_t_i1, g_t_i2;
+static uint8_t g_t_u8;
+static void t_vol_orig() { g_t_ret = ((double(__fastcall*)(void*, int, float))0x00472df0)(AR(A_SAMPLE), 0, g_t_rpm); }
+static void t_vol_new() { g_t_ret = EngineSoundSample_GetVolume((EngineSoundSample*)AR(A_SAMPLE), 0, g_t_rpm); }
+static void t_supd_orig() { ((void(__fastcall*)(void*, int, float, void*, float))0x00472ed0)(AR(A_SAMPLE), 0, g_t_rpm, snd(0), g_t_vol); }
+static void t_supd_new() { EngineSoundSample_Update((EngineSoundSample*)AR(A_SAMPLE), 0, g_t_rpm, (Sound3D*)snd(0), g_t_vol); }
+static void t_ctor_orig() { ((void*(__fastcall*)(void*, int, void*))0x004728f0)(AR(A_ES), 0, AR(A_CAR)); }
+static void t_ctor_new() { EngineSound_ctor((EngineSound*)AR(A_ES), 0, AR(A_CAR)); }
+static void t_upd_orig() { ((void(__fastcall*)(void*, int, uint8_t))0x00472c60)(AR(A_ES), 0, g_t_u8); }
+static void t_upd_new() { EngineSound_Update((EngineSound*)AR(A_ES), 0, g_t_u8); }
+static void t_dtor_new() { EngineSound_dtor((EngineSound*)AR(A_ES), 0); }
+static void t_create_orig() { g_t_ret = (double)(uint32_t)((void*(__cdecl*)(int, int, void*, void*))0x004731c0)(g_t_i0, g_t_i1, wheel(g_t_i1), AR(A_CAR)); }
+static void t_create_new() { g_t_ret = (double)(uint32_t)(uintptr_t)TireSound_Create(g_t_i0, g_t_i1, wheel(g_t_i1), AR(A_CAR)); }
+static void t_rts_orig() { ((void*(__fastcall*)(void*, int, int, int, void*, void*, int))0x004732f0)(ts(1), 0, g_t_i0, g_t_i1, wheel(g_t_i1), AR(A_CAR), g_t_i2); }
+static void t_rts_new() { RealTireSound_ctor((RealTireSound*)ts(1), 0, g_t_i0, g_t_i1, wheel(g_t_i1), AR(A_CAR), g_t_i2); }
+
+static int directed_fix_tests() {
+    int bad = 0;
+    auto check = [&](bool ok, const char* what) { if (!ok) printf("  fix test: %s FAILED\n", what); bad += !ok; };
+    static uint8_t arena_o[ARENA_BYTES], arena_n[ARENA_BYTES];
+    static CallLog log_o, log_n;
+    g_po.arena = arena_o; g_pn.arena = arena_n;
+    g_po.data = (uint8_t*)malloc(DATA_BYTES); g_pn.data = (uint8_t*)malloc(DATA_BYTES);
+    g_po.log = &log_o; g_pn.log = &log_n;
+    int vol_div0 = 0, vol_masked_same = 0, orig_faults = 0, fixed_overflows = 0;
+
+    // (a) GetVolume, a zero-width plateau: sensible volumes, where the original faults
+    build_world();
+    set_sample(AR(A_SAMPLE), 1000.0f, 4000.0f, 4000.0f, 7000.0f, 0.4f, 0.6f, 3000.0f);
+    const float want[3][2] = {{3000.0f, 0.4f * 2000.0f / 3000.0f}, {5000.0f, 0.6f * 2000.0f / 3000.0f}, {6999.0f, 0.6f / 3000.0f}};
+    for (auto& wv : want) {
+        g_t_rpm = wv[0];
+        const int fo = guarded(t_vol_orig, 1), fn = guarded(t_vol_new, 1);
+        check(fo && !fn && fabs(g_t_ret - wv[1]) < 1e-5, "(a) a zero-width plateau: the original faults, the fixed volume is the ramp's");
+    }
+    // (a) every zero width, random data: masked, the fixed bits are the original's; unmasked, the fixed never faults and
+    // gives those same bits
+    for (int round = 0; round < 20000; round++) {
+        build_world();
+        uint8_t* p = AR(A_SAMPLE);
+        random_sample(p);
+        float* f = (float*)p;
+        const int k = rnd() % 3;                                       // which corners meet
+        if (k == 0) f[2] = f[1]; else if (k == 1) f[1] = f[0]; else f[3] = f[2];
+        if (chance(30)) { float t = f[1]; f[1] = f[2]; f[2] = t; }      // out of order: the ramps' own zero widths
+        if (chance(30)) { float t = f[0]; f[0] = f[1]; f[1] = t; }
+        for (int i = 0; i < 7; i++) if (fpclassify(f[i]) == FP_SUBNORMAL) f[i] = 0.0f;   // (a denormal faults on its load)
+        g_t_rpm = chance(50) ? range(f[0], f[3]) : rpm_for(p);
+        if (fpclassify(g_t_rpm) == FP_SUBNORMAL) g_t_rpm = 0.0f;
+        const unsigned pc = chance(50) ? _PC_24 : _PC_53;
+        guarded(t_vol_orig, 0, pc);
+        const double masked = g_t_ret;
+        const int fn0 = guarded(t_vol_new, 0, pc);
+        check(!fn0 && !memcmp(&masked, &g_t_ret, 8), "(a) masked: the fixed GetVolume's bits are the original's");
+        vol_masked_same++;
+        const int fo = guarded(t_vol_orig, 1, pc);
+        const int fn = guarded(t_vol_new, 1, pc);
+        const int fired = g_fix_fired;
+        // a fault left from an overflow (a huge corner) is no divide by zero: the fixed faults there too
+        if (fn) { fixed_overflows++; check(fo, "(a) unmasked: the fixed GetVolume faults only where the original does"); continue; }
+        check(!memcmp(&masked, &g_t_ret, 8), "(a) unmasked: the fixed GetVolume gives the masked original's bits");
+        orig_faults += fo;
+        vol_div0 += fired != 0;
+        if (bad) break;
+    }
+    check(orig_faults > 1000, "(a) the original faulted on the zero widths");
+
+    // (b) Sample::Update with ref_rpm 0
+    for (int round = 0; round < 200; round++) {
+        build_world();
+        set_sample(AR(A_SAMPLE), 0.0f, 1000.0f, 6000.0f, 7000.0f, 0.4f, 0.5f, chance(50) ? 0.0f : -0.0f);
+        g_t_rpm = range(100.0f, 6900.0f);
+        g_t_vol = range(0.1f, 2.0f);
+        *(float*)(snd(0) + 4) = 1.0f;                                    // (a NaN pitch is never replaced)
+        both(t_supd_orig, t_supd_new, 1);
+        const float pitch = *(float*)(arena_n + (snd(0) - g_arena) + 4);
+        check(g_po.fault && !g_pn.fault && isinf(pitch), "(b) ref_rpm 0: the original faults, the fixed pitch is infinite");
+        both(t_supd_orig, t_supd_new, 0);
+        check(!g_po.fault && !g_pn.fault && !memcmp(arena_o, arena_n, ARENA_BYTES), "(b) masked: the original's bytes");
+        if (bad) break;
+    }
+
+    // (c) an .ens resource with 8..12 bands
+    int orig_idle_lost = 0;
+    for (int round = 0; round < 300; round++) {
+        build_world();
+        rnd_bytes(AR(A_ES), 0x300);
+        random_resource();
+        const int32_t nb = 8 + (int32_t)(rnd() % 5);
+        *(int32_t*)AR(A_RES) = nb;
+        g_script.res_try = chance(50); g_script.res_get = 1;
+        g_script.exists = rnd();
+        both(t_ctor_orig, t_ctor_new, 0);
+        const uint8_t* e = arena_n + A_ES;
+        bool ok = !g_pn.fault && *(const int32_t*)(e + 0xf4) == 7 && *(uint8_t* const*)(e + 0xf0) == AR(A_NEWSND);
+        for (int i = 0; i < 7; i++) ok &= *(uint8_t* const*)(e + 0xd4 + 4 * i) == AR(A_NEWSND + 0x40 * (i + 1));
+        ok &= !memcmp(arena_o + A_ES + 0x10, e + 0x10, 0xc4);           // bands 0..6 read as the original reads them
+        ok &= !memcmp(g_arena_snap + A_ES + 0xf8, e + 0xf8, 0x300 - 0xf8);   // nothing past the object
+        ok &= count_tag('S3DC') == 8 && count_tag('RFGT') == 1 && g_fix_fired;
+        check(ok, "(c) 8+ bands: the first 7, idle kept, nothing written past the object");
+        orig_idle_lost += *(uint8_t* const*)(arena_o + A_ES + 0xf0) != AR(A_NEWSND);
+        if (bad) break;
+    }
+    check(orig_idle_lost == 300, "(c) the original lost its idle sound every time");
+
+    // (d) neither resource nor engine.txt: no bands; Update and the destructor then do nothing (the original's walk
+    // MemAlloc garbage as a count: not run here, its stray writes could land anywhere in this process)
+    for (int round = 0; round < 300; round++) {
+        build_world();
+        rnd_bytes(AR(A_ES), 0x300);
+        g_script.res_try = 0; g_script.res_get = 0; g_script.file = 0;
+        both(t_ctor_orig, t_ctor_new, 0);
+        bool ok = !g_pn.fault && *(int32_t*)(arena_n + A_ES + 0xf4) == 0;
+        ok &= !memcmp(arena_o, arena_n, A_ES + 0xf4) && !memcmp(arena_o + A_ES + 0xf8, arena_n + A_ES + 0xf8, ARENA_BYTES - A_ES - 0xf8);
+        ok &= same_logs(log_o, log_n);
+        check(ok, "(d) no engine data: count 0, the rest as the original");
+        memcpy(g_arena, arena_n, ARENA_BYTES);
+        snapshot();
+        g_t_u8 = 0;
+        int f = guarded(t_upd_new, 1) | guarded(t_dtor_new, 1);
+        check(!f && !memcmp(g_arena, g_arena_snap, ARENA_BYTES) && g_log.n == 0, "(d) Update and the destructor: nothing");
+        if (bad) break;
+    }
+
+    // (e) engine.txt: the uncounted last Sound3D deleted; a NULL band switched off
+    int deleted = 0, null_saved = 0;
+    for (int round = 0; round < 1000; round++) {
+        build_world();
+        rnd_bytes(AR(A_ES), 0x300);
+        g_script.res_try = 0; g_script.res_get = 0;
+        random_lines();
+        g_script.file = 7;
+        g_script.create_fail = chance(40) ? 0 : 1u << (1 + rnd() % 4);           // (a NULL band 1..4: switched off below)
+        both(t_ctor_orig, t_ctor_new, 0);
+        const int32_t n = *(int32_t*)(arena_n + A_ES + 0xf4);
+        const uint32_t so = A_ES + 0xd4 + 4 * n;                          // the uncounted slot
+        bool ok = !g_pn.fault && n == *(int32_t*)(arena_o + A_ES + 0xf4);
+        uint8_t* leaked = n < 7 ? *(uint8_t**)(arena_o + so) : 0;
+        if (leaked) {
+            ok &= *(uint32_t*)(arena_n + so) == 0;
+            ok &= !memcmp(arena_o, arena_n, so) && !memcmp(arena_o + so + 4, arena_n + so + 4, ARENA_BYTES - so - 4);
+            // the log: the original's, with the deletion before FileClose
+            CallLog want_log = log_o;
+            uint32_t at = want_log.n - 2;                                  // FCLS, its handle
+            memmove(want_log.w + at + 3, want_log.w + at, 8);
+            want_log.w[at] = 'SDEL'; want_log.w[at + 1] = (uint32_t)(uintptr_t)leaked; want_log.w[at + 2] = 1;
+            want_log.n += 3;
+            ok &= same_logs(want_log, log_n);
+            deleted++;
+        } else {
+            ok &= !memcmp(arena_o, arena_n, ARENA_BYTES) && same_logs(log_o, log_n);
+        }
+        check(ok, "(e) engine.txt: the original's bands, the uncounted Sound3D deleted");
+        // a NULL band the other view's: switched off without a fault; everything else as the original with a stand-in
+        int nulls = -1;
+        for (int i = 1; i < n; i++) if (!*(uint8_t**)(arena_n + A_ES + 0xd4 + 4 * i)) { nulls = i; break; }
+        if (nulls > 0) {
+            memcpy(g_arena, arena_n, ARENA_BYTES);
+            *(int32_t*)X_FOCUS = g_car_index + 1;                          // another car in view: bands 1.. go off
+            g_t_u8 = chance(20);
+            snapshot();
+            const int fo = guarded(t_upd_orig, 0);
+            restore();
+            const int fn = guarded(t_upd_new, 0);
+            const int fired = g_fix_fired;
+            memcpy(arena_n, g_arena, ARENA_BYTES);
+            restore();
+            *(uint8_t**)(g_arena + A_ES + 0xd4 + 4 * nulls) = snd(15);      // the stand-in
+            const int fs = guarded(t_upd_orig, 0);
+            *(uint8_t**)(g_arena + A_ES + 0xd4 + 4 * nulls) = 0;
+            memcpy(g_arena + (snd(15) - g_arena), arena_n + (snd(15) - g_arena), 0x40);
+            check(fo && !fn && !fs && !memcmp(g_arena, arena_n, ARENA_BYTES) && fired,
+                  "(e) a NULL band switched off: the original faults, the fixed skips it and does the rest");
+            null_saved++;
+        }
+        if (bad) break;
+    }
+    check(deleted > 100 && null_saved > 20, "(e) both cases seen");
+
+    // (f) a 31-character car name: the same resource name and results
+    for (int round = 0; round < 100; round++) {
+        build_world();
+        rnd_bytes(AR(A_ES), 0x300);
+        memset(AR(A_CAR) + 0x514, 0, 32);
+        memcpy(AR(A_CAR) + 0x514, "abcdefghijklmnopqrstuvwxyz01234", 31 - (rnd() % 5));
+        random_resource();
+        *(int32_t*)AR(A_RES) = 1 + (int32_t)(rnd() % 7);
+        g_script.res_try = chance(50); g_script.res_get = 1;
+        g_script.exists = rnd();
+        both(t_ctor_orig, t_ctor_new, 0);
+        check(!g_po.fault && !g_pn.fault && !memcmp(arena_o, arena_n, ARENA_BYTES) && same_logs(log_o, log_n),
+              "(f) a 27..31-character car name: the original's results");
+        if (bad) break;
+    }
+
+    // (g) TireSound::Create with no memory for the RealTireSound
+    int alloc_saved = 0;
+    for (int round = 0; round < 200; round++) {
+        build_world();
+        random_tire_table();
+        const bool axle = chance(50);
+        *(int32_t*)X_QUALITY = axle ? 1 : 0;                                 // RealWheel 2 (wheel 1 or 3) / 1 (wheel 3)
+        g_t_i0 = g_car_index;
+        g_t_i1 = axle ? (chance(50) ? 1 : 3) : 3;
+        g_script.alloc_fail = 1;
+        both(t_create_orig, t_create_new, 0);
+        const uint32_t e = X_TIRE_TABLE + 4 * (g_t_i1 + 4 * g_t_i0);
+        check(g_po.fault && !g_pn.fault && g_t_ret == 0.0 && *(uint32_t*)(g_pn.data + (e - 0x4e1000)) == 0,
+              "(g) no memory: the original faults, the fixed returns NULL, and NULL is in the table");
+        alloc_saved++;
+        if (bad) break;
+    }
+
+    // (h) car indices outside the table: it is neither read nor written
+    static const int k_idx[] = {16, 17, 23, 100, -1, -4, 0x40000000, (int)0x80000000};
+    for (int round = 0; round < 400; round++) {
+        build_world();
+        random_tire_table();
+        g_t_i0 = k_idx[rnd() % 8];
+        g_t_i1 = (int)(rnd() % 4);
+        if (chance(30)) *(int32_t*)X_PLAYER = g_t_i0;
+        snapshot();
+        const int fn = guarded(t_create_new, 1);
+        bool ok = !fn && !memcmp(DATA, g_data_snap, DATA_BYTES) && g_fix_fired;
+        const uint8_t* r = (const uint8_t*)(uintptr_t)(uint32_t)g_t_ret;
+        if (ok && r && *(const uint32_t*)r == VT_RealTireSound)
+            for (int k = 0; k < 4; k++) ok &= *(uint8_t* const*)(r + 0xc + 4 * k) == (k == g_t_i1 ? r : 0);
+        check(ok, "(h) a car index outside 0..15: no table access, the sound speaks for its own wheel");
+        if (bad) break;
+    }
+
+    // (i) a mixer quality outside 0..2: every wheel a dummy; quality 3 on another car's is the original's
+    static const int k_q[] = {3, 4, 5, 6, -1, -2, 1000, 0x7fffffff};
+    int q3_same = 0;
+    for (int round = 0; round < 400; round++) {
+        build_world();
+        random_tire_table();
+        const int q = k_q[rnd() % 8];
+        *(int32_t*)X_QUALITY = q;
+        g_t_i0 = g_car_index;
+        g_t_i1 = (int)(rnd() % 4);
+        *(int32_t*)X_PLAYER = chance(50) ? g_car_index : g_car_index + 1;
+        const bool player = *(int32_t*)X_PLAYER == g_car_index;
+        if (q == 3 && !player) {
+            both(t_create_orig, t_create_new, 1);
+            check(!g_po.fault && !g_pn.fault && !memcmp(arena_o, arena_n, ARENA_BYTES) && !memcmp(g_po.data, g_pn.data, DATA_BYTES) &&
+                  same_logs(log_o, log_n), "(i) quality 3, not the player's car: the original's results");
+            q3_same++;
+        } else {
+            snapshot();
+            const int fn = guarded(t_create_new, 1);
+            const uint8_t* r = (const uint8_t*)(uintptr_t)(uint32_t)g_t_ret;
+            check(!fn && r && *(const uint32_t*)r == VT_DummyTireSound &&
+                  *(const uint32_t*)(uintptr_t)(X_TIRE_TABLE + 4 * (g_t_i1 + 4 * g_t_i0)) == (uint32_t)(uintptr_t)r,
+                  "(i) a quality outside 0..2: a dummy, in the table");
+        }
+        if (bad) break;
+    }
+
+    // (j) RealTireSound with a RealWheel outside 0..3
+    for (int round = 0; round < 100; round++) {
+        build_world();
+        g_t_i0 = g_car_index; g_t_i1 = (int)(rnd() % 4);
+        static const int k_m[] = {4, 5, -1, 100, (int)0x3f333333};
+        g_t_i2 = k_m[rnd() % 5];
+        both(t_rts_orig, t_rts_new, 1);
+        check(!g_pn.fault && *(uint32_t*)(arena_n + (ts(1) - g_arena) + 0x38) == 0 && count_tag('LOGR') == 1 &&
+                  count_tag('PANC') == 0,
+              "(j) a RealWheel outside 0..3: logged, not a panic, gain 0");
+        uint32_t po = 0;
+        for (uint32_t i = 0; i < log_o.n; i++) po += log_o.w[i] == 'PANC';
+        check(po == 1, "(j) the original panicked");
+        if (bad) break;
+    }
+
+    printf("directed fix tests: %s -- GetVolume: %d zero widths (%d with the division by zero, the original faulted on %d, "
+           "the fixed on %d, overflows where the original faulted too); ctor: 8+ bands, no data, engine.txt (%d "
+           "uncounted Sound3Ds deleted, %d NULL bands switched off); Create: %d with no memory, car indices and "
+           "qualities outside the tables (%d quality-3 worlds as the original); RealTireSound: RealWheels outside 0..3\n",
+           bad ? "FAILED" : "all passed", vol_masked_same, vol_div0, orig_faults, fixed_overflows, deleted, null_saved,
+           alloc_saved, q3_same);
+    return bad;
+}
+#endif
 
 // ---- main ----------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
@@ -711,7 +1078,13 @@ int main(int argc, char** argv) {
     static Footprint fp;
     int fault_log_diff = 0, fault_state_diff = 0;
     int differ = 0, faults = 0, fault_both = 0, fp_bad = 0, replay_only = 0, wild_runs = 0, unmask_runs[3] = {0};
-    int per[N_KINDS] = {0}, per_bad[N_KINDS] = {0}, per_fault[N_KINDS] = {0};
+    int per[N_KINDS] = {0}, per_bad[N_KINDS] = {0}, per_fault[N_KINDS] = {0}, per_fix[N_KINDS] = {0};
+    int fix_worlds = 0, fix_saved = 0, fix_faulted = 0;
+#ifdef VP_SND_CAR_FIXES
+    const int directed_bad = directed_fix_tests();
+#else
+    const int directed_bad = 0;
+#endif
     // coverage, from the original's results
     int c_vol_silent = 0, c_vol_up = 0, c_vol_mid = 0, c_vol_down = 0, c_upd_off = 0, c_upd_on = 0, c_upd_same = 0;
     int c_idle_on = 0, c_idle_off = 0, c_band_calls = 0, c_band_mute = 0, c_ctor_res = 0, c_ctor_get = 0, c_ctor_txt = 0,
@@ -723,16 +1096,7 @@ int main(int argc, char** argv) {
         int pick = (int)(rnd() % total_w), kk = 0;
         while (pick >= kind_weight((Kind)kk)) pick -= kind_weight((Kind)kk++);
         const Kind kind = (Kind)kk;
-        memset(&g_script, 0, sizeof g_script);
-        memset(g_arena, 0, ARENA_BYTES);
-        random_car();
-        for (int i = 0; i < 16; i++) random_sound(snd(i));
-        void** svt = (void**)AR(A_SVT);
-        svt[0] = (void*)&stub_sound_vdel;
-        for (int i = 1; i < 8; i++) svt[i] = (void*)0x00000bad;
-        random_engine_sound();
-        for (int i = 0; i < 4; i++) random_wheel(wheel(i));
-        random_tire_sounds();
+        build_world();
         random_args(kind);
         const bool wild = chance(10);
         if (wild) {                                                       // floats replaced wholesale (not the pointers)
@@ -765,6 +1129,20 @@ int main(int argc, char** argv) {
         int fn = run_guarded(kind, true, &rn);
         per[kind]++;
         const char* kname = kind == K_STATIC_INIT ? g_args.e->name : kind_names[kind];
+        if (g_fix_fired) {                                           // a fix changed this world: counted, not compared
+            fix_worlds++;
+            per_fix[kind]++;
+            if (fo && !fn) fix_saved++;
+            if (fn) {
+                fix_faulted++;
+                if (fix_faulted <= 10)
+                    printf("  (world %d, %s: a fix fired and the rewrite faulted, %08x at %08x; the original %s)\n", it, kname,
+                           g_fault_code, g_fault_eip, fo ? "faulted too" : "didn't");
+            }
+            memcpy(g_arena, g_arena_snap, ARENA_BYTES);
+            memcpy(DATA, g_data_snap, DATA_BYTES);
+            continue;
+        }
         if (fo || fn) {
             faults++;
             per_fault[kind]++;
@@ -910,5 +1288,12 @@ int main(int argc, char** argv) {
            c_ctor_nofile, c_ctor_overflow);
     printf("TireSound::Create: real %d, dummy %d; RealTireSound::Update squealing %d / none %d; LogPanic reached %d\n",
            c_create_real, c_create_dummy, c_tire_some, c_tire_none, c_panic);
-    return differ || fp_bad ? 1 : 0;
+#ifdef VP_SND_CAR_FIXES
+    printf("fixes: %d worlds a fix changed (the original faulted and the rewrite didn't in %d; the rewrite faulted in %d, from "
+           "causes no fix covers); every other world compared as above. Per function:\n", fix_worlds, fix_saved, fix_faulted);
+    for (int i = 0; i < N_KINDS; i++) if (per_fix[i]) printf("  %-46s %7d\n", kind_names[i], per_fix[i]);
+#else
+    (void)fix_worlds; (void)fix_saved; (void)fix_faulted;
+#endif
+    return differ || fp_bad || directed_bad ? 1 : 0;
 }

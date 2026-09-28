@@ -18,7 +18,15 @@
 // original stores (update_f, the BGHook) are the ORIGINAL's addresses. Globals and object fields are read and written
 // through volatile where the original touches them: the main thread and the BG thread share the manager, and some of
 // its handshakes are ordered stores with no lock (SetListener, update's async create). Float arguments are passed as
-// their bits (the original pushes them with integer moves). No fixes: every FIX CANDIDATE below is reproduced.
+// their bits (the original pushes them with integer moves).
+//
+// Fixes (docs/PORTING.md, "Fixes"; each marked FIX:, off in a VP_FAITHFUL build): Doppler at exactly the speed of sound
+// no longer divides by zero; update() leaves its lock on the update_f == 0 path and stores the async create's result
+// before its done flag; no manager (sound failed to start) makes every sound "no sound" and the entry points do
+// nothing; SoundDash starts out heard (+0x38 = 1) until its first update; an old-format 'SFX0' shorter than 0x800 bytes
+// gets length 0; the sound table's capacity is the ctor's MemAlloc operand / 4 (384 stock, 1024 lifted by patching
+// that operand) and a sound past it is no sound; a class outside 0..7 is clamped (add_sound and Remove alike);
+// DestroyWhenStopped past 32 destroys the sound instead of panicking. The others are left as they were (see each).
 //
 // Threads. The SoundManager registers SoundManager::Update as a BGHook (priority 1, after physics_thread at 0), so
 // update() -- the sounds' UpdateStatus / UpdateSound, the sort, the voice budget, the destroy lists, the mixer's own
@@ -42,7 +50,7 @@
 //     +0x20 u8 0 (the name's end), +0x24 int sound class, +0x28 u8 muted (the voice budget's), +0x29 u8 play request,
 //     +0x2a u8 stop request (1), +0x2b u8 looped, +0x2c u8 volume changed (1), +0x2d u8 frequency changed (1)
 //   Sound (0x38, vtable 0x4dd6e8): +0x30 float pan, +0x34 u8 pan changed (1)
-//   SoundDash (0x3c, vtable 0x4dd6f8; a Sound): +0x38 u8 the listener is its car (never initialised: FIX CANDIDATE)
+//   SoundDash (0x3c, vtable 0x4dd6f8; a Sound): +0x38 u8 the listener is its car (never initialised: FIX, 1)
 //   Sound3D (0x40, vtable 0x4dd6d8): +0x30 u8 in range (1), +0x34 float attenuated volume, +0x38 const float* velocity,
 //     +0x3c const float* position
 //   ISound (group C; SoftSound 0x40): 0 deleting dtor, 4 Ok, 8 Play, 0xc PlayLooped, 0x10 Stop, 0x14 GetStatus
@@ -69,24 +77,30 @@
 // ring. SoundManager's constructor / destructor (through mixer_begin / mixer_end on the BG thread) create and release
 // the DirectSound objects: replay-only.
 //
-// FIX CANDIDATES (reproduced, marked where they happen):
-//   * every entry point uses the manager pointer (0x4f5708) unchecked: sound that failed to start (no mixer began, or
-//     the manager's allocation failed) leaves it NULL, and SoundMuteCars / SetListener / StopCar / FlushAsync / any
-//     sound's constructor then fault
-//   * add_sound: no bound on the 0x600-byte table (384 sounds) and none on the sound's class (0..7): an out-of-range
-//     class indexes past the 8 per-class tables and shifts the wrong ones
-//   * DestroyWhenStopped panics past 32 (LogPanic); Destroy's ISound hand-off has room for one
-//   * check_destroy_lists skips the entry it just moved down (checked a frame later)
-//   * update(): with update_f cleared between Update's read and the lock, it returns with the lock held; and it stores
-//     the async create's "done" (+0x170) BEFORE the result (+0x16c): the waiting thread can read the result as NULL
-//     (the sound is then deleted by its factory as if the mixer had failed)
-//   * Sound3D::update_sound: Doppler divides by (339.97 + closing speed): 0 when the source and listener close at the
-//     speed of sound -> divide-by-zero on the BG (physics) thread, where it is unmasked
-//   * SoundDash never initialises +0x38; CanBeHeard reads it on the first update (mute_sounds runs before UpdateSound)
-//   * SoundClassString indexes its table with a signed class: a negative one reads the stack
-//   * SoundResourceGet: an old-format 'SFX0' shorter than 0x800 bytes has its length wrapped negative
-//   * mute_sounds: a class that gets part of its cap leaves want = want - (given + cap), not want - cap (the budget
-//     sometimes grows back); harmless
+// The original's bugs (FIX: fixed, marked where they happen; FIX CANDIDATE: left, with the reason):
+//   * FIX: every entry point uses the manager pointer (0x4f5708) unchecked: sound that failed to start (no mixer
+//     began, or the manager's allocation failed) leaves it NULL, and SoundMuteCars / SetListener / StopCar /
+//     FlushAsync / any sound's constructor then fault
+//   * FIX: add_sound: no bound on the 0x600-byte table (384 sounds) and none on the sound's class (0..7): an
+//     out-of-range class indexes past the 8 per-class tables and shifts the wrong ones
+//   * FIX: DestroyWhenStopped panics past 32 (LogPanic, which ends the game)
+//   * left: Destroy's ISound hand-off has room for one (a second caller waits): only the main thread ever hands off
+//     (the BG thread deletes directly), so one at a time; not a hang
+//   * left: check_destroy_lists skips the entry it just moved down: it is checked a frame later (a stopped sound is
+//     deleted one frame late); no leak, no crash
+//   * FIX: update(): with update_f cleared between Update's read and the lock, it returns with the lock held; and it
+//     stores the async create's "done" (+0x170) BEFORE the result (+0x16c): the waiting thread can read the result
+//     as NULL (the sound is then deleted by its factory as if the mixer had failed, and the mixer's sound leaks)
+//   * FIX: Sound3D::update_sound: Doppler divides by (339.97 + closing speed): 0 when the source and listener close
+//     at the speed of sound -> divide-by-zero on the BG (physics) thread, where it is unmasked
+//   * FIX: SoundDash never initialises +0x38; CanBeHeard reads it on the first update (mute_sounds runs before
+//     UpdateSound)
+//   * left: SoundClassString indexes its table with a signed class: a negative one reads the stack (its one caller
+//     is sort_sounds' unreachable default, with 0..7)
+//   * FIX: SoundResourceGet: an old-format 'SFX0' shorter than 0x800 bytes has its length wrapped negative
+//   * left: mute_sounds: a class that gets part of its cap leaves want = want - (given + cap), not want - cap (the
+//     budget sometimes grows back); only which sounds get a voice changes, never more voices than the budget
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 #include "viperport.h"
@@ -150,6 +164,29 @@ enum : uint32_t {
 #define G8(a) (*(volatile uint8_t*)(uintptr_t)(a))
 #define G32(a) (*(volatile uint32_t*)(uintptr_t)(a))
 #define S(a) ((const char*)(uintptr_t)(a))                 // one of the game's own strings
+
+// A fix branch taken (docs/PORTING.md "Fixes"): nothing in the DLL; the harness counts them to tell a world a fix changed
+// from an ordinary one, which must still give the original's bits.
+#ifndef SNDM_FIX_FIRED
+#define SNDM_FIX_FIRED() ((void)0)
+#endif
+
+// The sound table's capacity: SoundManager's constructor allocates it with `push 0x600; call MemAlloc` (0x473ed0), 384
+// sounds, and nothing in the original bounds it. The limit is lifted by patching that operand (0x473ed1: 0x1000 for
+// 1024 sounds, the SoftMixer's lifted bag of sounds, since each sound owns one of the mixer's), so the capacity is read
+// from it (docs/PORTING.md rule 12): 384 in a harness or an unpatched game, the lifted value once patched. The
+// rewrite's constructor allocates the same operand.
+enum : uint32_t { SM_TABLE_BYTES_OP = 0x00473ed1 };
+static __forceinline int32_t sound_capacity() { return (int32_t)(m1_operand(0x00473ed1) >> 2); }
+// FIX: a sound's class outside 0..7 indexed past the 8 per-class tables (add_sound, Remove): clamped, the same in both
+static __forceinline int32_t sound_class(const uint8_t* s) {
+    int32_t cls = *(const volatile int32_t*)(s + 0x24);
+    if (VP_FIX && (uint32_t)cls > 7) {
+        cls = cls < 0 ? 0 : 7;
+        SNDM_FIX_FIRED();
+    }
+    return cls;
+}
 
 // ---- the functions they call, by address -------------------------------------------------------------------------------
 typedef void(__cdecl* Void_t)();
@@ -255,9 +292,9 @@ static void fp_manager(Footprint& f, uint8_t* mgr) {
     f.add(mgr, 0x180, "the SoundManager");
     uint8_t* list = PTR(mgr, 4);
     if (!list) return;
-    f.add(list, 0x600, "its sound table");
+    f.add(list, 4u * (uint32_t)sound_capacity(), "its sound table");
     const int32_t n = I32(mgr, 8);
-    for (int32_t i = 0; i < n && i < 0x180; i++) fp_sound(f, PTR(list, 4u * (uint32_t)i));
+    for (int32_t i = 0; i < n && i < sound_capacity(); i++) fp_sound(f, PTR(list, 4u * (uint32_t)i));
     const int32_t nd = I32(mgr, 0x158);
     for (int32_t i = 0; i < nd && i < 32; i++) fp_sound(f, PTR(mgr, 0xd8 + 4u * (uint32_t)i));
     if (I32(mgr, 0x160) > 0 && PTR(mgr, 0x15c)) f.add(PTR(mgr, 0x15c), 0x40, "the mixer sound to destroy");
@@ -343,20 +380,45 @@ static void __cdecl SoundEnd_rw() {
 static void fp_sound_end(Footprint& f) { f.replay_only = "destroys the manager, stops the mixer on the BG thread, frees"; }
 PORT_FN(0x00471d90, "SoundEnd", SoundEnd_rw, fp_sound_end)
 
-// FIX CANDIDATE: the manager unchecked (NULL when sound failed to start) -- here and in every entry point below
-static void __cdecl SoundMuteCars_rw() { B8(PTR((void*)(uintptr_t)S_MGR, 0), 1) = 1; }
-static void fp_sound_mute_cars(Footprint& f) { f.add((uint8_t*)(uintptr_t)G32(S_MGR) + 1, 1, "the manager's cars-muted flag"); }
+// FIX: the manager was used unchecked here and in every entry point below. It is NULL when sound failed to start (no
+// mixer began -- no audio device -- or its allocation failed), which app_begin ignores, so the first of these faulted.
+// With no manager they do nothing: there is no sound to mute, stop, flush or place.
+static __forceinline bool no_manager() {
+    if (VP_FIX && G32(S_MGR) == 0) {
+        SNDM_FIX_FIRED();
+        return true;
+    }
+    return false;
+}
+static void __cdecl SoundMuteCars_rw() {
+    if (no_manager()) return;
+    B8(PTR((void*)(uintptr_t)S_MGR, 0), 1) = 1;
+}
+static void fp_sound_mute_cars(Footprint& f) {
+    if (VP_FIX && !G32(S_MGR)) return;
+    f.add((uint8_t*)(uintptr_t)G32(S_MGR) + 1, 1, "the manager's cars-muted flag");
+}
 PORT_FN(0x00471dd0, "SoundMuteCars", SoundMuteCars_rw, fp_sound_mute_cars)
 
-static void __cdecl SoundUnMuteCars_rw() { B8(PTR((void*)(uintptr_t)S_MGR, 0), 1) = 0; }
+static void __cdecl SoundUnMuteCars_rw() {
+    if (no_manager()) return;
+    B8(PTR((void*)(uintptr_t)S_MGR, 0), 1) = 0;
+}
 PORT_FN(0x00471de0, "SoundUnMuteCars", SoundUnMuteCars_rw, fp_sound_mute_cars)
 
-static void __cdecl SoundFlushAsync_rw() { g_SM_FlushAsync((void*)(uintptr_t)G32(S_MGR), 0); }
+static void __cdecl SoundFlushAsync_rw() {
+    if (no_manager()) return;
+    g_SM_FlushAsync((void*)(uintptr_t)G32(S_MGR), 0);
+}
 static void fp_flush(Footprint& f) { f.replay_only = "sleeps 50 ms (the BG thread runs), deletes the sounds left to stop"; }
 PORT_FN(0x00471df0, "SoundFlushAsync", SoundFlushAsync_rw, fp_flush)
 
-static void __cdecl SoundSetListener_rw(const Listener* l) { g_SM_SetListener((void*)(uintptr_t)G32(S_MGR), 0, l); }
+static void __cdecl SoundSetListener_rw(const Listener* l) {
+    if (no_manager()) return;
+    g_SM_SetListener((void*)(uintptr_t)G32(S_MGR), 0, l);
+}
 static void fp_sound_set_listener(Footprint& f, const Listener*) {
+    if (VP_FIX && !G32(S_MGR)) return;
     f.add((uint8_t*)(uintptr_t)G32(S_MGR) + 0x50, 0x44, "the manager's listener (+0x50: the index, listener_info[0])");
 }
 PORT_FN(0x00471e00, "SoundSetListener", SoundSetListener_rw, fp_sound_set_listener)
@@ -365,10 +427,13 @@ static void fp_stop_car_of(Footprint& f, uint8_t* mgr) {
     if (!mgr) return;                                       // (the call faults)
     uint8_t* list = PTR(mgr, 4);
     const int32_t n = I32(mgr, 8);
-    for (int32_t i = 0; list && i < n && i < 0x180; i++)
+    for (int32_t i = 0; list && i < n && i < sound_capacity(); i++)
         if (uint8_t* s = PTR(list, 4u * (uint32_t)i)) f.add(s + 0x2a, 1, "a sound's stop request");
 }
-static void __cdecl SoundStopCar_rw(int car) { g_SM_StopCar((void*)(uintptr_t)G32(S_MGR), 0, car); }
+static void __cdecl SoundStopCar_rw(int car) {
+    if (no_manager()) return;
+    g_SM_StopCar((void*)(uintptr_t)G32(S_MGR), 0, car);
+}
 static void fp_sound_stop_car(Footprint& f, int) { fp_stop_car_of(f, (uint8_t*)(uintptr_t)G32(S_MGR)); }
 PORT_FN(0x00471e20, "SoundStopCar", SoundStopCar_rw, fp_sound_stop_car)
 
@@ -407,11 +472,15 @@ static void* __fastcall SoundBase_ctor_rw(uint8_t* self, Edx, const char* name, 
 static void fp_soundbase_ctor(Footprint& f, uint8_t* self, Edx, const char*, int) { f.add(self, 0x2e, "the sound (constructing)"); }
 PORT_FN(0x00471ec0, "SoundBase::SoundBase", SoundBase_ctor_rw, fp_soundbase_ctor)
 
+// FIX: with no manager (a SoundRestart whose SoundBegin failed, while a sound made before it lives on) Remove and Destroy
+// ran on NULL. The sound is let go of instead: its mixer sound (whose mixer may be gone) is left as it is.
 static void __fastcall SoundBase_dtor_rw(uint8_t* self, Edx) {
     U32(self, 0) = VT_SOUNDBASE;
     if (U32(self, 0xc) != 0) {
-        g_SM_Remove((void*)(uintptr_t)G32(S_MGR), 0, self);
-        g_SM_Destroy((void*)(uintptr_t)G32(S_MGR), 0, PTR(self, 0xc));
+        if (!no_manager()) {
+            g_SM_Remove((void*)(uintptr_t)G32(S_MGR), 0, self);
+            g_SM_Destroy((void*)(uintptr_t)G32(S_MGR), 0, PTR(self, 0xc));
+        }
         U32(self, 0xc) = 0;
     }
 }
@@ -510,7 +579,12 @@ static double __cdecl attenuation_rw(float d) {
 static void fp_attenuation(Footprint& f, float) { f.pure = true; }
 PORT_FN(0x00472120, "attenuation", attenuation_rw, fp_attenuation)
 
-// FIX CANDIDATE: Doppler's divisor 339.97 + closing speed reaches 0 at the speed of sound (divide-by-zero on the BG thread)
+// FIX: Doppler's divisor 339.97 + closing speed is exactly 0 when source and listener close at exactly the speed of
+// sound: a divide-by-zero on the BG thread, which is the physics thread (unmasked there), so the game crashed. That one
+// case now takes the quotient the division gives with the exception masked, +infinity (339.97 / +0: the sum of 339.97
+// and a value within 24 bits of -339.97 is +0, never -0); SoftSound::SetFrequency clamps it to 16, and storing it
+// raises nothing. Every other divisor, negative ones included (faster than sound: a negative ratio, clamped to 0.02 by
+// SetFrequency), is divided as before.
 static void __fastcall Sound3D_update_sound_rw(uint8_t* self, Edx, const Listener* l) {
     const uint8_t* pos = PTR(self, 0x3c);
     const uint8_t* lp = (const uint8_t*)l->frame + 0x24;
@@ -554,7 +628,13 @@ static void __fastcall Sound3D_update_sound_rw(uint8_t* self, Edx, const Listene
         double s = ((D(F32(v, 4)) - D(lv[1])) * D(d1) + (D(F32(v, 8)) - D(lv[2])) * D(d2)) +
                    (D(F32(v, 0)) - D(lv[0])) * D(d0);
         s = s + D(c);
-        const double q = D(c) / s;
+        double q;
+        if (VP_FIX && s == 0.0) {
+            q = HUGE_VAL;                                               // FIX: 339.97 / +0, as the masked fdiv gives it
+            SNDM_FIX_FIRED();
+        } else {
+            q = D(c) / s;
+        }
         freq = fb(st(q * D(bf(freq))));
     } else {
         vcall<void>(PTR(self, 0xc), 0x2c, (uint32_t)0);                // SetPanning(0)
@@ -563,6 +643,22 @@ static void __fastcall Sound3D_update_sound_rw(uint8_t* self, Edx, const Listene
 }
 PORT_FN(0x00472150, "Sound3D::update_sound", Sound3D_update_sound_rw, fp_one_sound)
 
+// FIX: with no manager (sound failed to start) the constructors called Create / Add on NULL. Now, as with a mixer that
+// fails to make the sound, the sound gets no mixer sound (+0xc stays 0) and isn't added: its factory then deletes it and
+// returns NULL, which every caller (Car, PlayCar, EngineSound, the tyre and collision sounds, Toss) already handles as
+// "no sound". The same when the sound table is full (FIX: add_sound had no bound): the sound past the capacity is no
+// sound, instead of a write past the table.
+static bool no_room() {
+    if (no_manager()) return true;
+    uint8_t* mgr = (uint8_t*)(uintptr_t)G32(S_MGR);
+    if (VP_FIX && I32(mgr, 8) >= sound_capacity()) {
+        static bool said;
+        if (!said) { said = true; logf("sound: the sound table is full (%d sounds): the rest are silent", sound_capacity()); }
+        SNDM_FIX_FIRED();
+        return true;
+    }
+    return false;
+}
 static void* __fastcall Sound3D_ctor_rw(uint8_t* self, Edx, const char* name, int cls, const void* vel, const void* pos) {
     g_SoundBase_ctor(self, 0, name, cls);
     U32(self, 0) = VT_SOUND3D;
@@ -570,7 +666,8 @@ static void* __fastcall Sound3D_ctor_rw(uint8_t* self, Edx, const char* name, in
     U32(self, 0x3c) = (uint32_t)(uintptr_t)pos;
     U32(self, 0x34) = 0;
     B8(self, 0x30) = 1;
-    void* is = g_SM_Create3D((void*)(uintptr_t)G32(S_MGR), 0, name, cls);
+    void* is = 0;
+    if (!no_room()) is = g_SM_Create3D((void*)(uintptr_t)G32(S_MGR), 0, name, cls);
     U32(self, 0xc) = (uint32_t)(uintptr_t)is;
     if (is) g_SM_Add_Sound3D((void*)(uintptr_t)G32(S_MGR), 0, self);
     return self;
@@ -591,7 +688,8 @@ static void* __fastcall Sound_ctor_rw(uint8_t* self, Edx, const char* name, int 
     U32(self, 0) = VT_SOUND;
     U32(self, 0x30) = 0;
     B8(self, 0x34) = 1;
-    void* is = g_SM_Create((void*)(uintptr_t)G32(S_MGR), 0, name, cls);
+    void* is = 0;
+    if (!no_room()) is = g_SM_Create((void*)(uintptr_t)G32(S_MGR), 0, name, cls);
     U32(self, 0xc) = (uint32_t)(uintptr_t)is;
     if (is) g_SM_Add_Sound((void*)(uintptr_t)G32(S_MGR), 0, self);
     return self;
@@ -610,8 +708,17 @@ static void __fastcall Sound_update_sound_rw(uint8_t* self, Edx, const Listener*
 }
 PORT_FN(0x00472410, "Sound::update_sound", Sound_update_sound_rw, fp_one_sound)
 
-// FIX CANDIDATE: +0x38 (heard from its own car) is never initialised here
+// FIX: +0x38 (the listener is its car) was never initialised: CanBeHeard reads it in the first mute_sounds, before any
+// update_sound has set it, and update_sound (the only place that sets it) runs only while the sound is unmuted. So a
+// dash sound whose garbage was 0 was muted and never updated again: silent for good (the gear shift, the cockpit
+// clicks); any other garbage worked as meant. It starts at 1 now -- what every non-zero value did: heard, as far as
+// its car is concerned, until its first update sets it from the listener. (Written before the Sound constructor adds
+// the sound to the table, so the BG thread never sees it unset.)
 static void* __fastcall SoundDash_ctor_rw(uint8_t* self, Edx, const char* name, int cls, int car) {
+    if (VP_FIX) {
+        B8(self, 0x38) = 1;
+        SNDM_FIX_FIRED();
+    }
     g_Sound_ctor(self, 0, name, cls);
     U32(self, 0) = VT_SOUNDDASH;
     I32(self, 0x10) = car;
@@ -837,7 +944,7 @@ static void* __fastcall SoundManager_ctor_rw(uint8_t* self, Edx, void* mixer) {
     g_SoundTable_ctor(self + 4, 0);
     for (uint32_t k = 0; k < 8; k++) g_SoundTable_ctor(self + 0xc + 8 * k, 0);
     for (uint32_t k = 0; k < 2; k++) g_listener_info_ctor(self + 0x54 + 0x40 * k, 0);
-    U32(self, 4) = (uint32_t)(uintptr_t)MemAlloc(0x600);
+    U32(self, 4) = (uint32_t)(uintptr_t)MemAlloc((int)m1_operand(0x00473ed1));   // push 0x600: the table (lifted)
     g_verify_entitlements();
     if (U32(self, 4) == 0) return self;
     U32(self, 0xd4) = (uint32_t)(uintptr_t)mixer;
@@ -969,11 +1076,21 @@ static void fp_set_listener(Footprint& f, uint8_t* self, Edx, const Listener*) {
 }
 PORT_FN(0x004741e0, "SoundManager::SetListener", SM_SetListener_rw, fp_set_listener)
 
-// FIX CANDIDATE: with update_f cleared after Update read it, returns holding the lock; the async create's done flag
-// is stored before its result
+// FIX: with update_f cleared after Update read it, the original returned holding the manager's lock, and the next
+// add_sound / Remove / DestroyWhenStopped on the main thread waited for it forever; it lets go of it now. (Only the BG
+// thread itself clears update_f today -- mixer_begin failing, mixer_end -- so the game doesn't reach it.)
+// FIX: the async create's done flag (+0x170) was stored before its result (+0x16c): fg_create_sound, polling on another
+// thread, could see done and read the result still NULL -- the new sound was then deleted by its factory as if the mixer
+// had failed, and the mixer's sound leaked. The result is stored first now; the memory both leave is the same.
 static void __fastcall SM_update_rw(uint8_t* self, Edx) {
     MultiEnter(I32(self, 0x178), 0, 0);
-    if (G32(S_UPDATE_F) == 0) return;
+    if (G32(S_UPDATE_F) == 0) {
+        if (VP_FIX) {
+            MultiLeave(I32(self, 0x178), 0, 0);
+            SNDM_FIX_FIRED();
+        }
+        return;
+    }
     if (I32(self, 0x17c) == 0) I32(self, 0x17c) = TaskGetID();
     const int32_t idx = I32(self, 0x50);
     if (idx != -1) {
@@ -996,8 +1113,13 @@ static void __fastcall SM_update_rw(uint8_t* self, Edx) {
         const char* name = (const char*)PTR(self, 0x164);
         if (name && U32(self, 0x16c) == 0) {
             void* r = g_SM_create_sound(self, 0, name, I32(self, 0x168));
-            B8(self, 0x170) = 1;
-            U32(self, 0x16c) = (uint32_t)(uintptr_t)r;
+            if (VP_FIX) {                                              // FIX: the result, then done (volatile: in order)
+                U32(self, 0x16c) = (uint32_t)(uintptr_t)r;
+                B8(self, 0x170) = 1;
+            } else {
+                B8(self, 0x170) = 1;
+                U32(self, 0x16c) = (uint32_t)(uintptr_t)r;
+            }
         }
     }
     MultiLeave(I32(self, 0x178), 0, 0);
@@ -1049,7 +1171,9 @@ static void __fastcall SM_destroy_isounds_rw(uint8_t* self, Edx) {
 static void fp_destroy_isounds(Footprint& f, uint8_t* self, Edx) { fp_update_f(f, F_DESTROY_ISOUNDS, self); }
 PORT_FN(0x004743d0, "SoundManager::destroy_isounds", SM_destroy_isounds_rw, fp_destroy_isounds)
 
-// FIX CANDIDATE: the entry moved down into a deleted one's slot is skipped this frame
+// FIX CANDIDATE (left): the entry moved down into a deleted one's slot is skipped this frame. It is checked (and deleted,
+// if stopped) on the next frame: a tossed sound is freed one frame late, nothing leaks or crashes, so the original's
+// order is kept.
 static void __fastcall SM_check_destroy_lists_rw(uint8_t* self, Edx) {
     if (B8(self, 0x174) == 0) {
         int32_t i = 0;
@@ -1077,6 +1201,10 @@ PORT_FN(0x00474420, "SoundManager::check_destroy_lists", SM_check_destroy_lists_
 // The voice budget (the quality's voices, each class capped): count the audible sounds per class (all but the UI class
 // skipped while the cars are muted), hand out voices class by class until the budget or the demand runs out, then mute
 // everything that didn't get one.
+// FIX CANDIDATE (left): a class that gets a partial cap is left wanting w - (given + cap) where w - cap was meant, which
+// can go negative on a later pass and hand voices back to the budget. Every step moves voices between `budget` and
+// `given` (their sum stays the quality's voices, budget never below 0), so no class is given more than the budget and
+// the loop ends; only which sounds get a voice differs. That is gameplay-level allocation, not a crash: kept.
 static void __fastcall SM_mute_sounds_rw(uint8_t* self, Edx) {
     const int32_t q = MixerGetQuality();
     uint8_t muted_with_cars[8];
@@ -1118,7 +1246,7 @@ static void __fastcall SM_mute_sounds_rw(uint8_t* self, Edx) {
                         const int32_t g = (int32_t)((uint32_t)given[i] + (uint32_t)cap);
                         given[i] = g;
                         done = 0;
-                        want[i] = (int32_t)((uint32_t)w - (uint32_t)g);     // FIX CANDIDATE: w - cap meant
+                        want[i] = (int32_t)((uint32_t)w - (uint32_t)g);     // FIX CANDIDATE (left): w - cap meant; see below
                     } else {
                         budget = (int32_t)((uint32_t)budget - (uint32_t)w);
                         given[i] = (int32_t)((uint32_t)given[i] + (uint32_t)w);
@@ -1152,7 +1280,7 @@ static void fp_mute_sounds(Footprint& f, uint8_t* self, Edx) {
     for (uint32_t k = 0; k < 8; k++) {
         uint8_t* l = PTR(self, 0xc + 8 * k);
         const int32_t n = I32(self, 0x10 + 8 * k);
-        for (int32_t i = 0; l && i < n && i < 0x180; i++)
+        for (int32_t i = 0; l && i < n && i < sound_capacity(); i++)
             if (uint8_t* s = PTR(l, 4u * (uint32_t)i)) f.add(s + 0x28, 1, "a sound's muted flag");
     }
 }
@@ -1226,7 +1354,7 @@ static void __fastcall SM_sort_sounds_rw(uint8_t* self, Edx, const Listener*) {
     }
 }
 static void fp_sort_sounds(Footprint& f, uint8_t* self, Edx, const Listener*) {
-    if (uint8_t* list = PTR(self, 4)) f.add(list, 0x600, "the sound table");
+    if (uint8_t* list = PTR(self, 4)) f.add(list, 4u * (uint32_t)sound_capacity(), "the sound table");
 }
 PORT_FN(0x00474780, "SoundManager::sort_sounds", SM_sort_sounds_rw, fp_sort_sounds)
 
@@ -1234,11 +1362,20 @@ static void __fastcall SM_verify_soundtables_rw(uint8_t*, Edx) {}   // an empty 
 static void fp_pure_this(Footprint& f, uint8_t*, Edx) { f.pure = true; }
 PORT_FN(0x00474800, "SoundManager::verify_soundtables", SM_verify_soundtables_rw, fp_pure_this)
 
-// FIX CANDIDATE: no bound on the table (384) nor on the class (0..7)
+// FIX: no bound on the table (384 sounds, or the lifted capacity: sound_capacity) nor on the class (0..7; sound_class
+// clamps it, and Remove finds it the same way). The constructors refuse a sound past the capacity before it is made
+// (no_room), so a full table here is only two threads adding the last sound at once: that one isn't added (its Remove
+// then reports it missing, the original's panic) rather than written past the table.
 static void __fastcall SM_add_sound_rw(uint8_t* self, Edx, uint8_t* s) {
     MultiEnter(I32(self, 0x178), 0, 0);
     const int32_t count = I32(self, 8);
-    const int32_t cls = I32(s, 0x24);
+    if (VP_FIX && count >= sound_capacity()) {
+        logf("sound: the sound table is full (%d sounds): %.12s not added", sound_capacity(), (const char*)s + 0x14);
+        SNDM_FIX_FIRED();
+        MultiLeave(I32(self, 0x178), 0, 0);
+        return;
+    }
+    const int32_t cls = sound_class(s);
     uint8_t* at = PTR(self, 0xc + 8u * (uint32_t)cls);
     const int32_t idx = (int32_t)((uint32_t)at - U32(self, 4)) >> 2;
     crt_memmove(at + 4, at, (uint32_t)(count - idx) << 2);
@@ -1259,7 +1396,8 @@ static void __fastcall SM_add_sound_rw(uint8_t* self, Edx, uint8_t* s) {
 }
 static void fp_add_sound(Footprint& f, uint8_t* self, Edx, uint8_t*) {
     f.add(self, 0x180, "the SoundManager");
-    if (uint8_t* list = PTR(self, 4)) f.add(list, 0x604, "the sound table (and past it, when it's full)");
+    if (uint8_t* list = PTR(self, 4))                               // (and past it: the original's add_sound, when full)
+        f.add(list, 4u * (uint32_t)sound_capacity() + 4u, "the sound table");
 }
 PORT_FN(0x00474810, "SoundManager::add_sound", SM_add_sound_rw, fp_add_sound)
 
@@ -1279,7 +1417,7 @@ PORT_FN(0x004748c0, "SoundManager::soundclass_is_3d", SM_soundclass_is_3d_rw, fp
 
 static void __fastcall SM_Remove_rw(uint8_t* self, Edx, uint8_t* s) {
     MultiEnter(I32(self, 0x178), 0, 0);
-    const int32_t cls = I32(s, 0x24);
+    const int32_t cls = sound_class(s);                     // FIX: clamped to 0..7, as add_sound put it
     const int32_t n = I32(self, 0x10 + 8u * (uint32_t)cls);
     uint8_t* found = 0;
     if (n > 0) {
@@ -1316,18 +1454,38 @@ PORT_FN(0x004748e0, "SoundManager::Remove", SM_Remove_rw, fp_remove)
 static void __fastcall SM_FlushAsync_rw(uint8_t* self, Edx) { g_SM_destroy_sounds(self, 0); }
 PORT_FN(0x004749a0, "SoundManager::FlushAsync", SM_FlushAsync_rw, fp_destroy_sounds)
 
+// FIX: a 33rd sound waiting to stop was a LogPanic (the game ends). The list is 32 slots inside the manager object (+0xd8,
+// its count at +0x158, then the ISound hand-off), so it can't simply be bigger. Past 32 the sound is destroyed at once
+// instead -- outside the lock, as check_destroy_lists would (its destructor's Destroy may wait for the BG thread, which
+// needs the lock): a fire-and-forget sound tossed while 32 are still playing is not played. (Looped tosses never stop
+// and hold their slots until FlushAsync, so this is where a run of them ends up.)
 static void __fastcall SM_DestroyWhenStopped_rw(uint8_t* self, Edx, uint8_t* s) {
     MultiEnter(I32(self, 0x178), 0, 0);
     const uint32_t n = U32(self, 0x158);
+    bool full = false;
     if (n < 32) {
         U32(self, 0xd8 + 4 * n) = (uint32_t)(uintptr_t)s;
         U32(self, 0x158) += 1;
+    } else if (VP_FIX) {
+        full = true;
+        SNDM_FIX_FIRED();
     } else {
         LogPanic(S(0x4f5bac));                               // "...DestroyWhenStopped: increase N"
     }
     MultiLeave(I32(self, 0x178), 0, 0);
+    if (full) {
+        static bool said;
+        if (!said) { said = true; logf("sound: 32 tossed sounds are still playing: another one isn't played"); }
+        if (s) vcall<void*>(s, 0, 1u);                       // its scalar deleting destructor
+    }
 }
-static void fp_destroy_when_stopped(Footprint& f, uint8_t* self, Edx, uint8_t*) { f.add(self + 0xd8, 0x84, "the destroy list and its count"); }
+static void fp_destroy_when_stopped(Footprint& f, uint8_t* self, Edx, uint8_t*) {
+    if (VP_FIX && U32(self, 0x158) >= 32) {
+        f.replay_only = "the list is full: deletes the sound (frees, or waits for the BG thread to)";
+        return;
+    }
+    f.add(self + 0xd8, 0x84, "the destroy list and its count");
+}
 PORT_FN(0x004749b0, "SoundManager::DestroyWhenStopped", SM_DestroyWhenStopped_rw, fp_destroy_when_stopped)
 
 // on the BG thread: the mixer's sound, placed by what the mixer can do (SoundLoc 0 hardware 3D, 1 hardware, 2 software)
@@ -1376,7 +1534,11 @@ static void* __fastcall SM_Create3D_rw(uint8_t* self, Edx, const char* name, int
 }
 PORT_FN(0x00474b60, "SoundManager::Create3D", SM_Create3D_rw, fp_create_sound)
 
-// FIX CANDIDATE: the hand-off holds one (a second thread waits for the first's to be taken)
+// FIX CANDIDATE (left): the hand-off holds one (a second thread waits for the first's to be taken). Not a hang: only the
+// main thread hands off (the BG thread, whose id update() records, deletes directly), one at a time, and update()'s
+// check_destroy_lists -> destroy_isounds takes it every frame (the manager's destructor points update_f at
+// destroy_isounds itself while it deletes). Two other threads at once could both pass the wait and write slot 1 (the
+// count); the game has no such third thread.
 static void __fastcall SM_Destroy_rw(uint8_t* self, Edx, uint8_t* is) {
     if (TaskGetID() == I32(self, 0x17c)) {
         if (is) vcall<void*>(is, 0, 1u);
@@ -1402,7 +1564,10 @@ PORT_FN(0x004771f0, "$E1(soundres.obj)", soundres_E1_rw, fp_static_init)
 static void __cdecl soundres_E2_rw() { g_E1_soundres(); }
 PORT_FN(0x004771e0, "$E2(soundres.obj)", soundres_E2_rw, fp_static_init)
 
-// FIX CANDIDATE: an old-format resource shorter than 0x800 bytes gets a negative length
+// FIX: an old-format ('SFX0' version 0) resource has 0x800 bytes cut off its length; one shorter than that wrapped to
+// a huge length (SoftSound's is the byte count >> 1), and the mixer played on through whatever memory followed, until it
+// faulted. It gets length 0 now (nothing to play); longer ones are cut as before. (The stock data has no old-format
+// sounds: this is mod data.)
 static void* __cdecl SoundResourceGet_rw(const char* name) {
     uint32_t version;
     uint8_t b;
@@ -1410,7 +1575,12 @@ static void* __cdecl SoundResourceGet_rw(const char* name) {
     if (r) {
         if (version == 0) {
             LogReport(S(0x4f65d8), name);                    // "%s is in old format--truncating"
-            I32(r, 0) -= 0x800;
+            if (VP_FIX && U32(r, 0) < 0x800u) {
+                if (U32(r, 0) != 0) U32(r, 0) = 0;           // (0 already: a second fetch; left alone)
+                SNDM_FIX_FIRED();
+            } else {
+                I32(r, 0) -= 0x800;
+            }
         }
         return r;
     }

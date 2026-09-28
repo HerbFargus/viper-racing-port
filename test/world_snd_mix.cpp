@@ -4,6 +4,7 @@
 //   build (x86 tools, e.g. after vcvarsall.bat x86), from the repository root:
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_snd_mix.cpp
 //        /Fo%TEMP%\s1c\ /Fe%TEMP%\s1c\world_snd_mix.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
+//     the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS -- the rewrites as the game builds them
 //   run:   world_snd_mix.exe [episodes] [seed] [leaf-iterations]
 //          (environment: VP_S1C_VERBOSE=1 prints each episode, =2 each check; VP_S1C_GAME=<dir> the game install the
 //          .sfx resources are read from, default ..\game-files\installs\v1.0-RC next to the repository)
@@ -31,6 +32,15 @@
 // hooked into the image for the rewrite's pass). Then the leaf loops run long outside the check machinery: fastmix,
 // nullmix, fastout, fastout_8, setup_channel (the x87 gains), the setters and max_data_from_cursors, millions of calls
 // each on values chosen round the clamps and wraps.
+//
+// The fixes (port.h: VP_FIX): the plain build defines VP_FAITHFUL and checks the rewrites against the originals as
+// above. Built with /DFIX_TESTS it compiles the fixed rewrites and first runs the fix tests: mod-like sounds (unpadded,
+// short, empty, ending at a no-access page) played one-shot and looped at every rate through the fixed mixer, which
+// must not fault and must mix exactly what the original mixes from the same data with the game's padding added (zeros
+// after a one-shot, the data again after a loop); every stock .sfx the same way against the original on itself; a
+// missing resource; a failed allocation; the bag's capacity with M1's patch (1024) and without (256). Then the same
+// random worlds, kept to ordinary inputs (stock sounds, positions inside the data, the steps SetFrequency allows, no
+// failed allocation or missing resource), must all still equal the original.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -43,7 +53,12 @@
 #include <vector>
 #include <tuple>
 #include <type_traits>
+#ifndef FIX_TESTS
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+static const bool k_ordinary = false;
+#else
+static const bool k_ordinary = true;        // the random rounds keep to inputs the fixes don't change
+#endif
 #include "../hook/port.h"
 
 struct ChainReg {
@@ -246,8 +261,9 @@ static const char* global_name(uint32_t a) {
 }
 
 // ---- the sound resources -----------------------------------------------------------------------------------------------
-struct Res { uint8_t* p; uint32_t bytes; std::string name; };
+struct Res { uint8_t* p; uint32_t bytes; std::string name; bool real; };   // bytes: the payload (data and padding)
 static std::vector<Res> g_res;
+static std::vector<int> g_safe;              // the ordinary rounds' resources: stock, data longer than a block's reach
 static uint8_t* g_res_block;
 static uint32_t g_res_used;
 static bool load_res_file(const std::string& path) {
@@ -270,7 +286,7 @@ static bool load_res_file(const std::string& path) {
         if (!memcmp(e + 16, "0XFS", 4) && off + 8 + sz <= d.size() && g_res_used + sz + 16 < 0x400000) {
             uint8_t* p = g_res_block + g_res_used;
             memcpy(p, &d[off + 8], sz);
-            g_res.push_back({p, sz, std::string((const char*)e, strnlen((const char*)e, 16))});
+            g_res.push_back({p, sz, std::string((const char*)e, strnlen((const char*)e, 16)), true});
             g_res_used = (g_res_used + sz + 15) & ~15u;
         }
         off += sz + 8;
@@ -294,9 +310,36 @@ static void add_synthetic(uint32_t samples, bool loop_pad, const char* what) {
     DWORD old;
     VirtualProtect(b + pages * 0x1000, 0x1000, PAGE_NOACCESS, &old);
     VirtualProtect(b, pages * 0x1000, PAGE_READONLY, &old);
-    g_res.push_back({p, bytes, what});
+    g_res.push_back({p, bytes, what, false});
 }
-static uint8_t* pick_res() { return g_res[rnd() % g_res.size()].p; }
+static uint8_t* pick_res() { return k_ordinary ? g_res[g_safe[rnd() % g_safe.size()]].p : g_res[rnd() % g_res.size()].p; }
+// res.obj's set list, as the SoftSound constructor's fix walks it (0x4eae40: nodes {next +0x10, toc +0x14, count
+// +0x1c}; entries 0x24 {size +0x18, data +0x20: the resource - 8}), holding every resource above; its Multi (0x4eae3c)
+// made non-zero (MultiEnter / MultiLeave are stubs)
+static uint8_t g_set_node[0x3c];
+static std::vector<uint8_t> g_set_toc;
+static void build_res_set() {
+    g_set_toc.assign(g_res.size() * 0x24, 0);
+    for (size_t i = 0; i < g_res.size(); i++) {
+        uint8_t* e = &g_set_toc[i * 0x24];
+        memcpy(e, g_res[i].name.c_str(), std::min<size_t>(16, g_res[i].name.size()));
+        const uint32_t type = 0x53465830, size = g_res[i].bytes | 0x80000000u, data = (uint32_t)(uintptr_t)(g_res[i].p - 8);
+        memcpy(e + 0x10, &type, 4);
+        memcpy(e + 0x18, &size, 4);
+        memcpy(e + 0x20, &data, 4);
+    }
+    const uint32_t toc = (uint32_t)(uintptr_t)g_set_toc.data(), n = (uint32_t)g_res.size();
+    memset(g_set_node, 0, sizeof g_set_node);
+    memcpy(g_set_node + 0x14, &toc, 4);
+    memcpy(g_set_node + 0x1c, &n, 4);
+    G32(0x004eae3c) = 1;
+    G32(0x004eae40) = (uint32_t)(uintptr_t)g_set_node;
+    for (size_t i = 0; i < g_res.size(); i++) {
+        uint32_t len;
+        memcpy(&len, g_res[i].p, 4);
+        if (g_res[i].real && len > 0x1000) g_safe.push_back((int)i);
+    }
+}
 
 // ---- the stubs' script and log ---------------------------------------------------------------------------------------
 struct LogEntry { uint32_t kind, a[6]; };
@@ -420,13 +463,18 @@ static const char* __cdecl st_lookup(const char* key) {
     logn(L_LOOKUP, P(key), hash_str(key), P(r));
     return r;
 }
+static uint8_t* g_force_res;                // the fix tests: the resource SoundResourceGet hands out
 static uint8_t* __cdecl st_res_get(const char* name) {
     const uint32_t s = script();
-    uint8_t* r = (s % 100) < ctrl()->res_fail ? 0 : g_res[(s >> 8) % g_res.size()].p;
+    uint8_t* r = (s % 100) < ctrl()->res_fail ? 0
+                 : g_force_res                ? g_force_res
+                 : k_ordinary                 ? g_res[g_safe[(s >> 8) % g_safe.size()]].p
+                                              : g_res[(s >> 8) % g_res.size()].p;
     logn(L_RES_GET, P(name), hash_str(name), P(r));
     return r;
 }
 static void __cdecl st_res_forget(void* r) { logn(L_RES_FORGET, P(r)); }
+static void __cdecl st_multi(int32_t, const char*, int32_t) {}   // MultiEnter / MultiLeave (the fix's set walk)
 static uint8_t __cdecl st_sound_begin() { logn(L_SOUND_BEGIN); return 1; }
 static void __cdecl st_sound_end() { logn(L_SOUND_END); }
 static void __cdecl st_key_disable() { logn(L_KEY_DISABLE); }
@@ -572,6 +620,7 @@ static void install_stubs() {
         {0x0041aef0, (void*)&st_lookup}, {0x00477200, (void*)&st_res_get}, {0x00477270, (void*)&st_res_forget},
         {0x00471cb0, (void*)&st_sound_begin}, {0x00471d90, (void*)&st_sound_end}, {0x00413d90, (void*)&st_key_disable},
         {0x00413100, (void*)&st_scan_hit}, {0x004130e0, (void*)&st_scan_down}, {0x004cccec, (void*)&st_ds_create},
+        {0x00415180, (void*)&st_multi}, {0x004151d0, (void*)&st_multi},
     };
     for (auto& x : p) patch_jmp(x.at, x.to);
     for (int i = 0; i < 24; i++) g_ds_vtbl[i] = g_buf_vtbl[i] = (void*)&st_com_bad;
@@ -1020,16 +1069,21 @@ static void build_mixer(int nsounds) {
         s->vol = field_float(0.0f, 1.0f, 4);
         s->pan = field_float(-1.0f, 1.0f, 4);
         s->ratio = field_float(0.02f, chance(70) ? 2.0f : 16.0f, 4);
+        if (k_ordinary) s->ratio = chance(5) ? 0x7fc00000u : field_float(0.02f, chance(70) ? 2.0f : 16.0f, 0);   // (SetFrequency's)
         s->_24 = rnd();
         s->_28 = rnd();
         // the current position: in the data, near its end, at it, or (rarely) past it
         const uint32_t len2 = s->len * 2;
         uint32_t off = chance(60) ? (len2 ? (rnd() % len2) & ~1u : 0) : chance(60) ? (len2 > 0x300 ? len2 - (rnd() % 0x300 & ~1u) : 0) : len2 + (rnd() % 0x100 & ~1u);
+        if (k_ordinary && off >= len2) off = len2 - 2;                   // (inside the data)
         s->ch.src = s->start + off;
-        s->ch.frac = rnd() & (chance(90) ? 0xffff : 0xffffffff);
+        s->ch.frac = rnd() & (chance(90) || k_ordinary ? 0xffff : 0xffffffff);
         s->ch.lg = (int32_t)rnd();
         s->ch.rg = (int32_t)rnd();
-        s->ch.step = rnd();
+        s->ch.step = k_ordinary ? rnd() % 0x100001 : rnd();              // (at most 16.0: SetFrequency's clamp)
+#ifdef FIX_TESTS
+        note_extent(s, r, s->start, s->len);                             // (as the fixed constructor records it)
+#endif
     }
 }
 
@@ -1140,8 +1194,17 @@ static void wave_episode() {
     }
 }
 
+// the ordinary rounds: a block mixed straight from do_run / fastmix / nullmix (no setup_run first, as mix_bytes makes
+// it) starts inside a built sound's data, so it and the next setup_run stay where the game's own blocks go
+static long g_ordinary_skipped;
+static bool ordinary_place(const SoftSoundO* s) {
+    bool known = false;
+    for (int k : g_safe) known |= g_res[k].p == s->res;
+    return known && s->ch.src >= s->start && s->ch.src - s->start < s->len * 2 && s->ch.step <= 0x100000 && s->ch.frac <= 0xffff;
+}
 static void mix_episode() {
     g_phase = "mix";
+    if (k_ordinary) ctrl()->alloc_fail = ctrl()->res_fail = 0;          // (CreateSound's and SoftSound's fixes)
     build_mixer(chance(10) ? 0 : chance(80) ? ri(1, 12) : ri(13, 40));
     SoftMixerO* m = mixer();
     const int n = ri(10, 40);
@@ -1167,8 +1230,9 @@ static void mix_episode() {
         case 7: if (ns > 0) CB(setup_channel_rw, s, 0); break;
         case 8: if (ns > 0) { if (s->looped) g_cov[C_mix_loop_wrapped]++; else g_cov[C_mix_one_shot_ended]++; CB(setup_run_rw, s, 0); } break;
         case 9: if (ns > 0) {
-                int32_t blk = chance(90) ? ri(1, 128) : ri(129, 256);
+                int32_t blk = chance(90) || k_ordinary ? ri(1, 128) : ri(129, 256);
                 if (s->muted) g_cov[C_mix_muted]++;
+                if (k_ordinary && !ordinary_place(s)) { g_ordinary_skipped++; break; }
                 CB(do_run_rw, s, 0, (void*)at(OFF_BUF), blk);
             }
             break;
@@ -1220,6 +1284,7 @@ static void mix_episode() {
         }
         case 17: if (ns > 0) {
                 int32_t blk = ri(1, 128);
+                if (k_ordinary && !ordinary_place(s)) { g_ordinary_skipped++; break; }
                 MixChannel* ch = &s->ch;
                 if (chance(50)) CB(fastmix_rw, ch, (void*)at(OFF_BUF), blk);
                 else CB(nullmix_rw, ch, (void*)at(OFF_BUF), (SndCount)blk);
@@ -1308,7 +1373,8 @@ static void music_episode() {
     build_mixer(0);
     ctrl()->scan_hits_left = chance(20) ? 0 : (uint32_t)ri(1, 6);
     ctrl()->scan_down = ri(0, 50);
-    ctrl()->alloc_fail = chance(80) ? 0 : ri(1, 10);
+    ctrl()->alloc_fail = chance(80) || k_ordinary ? 0 : ri(1, 10);
+    if (k_ordinary) ctrl()->res_fail = 0;
     set_cursors();
     g_cov[C_music_notes] += ctrl()->scan_hits_left;
     CB0(music_test_rw);
@@ -1329,6 +1395,7 @@ static void run_episode() {
 // the leaf loops, long: original and rewrite on the same inputs, outside the check machinery
 // =====================================================================================================================
 struct LeafStat { const char* name; long long calls, bad; };
+static long long g_fix_leaf;                        // (FIX_TESTS: setup_run calls in the fix's case, checked apart)
 static LeafStat g_leaf[] = {{"fastmix", 0, 0}, {"nullmix", 0, 0}, {"fastout", 0, 0}, {"fastout_8", 0, 0},
                             {"setup_channel", 0, 0}, {"SoftSound::SetFrequency", 0, 0}, {"SoftSound::SetVolume", 0, 0},
                             {"MixerSetVolume", 0, 0}, {"max_data_from_cursors", 0, 0}, {"setup_run", 0, 0},
@@ -1480,9 +1547,17 @@ static void leaf_runs(long long iterations) {
             if (chance(50)) s0.ch.src = s0.start + (s0.len * 2 + (uint32_t)ri(-4, 4));
             s0.playing = (uint8_t)(chance(70) ? 1 : chance(50) ? 0 : rnd());
             SoftSoundO s1 = s0;
+            const SoftSoundO in = s0;
             HFN(void(__fastcall*)(void*, Edx), 0x00474fd0)(&s0, 0);
             setup_run_rw(&s1, 0);
             g_leaf[9].calls++;
+            // the fix's case: a playing loop at or past its end that one step back leaves outside its data
+            const uint32_t tw = in.len + in.len;
+            if (k_ordinary && in.playing && in.looped && !(in.start + tw > in.ch.src) && in.ch.src - tw - in.start >= tw) {
+                g_fix_leaf++;
+                if (s1.ch.src != (tw ? in.start + (in.ch.src - in.start) % tw : in.start)) leaf_bad(9, "the fix's step back into the loop");
+                s1.ch.src = s0.ch.src;
+            }
             if (memcmp(&s0, &s1, sizeof s0)) leaf_bad(9, "state");
             g_leaf[11].calls++;
             if (HFN(int32_t(__fastcall*)(void*, Edx), 0x00475240)(&s0, 0) != SoftSound_GetStatus_rw(&s1, 0)) leaf_bad(11, "status");
@@ -1500,6 +1575,282 @@ static void leaf_runs(long long iterations) {
     }
     _controlfp_s(&cw, _PC_53, _MCW_PC);
 }
+
+// =====================================================================================================================
+// the fixes (built with /DFIX_TESTS)
+// =====================================================================================================================
+#ifdef FIX_TESTS
+static int g_fix_checks, g_fix_fail;
+static void expect(bool ok, const char* what, const char* res = "", int a = 0, int b = 0) {
+    g_fix_checks++;
+    if (!ok && g_fix_fail++ < 40) printf("  FIX FAILED: %s (%s, %d, %d)\n", what, res, a, b);
+}
+template <typename F> static uint32_t fguard(F f) {                 // 0, or the exception (LogPanic's included)
+    unsigned cw;
+    uint32_t r = 0;
+    __asm fninit
+    _controlfp_s(&cw, _PC_24, _MCW_PC);
+    __try { f(); } __except (fault_filter(GetExceptionInformation())) { r = g_fault_code; }
+    fpu_reset();
+    return r;
+}
+typedef void(__fastcall* MixBytes_t)(void*, Edx, uint8_t*, uint32_t);
+typedef void*(__fastcall* Ctor_t)(void*, Edx, const char*, void*);
+typedef void*(__fastcall* Create_t)(void*, Edx, const char*, int32_t);
+typedef uint8_t(__fastcall* Begin_t)(void*, Edx);
+
+// a clean world: the SoftMixer with an empty bag (256), effects volume 1, nothing failing
+static void fix_world(bool eight) {
+    new_episode();
+    Ctrl* c = ctrl();
+    c->alloc_fail = c->hr_fail = c->lost = c->res_fail = c->create_fail = 0;
+    c->caps_flags = 0xf;
+    c->status_playing = 100;
+    SoftMixerO* m = mixer();
+    Bag* b = bag();
+    m->vtbl = (void*)(uintptr_t)0x004dd8c0;
+    m->eight_bit = (uint8_t)eight;
+    m->ok = 1;
+    m->sounds = b;
+    b->items = (void**)at(OFF_ITEMS);
+    b->name = (const char*)(uintptr_t)0x004f5c8c;
+    b->count = 0;
+    b->max = 0x100;
+    b->panic = 1;
+    G32(0x004f5930) = 0x3f800000;
+    g_pass = 0;
+    g_nlog[0] = 0;
+    g_force_res = 0;
+}
+// sound 0 on resource r, in the bag: made by the fixed constructor (its extent noted) or set up as the original's
+// constructor leaves it; then playing (looped or not) from byte `off` of its data at `ratio`
+static SoftSoundO* one_sound(uint8_t* r, bool ctor, bool looped, uint32_t ratio, uint32_t off) {
+    SoftSoundO* s = sound(0);
+    memset(s, 0, sizeof *s);
+    if (ctor) {
+        g_force_res = r;
+        SoftSound_ctor_rw(s, 0, (const char*)(uintptr_t)0x004f5cfc, mixer());
+        g_force_res = 0;
+    } else {
+        uint32_t bytes;
+        memcpy(&bytes, r, 4);
+        s->vtbl = (void*)(uintptr_t)0x004dd8e0;
+        s->mixer = mixer();
+        s->res = r;
+        s->start = (uint32_t)(uintptr_t)(r + 0x16);
+        s->len = bytes >> 1;
+        s->vol = 0x3f800000;
+        s->ratio = 0x3f800000;
+    }
+    bag()->items[0] = s;
+    bag()->count = 1;
+    s->ratio = ratio;
+    s->playing = 1;
+    s->looped = (uint8_t)looped;
+    s->ch.src = s->start + off;
+    s->ch.frac = 0;
+    return s;
+}
+enum { MIX_CALLS = 12, MIX_BYTES = 0x1000 };
+static uint8_t g_out0[MIX_CALLS * MIX_BYTES], g_out1[MIX_CALLS * MIX_BYTES];
+static uint32_t run_mix(bool chain, uint8_t* out, int calls = MIX_CALLS) {
+    memset(out, 0xcd, (size_t)calls * MIX_BYTES);
+    if (chain) chain_patch();
+    const uint32_t e = fguard([&] {
+        for (int k = 0; k < calls; k++) ((MixBytes_t)0x00475040)(mixer(), 0, out + k * MIX_BYTES, MIX_BYTES);
+    });
+    if (chain) chain_unpatch();
+    return e;
+}
+// resource r with the game's padding carried on for 1 MB: its payload as it is, then silence (a one-shot) or its data
+// again from the start (a loop) -- what the fixed mixer reads past r's end
+static uint8_t* g_twin;
+enum { TWIN_EXTRA = 0x100000 };
+static uint8_t* make_twin(const Res& R, bool looped) {
+    uint32_t bytes;
+    memcpy(&bytes, R.p, 4);
+    const uint32_t twice = bytes & ~1u, have = R.bytes - 0x16;
+    memcpy(g_twin, R.p, R.bytes);
+    uint8_t* d = g_twin + 0x16;
+    for (uint32_t k = have; k < have + TWIN_EXTRA; k++) d[k] = looped && twice ? d[k % twice] : 0;
+    return g_twin;
+}
+
+// a sound's reads stay inside its resource; what it mixes is the original's with the game's padding
+static void fix_overread() {
+    static const uint32_t ratios[] = {0x3ca3d70a, 0x3f000000, 0x3f800000, 0x3fc00000, 0x40000000, 0x40e9999a, 0x41800000};
+    int runs = 0, orig_faults = 0, orig_runs = 0, short_loops = 0;
+    for (size_t i = 0; i < g_res.size(); i++) {
+        const Res& R = g_res[i];
+        uint32_t bytes;
+        memcpy(&bytes, R.p, 4);
+        const uint32_t twice = bytes & ~1u;
+        const bool padded = R.bytes - 0x16 >= twice + 0x1000;             // the game's 4096 bytes after the data
+        for (int looped = 0; looped < 2; looped++)
+            for (uint32_t ratio : ratios)
+                for (int eight = 0; eight < 2; eight++)
+                    for (int near_end = 0; near_end < 2; near_end++) {
+                        const uint32_t off = near_end && twice > 0x3000 ? (twice - 0x3000 + (rnd() & 0xffe)) & ~1u : 0;
+                        runs++;
+                        const char* nm = R.name.c_str();
+                        if (padded && (!looped || twice > 4066)) {
+                            // a padded sound, as the game's: the original's bits exactly
+                            fix_world(eight != 0);
+                            one_sound(R.p, false, looped != 0, ratio, off);
+                            const uint32_t e0 = run_mix(false, g_out0);
+                            const SoftSoundO s0 = *sound(0);
+                            fix_world(eight != 0);
+                            one_sound(R.p, true, looped != 0, ratio, off);
+                            const uint32_t e1 = run_mix(true, g_out1);
+                            const SoftSoundO s1 = *sound(0);
+                            expect(!e0 && !e1, "padded: both run", nm, looped, (int)ratio);
+                            expect(!memcmp(g_out0, g_out1, sizeof g_out0), "padded: the original's output", nm, looped, (int)ratio);
+                            expect(!memcmp(&s0, &s1, sizeof s0), "padded: the original's sound state", nm, looped, (int)ratio);
+                        } else if (padded) {
+                            // a stock sound too short to loop (a one-shot's data played looped): the original reads on
+                            // past its padding; the fixed one stays inside
+                            short_loops++;
+                            fix_world(eight != 0);
+                            SoftSoundO* s = one_sound(R.p, true, true, ratio, off);
+                            const uint32_t e1 = run_mix(true, g_out1);
+                            expect(!e1 && s->ch.src - s->start < twice + 0x1000, "a short stock loop: runs, stays in its resource", nm, 0, (int)ratio);
+                        } else {
+                            // a mod-like sound: the original on its data with the padding carried on
+                            fix_world(eight != 0);
+                            one_sound(make_twin(R, looped != 0), false, looped != 0, ratio, off);
+                            const uint32_t e0 = run_mix(false, g_out0);
+                            const SoftSoundO s0 = *sound(0);
+                            fix_world(eight != 0);
+                            one_sound(R.p, true, looped != 0, ratio, off);
+                            const uint32_t e1 = run_mix(true, g_out1);
+                            const SoftSoundO s1 = *sound(0);
+                            expect(!e0, "the twin: the original runs", nm, looped, (int)ratio);
+                            expect(!e1, "unpadded: the fixed mixer runs", nm, looped, (int)ratio);
+                            expect(!memcmp(g_out0, g_out1, sizeof g_out0), "unpadded: the original's output with the padding", nm, looped, (int)ratio);
+                            const uint32_t o0 = s0.ch.src - s0.start, o1 = s1.ch.src - s1.start;
+                            expect(s0.playing == s1.playing && s0.muted == s1.muted && s0.ch.frac == s1.ch.frac && s0.ch.step == s1.ch.step &&
+                                       s0.ch.lg == s1.ch.lg && s0.ch.rg == s1.ch.rg,
+                                   "unpadded: the original's state", nm, looped, (int)ratio);
+                            expect(looped ? (twice ? o0 % twice == o1 % twice : true) : o0 == o1, "unpadded: the same place (in the loop)", nm, looped, (int)ratio);
+                            if (looped) expect(o1 < twice + 0x1000 || !twice, "unpadded: a loop stays in its data", nm, (int)o1, (int)ratio);
+                            // and the original on the unpadded data itself
+                            fix_world(eight != 0);
+                            one_sound(R.p, false, looped != 0, ratio, off);
+                            orig_runs++;
+                            if (run_mix(false, g_out0) == 0xC0000005) orig_faults++;
+                        }
+                    }
+    }
+    printf("  over-reads: %d runs (%d stock sounds looped too short to loop); the original faulted on %d of %d unpadded runs\n",
+           runs, short_loops, orig_faults, orig_runs);
+}
+
+// a missing resource: an empty, silent sound
+static void fix_missing_resource() {
+    for (int eight = 0; eight < 2; eight++) {
+        fix_world(eight != 0);
+        ctrl()->res_fail = 100;
+        SoftSoundO* s = sound(0);
+        memset(s, 0, sizeof *s);
+        const uint32_t e0 = fguard([&] { ((Ctor_t)0x00475160)(s, 0, (const char*)(uintptr_t)0x004f5cfc, mixer()); });
+        expect(e0 == 0xC0000005, "the original's constructor faults on a missing resource");
+        memset(s, 0, sizeof *s);
+        const uint32_t e1 = fguard([&] { SoftSound_ctor_rw(s, 0, (const char*)(uintptr_t)0x004f5cfc, mixer()); });
+        expect(!e1 && !s->res && !s->len && s->vtbl == (void*)(uintptr_t)0x004dd8e0, "the fixed constructor: an empty sound");
+        bag()->items[0] = s;
+        bag()->count = 1;
+        for (int looped = 0; looped < 2; looped++) {
+            if (looped) SoftSound_PlayLooped_rw(s, 0); else SoftSound_Play_rw(s, 0);
+            s->ratio = 0x41800000;
+            const uint32_t e = run_mix(true, g_out1, 3);
+            bool silent = true;
+            for (int k = 0; k < 3 * MIX_BYTES; k++) silent &= g_out1[k] == (eight ? 0x80 : 0);
+            expect(!e && silent, "mixed: silence", "", eight, looped);
+            expect(s->playing == looped, "a one-shot stops, a loop plays on", "", eight, looped);
+        }
+        const int n0 = g_nlog[0];
+        const uint32_t e2 = fguard([&] { SoftSound_dtor_rw(s, 0); });
+        bool forgot = false;
+        for (int k = n0; k < g_nlog[0] && k < LOGN; k++) forgot |= g_log[0][k].kind == L_RES_FORGET;
+        expect(!e2 && !forgot && bag()->count == 0, "the destructor: out of the bag, no resource to forget");
+    }
+}
+
+// a failed allocation: nothing added to the bag
+static void fix_failed_alloc() {
+    fix_world(false);
+    ctrl()->alloc_fail = 100;
+    void* r = (void*)1;
+    uint32_t e = fguard([&] { r = ((Create_t)0x00474e30)(mixer(), 0, (const char*)(uintptr_t)0x004f5cfc, 3); });
+    expect(!e && !r && bag()->count == 1 && !bag()->items[0], "the original adds a null sound");
+    e = run_mix(false, g_out0, 1);
+    expect(e == 0xC0000005, "and the original's mix faults on it");
+    fix_world(false);
+    ctrl()->alloc_fail = 100;
+    r = (void*)1;
+    e = fguard([&] { r = SoftMixer_CreateSound_rw(mixer(), 0, (const char*)(uintptr_t)0x004f5cfc, 3); });
+    expect(!e && !r && bag()->count == 0, "the fixed one returns null and adds nothing");
+    e = run_mix(true, g_out1, 1);
+    expect(!e, "and its mix runs");
+}
+
+// the bag's capacity: M1's operand (0x474d79), 256 stock, 1024 lifted
+static void fix_bag_capacity() {
+    const uint32_t stock = G32(0x00474d79);
+    for (int m1 = 0; m1 < 2; m1++) {
+        const int32_t cap = m1 ? 0x400 : 0x100;
+        G32(0x00474d79) = (uint32_t)cap;                                 // as M1 patches it
+        fix_world(false);
+        SoftMixerO* m0 = (SoftMixerO*)at(OFF_MIX + 0x80);
+        SoftMixerO* m = (SoftMixerO*)at(OFF_MIX + 0xc0);
+        memset(m0, 0, sizeof *m0);
+        memset(m, 0, sizeof *m);
+        SoftMixer_ctor_rw(m0, 0);
+        SoftMixer_ctor_rw(m, 0);
+        uint8_t ok0 = 0, ok1 = 0;
+        uint32_t e = fguard([&] { ok0 = ((Begin_t)0x00474d40)(m0, 0); });
+        expect(!e && ok0 && m0->sounds && m0->sounds->max == cap, "the original's Begin: the operand's capacity", "", m1, 0);
+        e = fguard([&] { ok1 = SoftMixer_Begin_rw(m, 0); });
+        expect(!e && ok1 && m->sounds && m->sounds->max == cap, "the rewrite's Begin: the operand's capacity", "", m1, 0);
+        if (e || !ok1 || !m->sounds) continue;
+        chain_patch();
+        int made = 0;
+        e = fguard([&] {
+            for (int k = 0; k < cap; k++) {
+                if (!((Create_t)0x00474e30)(m, 0, (const char*)(uintptr_t)0x004f5cfc, 3)) break;
+                made++;
+            }
+        });
+        chain_unpatch();
+        expect(!e && made == cap && m->sounds->count == cap, "CreateSound up to the capacity", "", m1, made);
+        for (int k = 0; k < cap; k += 7) {
+            SoftSoundO* s = (SoftSoundO*)m->sounds->items[k];
+            s->playing = 1;
+            s->looped = (uint8_t)(k & 1);
+        }
+        chain_patch();
+        e = fguard([&] { ((MixBytes_t)0x00475040)(m, 0, g_out1, MIX_BYTES); });
+        chain_unpatch();
+        expect(!e, "mixing them all", "", m1, 0);
+        chain_patch();
+        e = fguard([&] { ((Create_t)0x00474e30)(m, 0, (const char*)(uintptr_t)0x004f5cfc, 3); });
+        chain_unpatch();
+        expect(e == PANIC_CODE, "one past the capacity: the bag's panic, as before", "", m1, 0);
+    }
+    G32(0x00474d79) = stock;
+}
+
+static void fix_tests() {
+    g_twin = (uint8_t*)VirtualAlloc(0, 0x400000 + TWIN_EXTRA, MEM_COMMIT, PAGE_READWRITE);
+    g_abort = false;
+    fix_overread();
+    fix_missing_resource();
+    fix_failed_alloc();
+    fix_bag_capacity();
+    g_force_res = 0;
+    printf("fixes: %d expectations, %d failed\n", g_fix_checks, g_fix_fail);
+}
+#endif
 
 // the watchdog: a check that runs for more than a minute is reported and the harness ends itself
 static DWORD WINAPI watchdog(void*) {
@@ -1544,7 +1895,7 @@ int main(int argc, char** argv) {
     // the game's .sfx resources, read-only (the mixer only reads them)
     std::string game = getenv("VP_S1C_GAME") ? getenv("VP_S1C_GAME") : root + "\\..\\game-files\\installs\\v1.0-RC";
     g_res_block = (uint8_t*)VirtualAlloc(0, 0x400000 + 0x1000, MEM_COMMIT, PAGE_READWRITE);
-    for (const char* f : {"race.res", "common.res", "viper.car", "ui.res"}) load_res_file(game + "\\" + f);
+    for (const char* f : {"race.res", "common.res", "viper.car", "ui.res", "exotic.car", "plane.car", "sedan.car", "sports.car"}) load_res_file(game + "\\" + f);
     const size_t nreal = g_res.size();
     if (!nreal) { printf("no .sfx resources found under %s\n", game.c_str()); return 2; }
     DWORD old;
@@ -1554,6 +1905,7 @@ int main(int argc, char** argv) {
         add_synthetic(n, false, "synthetic");
     add_synthetic(3000, true, "synthetic padded");
     printf("%d .sfx resources from %s, %d mod-like\n", (int)nreal, game.c_str(), (int)(g_res.size() - nreal));
+    build_res_set();
     g_arena = (uint8_t*)VirtualAlloc(0, ARENA_SIZE + 0x1000, MEM_COMMIT, PAGE_READWRITE);
     if (!g_arena) return 2;
     VirtualProtect(g_arena + ARENA_SIZE, 0x1000, PAGE_NOACCESS, &old);
@@ -1563,6 +1915,9 @@ int main(int argc, char** argv) {
     int nreg = 0;
     for (ChainReg* r = ChainReg::head(); r; r = r->next) nreg++;
     printf("%d rewrites registered\n", nreg);
+#ifdef FIX_TESTS
+    fix_tests();
+#endif
     const bool verbose = GetEnvironmentVariableA("VP_S1C_VERBOSE", 0, 0) != 0;
     g_verbose = verbose && getenv("VP_S1C_VERBOSE")[0] == '2';
     for (g_eno = 0; g_eno < episodes; g_eno++) {
@@ -1599,5 +1954,11 @@ int main(int argc, char** argv) {
         lbad += l.bad;
     }
     printf("leaf loops: %lld calls, %lld differ\n", lcalls, lbad);
+    if (k_ordinary) printf("(ordinary rounds: stock sounds over 4 KB, positions inside the data, steps up to 16.0, no failed allocation or "
+                           "missing resource; %ld direct blocks from outside the data left out; %lld setup_run leaf calls in the fix's "
+                           "case checked against it apart)\n", g_ordinary_skipped, g_fix_leaf);
+#ifdef FIX_TESTS
+    if (g_fix_fail) return 1;
+#endif
     return failed || lbad ? 1 : 0;
 }

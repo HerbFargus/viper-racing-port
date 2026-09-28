@@ -36,6 +36,13 @@
 //
 // Not covered: SoundClassString with a negative class (reads the original's stack: a FIX CANDIDATE); real DirectSound
 // (group C's; update()'s mixer frame is the fake's Update here).
+//
+// Fixes (docs/PORTING.md, "Fixes"): built as above plus /DVP_SND_FIXES, the rewrites have their fixes on. A world in
+// which a fix branch fires is counted, not compared (it is meant to differ); every other world must still match the
+// original bit for bit. Then directed tests run each fix on the input that used to fail (a divide-by-zero, a NULL
+// manager, a lock left held, a garbage SoundDash flag, a short old-format resource, a full or lifted sound table, a
+// class outside 0..7, a 33rd sound to destroy when stopped) and check what it does now, and that the inputs beside it
+// still give the original's bits.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -45,7 +52,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef VP_SND_FIXES                // (built with /DVP_SND_FIXES: the fixes on, and tested -- see main)
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#endif
+static int g_fix_fired;             // fix branches the rewrite took in this pass
+#define SNDM_FIX_FIRED() (++g_fix_fired)
 #include "../hook/port.h"
 #undef PORT_FN_BUILDS
 #define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
@@ -605,6 +616,7 @@ struct Args {
     uint32_t u;
 };
 static Args g_args;
+static bool g_dws_full;             // DestroyWhenStopped on a full list (the fixed one destroys the sound at once)
 static uint8_t* any_listed() { return g_w.n ? sound_at((int)(rnd() % g_w.n)) : sound_at(g_w.n + (int)(rnd() % g_w.nstray)); }
 static uint8_t* any_sound() { return chance(90) ? any_listed() : sound_at(g_w.n + (int)(rnd() % g_w.nstray)); }
 static uint8_t* any_of(uint32_t vt) {
@@ -618,6 +630,7 @@ static uint8_t* any_of(uint32_t vt) {
 static int rnd_class() { return chance(92) ? (int)(rnd() % 8) : chance(50) ? -1 : 8 + (int)(rnd() % 2); }
 static void random_args(Kind k) {
     memset(&g_args, 0, sizeof g_args);
+    g_dws_full = false;
     g_args.name = (const char*)ARG(G_NAME);
     uint8_t* mgr = MGR();
     g_task = g_script.task;
@@ -704,7 +717,29 @@ static void random_args(Kind k) {
         break;
     }
     case K_REMOVE: g_args.self = chance(85) ? any_listed() : sound_at(g_w.n + (int)(rnd() % g_w.nstray)); break;
-    case K_DWS: g_args.self = any_sound(); if (chance(10)) *(int32_t*)(mgr + 0x158) = chance(50) ? 32 : -1; break;
+    case K_DWS:
+        g_args.self = any_sound();
+        if (chance(10)) *(int32_t*)(mgr + 0x158) = chance(50) ? 32 : -1;
+        if ((uint32_t)*(int32_t*)(mgr + 0x158) >= 32) {                // full (here or from the world)
+            // 32 distinct sounds listed, none of them the new one (Toss hands over a sound it has just made, and never
+            // lists one twice); more strays made where the world has fewer than 33
+            while (g_w.n + g_w.nstray < 33) {
+                const int i = g_w.n + g_w.nstray++;
+                g_w.cls_of[i] = 0;
+                make_sound(i, 0, VT_SOUND);
+            }
+            const int m = g_w.n + g_w.nstray;
+            int k = 0;
+            for (int j = (int)(rnd() % (uint32_t)m), c = 0; c < m && k < 32; c++, j = (j + 1) % m)
+                if (sound_at(j) != g_args.self) *(uint8_t**)(mgr + 0xd8 + 4 * k++) = sound_at(j);
+            // and a BG thread that gets on with it, whose id the manager knows: the fixed one deletes the sound, whose
+            // Destroy deletes its mixer sound on the BG thread or hands it to update() from the main thread
+            *(uint32_t*)S_UPDATE_F = F_MGR_UPDATE;
+            if (*(int32_t*)(mgr + 0x50) == -1) *(int32_t*)(mgr + 0x50) = 0;
+            *(int32_t*)(mgr + 0x17c) = BG_TASK;
+            g_dws_full = true;
+        }
+        break;
     case K_CREATE_SOUND: case K_FG_CREATE: case K_CREATE: case K_CREATE3D:
         g_args.i = rnd_class();
         if (k != K_CREATE_SOUND) {
@@ -727,7 +762,7 @@ static void random_args(Kind k) {
     // with the manager's BG task id known); the rest wait forever (an exception after 64 sleeps, in both passes)
     const bool keeps_update_f = k == K_UPDATE_STATIC || k == K_SM_UPDATE || k == K_MIXER_BEGIN || k == K_MIXER_END ||
                                 k == K_FG_MIXER_BEGIN || k == K_FG_MIXER_END || k == K_SM_DTOR || k == K_SOUND_BEGIN;
-    if (g_task == MAIN_TASK && !keeps_update_f && chance(92)) {
+    if (g_task == MAIN_TASK && !keeps_update_f && (chance(92) || g_dws_full)) {
         *(uint32_t*)S_UPDATE_F = F_MGR_UPDATE;
         if (*(int32_t*)(mgr + 0x50) == -1) *(int32_t*)(mgr + 0x50) = 0;
         *(int32_t*)(mgr + 0x17c) = BG_TASK;
@@ -951,6 +986,7 @@ static bool g_unmask;               // overflow and divide-by-zero unmasked (doc
 static int32_t g_world_task;
 static int run_guarded(Kind k, bool rw, uint64_t* ret) {
     g_log.n = 0;
+    g_fix_fired = 0;
     g_heap = g_heap_mark;
     g_alloc_calls = g_create_calls = g_pool_next = g_sleeps = 0;
     g_task = g_world_task;
@@ -977,6 +1013,428 @@ static const char* where(uint32_t a, char* buf) {
     sprintf(buf, "0x%08x", a);
     return buf;
 }
+
+#ifdef VP_SND_FIXES
+// ---- the fixes, each on the input that used to fail --------------------------------------------------------------------
+static uint32_t g_t_fault;
+static int guarded(void (*fn)(), bool unmask, int32_t task) {
+    g_log.n = 0;
+    g_fix_fired = 0;
+    g_heap = g_heap_mark;
+    g_alloc_calls = g_create_calls = g_pool_next = g_sleeps = 0;
+    g_task = task;
+    g_in_tick = false;
+    unsigned cw;
+    __asm fninit
+    _controlfp_s(&cw, _MCW_EM, _MCW_EM);
+    _controlfp_s(&cw, _PC_24, _MCW_PC);                              // (the BG thread's precision)
+    if (unmask) _controlfp_s(&cw, _MCW_EM & ~(_EM_OVERFLOW | _EM_ZERODIVIDE), _MCW_EM);
+    int fault = 0;
+    g_t_fault = 0;
+    __try {
+        fn();
+        __asm fwait
+    } __except (fault_filter(GetExceptionInformation())) { fault = 1; g_t_fault = g_fault_code; }
+    __asm fninit
+    _controlfp_s(&cw, _MCW_EM, _MCW_EM);
+    _controlfp_s(&cw, _PC_53, _MCW_PC);
+    return fault;
+}
+static int count_tag(uint32_t tag) { int n = 0; for (uint32_t i = 0; i < g_log.n && i < LOG_MAX; i++) n += g_log.w[i] == tag; return n; }
+static uint32_t last_after(uint32_t tag, uint32_t k) {           // the k-th word after the last `tag` (0: none)
+    uint32_t v = 0;
+    for (uint32_t i = 0; i + k < g_log.n && i + k < LOG_MAX; i++) if (g_log.w[i] == tag) v = g_log.w[i + k];
+    return v;
+}
+static void snap() { memcpy(g_arena_snap, g_arena, ARENA_BYTES); memcpy(g_data_snap, DATA, DATA_BYTES); }
+static void restore() { memcpy(g_arena, g_arena_snap, ARENA_BYTES); memcpy(DATA, g_data_snap, DATA_BYTES); }
+static void keep_after() { memcpy(g_arena_after, g_arena, ARENA_BYTES); memcpy(g_data_after, DATA, DATA_BYTES); g_log_orig = g_log; }
+static bool same_as_after() {                                     // arena, .data/.bss and the log as the original left them
+    return !memcmp(g_arena_after, g_arena, ARENA_BYTES) && !memcmp(g_data_after, DATA, DATA_BYTES) && g_log.n == g_log_orig.n &&
+           !memcmp(g_log.w, g_log_orig.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+}
+static bool unchanged() { return !memcmp(g_arena_snap, g_arena, ARENA_BYTES) && !memcmp(g_data_snap, DATA, DATA_BYTES); }
+struct Saved5 { uint32_t at; uint8_t b[5]; };
+static void hook_to(Saved5& s, uint32_t at, void* to) { s.at = at; memcpy(s.b, (void*)at, 5); patch_jmp(at, to); }
+static void unhook(const Saved5& s) { memcpy((void*)s.at, s.b, 5); }
+
+static uint8_t* g_t_s;
+static uint8_t* g_t_ret;
+static const Listener* TL() { return (const Listener*)ARG(G_LIST); }
+static const char* TN() { return (const char*)ARG(G_NAME); }
+// (a) Doppler
+static void t_dop_o() { ((decltype(&Sound3D_update_sound_rw))0x00472150)(g_t_s, 0, TL()); }
+static void t_dop_n() { Sound3D_update_sound_rw(g_t_s, 0, TL()); }
+// (b) no manager
+static void t_mute_o() { ((void(__cdecl*)())0x00471dd0)(); }
+static void t_mute_n() { SoundMuteCars_rw(); }
+static void t_unmute_o() { ((void(__cdecl*)())0x00471de0)(); }
+static void t_unmute_n() { SoundUnMuteCars_rw(); }
+static void t_flush_o() { ((void(__cdecl*)())0x00471df0)(); }
+static void t_flush_n() { SoundFlushAsync_rw(); }
+static void t_setl_o() { ((void(__cdecl*)(const Listener*))0x00471e00)(TL()); }
+static void t_setl_n() { SoundSetListener_rw(TL()); }
+static void t_stop_o() { ((void(__cdecl*)(int))0x00471e20)(3); }
+static void t_stop_n() { SoundStopCar_rw(3); }
+static void t_sctor_o() { ((decltype(&Sound_ctor_rw))0x004723c0)(AR(A_OBJ), 0, TN(), 3); }
+static void t_sctor_n() { Sound_ctor_rw(AR(A_OBJ), 0, TN(), 3); }
+static void t_s3ctor_o() { ((decltype(&Sound3D_ctor_rw))0x00472340)(AR(A_OBJ), 0, TN(), 3, AR(A_P3) + 12, AR(A_P3)); }
+static void t_s3ctor_n() { Sound3D_ctor_rw(AR(A_OBJ), 0, TN(), 3, AR(A_P3) + 12, AR(A_P3)); }
+static void t_sdctor_n() { SoundDash_ctor_rw(AR(A_OBJ), 0, TN(), 6, 2); }
+static void t_sdctor_o() { ((decltype(&SoundDash_ctor_rw))0x00472440)(AR(A_OBJ), 0, TN(), 6, 2); }
+static void t_screate_o() { g_t_ret = ((decltype(&Sound_Create_rw))0x004725b0)(TN(), 3); }
+static void t_screate_n() { g_t_ret = Sound_Create_rw(TN(), 3); }
+static void t_s3create_n() { g_t_ret = Sound3D_Create_rw(TN(), 3, AR(A_P3) + 12, AR(A_P3)); }
+static void t_sdcreate_n() { g_t_ret = SoundDash_Create_rw(TN(), 6, 2); }
+static void t_toss_n() { Sound_Toss_rw(TN(), 0); }
+static void t_dtor_o() { ((decltype(&SoundBase_dtor_rw))0x00471f20)(g_t_s, 0); }
+static void t_dtor_n() { SoundBase_dtor_rw(g_t_s, 0); }
+// (c) update's lock
+static void t_upd_o() { ((decltype(&SM_update_rw))0x00474230)(MGR(), 0); }
+static void t_upd_n() { SM_update_rw(MGR(), 0); }
+static void t_frames_o() { for (int i = 0; i < 3; i++) ((decltype(&SM_update_rw))0x00474230)(MGR(), 0); }
+// (f) resources
+static void t_res_o() { g_t_ret = (uint8_t*)((decltype(&SoundResourceGet_rw))0x00477200)(TN()); }
+static void t_res_n() { g_t_ret = (uint8_t*)SoundResourceGet_rw(TN()); }
+// (g), (h) the table
+static void t_add_o() { ((decltype(&SM_add_sound_rw))0x00474810)(MGR(), 0, g_t_s); }
+static void t_add_n() { SM_add_sound_rw(MGR(), 0, g_t_s); }
+static void t_rem_n() { SM_Remove_rw(MGR(), 0, g_t_s); }
+static void t_smctor_n() { SoundManager_ctor_rw(AR(A_MGR2), 0, AR(A_MIXER)); }
+// (i) DestroyWhenStopped
+static void t_dws_o() { ((decltype(&SM_DestroyWhenStopped_rw))0x004749b0)(MGR(), 0, g_t_s); }
+static void t_dws_n() { SM_DestroyWhenStopped_rw(MGR(), 0, g_t_s); }
+
+static uint32_t g_big[1024 + 16];                                  // a lifted sound table (1024) and room past it
+
+// a world with the manager ready on the BG thread (creating directly), nothing in flight
+static void calm_world(bool no_sounds) {
+    random_world();
+    uint8_t* mgr = MGR();
+    if (no_sounds) { g_w.n = 0; build_tables(); }
+    mgr[0] = 1; mgr[1] = 0; mgr[0x4c] = 0; mgr[0x174] = 0;
+    *(int32_t*)(mgr + 0x50) = 0;
+    *(int32_t*)(mgr + 0x17c) = BG_TASK;
+    *(uint32_t*)(mgr + 0x164) = 0; *(uint32_t*)(mgr + 0x16c) = 0;
+    *(int32_t*)(mgr + 0x160) = 0;
+    *(uint32_t*)S_UPDATE_F = F_MGR_UPDATE;
+    g_script.alloc_fail = 0; g_script.create_fail = 0;
+}
+
+static int directed_fix_tests() {
+    int bad = 0;
+    auto check = [&](bool ok, const char* what) { if (!ok) printf("  fix test: %s FAILED\n", what); bad += !ok; };
+    int dop_orig_faults = 0, dop_cases = 0, dop_near_same = 0, null_orig_faults = 0, res_short = 0, res_same = 0;
+    for (int round = 0; round < 40 && bad < 20; round++) {
+        // (a) Doppler at exactly the speed of sound, exceptions unmasked (the BG thread's state)
+        calm_world(false);
+        g_t_s = any_of(VT_SOUND3D);
+        g_t_s[0x30] = 1;
+        setf(g_t_s + 4, range(0.5f, 2.0f));
+        init_isound(*(uint8_t**)(g_t_s + 0xc), 1, 0);                  // (Can3D 0: the software path)
+        float* fr = (float*)ARG(G_FRAME);
+        memset(fr, 0, 48);
+        fr[0] = fr[4] = fr[8] = 1.0f;
+        for (int c = 9; c < 12; c++) fr[c] = (float)(int)(rnd() % 200) - 100.0f;
+        float* lv = (float*)ARG(G_VEL);
+        for (int c = 0; c < 3; c++) lv[c] = (float)(int)(rnd() % 60) - 30.0f;
+        *(int32_t*)ARG(G_LIST) = 0;
+        *(uint8_t**)(ARG(G_LIST) + 4) = ARG(G_FRAME);
+        *(uint8_t**)(ARG(G_LIST) + 8) = ARG(G_VEL);
+        float* pos = *(float**)(g_t_s + 0x3c);
+        float* vel = *(float**)(g_t_s + 0x38);
+        pos[0] = fr[9] + 16.0f; pos[1] = fr[10]; pos[2] = fr[11];      // 16 m along x: the unit vector is exact
+        vel[0] = lv[0] - bitsf(0x43a9fc29); vel[1] = lv[1]; vel[2] = lv[2];
+        if (fbits(vel[0] - lv[0]) == 0xc3a9fc29u) {                     // (exact for these values)
+            dop_cases++;
+            snap();
+            const int fo = guarded(t_dop_o, true, BG_TASK);
+            dop_orig_faults += fo && g_t_fault == EXCEPTION_FLT_DIVIDE_BY_ZERO;
+            const uint32_t ocode = g_t_fault;
+            restore();
+            const int fn = guarded(t_dop_n, true, BG_TASK);
+            check(fo && ocode == EXCEPTION_FLT_DIVIDE_BY_ZERO && !fn && g_fix_fired == 1 && last_after('SFRQ', 2) == 0x7f800000u,
+                  "(a) Doppler at the speed of sound: the original divides by zero, the rewrite hands SetFrequency +inf");
+            // beside it: a closing speed one step off, and a few near ones: the original's bits
+            const float v0 = vel[0];
+            for (int k = 0; k < 4; k++) {
+                restore();
+                vel[0] = k == 0 ? bitsf(fbits(v0) + 1) : v0 + range(-2.0f, 2.0f);
+                snap();
+                const int o2 = guarded(t_dop_o, true, BG_TASK);
+                keep_after();
+                restore();
+                const int n2 = guarded(t_dop_n, true, BG_TASK);
+                if (o2) continue;                                       // (a near value can land on 0 too)
+                const bool ok = !n2 && g_fix_fired == 0 && same_as_after();
+                check(ok, "(a) Doppler beside the speed of sound: the original's bits");
+                dop_near_same += ok;
+            }
+        }
+
+        // (b) no manager: the entry points
+        void (*const eo[5])() = {t_mute_o, t_unmute_o, t_flush_o, t_setl_o, t_stop_o};
+        void (*const en[5])() = {t_mute_n, t_unmute_n, t_flush_n, t_setl_n, t_stop_n};
+        for (int e = 0; e < 5; e++) {
+            calm_world(false);
+            *(uint8_t**)S_MGR = 0;
+            snap();
+            const int fo = guarded(eo[e], false, MAIN_TASK);
+            null_orig_faults += fo;
+            restore();
+            const int fn = guarded(en[e], false, MAIN_TASK);
+            check(fo && !fn && unchanged() && g_log.n == 0, "(b) an entry point with no manager: the original faults, the rewrite does nothing");
+        }
+        // (b) the constructors: no mixer sound, nothing asked of the manager
+        {
+            void (*const co[2])() = {t_sctor_o, t_s3ctor_o};
+            void (*const cn[3])() = {t_sctor_n, t_s3ctor_n, t_sdctor_n};
+            for (int e = 0; e < 3; e++) {
+                calm_world(false);
+                *(uint8_t**)S_MGR = 0;
+                memset(AR(A_OBJ), 0xcd, 0x100);
+                Saved5 h;
+                if (e < 2) {
+                    const int fo = guarded(co[e], false, MAIN_TASK);
+                    null_orig_faults += fo;
+                    check(fo != 0, "(b) a sound's constructor with no manager: the original faults");
+                    memset(AR(A_OBJ), 0xcd, 0x100);
+                } else {
+                    hook_to(h, 0x004723c0, (void*)&Sound_ctor_rw);      // SoundDash's base: the fixed one
+                }
+                const int fn = guarded(cn[e], false, MAIN_TASK);
+                if (e == 2) unhook(h);
+                check(!fn && *(uint32_t*)(AR(A_OBJ) + 0xc) == 0 && count_tag('TGID') == 0 && count_tag('CRSN') == 0 && count_tag('MENT') == 0,
+                      "(b) a sound's constructor with no manager: no mixer sound, the manager left alone");
+            }
+        }
+        // (b) the factories and Toss, with the fixed constructors and destructor in place: NULL, the sound freed
+        {
+            calm_world(false);
+            *(uint8_t**)S_MGR = 0;
+            snap();
+            const int fo = guarded(t_screate_o, false, MAIN_TASK);
+            null_orig_faults += fo;
+            check(fo != 0, "(b) Sound::Create with no manager: the original faults");
+            Saved5 h[4];
+            hook_to(h[0], 0x004723c0, (void*)&Sound_ctor_rw);
+            hook_to(h[1], 0x00472340, (void*)&Sound3D_ctor_rw);
+            hook_to(h[2], 0x00472440, (void*)&SoundDash_ctor_rw);
+            hook_to(h[3], 0x00471f20, (void*)&SoundBase_dtor_rw);
+            void (*const fns[3])() = {t_screate_n, t_s3create_n, t_sdcreate_n};
+            for (int e = 0; e < 3; e++) {
+                restore();
+                g_t_ret = (uint8_t*)1;
+                const int fn = guarded(fns[e], false, MAIN_TASK);
+                check(!fn && g_t_ret == 0 && count_tag('MALC') == 1 && count_tag('DELE') == 1 && count_tag('CRSN') == 0,
+                      "(b) Create with no manager: the sound is made, deleted, and NULL returned");
+            }
+            restore();
+            const int ft = guarded(t_toss_n, false, MAIN_TASK);
+            check(!ft && count_tag('DELE') == 1 && count_tag('MENT') == 0 && count_tag('PANC') == 0, "(b) Toss with no manager: nothing played or listed");
+            for (int k = 3; k >= 0; k--) unhook(h[k]);
+        }
+        // (b) a sound outliving its manager
+        if (g_w.n) {
+            calm_world(false);
+            g_t_s = any_listed();
+            *(uint8_t**)S_MGR = 0;
+            snap();
+            const int fo = guarded(t_dtor_o, false, MAIN_TASK);
+            null_orig_faults += fo;
+            restore();
+            const int fn = guarded(t_dtor_n, false, MAIN_TASK);
+            check(fo && !fn && *(uint32_t*)(g_t_s + 0xc) == 0 && g_log.n == 0, "(b) ~SoundBase with no manager: let go of, nothing called");
+        }
+
+        // (c) update() with update_f cleared: the lock let go of
+        {
+            calm_world(false);
+            *(uint32_t*)S_UPDATE_F = 0;
+            snap();
+            guarded(t_upd_o, false, BG_TASK);
+            const int oe = count_tag('MENT'), ol = count_tag('MLEV');
+            keep_after();
+            restore();
+            guarded(t_upd_n, false, BG_TASK);
+            check(oe == 1 && ol == 0 && count_tag('MENT') == 1 && count_tag('MLEV') == 1 && !memcmp(g_arena_after, g_arena, ARENA_BYTES),
+                  "(c) update() with update_f 0: the original keeps the lock, the rewrite lets go of it");
+        }
+
+        // (e) SoundDash +0x38: garbage 0 left the dash sound silent for good; 1 lets its first update decide
+        {
+            calm_world(true);
+            g_script.quality = 2;
+            *(int32_t*)(MGR() + 0x54) = 2;                              // the listener is car 2, the dash's car
+            memset(AR(A_OBJ), 0, 0x100);                                // (the garbage: 0)
+            snap();
+            const int fo = guarded(t_sdctor_o, false, BG_TASK);
+            keep_after();
+            restore();
+            const int fn = guarded(t_sdctor_n, false, BG_TASK);
+            const uint8_t o38 = g_arena_after[A_OBJ + 0x38], n38 = g_arena[A_OBJ + 0x38];
+            g_arena_after[A_OBJ + 0x38] = n38;
+            check(!fo && !fn && o38 == 0 && n38 == 1 && same_as_after(), "(e) SoundDash: +0x38 starts at 1, everything else the original's");
+            // three frames with a play request, heard from its own car: the original's stays muted, the fixed one plays
+            int32_t st[2] = {-1, -1};
+            for (int pass = 0; pass < 2; pass++) {
+                restore();
+                guarded(pass ? t_sdctor_n : t_sdctor_o, false, BG_TASK);
+                uint8_t* sd = AR(A_OBJ);
+                sd[0x29] = 1; sd[0x2a] = 0; sd[0x2b] = 0;
+                setf(sd + 8, 1.0f);
+                guarded(t_frames_o, false, BG_TASK);
+                uint8_t* is = *(uint8_t**)(sd + 0xc);
+                st[pass] = in_arena(is, 0x40) ? *(int32_t*)(is + 4) : -2;
+            }
+            check(st[0] == 2 && st[1] == 1, "(e) SoundDash heard from its own car: the original's (garbage 0) never plays, the fixed one does");
+        }
+
+        // (f) an old-format resource shorter than 0x800 bytes
+        {
+            static const uint32_t lens[] = {0, 1, 0x7fe, 0x7ff, 0x800, 0x801, 0x1234, 0x10000};
+            for (uint32_t L : lens) {
+                calm_world(false);
+                g_script.res_found = 1;
+                g_script.res_version = 0;
+                *(uint32_t*)AR(A_RES) = L;
+                snap();
+                guarded(t_res_o, false, MAIN_TASK);
+                keep_after();
+                restore();
+                guarded(t_res_n, false, MAIN_TASK);
+                const uint32_t got = *(uint32_t*)AR(A_RES);
+                if (L < 0x800) {
+                    check(*(uint32_t*)(g_arena_after + A_RES) == L - 0x800 && got == 0 && g_t_ret == AR(A_RES) && g_fix_fired == 1,
+                          "(f) a short old-format resource: length 0, not wrapped negative");
+                    res_short++;
+                } else {
+                    check(g_fix_fired == 0 && same_as_after() && got == L - 0x800, "(f) a long old-format resource: cut as before");
+                    res_same++;
+                }
+            }
+        }
+
+        // (h) a class outside 0..7: clamped on the way in, found the same way on the way out
+        {
+            static const int32_t bad_cls[] = {-1, 8, 100, (int32_t)0x80000000, 0x7fffffff};
+            for (int32_t c : bad_cls) {
+                calm_world(false);
+                g_t_s = sound_at(g_w.n);                                // a stray: not in the table
+                *(int32_t*)(g_t_s + 0x24) = c;
+                uint8_t* mgr = MGR();
+                static uint8_t mgr0[0x180], list0[0x600];
+                memcpy(mgr0, mgr, 0x180);
+                const int32_t n0 = *(int32_t*)(mgr + 8);
+                memcpy(list0, AR(A_LIST), 4 * n0);
+                const int cc = c < 0 ? 0 : 7;
+                const int32_t nc0 = *(int32_t*)(mgr + 0x10 + 8 * cc);
+                const int f1 = guarded(t_add_n, false, BG_TASK);
+                uint8_t** run = *(uint8_t***)(mgr + 0xc + 8 * cc);
+                const bool in = *(int32_t*)(mgr + 8) == n0 + 1 && *(int32_t*)(mgr + 0x10 + 8 * cc) == nc0 + 1 && run[0] == g_t_s;
+                const int f2 = guarded(t_rem_n, false, BG_TASK);
+                check(!f1 && !f2 && in && count_tag('PANC') == 0 && !memcmp(mgr0, mgr, 0x180) && !memcmp(list0, AR(A_LIST), 4 * n0),
+                      "(h) a class outside 0..7: added to the nearest class's run, removed again, the tables as before");
+            }
+            calm_world(false);                                          // the original, class 8: its "run" is the listener index
+            g_t_s = sound_at(g_w.n);
+            *(int32_t*)(g_t_s + 0x24) = 8;
+            *(int32_t*)(MGR() + 0x4c) = 0;
+            check(guarded(t_add_o, false, BG_TASK) != 0, "(h) the original, class 8: faults");
+        }
+
+        // (i) DestroyWhenStopped past 32: the sound destroyed, no panic -- on the BG thread and on the main thread
+        for (int thread = 0; thread < 2; thread++) {
+            calm_world(false);
+            if (!g_w.n) continue;
+            g_t_s = any_listed();
+            uint8_t* is = *(uint8_t**)(g_t_s + 0xc);
+            for (int k = 0; k < 32; k++) {                              // 32 tossed sounds still playing
+                uint8_t* p = sound_at(g_w.n + k % g_w.nstray);
+                *(uint8_t**)(MGR() + 0xd8 + 4 * k) = p;
+                *(int32_t*)(*(uint8_t**)(p + 0xc) + 4) = 1;
+            }
+            *(int32_t*)(MGR() + 0x158) = 32;
+            snap();
+            guarded(t_dws_o, false, thread ? MAIN_TASK : BG_TASK);
+            const int op = count_tag('PANC');
+            restore();
+            const int fn = guarded(t_dws_n, false, thread ? MAIN_TASK : BG_TASK);
+            const bool ok = op == 1 && !fn && count_tag('PANC') == 0 && *(int32_t*)(MGR() + 0x158) == 32 &&
+                            *(uint32_t*)(is + 0x3c) == 0xdead && count_tag('DELE') == 1;
+            if (!ok) printf("    (%s thread: original panics %d; rewrite fault %d (%08x), panics %d, count %d, ISound %08x, deletes %d)\n",
+                            thread ? "main" : "BG", op, fn, g_t_fault, count_tag('PANC'), *(int32_t*)(MGR() + 0x158),
+                            *(uint32_t*)(is + 0x3c), count_tag('DELE'));
+            check(ok, "(i) a 33rd sound to destroy when stopped: destroyed at once, no panic");
+        }
+    }
+
+    // (g) the sound table: its capacity from the constructor's operand; stock 384, lifted 1024
+    {
+        const uint32_t op0 = *(uint32_t*)SM_TABLE_BYTES_OP;
+        check(op0 == 0x600 && sound_capacity() == 384, "(g) the stock operand: 0x600, 384 sounds");
+        for (int lifted = 0; lifted < 2; lifted++) {
+            const int32_t cap = lifted ? 1024 : 384;
+            if (lifted) *(uint32_t*)SM_TABLE_BYTES_OP = 0x1000;
+            for (int full = 0; full < 2; full++) {
+                calm_world(true);
+                uint8_t* mgr = MGR();
+                uint32_t* list = lifted ? g_big : (uint32_t*)AR(A_LIST);
+                const int32_t n = full ? cap : cap - 1;
+                for (int32_t i = 0; i < n; i++) list[i] = (uint32_t)(uintptr_t)sound_at(0);
+                for (int i = 0; i < 16; i++) list[cap + i] = 0x5e5e5e5e;
+                *(uint32_t**)(mgr + 4) = list;
+                for (int k = 0; k < 8; k++) { *(uint32_t**)(mgr + 0xc + 8 * k) = list; *(int32_t*)(mgr + 0x10 + 8 * k) = 0; }
+                *(int32_t*)(mgr + 0x10 + 8 * 7) = n;
+                *(int32_t*)(mgr + 8) = n;
+                g_t_s = sound_at(1);
+                *(int32_t*)(g_t_s + 0x24) = 3;
+                snap();
+                static uint32_t list_snap[1024 + 16];
+                memcpy(list_snap, list, 4 * (cap + 16));
+                const int fo = guarded(t_add_o, false, BG_TASK);
+                const bool o_over = memcmp(list_snap + cap, list + cap, 64) != 0;
+                restore();
+                memcpy(list, list_snap, 4 * (cap + 16));
+                const int fn = guarded(t_add_n, false, BG_TASK);
+                const bool n_over = memcmp(list_snap + cap, list + cap, 64) != 0;
+                if (full) {
+                    check(!fo && o_over && !fn && !n_over && *(int32_t*)(mgr + 8) == cap && g_fix_fired == 1,
+                          lifted ? "(g) a full lifted table (1024): the original writes past it, the rewrite adds nothing"
+                                 : "(g) a full stock table (384): the original writes past it, the rewrite adds nothing");
+                } else {
+                    check(!fn && !n_over && *(int32_t*)(mgr + 8) == cap && list[0] == (uint32_t)(uintptr_t)g_t_s && g_fix_fired == 0,
+                          lifted ? "(g) the lifted table's last slot (the 1024th): added" : "(g) the stock table's last slot (the 384th): added");
+                }
+                // a sound made with the table full is no sound (not created); one slot short, it is made and added
+                restore();
+                memcpy(list, list_snap, 4 * (cap + 16));
+                *(uint8_t**)S_MGR = mgr;
+                memset(AR(A_OBJ), 0xcd, 0x100);
+                const int fc = guarded(t_sctor_n, false, BG_TASK);
+                check(!fc && (full ? *(uint32_t*)(AR(A_OBJ) + 0xc) == 0 && count_tag('CRSN') == 0
+                                   : *(uint32_t*)(AR(A_OBJ) + 0xc) != 0 && count_tag('CRSN') == 1 && *(int32_t*)(mgr + 8) == cap),
+                      full ? "(g) Sound::Sound with the table full: no sound" : "(g) Sound::Sound with one slot left: made and added");
+                check(memcmp(list_snap + cap, list + cap, 64) == 0, "(g) nothing written past the table");
+            }
+            if (lifted) {                                               // the constructor allocates the operand's size
+                calm_world(false);
+                memset(AR(A_MGR2), 0xcd, 0x180);
+                const int f = guarded(t_smctor_n, false, MAIN_TASK);
+                bool saw = false;
+                for (uint32_t i = 0; i + 1 < g_log.n; i++) if (g_log.w[i] == 'MALC' && g_log.w[i + 1] == 0x1000) saw = true;
+                check(!f && saw, "(g) SoundManager::SoundManager with the lifted operand allocates 0x1000 bytes");
+            }
+            *(uint32_t*)SM_TABLE_BYTES_OP = op0;
+        }
+    }
+    printf("directed fix tests (40 rounds): %s -- at the speed of sound the original divided by zero %d / %d times, the "
+           "rewrite never; %d Doppler values beside it matched; with no manager the original faulted %d times; old-format "
+           "resources: %d short made empty, %d cut as before\n",
+           bad ? "FAILED" : "all passed", dop_orig_faults, dop_cases, dop_near_same, null_orig_faults, res_short, res_same);
+    return bad;
+}
+#endif
 
 // ---- main ----------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
@@ -1028,7 +1486,13 @@ int main(int argc, char** argv) {
     const bool trace = GetEnvironmentVariableA("VP_TRACE", 0, 0) != 0;
     int unmasked_runs = 0;
     int differ = 0, faults = 0, fault_both = 0, fp_bad = 0, replay_only = 0, wild_runs = 0, wild_differ = 0;
-    int per[N_KINDS] = {0}, per_bad[N_KINDS] = {0}, per_fault[N_KINDS] = {0};
+    int per[N_KINDS] = {0}, per_bad[N_KINDS] = {0}, per_fault[N_KINDS] = {0}, per_fix[N_KINDS] = {0};
+    int fix_worlds = 0, fix_saved = 0, fix_faulted = 0, fix_both_faulted = 0;
+#ifdef VP_SND_FIXES
+    const int directed_bad = directed_fix_tests();
+#else
+    const int directed_bad = 0;
+#endif
     long long log_words = 0;
     // coverage, from the original's results
     int c_panic = 0, c_report = 0, c_sleep = 0, c_hang = 0, c_create = 0, c_idel = 0, c_play = 0, c_stop = 0, c_mute = 0,
@@ -1068,6 +1532,18 @@ int main(int argc, char** argv) {
         int fn = run_guarded(kind, true, &rn);
         per[kind]++;
         log_words += g_log_orig.n;
+        if (g_fix_fired) {                                           // a fix changed this world: counted, not compared
+            fix_worlds++;
+            per_fix[kind]++;
+            if (fo && !fn) fix_saved++;
+            if (fo && fn) fix_both_faulted++;                       // (from causes no fix covers, as in the original)
+            if (fn && !fo) {
+                fix_faulted++;
+                printf("  (world %d, %s: a fix fired and the rewrite faulted where the original didn't, %08x at %08x)\n", it,
+                       kind_names[kind], g_fault_code, g_fault_eip);
+            }
+            continue;
+        }
         if (fo || fn) {
             faults++;
             per_fault[kind]++;
@@ -1180,5 +1656,10 @@ int main(int argc, char** argv) {
            c_panic, c_report, c_sleep, c_create, c_idel, c_play, c_stop, c_mute, c_unmute, c_set3d, c_pan, c_mupd, c_alloc_null);
     printf("mute_sounds: muted some %d, unmuted some %d; Sound3D::update_sound within 10 m %d, within 0.1 m %d; update_status in range %d / out %d; has_priority focus-car path %d\n",
            c_muted_some, c_unmuted_some, c_s3_near, c_s3_close, c_s3_in, c_s3_out, c_prio_focus);
-    return differ || fp_bad ? 1 : 0;
+#ifdef VP_SND_FIXES
+    printf("fixes: %d worlds a fix changed (the original faulted and the rewrite didn't in %d; both faulted in %d; the rewrite alone faulted in %d); "
+           "every other world compared as above. Per function:\n", fix_worlds, fix_saved, fix_both_faulted, fix_faulted);
+    for (int i = 0; i < N_KINDS; i++) if (per_fix[i]) printf("  %-52s %6d\n", kind_names[i], per_fix[i]);
+#endif
+    return differ || fp_bad || directed_bad || fix_faulted ? 1 : 0;
 }

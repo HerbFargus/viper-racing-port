@@ -146,6 +146,45 @@ dozen places and the game dies.
   the desktop's compositor, so it kept whatever it last composited. The race's picture is shown once more
   when the game starts waiting, by which time the window is composited. (Cosmetic; `gfx::repaint`.)
 
+## Sound
+
+- Doppler: a sound source and the listener closing at exactly the speed of sound divided by zero. The
+  sound mixes on the physics thread, which runs with divide-by-zero exceptions on, so the game crashed. That
+  pitch is now simply the highest the mixer allows.
+- With no working sound device the game went on without a sound manager and crashed at the first sound or at
+  the start of a race. It now runs silently.
+- The dash sounds (gear changes, cockpit clicks) started out heard or unheard at random, from an
+  uninitialised field, and one that started unheard was never heard. Each now starts heard until its first
+  update checks it against the listener.
+- The sound library could return with its lock still held (a hang), and a sound created for another thread
+  was marked done before it was stored, so it could be lost. Both fixed.
+- More than 32 fire-and-forget sounds still playing at once ended the game. The extra one is now not played.
+- A sound class outside 0-7 wrote past the per-class tables; it is clamped.
+
+Mod cars and sounds:
+
+- Mod sounds without the 4 KB of padding the stock ones carry after their data were read past their end on
+  their last mixing block (a crash if the sound sat at the end of its memory). The mixer now stays inside
+  each sound's resource and plays what the padding would have held: silence after a one-shot, the loop's
+  start after a loop. Every stock sound has that padding and mixes exactly as before.
+- A looping sound shorter than one mixing block (about 2,000 samples at the top pitch), or with no data,
+  drifted further past its end every block; it now wraps within its loop.
+- A missing sound resource makes a silent sound instead of a crash.
+- An old-format sound shorter than 2 KB got a negative length and played on through whatever memory followed
+  it; it is now silent.
+- Engine sound data whose volume corners meet (for example full volume and peak at the same RPM), or a band
+  recorded at 0 RPM, divided by zero and crashed the game. The volume is now what the data means, and a
+  0 RPM band plays at the mixer's highest pitch.
+- An engine file (`<car>e.ens`) with more than 7 bands overwrote the car's idle sound and ran past the engine
+  object. The first 7 are used, and the log says so.
+- A car with no engine sound data at all had a garbage band count; it now has no engine bands.
+- A car using `engine.txt`: a missing `engine<n>.sfx` crashed the game when another car was in view, and one
+  engine sound per car was leaked. Both fixed.
+- Tyre sounds: running out of memory for one crashed the game, a car index past the 16-car tyre-sound table
+  wrote into the mixer's data, and a mixer quality outside the three settings read past the table (it now
+  means no tyre squeal).
+- Car names of 27-31 characters overflowed the engine file name's buffer (harmless: nothing used the bytes).
+
 ## Limits lifted
 
 Like M1's limits, these move a table into the DLL for the original code and the rewrites alike, so
@@ -159,6 +198,8 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
 - A track's camera-facing and upright models in view (trees, signs): 512 and 514 -> 8192 each. More than
   512 overwrote the dynamic-model table, more than 514 the other list. Past 8192 the rest aren't drawn,
   and the log says so once.
+- Sounds: the sound manager's table 384 -> 1024 (the 385th overran the heap) and the software mixer's list
+  256 -> 1024 (the 257th panicked "full"). Past 1024 a new sound is silent.
 
 ## Not fixed
 
@@ -168,3 +209,7 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
   overwritten) are gameplay, not bugs, and stay.
 - `collide_sphere_sphere`'s 0/0 for coincident centres needs no fix: it is caught before its result is
   used.
+- Sound: the mixer ignores each sound's sample rate, so the three 44.1 kHz stock sounds (the Viper's engine)
+  play as the game always played them; fixing it would change how the stock game sounds. Out-of-range mixer
+  and quality lookups are only reachable from the game's own menus. An old-format sound is shortened by 2 KB
+  every time it is fetched (no stock or known mod sound is old-format).
