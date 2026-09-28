@@ -189,6 +189,53 @@ Mod cars and sounds:
   means no tyre squeal).
 - Car names of 27-31 characters overflowed the engine file name's buffer (harmless: nothing used the bytes).
 
+## Menus
+
+The widget toolkit every menu and dialog is built from. None of these come up with the stock menus as they
+are; most are a mod's text or data (a long track description, an odd setup range), a long install path, or
+a menu grown past a table.
+
+- Text fields: a field with no room (a width or line count of 0) took characters without end, writing
+  past its buffer; it now takes none. A caret before the start of the text (the field never puts one there)
+  wrote the key before the buffer; it goes at the start.
+- Number fields (the garage's settings, the options' values) printed into 80 bytes, so a huge value or a
+  long format overran the widget; the text is cut to 79 characters. A drop-down list over ~600 pixels wide,
+  or with a very long entry, overran the stack drawing its row; the row is now drawn in full, up to 1008
+  characters (well past any screen's edge).
+- A slider with no steps crashed when dragged (a division by zero); it now behaves as a one-step slider
+  always did: dragging sets its value to its one position, the bottom of its range. A list whose rows
+  measure 0 pixels high crashed; it shows no rows and a click picks none.
+- An arrow button with one step or an empty range, a one-step slider's bars, and a scroll bar on an empty
+  list divided by zero. The menus run with that exception masked, so the original got infinities and got
+  away with it; the rewrites give exactly the same results without dividing, so nothing changes on screen,
+  and nothing can fault if the exception is ever unmasked.
+- The open and save file boxes (replays, the model tool): a directory plus pattern longer than the 260-byte
+  search path, or a directory plus name longer than the caller's buffer, overran the stack. A directory too
+  long to search now lists no files (and says so, as for none found); a name that doesn't fit isn't
+  returned (the open box answers as for a missing file, the save box as if cancelled). The name field is
+  held to its 300-byte buffer. The boxes also left two pointers aimed at their finished stack frame; they are
+  cleared (nothing read them afterwards).
+- The text box (the multiplayer prompts: the host to find, the line to connect): a text over 255
+  characters, or a limit over 256, overran its buffer; the text is cut to 255 and the field held to 256.
+- String lists (the file lists, the multiplayer and setup lists) started with an uninitialised change
+  counter. The list boxes only watch it change, so nothing showed; it now starts at 0.
+- A title bar dragged while no window was running wrote through a null pointer; it does nothing. A
+  picture radio button with no variable did the same when clicked; it does nothing.
+
+Past the toolkit's tables (a mod or menu code that adds too much):
+
+- A style number outside the 32 styles read or wrote past the style table: adding or removing one is
+  refused, and drawing or measuring with one uses style 0. A style state past 3 read the next style as a
+  palette; it takes the palette of its pressed and over bits. A style stamp with no frames crashed when
+  drawn; no frame is drawn.
+- Word-wrapped text (the long message boxes, the pre-race track description) had no length limit; it is
+  cut to 4095 characters, the size of those buffers.
+- A window's 257th widget overwrote its widget count, and a widget's 33rd watched value overwrote its
+  value count; both are refused (the widget isn't shown, the value isn't watched). A window's draw keeps to
+  its 256 widgets. A 17th window leaked a window before the game stopped with its "too many windows" error;
+  the error now comes first. A cycling text button with more than 8 choices wrote past itself; it keeps
+  the first 8.
+
 ## Limits lifted
 
 Like M1's limits, these move a table into the DLL for the original code and the rewrites alike, so
@@ -217,3 +264,8 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
   play as the game always played them; fixing it would change how the stock game sounds. Out-of-range mixer
   and quality lookups are only reachable from the game's own menus. An old-format sound is shortened by 2 KB
   every time it is fetched (no stock or known mod sound is old-format).
+- Menus: a menu's custom controls (the options panels, the car and track choosers, the garage, the career
+  and paint screens) get their width and height where the toolkit's own layout expects a right and bottom
+  edge. Every control reads them as a width and height, so it's as the game was written, and stays. The
+  upgrade catalogue (career) word-wraps an upgrade's description into a 2 KB buffer of its own, so a
+  description of 2-4 KB still overruns it until the career stage's rewrite grows the buffer.

@@ -24,20 +24,16 @@
 // RemoveNotification), what calls unbounded code (a button's callback, CustomWidget -> UICustomControl, CDetect's
 // dialog and its idle function), per call where it depends on the object (a button without a callback is checked).
 //
-// FIX CANDIDATES (left as the original has them):
-//   * Widget::AddNotification has no bound on its 32 entries: the 33rd writes over the count (+0x21c) and the dirty
-//     flag, and past the object.
-//   * Multi's constructor has no bound on its 8 strings: a ninth is written past the object.
-//   * Numeric / IntNumeric sprintf into an 80-byte buffer; DropList::Draw sprintf's "%-*s `" with the list's width in
-//     characters into an 80-byte stack buffer (a list wider than ~600 pixels overruns it).
-//   * Input::CharHit: a buffer of width * lines == 0 takes characters without end (max - 1 wraps unsigned); a cursor
-//     below 0 (never set by the widget) writes before the buffer.
-//   * Input::UpdateTable (never called) has no bound on its 512 line starts.
-//   * ArrowButton::Do divides by (steps - 1) and by the step: 1 step, or lo == hi, gives inf / NaN (the value becomes
-//     0 or NaN). Slider::MouseMove and Draw divide by steps (idiv: 0 steps faults) and steps - 1; ListBox divides by
-//     its row height; ScrollBar by the axis's total (0: inf, ftol -> 0).
-//   * FStaticText::Draw (no vtable: never called) passes its text as a printf format with no arguments.
-//   * BRadioButton::MouseDown writes *var unchecked (its constructor already needs var).
+// Fixes (// FIX:, docs/FIXES.md "Menus"): Widget::AddNotification refuses a 33rd entry (it overwrote the count and
+// the dirty flag); Multi keeps its first 8 strings (a ninth was written past the object); Numeric / IntNumeric format
+// their text in a local buffer and keep what fits their 80 bytes, DropList::Draw formats its row in a bigger one (both
+// overran); Input::CharHit inserts nothing into a buffer of no size (it inserted without end) and puts a caret below 0 at
+// the start (it wrote before the buffer); Slider::MouseMove gives a slider of fewer than 2 steps its one position, lo
+// (0 steps faulted); ListBox with rows 0 pixels high shows none and a click picks none (it faulted); the divisions by
+// zero of ArrowButton::Do, Slider::Draw and ScrollBar give what the FPU gave with the exception masked (the original's
+// bits: ui_div_masked); BRadioButton::MouseDown with no variable does nothing. Every other input gives the original's
+// bits. Left (never called): Input::UpdateTable's unbounded 512 line starts, FStaticText::Draw's text passed as a
+// printf format.
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -336,8 +332,11 @@ static void __fastcall Widget_Update_n(Widget* self, Edx) {
 }
 PORT_FN(0x0047bd50, "Widget::Update", Widget_Update_n, fp_reach0)
 
-// AddNotification: a copy of *ptr (size bytes) kept to compare against (no bound on the 32 entries)
+// AddNotification: a copy of *ptr (size bytes) kept to compare against (32 entries at most)
 static void __fastcall Widget_AddNotification_n(Widget* self, Edx, int32_t id, const void* ptr, uint32_t size) {
+    // FIX: a 33rd entry went over the count (+0x21c) and the dirty flag, and past the object: refused (nothing
+    // allocated; that value isn't watched, so its changes don't redraw the widget)
+    if (VP_FIX && (uint32_t)self->nnotes >= 32u) return;
     void* copy = ccall<void*>(F_MemAlloc, (int32_t)size);
     self->notes[self->nnotes].id = id;
     self->notes[self->nnotes].ptr = ptr;
@@ -782,7 +781,10 @@ PORT_FN(0x0047c6b0, "BRadioButton::Draw", BRadioButton_Draw_n, fp_draw)
 
 static void __fastcall BRadioButton_MouseDown_n(BRadioButton* self, Edx, int32_t, int32_t) {
     const int32_t v = self->value;
-    *(volatile int32_t*)self->var = v;
+    volatile int32_t* var = self->var;
+    // FIX: a button with no variable wrote through null: nothing to set
+    if (VP_FIX && var == 0) return;
+    *var = v;
 }
 static void fp_BRadioButton_MouseDown(Footprint& f, BRadioButton* self, Edx, int32_t, int32_t) { f.add(self->var, 4, "radio variable"); }
 PORT_FN(0x0047ec20, "BRadioButton::MouseDown", BRadioButton_MouseDown_n, fp_BRadioButton_MouseDown)
@@ -867,12 +869,15 @@ static void __fastcall ArrowButton_Do_n(ArrowButton* self, Edx) {
     double step = D(self->hi) - D(self->lo);
     const int32_t sm1 = self->steps - 1;
     float* v = self->value;
-    step = step / D(sm1);
+    // FIX: one step (steps - 1 == 0) divided by zero, and so (below) did an empty range (a step of 0): both give what the
+    // FPU gave with divide-by-zero masked, so the value goes where the original's sent it -- lo (hi if hi < lo), the
+    // control's one position -- bit for bit, and nothing can fault
+    step = ui_div_masked(step, D(sm1));
     double t = D(self->dir) * step;
     t = t + D(*(volatile float*)v);
     *(volatile float*)v = (float)t;
     volatile float* v2 = self->value;
-    double q = D(*v2) / step;
+    double q = ui_div_masked(D(*v2), step);                 // FIX: (above)
     q = q + D(bits_f(0x3f000000));
     const int32_t k = x87_ftol(q);
     *v2 = (float)(step * D(k));
@@ -1025,7 +1030,16 @@ PORT_FN(0x0047cc40, "Numeric::Numeric", Numeric_ctor_n, fp_numeric_ctor)
 static void __fastcall Numeric_update_text_n(Numeric* self, Edx) {
     double d = D(*(const volatile float*)self->value) * D(self->scale);
     d = d + D(self->offset);
-    UI_sprintf(self->text, self->format, d);
+    // FIX: sprintf'd straight into the 80-byte text, so a long number (a huge value, a long format) overran the object:
+    // formatted in a local buffer (the longest any of the game's formats can print is well under 0x400), and the first
+    // 79 characters kept. Text that fits is the same bytes.
+    if (VP_FIX) {
+        char t[0x400];
+        UI_sprintf(t, self->format, d);
+        ui_copy_bounded((char*)self->text, t, sizeof self->text);
+    } else {
+        UI_sprintf(self->text, self->format, d);
+    }
     ccall<void>(F_LocaleConvertNumeric, (char*)self->text);
     tcall<void>(F_StyleWidget_UpdateText, self);
     dirty_if_visible(self);
@@ -1056,7 +1070,13 @@ static void __fastcall IntNumeric_update_text_n(Numeric* self, Edx) {
     d = d + D(self->offset);
     d = d + D(bits_f(0x3f000000));
     const int32_t n = x87_ftol(d);
-    UI_sprintf(self->text, self->format, n);
+    if (VP_FIX) {                                             // FIX: as Numeric's
+        char t[0x400];
+        UI_sprintf(t, self->format, n);
+        ui_copy_bounded((char*)self->text, t, sizeof self->text);
+    } else {
+        UI_sprintf(self->text, self->format, n);
+    }
     ccall<void>(F_LocaleConvertNumeric, (char*)self->text);
     tcall<void>(F_StyleWidget_UpdateText, self);
     dirty_if_visible(self);
@@ -1079,6 +1099,8 @@ static Multi* __fastcall Multi_ctor_n(Multi* self, Edx, int32_t x, int32_t y, in
     self->count = 0;
     const char* p = strings;
     while (*(const volatile char*)p != 0) {
+        // FIX: room for 8 strings; a ninth was written past the object: the rest are left out
+        if (VP_FIX && self->count >= 8) break;
         self->options[self->count] = p;
         self->count = self->count + 1;
         p += crt_strlen(p) + 1;
@@ -1130,7 +1152,11 @@ static ListBox* __fastcall ListBox_ctor_n(ListBox* self, Edx, int32_t x, int32_t
     self->sel = sel;
     self->cols = w / 8;
     self->axis = axis;
-    self->rows = h / self->row_h;
+    // FIX: rows 0 pixels high (style 10 measuring -2) divided by zero, a fault: no rows are shown
+    {
+        const int32_t rh = self->row_h;
+        self->rows = VP_FIX && rh == 0 ? 0 : h / rh;
+    }
     if (axis) {
         axis->total = list->count;
         axis->visible = self->rows;
@@ -1154,7 +1180,11 @@ static void __fastcall ListBox_MouseMove_n(ListBox* self, Edx, int32_t, int32_t 
     int32_t top = 0;
     UIScrollAxis* a = self->axis;
     if (a) top = a->pos;
-    int32_t r = top + (y - self->y0 - 2) / self->row_h;
+    const int32_t dy = y - self->y0 - 2;
+    const int32_t rh = self->row_h;
+    // FIX: rows 0 pixels high divided by zero, a fault: there's no row under the mouse, the selection stays
+    if (VP_FIX && rh == 0) return;
+    int32_t r = top + dy / rh;
     if (r < 0) r = 0;
     const UIStringList* l = self->list;
     const int32_t n = l->count;
@@ -1256,7 +1286,10 @@ PORT_FN(0x0047d220, "DropList::DropList", DropList_ctor_n, fp_DropList_ctor)
 // DropList::Draw: while open (dragging), the list drawn below the field at its open size; then the field: a box, the
 // selected entry, and a "`" after it
 static void __fastcall DropList_Draw_n(DropList* self, Edx, gxCanvas* c) {
-    char buf[0x50];
+    // FIX: the row, padded to the list's width in characters, went into 80 bytes, so a list over ~600 pixels wide (or a
+    // long entry) overran the stack: a 1 KB buffer, the width and the entry each held to 1008 characters (8064 pixels,
+    // past any screen's edge, where the text is clipped anyway). A row that fitted is the same.
+    char buf[VP_FIX ? 0x400 : 0x50];
     if (self->dragging != 0) {
         tcall<void>(F_Widget_Move, self, (int32_t)self->x0, (int32_t)(self->y1 + 3));
         const int32_t h = self->y1 - self->y0;
@@ -1272,7 +1305,11 @@ static void __fastcall DropList_Draw_n(DropList* self, Edx, gxCanvas* c) {
     ccall<void>(F_gxRect, (int32_t)self->x0, (int32_t)self->y0, (int32_t)self->x1, (int32_t)self->y1, UI_GU32(S_C_HILITE));
     const char* s = tcall<char*>(F_UIStringList_GetEntry, (const void*)self->list, (int32_t)*(volatile int32_t*)self->sel);
     if (!s) s = (const char*)0x004f7154;
-    UI_sprintf(buf, (const char*)0x004f7158, (int32_t)self->cols, s);
+    const int32_t cols = self->cols;
+    if (VP_FIX && (cols > 0x3f0 || cols < -0x3f0 || ui_strnlen(s, 0x3f0) > 0x3f0))
+        UI_sprintf(buf, "%-*.*s `", cols > 0x3f0 ? 0x3f0 : cols < -0x3f0 ? -0x3f0 : cols, 0x3f0, s);   // FIX: (above)
+    else
+        UI_sprintf(buf, (const char*)0x004f7158, cols, s);
     ccall<void>(F_gxText, (int32_t)self->x0 + 1, (int32_t)self->y0 + 1, (const char*)buf, UI_GU32(S_C_TEXT));
 }
 PORT_FN(0x0047d290, "DropList::Draw", DropList_Draw_n, fp_draw)
@@ -1521,7 +1558,12 @@ static uint8_t __fastcall Input_CharHit_n(Input* self, Edx, uint16_t key) {
     }
     // printable
     if ((key & 0x100) || key <= 0x1f) return tcall<uint8_t>(F_Widget_CharHit, self, key);
-    if (crt_strlen(self->buf) < max - 1) {
+    // FIX: width * lines of 0 (or past 2^31: a negative line count) made max - 1 wrap, so characters were inserted
+    // without end: no room, nothing inserted
+    if (VP_FIX ? (int32_t)max > 0 && crt_strlen(self->buf) < max - 1 : crt_strlen(self->buf) < max - 1) {
+        // FIX: a caret below 0 (the widget never sets one) shifted the text down to it and wrote the key before the
+        // buffer: it's at the start
+        if (VP_FIX && self->cursor < 0) self->cursor = 0;
         int32_t c = (int32_t)crt_strlen(self->buf) + 1;
         if (self->cursor < c) {
             do {
@@ -1648,6 +1690,16 @@ static void __fastcall Slider_MouseMove_n(Slider* self, Edx, int32_t x, int32_t 
     const double range = D(self->hi) - D(self->lo);
     const int32_t tw = self->tw;
     const int32_t steps = self->steps;
+    // FIX: 0 steps divided the track by zero (`idiv`: a fault); 1 step divided by zero twice more, ending at lo (hi if
+    // hi < lo), the slider's one position. Fewer than 2 steps: the value goes there, with no division -- for 1 step the
+    // original's own result, bit for bit
+    if (VP_FIX && (uint32_t)steps < 2u) {
+        volatile float out;
+        copy_f(&out, &self->lo);
+        if (!(D(self->hi) >= D(out))) copy_f(&out, &self->hi);
+        copy_f(self->value, &out);
+        return;
+    }
     const int32_t dx = x - self->tx;
     const double sm1 = D(steps - 1);
     const int32_t span = tw - tw / steps;
@@ -1716,7 +1768,7 @@ static void __fastcall Slider_Draw_n(Slider* self, Edx, gxCanvas* c) {
         double t = D(i) + D(off);
         const double range = D(self->hi) - D(self->lo);
         t = t * range;
-        t = t / D(sm1);
+        t = ui_div_masked(t, D(sm1));      // FIX: 1 step divided by zero: what the FPU gave with the exception masked
         t = t + D(self->lo);
         const uint32_t col = t > D(*(volatile float*)self->value) ? dim : lit;
         const int32_t tw = self->tw;
@@ -1799,13 +1851,15 @@ PORT_FN(0x0047e1d0, "ScrollBar::ScrollBar", ScrollBar_ctor_n, fp_ScrollBar_ctor)
 static void __fastcall ScrollBar_MouseDown_n(ScrollBar* self, Edx, int32_t x, int32_t y) {
     self->dragging = 1;
     UIScrollAxis* a = self->axis;
+    // FIX: an empty axis (total 0) divided by zero: what the FPU gave with the exception masked (the original's grab,
+    // which MouseMove then multiplies by total / size = 0)
     if (self->type == 0) {
-        double t = D((int32_t)(self->y1 - self->y0)) / D(a->total);
+        double t = ui_div_masked(D((int32_t)(self->y1 - self->y0)), D(a->total));
         t = t * D(a->pos);
         self->grab_y = x87_ftol(t) - y;
         return;
     }
-    double t = D((int32_t)(self->x1 - self->x0)) / D(a->total);
+    double t = ui_div_masked(D((int32_t)(self->x1 - self->x0)), D(a->total));
     t = t * D(a->pos);
     self->grab_x = x87_ftol(t) - x;
 }
@@ -1886,7 +1940,8 @@ static void __fastcall ScrollBar_Draw_n(ScrollBar* self, Edx, gxCanvas* c) {
     if (self->type == 0) {
         const int32_t left = self->x0 + 1;
         int32_t right = self->x1;
-        const double sc = D((int32_t)(self->y1 - self->y0)) / D(a->total);
+        // FIX: total 0 (reached only with a negative visible count) divided by zero: as MouseDown's
+        const double sc = ui_div_masked(D((int32_t)(self->y1 - self->y0)), D(a->total));
         const int32_t k1 = x87_ftol(D(a->pos) * sc);
         right--;
         const int32_t top = self->y0 + k1 + 1;
@@ -1901,7 +1956,7 @@ static void __fastcall ScrollBar_Draw_n(ScrollBar* self, Edx, gxCanvas* c) {
     }
     const int32_t top = self->y0 + 1;
     int32_t bottom = self->y1;
-    const double sc = D((int32_t)(self->x1 - self->x0)) / D(total);
+    const double sc = ui_div_masked(D((int32_t)(self->x1 - self->x0)), D(total));    // FIX: (above)
     bottom--;
     const int32_t k1 = x87_ftol(D(a->pos) * sc);
     const int32_t left = self->x0 + k1 + 1;

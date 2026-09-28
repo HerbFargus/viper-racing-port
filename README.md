@@ -139,7 +139,8 @@ That is the whole physics and AI code, apart from the debug screens' drawing.
 Then a chosen set of the original's bugs is fixed, always on: the AI crash (a car losing its place on
 its racing line), degenerate racing lines, a ground-contact divide by zero, vrmod's obstacle wake, a single race on a
 track with no AI racing line (it runs without AI cars instead of crashing), sound crashes (Doppler at
-the speed of sound, no sound device, mod sounds and engine files), and
+the speed of sound, no sound device, mod sounds and engine files), the menus' widget crashes (divides by
+zero, text and file-name overruns, overflowing widget and style tables), and
 buffer overruns that long mod-car, driver and track names could trigger. A fix only changes what happens
 where the original would crash, hang or overrun, so a race replays identically on the original code
 until one of those comes up. The AI crash is the one that comes up in ordinary racing (after the

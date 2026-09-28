@@ -13,14 +13,10 @@
 // (fonts, palettes, stamps): replay_only. UIStyleDraw draws on the current canvas (its pixels and clip); the measures
 // write only their outputs; get_style / get_width / charcount are pure.
 //
-// FIX CANDIDATES (left as the original has them):
-//   * UIAddStyle / UIRemoveStyle / get_style / UIStyleDraw take the style index unchecked: outside 0..31 they read or
-//     write past the 32-entry table (0x5790e0).
-//   * UIStyleDraw indexes the four palettes with its `state` argument unchecked (a state past 3 reads the next
-//     style's fields as a palette), and divides the state by the stamp's frame count: a stamp with no frames divides
-//     by zero.
-//   * UIStyleWordWrap copies its input into `out` with no length: the caller's buffer must hold it (the long dialog
-//     boxes' 4 KB).
+// Fixes (// FIX:, docs/FIXES.md "Menus"): a style index outside the 32-entry table (0x5790e0) is refused by UIAddStyle
+// and UIRemoveStyle and means style 0 to get_style and UIStyleDraw; UIStyleDraw takes a palette by the state's two low
+// bits (pressed, over) and draws no stamp frame for a stamp with no frames; UIStyleWordWrap copies at most 4095
+// characters (the long boxes' and PreRaceDo's buffers are 4 KB). Every in-range input gives the original's bits.
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -58,6 +54,8 @@ PORT_FN(0x0047f370, "UIStyleEnd", UIStyleEnd_n, fp_UIStyleEnd)
 // UIAddStyle: the style made from a description -- its font, four gradients (normal: c_normal..c_normal2, pressed:
 // c_down..c_down2, over: c_over..c_normal2, pressed and over: c_down_over..c_down2), flags, offsets, stamp
 static void __cdecl UIAddStyle_n(int32_t i, const UIStyleDesc* d) {
+    // FIX: an index outside the 32 styles wrote a font, palettes and a stamp past the table: refused (nothing loaded)
+    if (VP_FIX && (uint32_t)i >= 32u) return;
     UIStyle* s = ui_style_at(i);
     const volatile uint32_t* dv = (const volatile uint32_t*)d;
     s->used = 1;
@@ -113,6 +111,8 @@ PORT_FN(0x0047f4a0, "UIAddDynamicStyle", UIAddDynamicStyle_n, fp_UIAddDynamicSty
 
 // UIRemoveStyle: its font, palettes and stamp released, the spare copied over it, then marked unused
 static void __cdecl UIRemoveStyle_n(int32_t i) {
+    // FIX: an index outside the 32 styles freed whatever lay past the table and overwrote it: refused
+    if (VP_FIX && (uint32_t)i >= 32u) return;
     UIStyle* s = ui_style_at(i);
     ((Assert_t)(uintptr_t)F_UIStyleAssert)((int)s->used, (const char*)0x004f7200, i);
     ccall<void>(F_gxFontForget, (void*)s->font);
@@ -211,8 +211,13 @@ static void fp_UIStyleGetBounds(Footprint& f, int32_t, const char*, int32_t, int
 }
 PORT_FN(0x0047f570, "UIStyleGetBounds", UIStyleGetBounds_n, fp_UIStyleGetBounds)
 
-// get_style: the table entry (index unchecked)
-static UIStyle* __cdecl get_style_n(int32_t i) { return ui_style_at(i); }
+// get_style: the table entry
+static UIStyle* __cdecl get_style_n(int32_t i) {
+    // FIX: an index outside the 32 styles gave a pointer past the table, read as a style (its font, palettes, stamp):
+    // style 0 instead, the first of the game's own
+    if (VP_FIX && (uint32_t)i >= 32u) i = 0;
+    return ui_style_at(i);
+}
 static void fp_get_style(Footprint& f, int32_t) { f.pure = true; }
 PORT_FN(0x0047f7d0, "get_style", get_style_n, fp_get_style)
 
@@ -332,13 +337,18 @@ PORT_FN(0x0047f9b0, "UIStyleHeight", UIStyleHeight_n, fp_UIStyleHeight)
 // UIStyleDraw: the stamp's frame (state mod its frame count), then each line in the state's palette, at the pressed
 // offsets for an odd state; vertically centred (0x10) or bottom-aligned (0x40) as a block
 static void __cdecl UIStyleDraw_n(int32_t style, int32_t x, int32_t y, const char* text, uint32_t state) {
+    // FIX: an index outside the 32 styles drew with whatever lay past the table: style 0, as get_style gives
+    if (VP_FIX && (uint32_t)style >= 32u) style = 0;
     UIStyle* s = ccall<UIStyle*>(F_get_style, style);
     void* st = s->stamp;
     const uint8_t down = (uint8_t)(state & 1);
-    void* pal = ((void* volatile*)((uint8_t*)s + 8))[state];
+    // FIX: a state past 3 read the next fields (and styles) as a palette: its two low bits pick it (pressed, over), as
+    // bit 0 already picks the offsets
+    void* pal = ((void* volatile*)((uint8_t*)s + 8))[VP_FIX && state > 3u ? state & 3u : state];
     if (st) {
         const uint32_t n = (uint32_t)ccall<int32_t>(F_gxStampCount, st);
-        ccall<void>(F_gxDrawStamp, st, x, y, (int32_t)(state % n), (void*)0);
+        // FIX: a stamp with no frames divided by zero (`div`: a fault): it has nothing to draw
+        if (!VP_FIX || n != 0) ccall<void>(F_gxDrawStamp, st, x, y, (int32_t)(state % n), (void*)0);
     }
     const char* p = text;
     if (!p) return;
@@ -366,7 +376,11 @@ PORT_FN(0x0047fa40, "UIStyleDraw", UIStyleDraw_n, fp_UIStyleDraw)
 // UIStyleWordWrap: in copied to out, then each line broken at its last space (or newline) before it grows past
 // `width` (get_width: 8 pixels a character); a space it breaks at becomes a newline
 static void __cdecl UIStyleWordWrap_n(int32_t style, int32_t width, char* out, const char* in) {
-    crt_strcpy(out, in);
+    // FIX: the copy had no bound, so a longer text than the caller's buffer overran it: cut to 4095 characters, the
+    // 4 KB of the long dialog boxes' and PreRaceDo's (track text) buffers. A text that fits is copied as before.
+    // (UpgradeCatalog::Draw's buffer is at most 2 KB: its own rewrite has to grow it.)
+    if (VP_FIX) ui_copy_bounded(out, in, 0x1000);
+    else crt_strcpy(out, in);
     volatile char* line = out;
     if (*line == 0) return;
     for (;;) {

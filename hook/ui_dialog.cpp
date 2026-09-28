@@ -22,15 +22,15 @@
 // constructor / destructor. The group calls write the running window and its widgets; UIStringList::AddEntry /
 // DeleteEntry the list and its entries; file_idle the file boxes' statics and name; CreateMultiString its output.
 //
-// FIX CANDIDATES (left as the original has them):
-//   * UIDoOpenFileBox / UIDoSaveFileBox leave 0x578e78 / 0x578d48 aimed at their own stack frames (the list, the
-//     name); file_idle uses them only while the box runs. The name buffer is 300 bytes, the path 260: the sprintf's
-//     (directory + pattern, directory + name) have no bound.
-//   * UIDoInputBox copies the caller's text into its 256-byte static unbounded (strcpy), and back unbounded.
-//   * UIStringList's constructor never initialises `changes` (+0xc), which list boxes watch; AddEntry past the
-//     capacity does nothing, silently.
-//   * _UIAddItems: a CustomWidget's control gets the item's width and height in its x1 / y1 (+0xc / +0x10), as
-//     sizes.
+// Fixes (// FIX:, docs/FIXES.md "Menus"): the file boxes build their search path (260 bytes), their name (300) and the
+// caller's file name (`max` bytes, the size every caller passes) only when it fits -- a directory too long to search
+// lists no files, a name too long for the caller isn't returned -- and clear 0x578e78 / 0x578d48 (the list and name
+// they aim at their own stack frame) on the way out, which file_idle then leaves alone; UIDoInputBox keeps to its
+// 256-byte static (the text copied in, the field and the paste held to it); UIStringList's constructor sets `changes`
+// (+0xc) to 0 (it was left uninitialised; list boxes only watch it change, so nothing shows). Every input that fitted
+// gives the original's bits.
+// Left: AddEntry past the capacity does nothing, silently. _UIAddItems gives a CustomWidget's control its item's x, y,
+// width and height (+4..+0x10): every control the game has reads +0xc / +0x10 as a width and height, so it's as meant.
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -1053,7 +1053,11 @@ PORT_FN(0x0047a0d0, "UIDoYesNoCancelBox", UIDoYesNoCancelBox_n, fp_modal2)
 static uint8_t __cdecl UIDoInputBox_n(const char* title, const char* prompt, char* text, int32_t max) {
     UIDialog dlg;
     UIDialogItem it[6];
-    crt_strcpy((char*)(uintptr_t)S_INPUT_TEXT, text);
+    // FIX: the text was copied into the 256-byte static with no bound, and a max over 256 let the field (and a paste)
+    // grow past it: the copy is cut to 255 characters and max held to 256, so the copy back gives at most 255
+    if (VP_FIX) ui_copy_bounded((char*)(uintptr_t)S_INPUT_TEXT, text, 0x100);
+    else crt_strcpy((char*)(uintptr_t)S_INPUT_TEXT, text);
+    if (VP_FIX && max > 0x100) max = 0x100;
     UI_G32(S_INPUT_MAX) = max;
     item(&it[0], 4, 0, 0x16, 0, 0, 0, 0, 0, (void*)(uintptr_t)F_inputbox_paste, 0);
     item(&it[1], 5, 0, 0xa0, 0x28, 0, 0, prompt, 0, 0, 0xe);
@@ -1108,11 +1112,29 @@ static __forceinline void find_files(FileFrame& fr, uint32_t report_fmt, const c
     } while (ccall<uint8_t>(F_FileFindNext, h, (char*)fr.found, (int32_t)0x104));
     ccall<void>(F_FileFindClose, h);
 }
+// the length of the extension strrchr(pattern, '.') finds (0 without one)
+static __forceinline uint32_t ext_len(const char* pattern) {
+    uint32_t n = 0;
+    for (const volatile char* p = pattern; *p; p++) n = *p == '.' ? 1 : n ? n + 1 : 0;
+    return n;
+}
+// FIX: the boxes left 0x578e78 / 0x578d48 aimed at their own (dead) stack frame; nothing reads them after the box (only
+// file_idle, while it runs), but a later reader would have written into whatever stack was there: cleared
+static __forceinline void file_done() {
+    if (!VP_FIX) return;
+    UI_GP(void, S_FILE_LIST) = 0;
+    UI_GP(char, S_FILE_NAME) = 0;
+}
 static __forceinline void file_setup(FileFrame& fr, const char* dir, const char* pattern, const char* fmt, const char* out) {
     UI_G32(S_FILE_SEL) = -1;
     UI_G32(S_FILE_LAST) = -1;
-    UI_sprintf(fr.path, fmt, dir, pattern);
-    crt_strcpy(fr.name, out);
+    // FIX: directory + pattern ("%s%s") went into the 260-byte path with no bound: one too long for it (too long for
+    // Windows to search anyway) leaves the path empty, so no files are found and the box says so, as for none
+    if (VP_FIX && crt_strlen(dir) + crt_strlen(pattern) >= sizeof fr.path) fr.path[0] = 0;
+    else UI_sprintf(fr.path, fmt, dir, pattern);
+    // FIX: the caller's file name went into the 300-byte name with no bound: cut to 299 characters
+    if (VP_FIX) ui_copy_bounded(fr.name, out, sizeof fr.name);
+    else crt_strcpy(fr.name, out);
     char* dot = ccall<char*>(F_strrchr, (const char*)fr.name, (int)'.');
     if (dot) *(volatile char*)dot = 0;
     tcall<void*>(F_UIStringList_ctor, &fr.list, (int32_t)0x40, (int32_t)0x20);
@@ -1125,7 +1147,7 @@ static __forceinline void file_setup(FileFrame& fr, const char* dir, const char*
 
 // UIDoOpenFileBox: a list of dir + pattern's files and the chosen name; OK: out = dir + name + pattern's extension,
 // true if that file exists
-static uint8_t __cdecl UIDoOpenFileBox_n(const char* title, const char* prompt, const char* pattern, char* out, int32_t,
+static uint8_t __cdecl UIDoOpenFileBox_n(const char* title, const char* prompt, const char* pattern, char* out, int32_t max,
                                          const char* dir) {
     FileFrame fr;
     file_setup(fr, dir, pattern, (const char*)0x004f6ff0, out);
@@ -1140,15 +1162,21 @@ static uint8_t __cdecl UIDoOpenFileBox_n(const char* title, const char* prompt, 
     item_ctor(&fr.it[5], 2, -1, 0xd7, 0xcb, 0, 0, cancel, 0, 0, 0, 0, 0);
     item_end(&fr.it[6]);
     dialog(&fr.dlg, title, (const char*)0x004f7020, -2, fr.it, (UIIdle)(uintptr_t)F_file_idle);
-    if (ccall<int32_t>(F_UIDoDialog, (const UIDialog*)&fr.dlg, (int32_t)0x140, (int32_t)0xfa, (int32_t)-999, (int32_t)-999, (int32_t)1) == -2) {
+    if (ccall<int32_t>(F_UIDoDialog, (const UIDialog*)&fr.dlg, (int32_t)0x140, (int32_t)0xfa, (int32_t)-999, (int32_t)-999, (int32_t)1) == -2 &&
+        // FIX: directory + name + the pattern's extension went into the caller's buffer with no bound; `max` is its
+        // size (every caller passes it; the original ignored it): a name that doesn't fit isn't returned, as a file
+        // that isn't there (a max of 0 or less, no size, keeps the original's behaviour)
+        !(VP_FIX && crt_strlen(dir) + crt_strlen(fr.name) + ext_len(pattern) >= (uint32_t)max)) {
         UI_sprintf(out, (const char*)0x004f702c, dir, fr.name);
         const char* ext = ccall<const char*>(F_strrchr, pattern, (int)'.');
         if (ext) crt_strcat(out, ext);
         const uint8_t r = ccall<uint8_t>(F_file_exists, (const char*)out);
         tcall<void>(F_UIStringList_dtor, &fr.list);
+        file_done();
         return r;
     }
     tcall<void>(F_UIStringList_dtor, &fr.list);
+    file_done();
     return 0;
 }
 static void fp_file_box(Footprint& f, const char*, const char*, const char*, char*, int32_t, const char*) {
@@ -1159,6 +1187,8 @@ PORT_FN(0x0047a6e0, "UIDoOpenFileBox", UIDoOpenFileBox_n, fp_file_box)
 // file_idle: a new list selection copied into the name field
 static uint8_t __cdecl file_idle_n(int32_t*) {
     if (UI_G32(S_FILE_SEL) == UI_G32(S_FILE_LAST)) return 0;
+    // FIX: no box running (the list and name cleared by file_done): nothing to copy
+    if (VP_FIX && (UI_GP(void, S_FILE_LIST) == 0 || UI_GP(char, S_FILE_NAME) == 0)) return 0;
     if (UI_G32(S_FILE_SEL) >= 0) {
         const char* e = tcall<const char*>(F_UIStringList_GetEntry, UI_GP(void, S_FILE_LIST), UI_G32(S_FILE_SEL));
         if (e) crt_strcpy(UI_GP(char, S_FILE_NAME), e);
@@ -1208,8 +1238,10 @@ static uint8_t __cdecl UIDoSaveFileBox_n(const char* title, const char* prompt, 
         ccall<int>(F_atexit, (uint32_t)F_file_atexit1);
     }
     item(&fr.it[0], 5, 0, 0xa0, 0x20, 0, 0, prompt, 0, 0, 0xe);
-    const int32_t cols = max < 0x20 ? max : 0x20;
-    item(&fr.it[1], 9, 0, 0x28, 0x24, cols << 3, 0x10, (const char*)1, max, fr.name, 9);
+    // FIX: the name field is `max` characters long, but edits the 300-byte name: held to 300
+    const int32_t fmax = VP_FIX && max > (int32_t)sizeof fr.name ? (int32_t)sizeof fr.name : max;
+    const int32_t cols = fmax < 0x20 ? fmax : 0x20;
+    item(&fr.it[1], 9, 0, 0x28, 0x24, cols << 3, 0x10, (const char*)1, fmax, fr.name, 9);
     item(&fr.it[2], 0x14, 0, 0x32, 0x42, 0xdc, 0x82, (const char*)&fr.axis, 0, &fr.list, 0, (int32_t*)(uintptr_t)S_FILE_SEL);
     item(&fr.it[3], 0x11, 0, 0x121, 0x3c, 0xa, 0x87, (const char*)0x004e4db8, 0, &fr.axis, 0);
     const char* ok = xlate(XL_OK);
@@ -1218,7 +1250,11 @@ static uint8_t __cdecl UIDoSaveFileBox_n(const char* title, const char* prompt, 
     item(&fr.it[5], 2, -1, 0xd7, 0xcb, 0, 0, cancel, 0, 0, 0);
     item_end(&fr.it[6]);
     dialog(&fr.dlg, title, (const char*)0x004f70c4, -2, fr.it, (UIIdle)(uintptr_t)F_file_idle);
-    if (ccall<int32_t>(F_UIDoDialog, (const UIDialog*)&fr.dlg, (int32_t)0x140, (int32_t)0xfa, (int32_t)-999, (int32_t)-999, (int32_t)1) == -2) {
+    if (ccall<int32_t>(F_UIDoDialog, (const UIDialog*)&fr.dlg, (int32_t)0x140, (int32_t)0xfa, (int32_t)-999, (int32_t)-999, (int32_t)1) == -2 &&
+        // FIX: directory + name went into the 512-byte `full`, then with the extension into the caller's buffer
+        // (`max` bytes), with no bound: a name that doesn't fit both isn't saved, as if cancelled
+        !(VP_FIX && (crt_strlen(dir) + crt_strlen(fr.name) >= sizeof full ||
+                     crt_strlen(dir) + crt_strlen(fr.name) + ext_len(pattern) >= (uint32_t)max))) {
         UI_sprintf(full, (const char*)0x004f70d0, dir, fr.name);
         bool go = true;
         if (ccall<uint8_t>(F_file_exists, (const char*)full)) {
@@ -1231,10 +1267,12 @@ static uint8_t __cdecl UIDoSaveFileBox_n(const char* title, const char* prompt, 
             const char* ext = ccall<const char*>(F_strrchr, pattern, (int)'.');
             if (ext) crt_strcat(out, ext);
             tcall<void>(F_UIStringList_dtor, &fr.list);
+            file_done();
             return 1;
         }
     }
     tcall<void>(F_UIStringList_dtor, &fr.list);
+    file_done();
     return 0;
 }
 PORT_FN(0x0047ac30, "UIDoSaveFileBox", UIDoSaveFileBox_n, fp_file_box)
@@ -1246,6 +1284,9 @@ static UIStringList* __fastcall UIStringList_ctor_n(UIStringList* self, Edx, int
     self->capacity = cap;
     self->entry_size = size;
     self->count = 0;
+    // FIX: `changes` was never set (heap filler 0xa3a3a3a3, or stack garbage); list boxes watch it only for changes, so
+    // 0 shows exactly as the garbage did
+    if (VP_FIX) self->changes = 0;
     self->entries = (char**)ccall<void*>(F_MemAlloc, cap * 4);
     for (int32_t i = 0, n = cap; n > 0; n--, i++) {
         void* e = ccall<void*>(F_MemAlloc, size);

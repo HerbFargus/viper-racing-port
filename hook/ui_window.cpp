@@ -4,7 +4,7 @@
 //   WidgetExecuteWindow (a window run modally: WidgetUpdate until WidgetExit) and WidgetUpdate (one frame: the mouse
 //   event and the key to the running window, its widgets' Update, the 3D windows' Draw3D, every window drawn on the
 //   grabbed screen, the cursor, the flip), the C wrappers (groups, items, default, idle function), and WidgetWindow:
-//   its canvas, the widget list (256, no bound), the mouse (capture on a press, over / not over), the keyboard (the
+//   its canvas, the widget list (256), the mouse (capture on a press, over / not over), the keyboard (the
 //   focused widget, then every visible enabled one: hot keys), the focus (Tab order: IsTabStop), groups (32 bits:
 //   hidden, disabled), Draw (dirty widgets' rectangles cleared to the background, four passes spreading the redraw to
 //   the widgets they overlap, then each drawn clipped to itself, and the canvas pasted onto the screen), and
@@ -21,12 +21,10 @@
 // WidgetExecuteWindow (runs a window modally), and what allocates or frees (Begin / End, window creation and
 // destruction, the constructor and destructor).
 //
-// FIX CANDIDATES (left as the original has them):
-//   * WidgetWindow::AddWidget has no bound: the 257th widget's pointer is written over the count (+0x428) and past.
-//   * WidgetWindow::Draw keeps a 256-byte "redraw" flag per widget on its stack: more widgets write past it.
-//   * WidgetCreateWindow: with 16 windows open it panics (LogPanic) after constructing the 17th, which leaks.
-//   * WidgetWindow::PrevWidget doesn't check find_widget_index's -1 (harmless: the loop starts below 0).
-//   * TitleBar::MouseMove moves WidgetGetActiveWindow's window, unchecked (null while none runs).
+// Fixes (// FIX:, docs/FIXES.md "Menus"): WidgetWindow::AddWidget refuses a 257th widget (it overwrote the count);
+// WidgetWindow::Draw keeps to its 256 redraw flags; WidgetCreateWindow panics before it builds a 17th window, not after
+// (it leaked); TitleBar::MouseMove does nothing while no window runs (it wrote through null).
+// Left: WidgetWindow::PrevWidget doesn't check find_widget_index's -1 (harmless: the loop starts below 0).
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -54,8 +52,18 @@ PORT_FN(0x0047fe50, "WidgetBegin", WidgetBegin_n, fp_replay_alloc)
 static void __cdecl WidgetEnd_n() { ccall<void>(F_gxForgetStamp, UI_GP(void, S_DEFAULT_CURSOR)); }
 PORT_FN(0x0047fe90, "WidgetEnd", WidgetEnd_n, fp_replay_alloc)
 
-// WidgetCreateWindow: a new window in the first free slot (a panic and 0 if all 16 are taken; the window leaks)
+// WidgetCreateWindow: a new window in the first free slot (a panic and 0 if all 16 are taken)
 static WidgetWindow* __cdecl WidgetCreateWindow_n(const char* bg, int32_t x, int32_t y, int32_t w, int32_t h, int32_t ui3d) {
+    // FIX: with all 16 slots taken the original built the window (its canvas, its background stamp) and then panicked,
+    // leaking it: the panic comes first, and nothing is built
+    if (VP_FIX) {
+        int i = 0;
+        while (i < 16 && windows()[i] != 0) i++;
+        if (i == 16) {
+            UI_LogPanic((const char*)0x004f724c);
+            return 0;
+        }
+    }
     void* p = ccall<void*>(F_MemAlloc, 0x464);
     WidgetWindow* win = 0;
     if (p) win = tcall<WidgetWindow*>(F_WidgetWindow_ctor, p, bg, x, y, w, h, ui3d);
@@ -477,11 +485,14 @@ static __forceinline void clear_rect(WidgetWindow* self, gxCanvas* c) {
 // Draw: dirty widgets' rectangles cleared (all of it on a full redraw), four passes marking the visible widgets that
 // overlap a marked one, each marked (or, on a full redraw, every) visible widget drawn clipped to itself, and the
 // window's canvas pasted onto `to` at the window's place
+// FIX: a redraw flag per widget, 256 of them on the stack: a count past 256 (only a corrupt one, now AddWidget keeps to
+// 256) wrote past them. Every loop stops at 256.
+static __forceinline bool draw_in_marks(int32_t i) { return !VP_FIX || i < 0x100; }
 static void __fastcall WidgetWindow_Draw_n(WidgetWindow* self, Edx, gxCanvas* to) {
     volatile uint8_t mark[0x100];
     gxCanvas* c = &self->canvas;
     if (self->full_redraw != 0) clear_rect(self, c);
-    for (int32_t i = 0; i < self->count; i++) {
+    for (int32_t i = 0; i < self->count && draw_in_marks(i); i++) {
         Widget* w = self->widgets[i];
         if (tcall<uint8_t>(F_Widget_IsDirty, w) || self->full_redraw != 0) {
             const int32_t x0 = w->x0;
@@ -498,7 +509,8 @@ static void __fastcall WidgetWindow_Draw_n(WidgetWindow* self, Edx, gxCanvas* to
         }
         mark[i] = 0;
     }
-    const int32_t n = self->count;
+    int32_t n = self->count;
+    if (VP_FIX && n > 0x100) n = 0x100;                      // FIX: (above)
     for (int pass = 4; pass != 0; pass--) {
         for (int32_t i = 0; i < n; i++) {
             Widget* a = self->widgets[i];
@@ -527,7 +539,7 @@ static void __fastcall WidgetWindow_Draw_n(WidgetWindow* self, Edx, gxCanvas* to
                 }
             }
             i++;
-        } while (self->count > i);
+        } while (self->count > i && draw_in_marks(i));      // FIX: (above)
     }
     self->full_redraw = 0;
     ccall<gxCanvas*>(F_gxSetCanvas, to);
@@ -637,10 +649,13 @@ static void __fastcall WidgetWindow_DisableGroup_n(WidgetWindow* self, Edx, uint
 }
 PORT_FN(0x00480cc0, "WidgetWindow::DisableGroup", WidgetWindow_DisableGroup_n, fp_groups)
 
-// AddWidget: appended (no bound), focused if it's the first tab stop, given the groups being entered, told it's added
+// AddWidget: appended (256 at most), focused if it's the first tab stop, given the groups being entered, told it's added
 // (through the vtable it had when it came in)
 static void __fastcall WidgetWindow_AddWidget_n(WidgetWindow* self, Edx, Widget* w) {
     const int32_t n = self->count;
+    // FIX: the list holds 256; the 257th pointer went over the count (+0x428) and the fields after it: refused, so the
+    // widget isn't in the window (not drawn, never given input; it isn't freed with the window either)
+    if (VP_FIX && (uint32_t)n >= 0x100u) return;
     void* const* vt = *(void* const* volatile*)w;
     self->widgets[n] = w;
     self->count = self->count + 1;
@@ -692,6 +707,8 @@ static void __fastcall TitleBar_MouseMove_n(TitleBar* self, Edx, int32_t x, int3
     const int32_t dy = self->dy;
     WidgetWindow* b = ACTIVE;
     const int32_t dx = self->dx;
+    // FIX: while no window runs (WidgetGetActiveWindow null) the original moved a window at address 0: nothing moves
+    if (VP_FIX && (a == 0 || b == 0)) return;
     const int32_t ny = dy + a->y + y;
     b->x = b->x + (dx + x);
     a->y = ny;

@@ -51,6 +51,21 @@
 // atexit, and the game's CRT fatal paths. The game's own code runs everywhere else: gxSetClip / gxRestoreClip,
 // strncpy / strchr / strrchr / memmove / __ftol, UIDialogItem's and Xlator's constructors, and every function of this
 // library (each rewrite is checked against its original with the same callees).
+//
+// Built with /DVP_UI_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Menus"). Every
+// function is still compared as above, on states kept clear of the fixed cases: a text field's caret never below 0, an
+// arrow button never of one step, a scroll axis never empty, a style index and a style state always in range, the file
+// boxes' `max` (their output's size) big enough for any name the round can build, and a fresh string list's `changes`
+// already 0. Three things compare differently: sprintf's destination isn't logged (Numeric formats into its own buffer
+// now; what lands in the text is compared in memory), the stack is filled with zeros (so the file boxes' uninitialised
+// `changes`, on the stack, is what the fix sets), and the two statics the file boxes now clear on the way out (0x578e78,
+// 0x578d48) are taken as equal when the original left them aimed at the stack and the rewrite left 0. A round where only
+// the original faults is a crash the fixes remove: it's kept out of the comparison, and counted (per function, listed).
+// Then directed_fix_tests: for each fix, the bad case run on the rewrite alone -- no fault (divide-by-zero unmasked for
+// the divisions), the bytes popped and ebx / esi / edi / ebp kept, nothing written outside the object or buffer (the
+// memory around it compared), and the result the fix promises (where the fix keeps the original's bits, the original is
+// run too, with the exception masked as the game has it, and the two compared). Without it (VP_FAITHFUL) every rewrite
+// must match its original bit for bit.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -64,7 +79,12 @@
 #include <utility>
 #include <vector>
 
+#ifndef VP_UI_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#define UI_FIXES 0
+#else
+#define UI_FIXES 1
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------------
@@ -468,7 +488,11 @@ static void __cdecl stub_gxClear(uint32_t c) { L('CLR '); L(c); L_canvas(); }
 static void __cdecl stub_gxRect(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t col) { L('RECT'); L(a); L(b); L(c); L(d); L(col); L_canvas(); }
 static void __cdecl stub_gxLine(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t col) { L('LINE'); L(a); L(b); L(c); L(d); L(col); L_canvas(); }
 static void __cdecl stub_gxPaste(const gxCanvas* src, int32_t x, int32_t y) { L('PAST'); L(P(src)); L((uint32_t)x); L((uint32_t)y); L_canvas(); }
-static void __cdecl stub_gxText(int32_t x, int32_t y, const char* s, uint32_t col) { L('TEXT'); L((uint32_t)x); L((uint32_t)y); LS(s); L(col); L_canvas(); }
+static uint32_t g_text_len, g_fff_len;                   // the last gxText's and FileFindFirst's string lengths
+static void __cdecl stub_gxText(int32_t x, int32_t y, const char* s, uint32_t col) {
+    L('TEXT'); L((uint32_t)x); L((uint32_t)y); LS(s); L(col); L_canvas();
+    g_text_len = readable(s, 1) ? (uint32_t)strnlen(s, 0x10000) : 0xffffffffu;
+}
 static int32_t __cdecl stub_gxTextHeight() { L('TXTH'); return 8; }
 static void __cdecl stub_gxAllocCanvas(gxCanvas* c, int32_t w, int32_t h) {
     L('ACNV'); L(P(c)); L((uint32_t)w); L((uint32_t)h);
@@ -495,7 +519,7 @@ static void __fastcall stub_xlate(uint32_t* xl, int) {
     xl[2] = UI_GU32(S_XLATOR_COOKIE);
 }
 static int __cdecl stub_sprintf(char* buf, const char* fmt, ...) {
-    L('SPRF'); L(P(buf)); LS(fmt);
+    L('SPRF'); L(UI_FIXES ? 'DEST' : P(buf)); LS(fmt);      // (the fix build: Numeric formats into its own buffer)
     va_list ap;
     va_start(ap, fmt);
     const uint32_t* w = (const uint32_t*)ap;
@@ -535,6 +559,7 @@ static uint8_t __cdecl stub_ControlDetect(uint32_t* ctl) {
 }
 static void* __cdecl stub_FileFindFirst(const char* pat, char* out, int n) {
     L('FFF '); LS(pat); L((uint32_t)n);
+    g_fff_len = readable(pat, 1) ? (uint32_t)strnlen(pat, 0x10000) : 0xffffffffu;
     HS->file_pos = 0;
     if (HS->nfiles <= 0) return (void*)(intptr_t)-1;
     strncpy(out, HS->files[0], (size_t)n); HS->file_pos = 1;
@@ -637,9 +662,10 @@ static int fault_filter(EXCEPTION_POINTERS* e) {
 // same thing in both passes)
 __declspec(noinline) static void fill_stack() {
     volatile uint32_t buf[0x30000 / 4];
-    for (uint32_t i = 0; i < sizeof buf / 4; i++) buf[i] = 0xcdcdcdcdu;
+    for (uint32_t i = 0; i < sizeof buf / 4; i++) buf[i] = UI_FIXES ? 0u : 0xcdcdcdcdu;
 }
 static unsigned g_pc;
+static unsigned g_unmask;                                 // exceptions unmasked for the call (the directed fix tests)
 __declspec(noinline) static Result run(const Ent& f, bool rewrite, const uint32_t* words) {
     Result r = {};
     g_log.n = 0;
@@ -654,6 +680,7 @@ __declspec(noinline) static Result run(const Ent& f, bool rewrite, const uint32_
     __asm fninit
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, g_pc, _MCW_PC);
+    if (g_unmask) _controlfp_s(&cw, 0, g_unmask);
     __try {
         raw_call();
     } __except (fault_filter(GetExceptionInformation())) { r.fault = 1; r.code = g_fault_code; r.eip = g_fault_eip; }
@@ -886,7 +913,11 @@ static void randomize_world() {
             s->pressed = chance(60);
             s->timer = chance(10) ? wildf() : range(-0.5f, 0.5f);
             s->rate = chance(10) ? wildf() : range(0.001f, 0.4f);
-            if (chance(15) && (uint32_t)(uintptr_t)w->vtbl == VT_ArrowButton) ((ArrowButton*)w)->steps = irange(-2, 3);
+            if (chance(15) && (uint32_t)(uintptr_t)w->vtbl == VT_ArrowButton) {
+                int st = irange(-2, 3);
+                if (UI_FIXES && st == 1) st = 2;                       // (the fix build: never one step)
+                ((ArrowButton*)w)->steps = st;
+            }
             break;
         }
         case VT_ListBox: case VT_DropList: ((ListBox*)w)->scroll = irange(-1, 1); ((ListBox*)w)->dragging = chance(50); break;
@@ -896,7 +927,7 @@ static void randomize_world() {
         case VT_Input: case VT_CDetect: {
             Input* in = (Input*)w;
             const int len = in->buf ? (int)strlen(in->buf) : 0;
-            in->cursor = chance(5) ? irange(-2, len + 4) : irange(0, len);
+            in->cursor = chance(5) ? irange(UI_FIXES ? 0 : -2, len + 4) : irange(0, len);   // (fix build: never below 0)
             if (chance(10)) for (int k = 0; k < 8; k++) in->line_start[k] = irange(0, len);
             break;
         }
@@ -920,7 +951,7 @@ static void randomize_world() {
     for (int i = 0; i < 16; i++) W.floats[i] = chance(10) ? wildf() : range(-6.0f, 12.0f);
     for (int i = 0; i < 16; i++) W.controls[i] = rnd();
     for (int i = 0; i < 3; i++) {
-        W.axis[i]->total = irange(0, 40); W.axis[i]->visible = irange(0, 20); W.axis[i]->pos = irange(-3, 40);
+        W.axis[i]->total = irange(UI_FIXES ? 1 : 0, 40); W.axis[i]->visible = irange(0, 20); W.axis[i]->pos = irange(-3, 40);
         W.list[i]->changes = (int32_t)rnd();
     }
     for (int i = 0; i < 3; i++) random_text(W.buf[i], W.buf_cap[i] > 2 ? W.buf_cap[i] - 2 : 0, i == 1 ? 8 : 0);
@@ -1125,7 +1156,10 @@ static bool make_args(const Ent& f, uint32_t* w) {
     }
     if (!strcmp(cls, "UIStringList")) {
         w[0] = U(W.list[rnd() % 3]);
-        if (!strcmp(meth, "UIStringList")) { w[0] = U(W.scratch); a[0] = (uint32_t)irange(-1, 10); a[1] = (uint32_t)irange(1, 40); }
+        if (!strcmp(meth, "UIStringList")) {
+            w[0] = U(W.scratch); a[0] = (uint32_t)irange(-1, 10); a[1] = (uint32_t)irange(1, 40);
+            if (UI_FIXES) ((UIStringList*)W.scratch)->changes = 0;   // (the fix build: as the fix leaves it)
+        }
         else if (!strcmp(meth, "AddEntry")) a[0] = U(text());
         else if (!strcmp(meth, "GetEntry") || !strcmp(meth, "DeleteEntry")) a[0] = (uint32_t)irange(-2, 12);
         return true;
@@ -1253,7 +1287,7 @@ static bool make_args(const Ent& f, uint32_t* w) {
         W.desc->font = chance(80) ? "desc.fnt" : 0; W.desc->stamp = chance(50) ? "desc.stp" : 0;
         if (IS("UIAddStyle")) { a[0] = (uint32_t)irange(0, 31); a[1] = d; }
         else a[0] = d;
-    } else if (IS("UIRemoveStyle") || IS("get_style")) a[0] = (uint32_t)(chance(95) ? irange(0, 31) : irange(-4, 40));
+    } else if (IS("UIRemoveStyle") || IS("get_style")) a[0] = (uint32_t)(chance(95) || UI_FIXES ? irange(0, 31) : irange(-4, 40));
     else if (strstr(nm, "ASSERT_MSG")) { a[0] = rnd() & 1; a[1] = U("assert %d"); }
     else if (IS("UIStyleGetBounds")) { a[0] = s; a[1] = chance(85) ? U(text()) : 0; a[2] = irange(-50, 400); a[3] = irange(-50, 300);
                                        a[4] = U(W.scratch2); a[5] = U(W.scratch2 + 4); a[6] = U(W.scratch2 + 8); a[7] = U(W.scratch2 + 12); }
@@ -1261,7 +1295,7 @@ static bool make_args(const Ent& f, uint32_t* w) {
     else if (IS("UIStylePointToIndex")) { a[0] = s; a[1] = U(short_text()); a[2] = irange(-20, 300); a[3] = irange(-20, 100); }
     else if (IS("UIStyleIndexToPoint")) { a[0] = s; a[1] = U(text()); a[2] = irange(-2, 60); a[3] = U(W.scratch2); a[4] = U(W.scratch2 + 4); }
     else if (IS("UIStyleWidth") || IS("UIStyleHeight")) { a[0] = s; a[1] = chance(85) ? U(text()) : 0; }
-    else if (IS("UIStyleDraw")) { a[0] = s; a[1] = irange(-50, 640); a[2] = irange(-50, 480); a[3] = chance(90) ? U(text()) : 0; a[4] = chance(90) ? irange(0, 3) : irange(4, 7); }
+    else if (IS("UIStyleDraw")) { a[0] = s; a[1] = irange(-50, 640); a[2] = irange(-50, 480); a[3] = chance(90) ? U(text()) : 0; a[4] = chance(90) || UI_FIXES ? irange(0, 3) : irange(4, 7); }
     else if (IS("UIStyleWordWrap")) { a[0] = s; a[1] = chance(80) ? irange(20, 300) : irange(-5, 20); a[2] = U(W.scratch2); a[3] = U(text()); }
     else if (IS("get_width")) { a[0] = s; a[1] = U(W.texts[0]); a[2] = U(W.texts[0] + irange(-3, 40)); }
     else if (IS("WidgetCreateWindow")) { a[0] = chance(70) ? name_ptr() : 0; a[1] = irange(-10, 400); a[2] = irange(-10, 300); a[3] = irange(1, 400); a[4] = irange(1, 300); a[5] = irange(0, 2); }
@@ -1300,7 +1334,8 @@ static bool make_args(const Ent& f, uint32_t* w) {
     } else if (IS("UIDoOpenFileBox") || IS("UIDoSaveFileBox")) {
         char* out = W.scratch2;
         sprintf(out, chance(70) ? "name%d.trk" : "noext%d", irange(0, 99));
-        a[0] = U(short_text()); a[1] = U(text()); a[2] = U(chance(70) ? "*.trk" : "*"); a[3] = U(out); a[4] = irange(1, 60);
+        a[0] = U(short_text()); a[1] = U(text()); a[2] = U(chance(70) ? "*.trk" : "*"); a[3] = U(out);
+        a[4] = UI_FIXES ? irange(0x60, 0x104) : irange(1, 60);   // (the fix build: out's size, room for any name)
         a[5] = U(chance(70) ? "tracks\\" : "");
     } else if (IS("inputbox_paste")) a[0] = rnd();
     else if (IS("file_idle") || IS("cdetect_idle")) { a[0] = U(W.scratch2); }
@@ -1315,6 +1350,555 @@ static bool make_args(const Ent& f, uint32_t* w) {
 #undef IS
     return true;
 }
+
+#if UI_FIXES
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+// The rewrite alone (the original would crash, hang or overrun there -- this program's own stack among what it would
+// take), from the pristine world with the case set up: it must return cleanly (no fault, the bytes popped, ebx / esi /
+// edi / ebp kept), write nothing outside the object or buffer it's given (every other byte of .data/.bss/.idata and the
+// arena compared with before), and give what the fix promises. Divisions by zero are run with the exception unmasked, so
+// one left in faults; where a fix keeps the original's bits (ui_div_masked, a slider of one step) the original runs too,
+// with the exception masked as the game has it, and memory and the call logs are compared.
+static int g_fx_bad, g_fx_n;
+static const Ent& fx_fn(const char* name) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, name)) return g_fns[i];
+    printf("  fix test: %s isn't listed\n", name);
+    fflush(stdout);
+    ExitProcess(4);
+}
+static Widget* fx_widget(uint32_t vt, int nth = 0) {
+    for (Widget* w : W.widgets)
+        if ((uint32_t)(uintptr_t)w->vtbl == vt && nth-- == 0) return w;
+    printf("  fix test: no widget of vtable %08x\n", vt);
+    fflush(stdout);
+    ExitProcess(4);
+}
+struct Span { const void* p; uint32_t n; };
+// the first byte that changed since `before` outside the spans (the stubs' state block aside, and the heap's new blocks
+// when heap_from is given); 0 if none
+static uint32_t fx_outside(const Mem& before, std::initializer_list<Span> ok, uint32_t heap_from = 0) {
+    auto in = [&](const uint8_t* q) {
+        for (const Span& sp : ok)
+            if (q >= (const uint8_t*)sp.p && q < (const uint8_t*)sp.p + sp.n) return true;
+        return false;
+    };
+    for (uint32_t i = 0; i < DATA_BYTES; i++)
+        if (before.data[i] != DATA[i] && !in(DATA + i)) return 0x004e1000 + i;
+    for (uint32_t i = 0; i < IDATA_BYTES; i++)
+        if (before.idata[i] != IDATA[i] && !in(IDATA + i)) return 0x005d7000 + i;
+    for (uint32_t i = sizeof(HState); i < ARENA_BYTES; i++)
+        if (before.arena[i] != g_arena[i] && !in(g_arena + i) && !(heap_from && i >= heap_from && i < HS->heap_next)) return U(g_arena + i);
+    return 0;
+}
+static Result fx_run(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w, bool unmask_zd) {
+    uint32_t words[72] = {};
+    int i = 0;
+    for (uint32_t x : w) words[i++] = x;
+    g_pc = _PC_53;
+    g_unmask = unmask_zd ? _EM_ZERODIVIDE : 0;
+    const Result r = run(f, rewrite, words);
+    g_unmask = 0;
+    return r;
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0, uint32_t where = 0) {
+    g_fx_n++;
+    if (ok) return;
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, popped %u, ebx esi edi ebp %08x %08x %08x %08x)", r->fault, r->code, r->eip, r->pops, r->regs[0],
+                  r->regs[1], r->regs[2], r->regs[3]);
+    if (where) printf(" (wrote %08x)", where);
+    printf("\n");
+}
+static bool fx_logged(uint32_t tag) {
+    for (uint32_t i = 0; i < g_log.n && i < LOG_MAX; i++)
+        if (g_log.w[i] == tag) return true;
+    return false;
+}
+static void fx_script_key(uint16_t key) {
+    HS->script[0][0] = OP_KEY; HS->script[0][1] = key; HS->script[0][2] = 0;
+    HS->script_n = 1; HS->script_pos = 0; HS->frames = 0; HS->frame_limit = 40;
+}
+static uint32_t fbits_v(const volatile float* p) { uint32_t u; memcpy(&u, (const void*)p, 4); return u; }
+static CallLog g_fx_log;
+static int g_fx_zd_cases, g_fx_zd_faults;
+// the original (divide-by-zero masked, as the game runs) and the rewrite (unmasked) from the same state: the rewrite
+// clean, and the same memory and call logs. (The original is also run unmasked, to count the cases that really divide
+// by zero: it faults there.)
+static void fx_same_as_original(const Ent& f, std::initializer_list<uint32_t> w, const char* what) {
+    mem_save(g_snap);
+    const Result ro = fx_run(f, false, w, false);
+    mem_save(g_after);
+    memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+    mem_load(g_snap);
+    const Result rz = fx_run(f, false, w, true);
+    g_fx_zd_cases++;
+    g_fx_zd_faults += rz.fault && rz.code == EXCEPTION_FLT_DIVIDE_BY_ZERO;
+    mem_load(g_snap);
+    const Result rn = fx_run(f, true, w, true);
+    char m[160];
+    sprintf(m, "%s: a clean return with divide-by-zero unmasked", what);
+    fx_check(fx_clean(f, rn), m, &rn);
+    sprintf(m, "%s: the original's result, bit for bit", what);
+    const uint32_t where = mem_diff(g_after);
+    const bool same = !ro.fault && where == 0 && ro.ret == rn.ret && g_log.n == g_fx_log.n &&
+                      !memcmp(g_log.w, g_fx_log.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+    fx_check(same, m, 0, where);
+}
+
+static int directed_fix_tests() {
+    Result r;
+    uint32_t o;
+    // ---- 1. Input::CharHit ----
+    {
+        const Ent& f = fx_fn("Input::CharHit");
+        Input* in = 0;
+        for (Widget* w : W.widgets)
+            if ((uint32_t)(uintptr_t)w->vtbl == VT_Input && ((Input*)w)->buf == W.buf[0]) in = (Input*)w;
+        for (int k = 0; k < 2; k++) {                      // no room: width x lines 0, then negative
+            mem_load(g_pristine);
+            strcpy(W.buf[0], "abc");
+            in->width = k == 0 ? 0 : 32; in->lines = k == 0 ? 1 : -1; in->focus = 1; in->visible = 1; in->cursor = 3;
+            mem_save(g_snap);
+            bool ok = true;
+            for (int i = 0; i < 300 && ok; i++) {
+                r = fx_run(f, true, {U(in), 0, (uint32_t)'x'}, false);
+                ok = fx_clean(f, r) && r.ret == 1;
+            }
+            fx_check(ok, "Input::CharHit, a field of no size: a clean return", &r);
+            fx_check(!strcmp(W.buf[0], "abc"), "Input::CharHit, a field of no size: nothing inserted");
+            o = fx_outside(g_snap, {{in, sizeof(Input)}});
+            fx_check(o == 0, "Input::CharHit, a field of no size: nothing written outside the field", 0, o);
+        }
+        mem_load(g_pristine);                               // a caret below 0
+        strcpy(W.buf[0], "abc");
+        in->width = 32; in->lines = 1; in->focus = 1; in->visible = 1; in->cursor = -2;
+        mem_save(g_snap);
+        r = fx_run(f, true, {U(in), 0, (uint32_t)'x'}, false);
+        fx_check(fx_clean(f, r) && r.ret == 1, "Input::CharHit, a caret below 0: a clean return", &r);
+        fx_check(!strcmp(W.buf[0], "xabc") && in->cursor == 1, "Input::CharHit, a caret below 0: the key at the start");
+        o = fx_outside(g_snap, {{in, sizeof(Input)}, {W.buf[0], 0x20}});
+        fx_check(o == 0, "Input::CharHit, a caret below 0: nothing written before the buffer", 0, o);
+    }
+    // ---- 2. Numeric / IntNumeric::update_text ----
+    for (int k = 0; k < 2; k++) {
+        const Ent& f = fx_fn(k == 0 ? "Numeric::update_text" : "IntNumeric::update_text");
+        mem_load(g_pristine);
+        Numeric* nm = (Numeric*)fx_widget(k == 0 ? VT_Numeric : VT_IntNumeric);
+        char* fmt = W.texts[11];
+        char want[0x200];
+        if (k == 0) {
+            strcpy(fmt, "%.90f");
+            *(float*)nm->value = 1.25f;
+            sprintf(want, fmt, (double)1.25f * (double)nm->scale + (double)nm->offset);
+        } else {
+            strcpy(fmt, "%d");
+            memset(fmt + 2, 'y', 100);
+            fmt[102] = 0;
+            *(int32_t*)nm->value = 2;
+            sprintf(want, fmt, (int)((double)2 * (double)nm->scale + (double)nm->offset + 0.5));
+        }
+        nm->format = fmt;
+        nm->visible = 1;
+        mem_save(g_snap);
+        r = fx_run(f, true, {U(nm), 0}, false);
+        fx_check(fx_clean(f, r), k == 0 ? "Numeric::update_text, a long number: a clean return" : "IntNumeric::update_text, a long format: a clean return", &r);
+        fx_check(strlen(want) > 79 && strlen(nm->text) == 79 && !memcmp(nm->text, want, 79),
+                 k == 0 ? "Numeric::update_text, a long number: its first 79 characters" : "IntNumeric::update_text, a long format: its first 79 characters");
+        o = fx_outside(g_snap, {{nm, sizeof(Numeric)}});
+        fx_check(o == 0, k == 0 ? "Numeric::update_text: nothing written past the object" : "IntNumeric::update_text: nothing written past the object", 0, o);
+    }
+    // ---- 3. DropList::Draw ----
+    {
+        const Ent& f = fx_fn("DropList::Draw");
+        DropList* dl = (DropList*)fx_widget(VT_DropList);
+        const struct { int32_t cols; int longentry; uint32_t want; } cases[] = {{100, 0, 102}, {5000, 0, 0x3f2}, {-5000, 0, 0x3f2}, {12, 1, 0x3f2}};
+        for (const auto& c : cases) {
+            mem_load(g_pristine);
+            dl->dragging = 0;
+            dl->cols = c.cols;
+            if (c.longentry) {                              // a list of one 2000-character entry
+                UIStringList* l = (UIStringList*)W.scratch;
+                char** ents = (char**)(W.scratch + 0x20);
+                char* e = W.scratch + 0x40;
+                memset(e, 'e', 2000);
+                e[2000] = 0;
+                l->capacity = 1; l->entry_size = 0x800; l->count = 1; l->changes = 0; l->entries = ents;
+                ents[0] = e;
+                dl->list = l;
+            }
+            *(int32_t*)dl->sel = 0;
+            mem_save(g_snap);
+            g_text_len = 0;
+            r = fx_run(f, true, {U(dl), 0, U(W.screen)}, false);
+            char m[128];
+            sprintf(m, "DropList::Draw, %d columns%s: a clean return", c.cols, c.longentry ? ", a 2000-character entry" : "");
+            fx_check(fx_clean(f, r), m, &r);
+            sprintf(m, "DropList::Draw, %d columns%s: the row drawn (%u characters, want %u)", c.cols, c.longentry ? ", a 2000-character entry" : "",
+                    g_text_len, c.want);
+            fx_check(g_text_len == c.want, m);
+            o = fx_outside(g_snap, {{dl, sizeof(DropList)}, {W.screen, sizeof(gxCanvas)}, {(void*)(uintptr_t)S_GX_CANVAS, 4}});
+            fx_check(o == 0, "DropList::Draw: nothing written but the canvas", 0, o);
+        }
+    }
+    // ---- 4. ArrowButton::Do: one step, an empty range (the original's bits) ----
+    {
+        const Ent& f = fx_fn("ArrowButton::Do");
+        ArrowButton* ab = (ArrowButton*)fx_widget(VT_ArrowButton);
+        const struct { int32_t steps; float lo, hi, v; int32_t dir; uint32_t want; } cases[] = {
+            {1, 0, 10, 3, 1, 0x00000000u}, {1, 0, 10, 3, -1, 0x00000000u}, {1, 10, 0, 3, 1, 0x00000000u}, {1, 2, 9, 30, 1, 0x40000000u},
+            {1, 5, 5, 2, 1, 0x40a00000u}, {11, 5, 5, 2, -1, 0x40a00000u}, {11, 0, 0, 3, 1, 0x00000000u}, {0, 4, 4, 7, 1, 0x40800000u},
+            {1, 0, 10, bitsf(0x7fc00000u), 1, 0x00000000u}, {1, -3, 3, INFINITY, -1, 0xc0400000u},
+        };
+        int n = 0;
+        for (const auto& c : cases) {
+            mem_load(g_pristine);
+            ab->steps = c.steps; ab->lo = c.lo; ab->hi = c.hi; *ab->value = c.v; ab->dir = c.dir;
+            char m[96];
+            sprintf(m, "ArrowButton::Do, case %d", n++);
+            fx_same_as_original(f, {U(ab), 0}, m);
+            sprintf(m, "ArrowButton::Do, case %d: the value at the control's one position (%08x, want %08x)", n - 1, fbits_v(ab->value), c.want);
+            fx_check(fbits_v(ab->value) == c.want, m);
+        }
+    }
+    // ---- 5. Slider::MouseMove: 0 steps (the original faults), 1 step (the original's bits); Slider::Draw, 1 step ----
+    {
+        const Ent& f = fx_fn("Slider::MouseMove");
+        Slider* sl = (Slider*)fx_widget(VT_Slider);
+        const struct { int32_t steps; float lo, hi, v; uint32_t want; } cases[] = {
+            {0, 0, 10, 3, 0x00000000u}, {0, 10, 0, 3, 0x00000000u}, {0, 2, 9, 30, 0x40000000u}, {1, 0, 10, 3, 0x00000000u},
+            {1, 10, 0, 3, 0x00000000u}, {1, 5, 5, 3, 0x40a00000u}, {1, 2, 9, 3, 0x40000000u},
+        };
+        int n = 0;
+        for (const auto& c : cases) {
+            mem_load(g_pristine);
+            sl->steps = c.steps; sl->lo = c.lo; sl->hi = c.hi; *sl->value = c.v; sl->dragging = 1;
+            const uint32_t x = (uint32_t)(sl->tx + 5), y = (uint32_t)(sl->ty + 1);
+            char m[128];
+            if (c.steps == 0) {
+                mem_save(g_snap);
+                const Result ro = fx_run(f, false, {U(sl), 0, x, y}, false);
+                mem_load(g_snap);
+                r = fx_run(f, true, {U(sl), 0, x, y}, true);
+                sprintf(m, "Slider::MouseMove, 0 steps (case %d; the original %s): a clean return", n, ro.fault ? "faults" : "DOESN'T fault");
+                fx_check(fx_clean(f, r) && ro.fault, m, &r);
+                o = fx_outside(g_snap, {{sl->value, 4}});
+                fx_check(o == 0, "Slider::MouseMove, 0 steps: nothing written but the value", 0, o);
+            } else {
+                sprintf(m, "Slider::MouseMove, 1 step (case %d)", n);
+                fx_same_as_original(f, {U(sl), 0, x, y}, m);
+            }
+            sprintf(m, "Slider::MouseMove, case %d: the value at the slider's one position (%08x, want %08x)", n, fbits_v(sl->value), c.want);
+            fx_check(fbits_v(sl->value) == c.want, m);
+            n++;
+        }
+        const Ent& fd = fx_fn("Slider::Draw");
+        for (int k = 0; k < 3; k++) {
+            mem_load(g_pristine);
+            sl->steps = 1; sl->neg = 0; sl->lo = k == 2 ? 4.0f : 0.0f; sl->hi = k == 1 ? -10.0f : k == 2 ? 4.0f : 10.0f; *sl->value = 3;
+            fx_same_as_original(fd, {U(sl), 0, U(W.screen)}, k == 0 ? "Slider::Draw, 1 step" : k == 1 ? "Slider::Draw, 1 step, hi < lo" : "Slider::Draw, 1 step, lo == hi");
+        }
+    }
+    // ---- 6. ListBox: rows 0 pixels high ----
+    {
+        const Ent& fc = fx_fn("ListBox::ListBox");
+        mem_load(g_pristine);
+        Fake* ng = fake_for("negrow.stp", 'STMP');
+        const int32_t keep_h = ng->h;
+        ng->h = -2;                                         // style 10 measures -2: a row 0 pixels high
+        UIStyle* st10 = ui_style_at(10);
+        st10->stamp = ng; st10->yo = -100; st10->yo_down = -100; st10->flags = 0;
+        ListBox* lb = (ListBox*)W.scratch;
+        memset(lb, 0, 0x300);
+        mem_save(g_snap);
+        const uint32_t heap0 = HS->heap_next;
+        r = fx_run(fc, true, {U(lb), 0, 10, 10, 100, 80, U(W.list[0]), U(&W.ints[9]), U(W.axis[2])}, false);
+        fx_check(fx_clean(fc, r) && r.ret == U(lb), "ListBox::ListBox, rows 0 pixels high: a clean return", &r);
+        fx_check(lb->row_h == 0 && lb->rows == 0, "ListBox::ListBox, rows 0 pixels high: no rows shown");
+        o = fx_outside(g_snap, {{lb, sizeof(ListBox)}, {W.axis[2], sizeof(UIScrollAxis)}}, heap0);
+        fx_check(o == 0, "ListBox::ListBox: nothing written outside the list box, its axis and its notifications' copies", 0, o);
+        ng->h = keep_h;
+        const Ent& fm = fx_fn("ListBox::MouseMove");
+        mem_load(g_pristine);
+        ListBox* w = (ListBox*)fx_widget(VT_ListBox);
+        w->row_h = 0; w->dragging = 1;
+        *(int32_t*)w->sel = 2;
+        mem_save(g_snap);
+        r = fx_run(fm, true, {U(w), 0, (uint32_t)(w->x0 + 5), (uint32_t)(w->y0 + 30)}, false);
+        fx_check(fx_clean(fm, r), "ListBox::MouseMove, rows 0 pixels high: a clean return", &r);
+        fx_check(*(int32_t*)w->sel == 2, "ListBox::MouseMove, rows 0 pixels high: the selection stays");
+        o = fx_outside(g_snap, {{w, sizeof(ListBox)}});
+        fx_check(o == 0, "ListBox::MouseMove: nothing written outside the list box", 0, o);
+    }
+    // ---- 7. ScrollBar: an empty axis (the original's bits) ----
+    {
+        const Ent& fd = fx_fn("ScrollBar::MouseDown");
+        const Ent& fw = fx_fn("ScrollBar::Draw");
+        for (int k = 0; k < 2; k++) {
+            mem_load(g_pristine);
+            ScrollBar* sb = (ScrollBar*)fx_widget(VT_ScrollBar, k);
+            for (int pos = 0; pos < 2; pos++) {
+                mem_load(g_pristine);
+                sb->axis->total = 0; sb->axis->visible = -2; sb->axis->pos = pos * 3;
+                fx_same_as_original(fd, {U(sb), 0, (uint32_t)(sb->x0 + 2), (uint32_t)(sb->y0 + 5)}, k ? "ScrollBar::MouseDown, horizontal, total 0" : "ScrollBar::MouseDown, total 0");
+                mem_load(g_pristine);
+                sb->axis->total = 0; sb->axis->visible = -2; sb->axis->pos = pos * 3;
+                fx_same_as_original(fw, {U(sb), 0, U(W.screen)}, k ? "ScrollBar::Draw, horizontal, total 0" : "ScrollBar::Draw, total 0");
+            }
+        }
+    }
+    // ---- 8. the file boxes ----
+    {
+        const Ent& fo = fx_fn("UIDoOpenFileBox");
+        const Ent& fs = fx_fn("UIDoSaveFileBox");
+        static char dir300[400];
+        memset(dir300, 'd', 300);
+        strcpy(dir300 + 300, "\\");
+        const struct { int save; const char* dir; int32_t max; uint16_t key; int namelen; const char* want; uint8_t ret; } cases[] = {
+            {0, dir300, 0x104, 0x1b, 10, 0, 0},  {0, "tracks\\", 16, 0xd, 10, 0, 0},  {0, "tracks\\", 0x104, 0xd, 10, "tracks\\abcdefghij.trk", 2},
+            {1, dir300, 0x104, 0x1b, 10, 0, 0},  {1, "tracks\\", 16, 0xd, 10, 0, 0},  {1, "tracks\\", 0x104, 0xd, 10, "tracks\\abcdefghij.trk", 1},
+            {1, "tracks\\", 1000, 0xd, 350, "*", 1},
+        };
+        int n = 0;
+        for (const auto& c : cases) {
+            mem_load(g_pristine);
+            memset(W.scratch2, 0x5a, 0x1400);
+            char* out = W.scratch2 + 0x40;
+            if (c.namelen == 10) strcpy(out, "abcdefghij.trk");
+            else { memset(out, 'n', (size_t)c.namelen); strcpy(out + c.namelen, ".trk"); }
+            HS->nfiles = 0;
+            char full[0x400];
+            sprintf(full, "%s%.*s", c.dir, c.namelen < 299 ? c.namelen : 299, out);
+            HS->file_open_mask = (int32_t)(hash_str(full) & 1);          // the file doesn't exist (no overwrite prompt)
+            fx_script_key(c.key);
+            mem_save(g_snap);
+            g_fff_len = 0xffffffffu;
+            const Ent& f = c.save ? fs : fo;
+            r = fx_run(f, true, {U("title"), U("prompt"), U("*.trk"), U(out), (uint32_t)c.max, U(c.dir)}, false);
+            char m[160];
+            sprintf(m, "%s case %d (a %u-character directory, max %d, %s): a clean return", f.name, n, (unsigned)strlen(c.dir), c.max,
+                    c.key == 0xd ? "OK" : "Cancel");
+            fx_check(fx_clean(f, r), m, &r);
+            if (c.dir == dir300) {
+                sprintf(m, "%s case %d: the directory too long to search: no search (a search path of %u characters)", f.name, n, g_fff_len);
+                fx_check(g_fff_len == 0, m);
+            }
+            sprintf(m, "%s case %d: returns %u (want %u)", f.name, n, r.ret, c.ret == 2 ? 0u : (unsigned)c.ret);
+            if (c.ret != 2) fx_check(r.ret == c.ret, m);      // (2: whether the file exists, the stub's say)
+            fx_check(UI_GP(void, S_FILE_LIST) == 0 && UI_GP(char, S_FILE_NAME) == 0, "file box: the list and name statics cleared on the way out");
+            // the caller's buffer: written only when a name fits, and nothing past it
+            uint32_t wrote = 0;
+            if (c.want && c.want[0] == '*') {
+                const size_t len = strlen(out);
+                bool ok = len == 7 + 299 + 4 && !memcmp(out, "tracks\\", 7) && !memcmp(out + 306, ".trk", 4);
+                for (int i = 0; i < 299 && ok; i++) ok = out[7 + i] == 'n';
+                sprintf(m, "%s case %d: a 350-character name cut to 299 (%u characters out)", f.name, n, (unsigned)len);
+                fx_check(ok, m);
+                wrote = (uint32_t)len + 1;
+            } else if (c.want) {
+                sprintf(m, "%s case %d: the name returned (\"%.40s\")", f.name, n, out);
+                fx_check(!strcmp(out, c.want), m);
+                wrote = (uint32_t)strlen(c.want) + 1;
+            }
+            bool untouched = true;
+            for (uint32_t i = 0; i < 0x1400 && untouched; i++)
+                if ((uint8_t)W.scratch2[i] != g_snap.arena[U(W.scratch2) - U(g_arena) + i] && !(i >= 0x40 && i < 0x40 + wrote)) untouched = false;
+            sprintf(m, "%s case %d: the caller's buffer written only where the name goes", f.name, n);
+            fx_check(untouched, m);
+            n++;
+        }
+    }
+    // ---- 9. UIDoInputBox ----
+    {
+        const Ent& f = fx_fn("UIDoInputBox");
+        for (int k = 0; k < 2; k++) {
+            mem_load(g_pristine);
+            char* text = W.scratch;
+            memset(text, 'a', 400);
+            text[400] = 0;
+            fx_script_key(k == 0 ? 0x1b : 0xd);
+            mem_save(g_snap);
+            r = fx_run(f, true, {U("title"), U("prompt"), U(text), 1000}, false);
+            fx_check(fx_clean(f, r) && r.ret == (k == 0 ? 0u : 1u), k == 0 ? "UIDoInputBox, a 400-character text, cancelled: a clean return" : "UIDoInputBox, a 400-character text, OK: a clean return", &r);
+            const char* st = (const char*)(uintptr_t)S_INPUT_TEXT;
+            bool ok = strnlen(st, 0x200) == 255;
+            for (int i = 0; i < 255 && ok; i++) ok = st[i] == 'a';
+            fx_check(ok && UI_G32(S_INPUT_MAX) == 0x100, "UIDoInputBox: the text cut to 255 characters in its static, the field held to 256");
+            fx_check(!memcmp(DATA + (0x00578e74 - 0x004e1000), g_snap.data + (0x00578e74 - 0x004e1000), 0xc),
+                     "UIDoInputBox: nothing written past its static (0x578e74..0x578e80)");
+            if (k == 1) {
+                ok = strlen(text) == 255;
+                for (int i = 256; i < 400 && ok; i++) ok = text[i] == 'a';
+                fx_check(ok, "UIDoInputBox, OK: the 255 characters copied back");
+            } else {
+                fx_check(!memcmp(text, g_snap.arena + (U(text) - U(g_arena)), 401), "UIDoInputBox, cancelled: the caller's text untouched");
+            }
+        }
+    }
+    // ---- 10. UIStringList::UIStringList ----
+    {
+        const Ent& f = fx_fn("UIStringList::UIStringList");
+        mem_load(g_pristine);
+        UIStringList* l = (UIStringList*)W.scratch;
+        memset(l, 0xa3, 0x40);
+        mem_save(g_snap);
+        const uint32_t heap0 = HS->heap_next;
+        r = fx_run(f, true, {U(l), 0, 4, 16}, false);
+        fx_check(fx_clean(f, r) && l->changes == 0 && l->count == 0, "UIStringList::UIStringList: changes set to 0", &r);
+        o = fx_outside(g_snap, {{l, sizeof(UIStringList)}}, heap0);
+        fx_check(o == 0, "UIStringList::UIStringList: nothing written outside the list and its entries", 0, o);
+    }
+    // ---- 11. TitleBar::MouseMove with no window running ----
+    {
+        const Ent& f = fx_fn("TitleBar::MouseMove");
+        mem_load(g_pristine);
+        TitleBar* t = (TitleBar*)fx_widget(VT_TitleBar);
+        t->dragging = 1;
+        UI_GP(WidgetWindow, S_ACTIVE) = 0;
+        mem_save(g_snap);
+        r = fx_run(f, true, {U(t), 0, 50, 5}, false);
+        fx_check(fx_clean(f, r), "TitleBar::MouseMove, no window running: a clean return", &r);
+        o = fx_outside(g_snap, {});
+        fx_check(o == 0, "TitleBar::MouseMove, no window running: nothing written", 0, o);
+    }
+    // ---- 12. the style table: indices outside it, states past 3, a stamp of no frames ----
+    {
+        const Ent& fa = fx_fn("UIAddStyle");
+        const Ent& fr = fx_fn("UIRemoveStyle");
+        const Ent& fg = fx_fn("get_style");
+        for (int32_t i : {32, 40, -1, 0x7fffffff}) {
+            mem_load(g_pristine);
+            mem_save(g_snap);
+            r = fx_run(fa, true, {(uint32_t)i, 0x004f6698u}, false);
+            fx_check(fx_clean(fa, r) && g_log.n == 0 && fx_outside(g_snap, {}) == 0, "UIAddStyle, an index outside the table: refused", &r);
+            r = fx_run(fr, true, {(uint32_t)i}, false);
+            fx_check(fx_clean(fr, r) && g_log.n == 0 && fx_outside(g_snap, {}) == 0, "UIRemoveStyle, an index outside the table: refused", &r);
+            r = fx_run(fg, true, {(uint32_t)i}, false);
+            fx_check(fx_clean(fg, r) && r.ret == S_STYLES, "get_style, an index outside the table: style 0", &r);
+        }
+        const Ent& fd = fx_fn("UIStyleDraw");
+        const char* txt = "two\nlines";
+        // style 40 draws as style 0
+        mem_load(g_pristine);
+        r = fx_run(fd, true, {0, 10, 20, U(txt), 1}, false);
+        memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+        mem_load(g_pristine);
+        mem_save(g_snap);
+        r = fx_run(fd, true, {40, 10, 20, U(txt), 1}, false);
+        fx_check(fx_clean(fd, r) && g_log.n == g_fx_log.n && !memcmp(g_log.w, g_fx_log.w, 4 * g_log.n) &&
+                 fx_outside(g_snap, {{(void*)(uintptr_t)S_GX_CANVAS, 4}}) == 0, "UIStyleDraw, style 40: drawn as style 0", &r);
+        // a state past 3: the palette of its two low bits (a style without a stamp, whose frame the whole state picks)
+        for (uint32_t st : {5u, 6u, 0xffffffffu}) {
+            mem_load(g_pristine);
+            ui_style_at(3)->stamp = 0;
+            r = fx_run(fd, true, {3, 10, 20, U(txt), st & 3u}, false);
+            memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+            mem_load(g_pristine);
+            ui_style_at(3)->stamp = 0;
+            r = fx_run(fd, true, {3, 10, 20, U(txt), st}, false);
+            fx_check(fx_clean(fd, r) && g_log.n == g_fx_log.n && !memcmp(g_log.w, g_fx_log.w, 4 * g_log.n), "UIStyleDraw, a state past 3: drawn as its two low bits", &r);
+        }
+        // a stamp with no frames
+        mem_load(g_pristine);
+        Fake* z = fake_for("noframes.stp", 'STMP');
+        const int32_t keep_c = z->count;
+        z->count = 0;
+        ui_style_at(3)->stamp = z;
+        mem_save(g_snap);
+        r = fx_run(fd, true, {3, 10, 20, U(txt), 1}, false);
+        fx_check(fx_clean(fd, r) && !fx_logged('DSTP') && fx_logged('FPRN'), "UIStyleDraw, a stamp of no frames: no frame drawn, the text is", &r);
+        z->count = keep_c;
+    }
+    // ---- 13. UIStyleWordWrap: a text longer than the 4 KB buffers ----
+    {
+        const Ent& f = fx_fn("UIStyleWordWrap");
+        static char big[6001];
+        for (int i = 0; i < 6000; i++) big[i] = i % 7 == 6 ? ' ' : 'w';
+        big[6000] = 0;
+        mem_load(g_pristine);
+        memset(W.scratch2, 0x5a, 0x1400);
+        mem_save(g_snap);
+        r = fx_run(f, true, {0xf, 0x11c, U(W.scratch2), U(big)}, false);
+        fx_check(fx_clean(f, r) && strnlen(W.scratch2, 0x1400) == 0xfff, "UIStyleWordWrap, 6000 characters: cut to 4095", &r);
+        o = fx_outside(g_snap, {{W.scratch2, 0x1000}});
+        fx_check(o == 0, "UIStyleWordWrap, 6000 characters: nothing written past the 4 KB", 0, o);
+    }
+    // ---- 14. WidgetWindow::AddWidget / Draw: 256 widgets ----
+    {
+        const Ent& fa = fx_fn("WidgetWindow::AddWidget");
+        const Ent& fd = fx_fn("WidgetWindow::Draw");
+        mem_load(g_pristine);
+        WidgetWindow* w2 = W.win[2];
+        for (int i = 0; i < 256; i++) w2->widgets[i] = (Widget*)fx_widget(VT_LineWidget);
+        w2->count = 256;
+        mem_save(g_snap);
+        r = fx_run(fa, true, {U(w2), 0, U(fx_widget(VT_StaticText))}, false);
+        fx_check(fx_clean(fa, r) && w2->count == 256 && g_log.n == 0 && fx_outside(g_snap, {}) == 0, "WidgetWindow::AddWidget, the 257th: refused", &r);
+        w2->count = 300;                                    // (a count only corruption could give)
+        w2->full_redraw = 1;
+        r = fx_run(fd, true, {U(w2), 0, U(W.screen)}, false);
+        fx_check(fx_clean(fd, r), "WidgetWindow::Draw, a count of 300: a clean return", &r);
+    }
+    // ---- 15. Widget::AddNotification: the 33rd ----
+    {
+        const Ent& f = fx_fn("Widget::AddNotification");
+        mem_load(g_pristine);
+        Widget* w = fx_widget(VT_CheckBox);
+        w->nnotes = 32;
+        w->dirty = 0;
+        mem_save(g_snap);
+        r = fx_run(f, true, {U(w), 0, 0, U(&W.ints[1]), 4}, false);
+        fx_check(fx_clean(f, r) && w->nnotes == 32 && w->dirty == 0 && g_log.n == 0 && fx_outside(g_snap, {}) == 0,
+                 "Widget::AddNotification, the 33rd: refused (nothing allocated or written)", &r);
+    }
+    // ---- 16. WidgetCreateWindow with the 16 slots taken ----
+    {
+        const Ent& f = fx_fn("WidgetCreateWindow");
+        mem_load(g_pristine);
+        for (int i = 0; i < 16; i++) (*(WidgetWindow* volatile*)(uintptr_t)(S_WINDOWS + 4 * i)) = W.win[0];
+        mem_save(g_snap);
+        r = fx_run(f, true, {U("dialog1.stp"), 10, 10, 100, 100, 0}, false);
+        fx_check(fx_clean(f, r) && r.ret == 0 && g_log.n > 0 && g_log.w[0] == 'PANC' && !fx_logged('ALOC') && fx_outside(g_snap, {}) == 0,
+                 "WidgetCreateWindow, 16 windows open: the panic, and nothing built", &r);
+    }
+    // ---- 17. Multi::Multi: 12 strings ----
+    {
+        const Ent& f = fx_fn("Multi::Multi");
+        mem_load(g_pristine);
+        char* strs = W.scratch2;
+        int o2 = 0;
+        for (int i = 0; i < 12; i++) o2 += sprintf(strs + o2, "o%d", i) + 1;
+        strs[o2] = 0;
+        Multi* m = (Multi*)W.scratch;
+        memset(m, 0x5a, 0x400);
+        mem_save(g_snap);
+        const uint32_t heap0 = HS->heap_next;
+        r = fx_run(f, true, {U(m), 0, 20, 30, U(&W.ints[1]), U(strs), 5}, false);
+        fx_check(fx_clean(f, r) && m->count == 8 && m->options[7] == strs + 7 * 3, "Multi::Multi, 12 strings: the first 8 kept", &r);
+        o = fx_outside(g_snap, {{m, sizeof(Multi)}}, heap0);
+        fx_check(o == 0, "Multi::Multi, 12 strings: nothing written past the object", 0, o);
+    }
+    // ---- 18. BRadioButton::MouseDown with no variable ----
+    {
+        const Ent& f = fx_fn("BRadioButton::MouseDown");
+        mem_load(g_pristine);
+        BRadioButton* b = (BRadioButton*)fx_widget(VT_BRadioButton);
+        b->var = 0;
+        mem_save(g_snap);
+        r = fx_run(f, true, {U(b), 0, 3, 3}, false);
+        fx_check(fx_clean(f, r) && fx_outside(g_snap, {}) == 0, "BRadioButton::MouseDown, no variable: nothing written", &r);
+    }
+    mem_load(g_pristine);
+    printf("directed fix tests: %s -- %d checks, %d failed (of the %d cases whose fix keeps the original's bits, the original "
+           "faults with divide-by-zero unmasked in %d)\n", g_fx_bad ? "FAILED" : "all passed", g_fx_n, g_fx_bad, g_fx_zd_cases, g_fx_zd_faults);
+    return g_fx_bad;
+}
+#endif
 
 // ---- main -----------------------------------------------------------------------------------------------------------------------
 static bool is_modal(const char* nm) {
@@ -1388,15 +1972,23 @@ int main(int argc, char** argv) {
                 dup++;
             }
 
+#if UI_FIXES
+    const int fix_bad = directed_fix_tests();
+#else
+    const int fix_bad = 0;
+#endif
+
     static Footprint fp;
     long long checks = 0, poisoned_checks = 0, log_words = 0;
     int differ = 0, fp_bad = 0, faults = 0, pure_n = 0, replay_n = 0, changed_fns = 0, still_fns = 0, bad_fns = 0, skipped = 0;
-    long long both_fault = 0;
+    long long both_fault = 0, orig_only = 0, file_statics = 0;
+    char orig_only_fns[2048] = "";
     for (int fi = 0; fi < g_nfns; fi++) {
         const Ent& f = g_fns[fi];
         if (only && !strstr(f.name, only)) continue;
         bool fn_bad = false, fn_changed = false;
-        int fn_faults = 0, fn_checks = 0;
+        int fn_faults = 0, fn_checks = 0, fn_orig_only = 0;
+        const bool file_box = !strcmp(f.name, "UIDoOpenFileBox") || !strcmp(f.name, "UIDoSaveFileBox");
         const int nr = is_modal(f.name) || f.name[0] == '$' ? rounds : rounds * 10;
         for (int rd = 0; rd < nr && !fn_bad; rd++) {
             const bool poisoned = rd & 1;
@@ -1435,6 +2027,20 @@ int main(int argc, char** argv) {
             memcpy(&g_log_orig, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
             mem_load(g_snap);
             const Result rn = run(f, true, words);
+            if (UI_FIXES && ro.fault && !rn.fault) {         // a crash the fixes remove: not compared (counted)
+                orig_only++;
+                fn_orig_only++;
+                if (rd == 0) { pure_n += fp.pure; replay_n += fp.replay_only != 0; }
+                continue;
+            }
+            if (UI_FIXES && file_box) {                       // the two statics the boxes now clear on the way out
+                for (uint32_t a2 : {(uint32_t)S_FILE_LIST, (uint32_t)S_FILE_NAME}) {
+                    uint32_t o, n2;
+                    memcpy(&o, g_after.data + (a2 - 0x004e1000), 4);
+                    memcpy(&n2, (void*)(uintptr_t)a2, 4);
+                    if (n2 == 0 && on_stack(o)) { memcpy((void*)(uintptr_t)a2, &o, 4); file_statics++; }
+                }
+            }
             checks++;
             fn_checks++;
             poisoned_checks += poisoned;
@@ -1473,6 +2079,11 @@ int main(int argc, char** argv) {
         }
         bad_fns += fn_bad;
         (fn_changed ? changed_fns : still_fns)++;
+        if (fn_orig_only) {
+            char e[96];
+            sprintf(e, "%s%s %d", orig_only_fns[0] ? ", " : "", f.name, fn_orig_only);
+            if (strlen(orig_only_fns) + strlen(e) < sizeof orig_only_fns) strcat(orig_only_fns, e);
+        }
         if (trace) printf("%08x %-64s %s%s (%d checks, %d faulted)\n", f.v10, f.name, fn_bad ? "BAD" : "ok", fn_changed ? "" : " (never changed memory)", fn_checks, fn_faults);
         if (differ >= 40) { printf("stopping after 40 differences\n"); break; }
     }
@@ -1482,5 +2093,8 @@ int main(int argc, char** argv) {
            "%d functions bad\n", g_nfns, pure_n, replay_n, g_nfns - pure_n - replay_n, dup, checks, poisoned_checks, log_words, differ,
            fp_bad, faults, both_fault, skipped, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
-    return differ || fp_bad || dup ? 1 : 0;
+    if (UI_FIXES)
+        printf("fix build: %lld rounds where only the original faulted (kept out of the comparison): %s; the file boxes' two cleared "
+               "statics taken as equal %lld times\n", orig_only, orig_only_fns[0] ? orig_only_fns : "none", file_statics);
+    return differ || fp_bad || dup || fix_bad ? 1 : 0;
 }

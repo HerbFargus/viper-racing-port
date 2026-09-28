@@ -22,6 +22,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include "port.h"
 
 namespace uit {
@@ -59,7 +60,7 @@ struct Widget {                                   // 0x228, vtable 0x4ddc88
     volatile uint8_t enabled;                     // +0x17 (its group isn't disabled)
     WidgetWindow* volatile window;                // +0x18 set by WidgetWindow::AddWidget
     Notification notes[32];                       // +0x1c
-    volatile int32_t nnotes;                      // +0x21c (no bound: the 33rd AddNotification writes over it)
+    volatile int32_t nnotes;                      // +0x21c (32 at most: the fix refuses a 33rd, which wrote over this)
     volatile uint8_t dirty;                       // +0x220 redraw
     uint8_t _pad221[3];
     volatile uint32_t groups;                     // +0x224 the window's group mask when it was added
@@ -180,7 +181,7 @@ struct Multi : StyleWidget {                      // 0x2ac, vtable 0x4de200: cyc
     int32_t* volatile var;                        // +0x234
     volatile int32_t count;                       // +0x238
     char text[0x50];                              // +0x23c
-    const char* volatile options[8];              // +0x28c (no bound: a ninth string writes past the object)
+    const char* volatile options[8];              // +0x28c (8 at most: the fix drops a ninth, written past the object)
 };
 static_assert(sizeof(Multi) == 0x2ac, "Multi");
 
@@ -285,7 +286,7 @@ static_assert(sizeof(TitleBar) == 0x234, "TitleBar");
 struct WidgetWindow {                             // 0x464 (no vtable)
     void* volatile background;                    // +0 stamp, or 0 (cleared to the colour at 0x579704)
     gxCanvas canvas;                              // +4
-    Widget* volatile widgets[256];                // +0x28 (no bound)
+    Widget* volatile widgets[256];                // +0x28 (256 at most: the fix refuses a 257th, which wrote over count)
     volatile int32_t count;                       // +0x428
     void(__cdecl* volatile idle)();               // +0x42c
     Widget* volatile over;                        // +0x430
@@ -505,6 +506,36 @@ static __forceinline int crt_memcmp_ne(const void* a, const void* b, uint32_t n)
 static __forceinline int32_t iabs(int32_t v) {
     const uint32_t m = (uint32_t)(v >> 31);
     return (int32_t)(((uint32_t)v ^ m) - m);
+}
+
+// The fixes' helpers (docs/PORTING.md, "Fixes"; each use is marked // FIX:).
+// num / den, where a zero den gives what the FPU gives with divide-by-zero masked, as the main thread (the UI's) always
+// runs: num times the infinity of den's sign -- a finite non-zero num gives the signed infinity, 0 the default NaN (0/0's),
+// an infinity or a NaN itself -- with no exception (an operation on an infinity is exact). So the result is the
+// original's bit for bit, and nothing can fault even with the exception unmasked. Every other den is the division.
+static __forceinline double ui_div_masked(double num, double den) {
+    if (!VP_FIX || !(den == 0.0)) return num / den;
+    uint64_t b;
+    memcpy(&b, &den, 8);
+    b = (b & 0x8000000000000000ull) | 0x7ff0000000000000ull;
+    double inf;
+    memcpy(&inf, &b, 8);
+    return num * inf;
+}
+// strlen, looking at most max + 1 bytes (so a string longer than max is known to be, without reading all of it)
+static __forceinline uint32_t ui_strnlen(const char* s, uint32_t max) {
+    const volatile char* p = s;
+    uint32_t n = 0;
+    while (n <= max && p[n]) n++;
+    return n;
+}
+// src into a buffer of `size` bytes: at most size - 1 characters, then a terminator. A string that fits is copied as
+// crt_strcpy copies it (the same bytes: strlen + 1 of them).
+static __forceinline void ui_copy_bounded(char* dst, const char* src, uint32_t size) {
+    uint32_t n = ui_strnlen(src, size - 1);
+    if (n > size - 1) n = size - 1;
+    crt_copy(dst, src, n);
+    *(volatile char*)(dst + n) = 0;
 }
 
 // ---- the game's functions (v1.0 addresses) --------------------------------------------------------------------------
