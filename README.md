@@ -48,7 +48,7 @@ code at its own address, puts the FPU in the physics thread's single precision, 
 whose footprint is pure against its original on millions of random inputs, NaN, infinity, denormals and
 overlapping arguments included.
 
-The rewrites so far, 2,186 functions (the physics and AI, 881 of them, in `hook/phys_*.cpp`, layouts in
+The rewrites so far, 5,189 functions (the physics and AI, 881 of them, in `hook/phys_*.cpp`, layouts in
 `hook/phys_types.h`):
 - **3.2, collisions:** the physics library's maths helpers, every collision volume (sphere, cube, sphere
   group, moveable sphere, cylinder, tube, box), the pairwise collision tests, and `collide.obj`'s crash
@@ -106,6 +106,14 @@ That is the whole physics and AI code, apart from the debug screens' drawing.
   DirectSound facade (`dsound_sdl`), on the same objects. A shadow check records every call to the core,
   including a hash of the mixed audio written, and compares them. The hardware DirectSound mixer the
   game ships (ds.obj) is never used by any build and isn't ported.
+- **What those libraries had left** (`hook/krn_leftover*.cpp`, 2,739 more): the static initialisers
+  (`$E`, which set up the game's global constants and objects before `WinMain`), the empty virtual
+  stubs, the compiler's deleting destructors and the per-file assert helpers. `tools/gen_leftovers.py`
+  reads each from its exact instruction bytes and writes the 2,734 mechanical ones; five are by hand.
+  The initialisers run once at start-up, before a shadow check could, so `test/world_leftover.cpp`
+  checks every one against its original offline, and a race recorded with them replays identically on
+  the original code. Still original: the 13 platform functions the SDL layer replaces, and `WinMain`,
+  which comes with the main loop.
 
 Then a chosen set of the original's bugs is fixed, always on: the AI crash (a car losing its place on
 its racing line), degenerate racing lines, a ground-contact divide by zero, vrmod's obstacle wake, a single race on a
@@ -152,5 +160,5 @@ main thread's buffers left out.
   SDL2 2.32 in `../sdl2`).
 - `tools/` — the analysis: linker-map extraction, the function inventory, cross-build matching
   (`match_builds.py`, `propagate.py`, `port_sites.py`), type recovery for Ghidra (`recover_types.py`,
-  `type_names.py`, `names/`, `ApplyTypes.java`), generators (`gen_com_base.py`, `gen_texture_table.py`, `gen_port_tables.py`), `trace_diff.py`, and `disasm.py` (disassembly with every constant's value and width).
+  `type_names.py`, `names/`, `ApplyTypes.java`), generators (`gen_com_base.py`, `gen_texture_table.py`, `gen_port_tables.py`, `gen_leftovers.py`), `trace_diff.py`, and `disasm.py` (disassembly with every constant's value and width).
 - `test/` — the offline fuzzer for pure rewrites (`fuzz.cpp`, `fuzz.h`, `build_fuzz.bat`) and a per-file compile check.
