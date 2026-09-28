@@ -2,6 +2,7 @@
 
     python tools/gen_leftovers.py [--list]              the finished libraries -> hook/krn_leftover.cpp
     python tools/gen_leftovers.py --lib ui [--list]     one stage's library -> its own file (STAGES)
+    python tools/gen_leftovers.py --lib menu [--list]
 
 M3 UI stage, step U0. The libraries whose stages are done -- physics, world, gx, ai, kernel, useful, state, sound --
 still hold functions no hook/*.cpp registers: the $E static initialisers, empty virtual stubs, compiler-generated
@@ -25,12 +26,19 @@ Shapes (the whole body, to its `ret`, plus the linker's padding):
   deleting destructors (`scalar` / `vector deleting destructor'):
     push esi ; mov esi, ecx ; call DTOR ; test byte [esp+8], 1 ; je ; push esi ; call operator delete ; ...
     test byte [esp+4], 1 ; push esi ; [mov dword [ecx+d], imm32]+ ; mov esi, ecx ; je ; push esi ; call delete ; ...
+      (d an 8-bit or a 32-bit displacement)
 
 With --lib, the same shapes for one library whose stage is being written (STAGES: the UI toolkit, library `ui`,
-into hook/ui_leftover.cpp): its $E initialisers and whatever else is mechanical there; the rest of it is written by hand
-in that stage's own hook/*.cpp files, which take their functions out of the list the same way. Every generated file is
-left out of the registered set (each run sees only the hand-written files), so a run for one target never changes
-another's output.
+into hook/ui_leftover.cpp; the menus, library `menu`, into hook/menu_leftover.cpp): its $E initialisers and whatever
+else is mechanical there; the rest of it is written by hand in that stage's own hook/*.cpp files, which take their
+functions out of the list the same way. Every generated file is left out of the registered set (each run sees only the
+hand-written files), so a run for one target never changes another's output.
+
+A stage may name the objects whose stubs and deleting destructors it generates (STAGE_FULL); in its other objects only
+the $E initialisers are (U2, the menus: the $E of all eleven object files; stubs and deleting destructors of moptions /
+mrace / mmixer only -- the other groups write their objects' by hand, and mmulti / msched wait for the multiplayer
+stage). One more stub shape there: a `local static destructor helper' thunk (the atexit entry of a function-local
+static Xlator, whose destructor is empty) that is a bare `ret`: a __cdecl void(void).
 
 Left out on purpose (listed with --list): ds.obj / ds3d_x.obj except dsounderr2str (the dead hardware DirectSound
 mixer), M2's SDL platform functions (platform.cpp detours them), WinMain (the main-loop stage).
@@ -58,7 +66,12 @@ LIBS = ("physics", "world", "gx", "ai", "kernel", "useful", "state", "sound")
 STAGES = {
     "ui": ("ui_leftover.cpp", "M3 UI stage, step U1: the mechanical functions of the widget toolkit (library `ui`: ui.obj,\n"
                               "// _widget.obj, widget.obj, uistyle.obj)", "hook/ui_*.cpp", "test/world_ui.cpp"),
+    "menu": ("menu_leftover.cpp", "M3 UI stage, step U2: the $E static initialisers of all eleven menu object files (library\n"
+                                  "// `menu`), and the stubs and deleting destructors of moptions.obj, mrace.obj and mmixer.obj",
+             "hook/menu_*.cpp", "test/world_menu_options.cpp"),
 }
+# --lib: the objects whose stubs and deleting destructors a stage generates (absent: all of them); elsewhere only $E
+STAGE_FULL = {"menu": ("moptions.obj", "mrace.obj", "mmixer.obj")}
 GENERATED = ["krn_leftover.cpp"] + [s[0] for s in STAGES.values()]
 DEAD_OBJECTS = ("ds.obj", "ds3d_x.obj")                  # the hardware DirectSound mixer: dead in every build
 DEAD_KEEP = {0x004756B0}                                  # dsounderr2str: live (wave.obj's error paths), by hand
@@ -380,6 +393,9 @@ def parse_other(img: Image, inv: dict, r: dict) -> tuple[str, list[str], str, di
                 elif code[i:i + 2] == b"\xC7\x41":
                     stores.append((code[i + 2], struct.unpack_from("<I", code, i + 3)[0]))
                     i += 7
+                elif code[i:i + 2] == b"\xC7\x81":                  # mov dword [ecx + disp32], imm32
+                    stores.append(struct.unpack_from("<II", code, i + 2))
+                    i += 10
                 else:
                     break
             if stores and code[i:i + 2] == b"\x8B\xF1" and code[i + 2:i + 6] == tail and rel32(code, i + 5, va) == OP_DELETE \
@@ -432,6 +448,20 @@ def parse_other(img: Image, inv: dict, r: dict) -> tuple[str, list[str], str, di
         done(4)
         return "ret_member", [f"return (uint8_t*)self + 0x{code[2]:x};"], "void*", sig
     raise Refused(f"unknown shape {code[:8].hex()}")
+
+
+# ---- local static destructor helpers (a stage with STAGE_FULL only) --------------------------------------------------
+THUNK_HELPER = re.compile(r"^\[thunk\]:class (?P<cls>\w+) `(?P<fn>.*)'::`\d+'::(?P<var>\w+)`local static destructor helper'$")
+
+
+def parse_thunk_helper(img: Image, r: dict) -> str:
+    """The rewrite's name for a `local static destructor helper' thunk whose body is a bare `ret` (else Refused)."""
+    va, size = int(r["va"], 16), int(r["size"])
+    m = THUNK_HELPER.match(r["demangled"])
+    if img.bytes_at(va, 1) != b"\xC3" or not padding_ok(img, va, 1, size):
+        raise Refused("a local static destructor helper that isn't a bare ret")
+    fn = parse_sig(m.group("fn"))
+    return f"{short_name(fn['name'])}::{m.group('var')} destructor helper"
 
 
 # ---- the file -------------------------------------------------------------------------------------------------------
@@ -530,12 +560,15 @@ def main() -> int:
     def objname(r: dict) -> str:             # "track.obj", or "world:track.obj" where two libraries have one
         return f"{r['library']}:{r['object']}" if len(libs_of[r["object"]]) > 1 else r["object"]
 
+    full = STAGE_FULL.get(stage) if stage else None
     targets, left_out = [], []
     for r in rows:
         va = int(r["va"], 16)
         if r["library"] not in LIBS or va in reg:
             continue
-        if r["object"] in DEAD_OBJECTS and va not in DEAD_KEEP:
+        if full is not None and r["object"] not in full and not r["demangled"].startswith("$E"):
+            left_out.append((va, r, "not this step's: only its $E initialisers are generated here"))
+        elif r["object"] in DEAD_OBJECTS and va not in DEAD_KEEP:
             left_out.append((va, r, "the dead hardware DirectSound mixer (ds.obj / ds3d_x.obj)"))
         elif va in PLATFORM:
             left_out.append((va, r, "M2: platform.cpp detours it to its SDL version"))
@@ -557,7 +590,16 @@ def main() -> int:
             except SystemExit as e:
                 raise Refused(f"can't be hooked: {e}")
             dem = r["demangled"]
-            if dem.startswith("$E"):
+            if full is not None and THUNK_HELPER.match(dem):
+                name = parse_thunk_helper(img, r)
+                kind = "thunk ret"
+                if name in names or name in names_taken:
+                    raise Refused(f"can't name it uniquely ({name})")
+                rid = ident(name) + "_lo"
+                code = [f"// {dem.strip()}", f"static void __cdecl {rid}() {{}}",
+                        f"static void fp_{rid}(Footprint& f) {{ f.pure = true; }}",
+                        f"PORT_FN(0x{va:08x}, \"{name}\", {rid}, fp_{rid})"]
+            elif dem.startswith("$E"):
                 lines, _types = parse_e(img, inv, va, size, obj)
                 shape = "$E"
                 name = f"{dem}({oname})"
@@ -625,7 +667,7 @@ def main() -> int:
         return 1
 
     order = ["$E ret", "$E jmp", "$E jmp (constructor)", "$E stores", "$E constructor", "$E array constructor", "$E mixed", "ret", "ret_n", "ret_al",
-             "ret_ax", "ret_this", "ret_member", "dtor_call", "dtor_inline"]
+             "ret_ax", "ret_this", "ret_member", "thunk ret", "dtor_call", "dtor_inline"]
     ctext = ", ".join(f"{k} {counts[k]}" for k in order if k in counts) + f"; {sum(counts.values())} in all"
     if stage:
         target, what, hand, harness = STAGES[stage]
