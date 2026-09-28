@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include "viperport.h"
 #include "port.h"
+#include "session.h"
 
 SDL_Window* platform_window();
 
@@ -149,6 +150,61 @@ bool on_gl_thread() {
 State st;
 Page pg;
 std::set<Surface*> handles;
+
+// ---- the session recorder's frame hash (session.h): what the game hands the renderer, never what the renderer makes of it
+namespace {
+
+// a texture by its pixels -- every level, the format, the colour key -- cached until a level changes (its gen)
+struct Content { uint64_t sig = 0, hash = 0; };
+std::unordered_map<const Surface*, Content> g_content;
+
+uint64_t content_of(Surface* root) {
+    uint32_t head[3] = {(uint32_t)root->fmt, root->keyed ? 1u : 0u, root->key};
+    uint64_t sig = session_hash(head, sizeof head);
+    for (Surface* l = root; l; l = l->next_mip) sig = session_hash(&l->gen, 4, sig);
+    Content& c = g_content[root];
+    if (c.hash && c.sig == sig) return c.hash;
+    uint64_t h = session_hash(head, sizeof head);
+    for (Surface* l = root; l; l = l->next_mip) {
+        const int32_t d[2] = {l->w, l->h};
+        h = session_hash(d, sizeof d, h);
+        if (!l->pixels.empty()) h = session_hash(l->pixels.data(), l->pixels.size() * 2, h);
+    }
+    c.sig = sig, c.hash = h ? h : 1;
+    return c.hash;
+}
+
+// the pixels of a rectangle of a surface (clipped to it), and the rectangle
+void hash_rect(uint8_t kind, Surface* d, int x, int y, int w, int h) {
+    int32_t head[6] = {d->w, d->h, x, y, w, h};
+    uint64_t px = 1469598103934665603ull;
+    for (int r = y < 0 ? 0 : y; r < y + h && r < d->h; r++) {
+        const int x0 = x < 0 ? 0 : x, x1 = x + w < d->w ? x + w : d->w;
+        if (x1 > x0 && !d->pixels.empty()) px = session_hash(&d->pixels[(size_t)r * d->w + x0], (size_t)(x1 - x0) * 2, px);
+    }
+    session_gfx(kind, head, sizeof head, &px, sizeof px);
+}
+
+// a draw: the call, the texture by its pixels, the vertices without what Direct3D never reads (as for_check below)
+void hash_draw(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vt, const void* v, DWORD n, const WORD* idx, DWORD ni) {
+    Surface* tex = (Surface*)(uintptr_t)st.rs[D3DRENDERSTATE_TEXTUREHANDLE];
+    const bool textured = tex && handles.count(tex);
+    const uint64_t t = textured ? content_of(tex) : 0;
+    const uint32_t head[7] = {(uint32_t)pt, (uint32_t)vt, n, ni, textured ? 1u : 0u, (uint32_t)t, (uint32_t)(t >> 32)};
+    std::vector<uint8_t> buf;
+    const bool lv = vt == D3DVT_LVERTEX;
+    if (v && (lv || !textured)) {
+        buf.assign((const uint8_t*)v, (const uint8_t*)v + (size_t)n * 32);
+        for (size_t i = 0; i < n; i++) {
+            if (lv) memset(&buf[i * 32 + 12], 0, 4);
+            if (!textured) memset(&buf[i * 32 + 24], 0, 8);
+        }
+        v = buf.data();
+    }
+    session_gfx(SG_DRAW, head, sizeof head, v, v ? (size_t)n * 32 : 0, idx, idx ? (size_t)ni * 2 : 0);
+}
+
+}  // namespace
 
 // ---- shadow checks ----------------------------------------------------------------------------------------------------
 namespace {
@@ -380,6 +436,7 @@ ULONG Surface::hold() { return root && root != this ? 1 : Obj::hold(); }
 ULONG Surface::drop() { return root && root != this ? 1 : Obj::drop(); }
 
 Surface::~Surface() {
+    if (g_session_frames) g_content.erase(this);
     if (tex && in.ready) {
         glr::Direct d;
         gl_api.DeleteTextures(1, &tex);
@@ -495,6 +552,7 @@ void set_defaults() {
 }
 
 void set_mode(int w, int h) {
+    if (g_session_frames) { const int32_t m[2] = {w, h}; session_gfx(SG_MODE, m, sizeof m); }
     touch_state();
     touch_page();
     st.w = w, st.h = h;
@@ -627,6 +685,7 @@ void draw_page() {                               // Unlock: what the 2D drew, ov
 }  // namespace
 
 void present() {
+    if (g_session_mode != SESSION_OFF) session_frame();   // a frame ends (the session recorder)
     if (!on_gl_thread()) return;
     glr::BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glr::BindFramebuffer(GL_READ_FRAMEBUFFER, st.fbo);
@@ -742,6 +801,11 @@ HRESULT create_surface(LPDDSURFACEDESC d, Surface** out) {
         }
     }
     *out = s;
+    if (g_session_frames) {
+        const uint32_t f[10] = {s->caps.dwCaps, s->flags, (uint32_t)s->w, (uint32_t)s->h, (uint32_t)s->fmt,
+                                (uint32_t)s->mip_count, s->keyed ? 1u : 0u, s->key, (uint32_t)s->backbuffers, s->back ? 1u : 0u};
+        session_gfx(SG_SURFACE, f, sizeof f);
+    }
     return DD_OK;
 }
 
@@ -764,12 +828,17 @@ HRESULT lock(Surface* s, LPDDSURFACEDESC d) {
 
 HRESULT unlock(Surface* s) {
     if (s->is_back && st.page_locked) {
+        if (g_session_frames) session_gfx_page(pg.page.data(), st.w, st.h);
         touch_state();
         st.page_locked = false;
         draw_page();
     } else {
         touch(s);
         s->gen++;
+        if (g_session_frames) {
+            const int32_t d[3] = {s->w, s->h, (int32_t)s->fmt};
+            session_gfx(SG_UNLOCK, d, sizeof d, s->pixels.data(), s->pixels.size() * 2);
+        }
     }
     return DD_OK;
 }
@@ -790,7 +859,11 @@ void copy_from(Surface* d, Surface* s, int sx, int sy, int dx, int dy, int cw, i
 }  // namespace
 
 HRESULT blt(Surface* dst, LPRECT dr, Surface* s, LPRECT sr) {
-    if (!s) { ::com_unsupported("IDirectDrawSurface3::Blt (colour fill)"); return DD_OK; }
+    if (!s) {
+        if (g_session_frames) session_gfx(SG_BLIT, dr, dr ? sizeof *dr : 0);
+        ::com_unsupported("IDirectDrawSurface3::Blt (colour fill)");
+        return DD_OK;
+    }
     RECT d = dr ? *dr : RECT{0, 0, dst->w, dst->h}, r = sr ? *sr : RECT{0, 0, s->w, s->h};
     int dw = d.right - d.left, dh = d.bottom - d.top, sw = r.right - r.left, sh = r.bottom - r.top;
     if (dw == sw && dh == sh) {
@@ -805,12 +878,14 @@ HRESULT blt(Surface* dst, LPRECT dr, Surface* s, LPRECT sr) {
             }
         dst->gen++;
     }
+    if (g_session_frames) hash_rect(SG_BLIT, dst, d.left, d.top, dw, dh);
     return DD_OK;
 }
 
 HRESULT blt_fast(Surface* dst, DWORD x, DWORD y, Surface* s, LPRECT sr) {
     RECT r = sr ? *sr : RECT{0, 0, s->w, s->h};
     copy_from(dst, s, r.left, r.top, (int)x, (int)y, r.right - r.left, r.bottom - r.top);
+    if (g_session_frames) hash_rect(SG_BLIT, dst, (int)x, (int)y, r.right - r.left, r.bottom - r.top);
     return DD_OK;
 }
 
@@ -819,6 +894,7 @@ void set_key(Surface* s, const DDCOLORKEY* k) {
     s->keyed = k != 0;
     s->key = k ? (uint16_t)k->dwColorSpaceLowValue : 0;
     s->gen++;
+    if (g_session_frames) { const uint32_t c[2] = {s->keyed ? 1u : 0u, s->key}; session_gfx(SG_KEY, c, sizeof c); }
 }
 
 HRESULT attached(Surface* s, const DDSCAPS* c, Surface** out) {
@@ -832,6 +908,7 @@ HRESULT tex_load(Surface* dst, Surface* from) {  // copy every level, as D3D doe
     for (Surface* d = dst; d && from; d = d->next_mip, from = from->next_mip)
         if (d->w == from->w && d->h == from->h) touch(d), d->pixels = from->pixels, d->gen++;
         else copy_from(d, from, 0, 0, 0, 0, d->w, d->h);
+    if (g_session_frames) { const uint64_t c = content_of(dst); session_gfx(SG_TEXLOAD, &c, sizeof c); }
     return DD_OK;
 }
 
@@ -953,6 +1030,10 @@ void enum_formats(LPD3DENUMTEXTUREFORMATSCALLBACK cb, LPVOID ctx) {
 }
 
 void set_state(DWORD s, DWORD v) {
+    if (g_session_frames) {                              // (a texture handle is an address: whether one is set)
+        const DWORD d[2] = {s, s == D3DRENDERSTATE_TEXTUREHANDLE ? (v != 0) : v};
+        session_gfx_state(1, d, sizeof d);
+    }
     if (s >= 64) return;
     touch_state();
     st.rs[s] = v;
@@ -961,6 +1042,7 @@ void set_state(DWORD s, DWORD v) {
 DWORD get_state(DWORD s) { return s < 64 ? st.rs[s] : 0; }
 
 void set_transform(DWORD t, const D3DMATRIX* m) {
+    if (g_session_frames) session_gfx_state(0x200 + t, m, sizeof *m);
     touch_state();
     if (t == D3DTRANSFORMSTATE_WORLD) st.world = *m;
     else if (t == D3DTRANSFORMSTATE_VIEW) st.view = *m;
@@ -974,27 +1056,39 @@ void remove_viewport(Device* d, Viewport* v) {
     if (v == d->current) touch(d), d->current = 0;
 }
 void use_viewport(Device* d, Viewport* v) {
+    if (g_session_frames) session_gfx_state(3, v ? &v->vp : 0, v ? sizeof v->vp : 0);
     touch(d);
     d->current = v;
     if (v) touch_state(), st.vp = v->vp;
 }
 void set_viewport(Viewport* v, const D3DVIEWPORT2* vp) {
+    if (g_session_frames) session_gfx_state(4, vp, sizeof *vp);
     touch(v);
     touch_state();
     v->vp = *vp;
     st.vp = *vp;
 }
 void set_background(Viewport* v, D3DMATERIALHANDLE h) {
+    if (g_session_frames) { const uint32_t b = h != 0; session_gfx_state(5, &b, sizeof b); }   // (the colour: at the clear)
     touch(v);
     v->background = (Material*)(uintptr_t)h;
 }
 void set_material(Material* m, const D3DMATERIAL* p) {
+    if (g_session_frames) {                              // the colours and power; not hTexture, a handle
+        session_gfx_state(6, p, offsetof(D3DMATERIAL, hTexture));
+        session_gfx_state(7, &p->dwRampSize, sizeof p->dwRampSize);
+    }
     touch(m);
     m->m = *p;
 }
 D3DMATERIALHANDLE material_handle(Material* m) { return (D3DMATERIALHANDLE)(uintptr_t)m; }
 
 void clear(Viewport* v, DWORD n, const D3DRECT* rects, DWORD flags) {
+    if (g_session_frames) {
+        D3DCOLORVALUE c = v->background ? v->background->m.diffuse : D3DCOLORVALUE{0, 0, 0, 1};
+        const DWORD head[2] = {n, flags};
+        session_gfx(SG_CLEAR, head, sizeof head, &c, sizeof c, rects, (size_t)n * sizeof *rects);
+    }
     if (!on_gl_thread()) return;
     glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
     glr::Enable(GL_SCISSOR_TEST);
@@ -1024,6 +1118,12 @@ void mat_mul(const D3DMATRIX& a, const D3DMATRIX& b, float* out) {     // row-ma
 }  // namespace
 
 void transform(Viewport* v, DWORD n, LPD3DTRANSFORMDATA d, DWORD flags, LPDWORD offscreen) {
+    if (g_session_frames) {                              // the game's input: each vertex's x y z (all that's read)
+        const DWORD head[4] = {n, flags, d->dwInSize, d->lpHOut ? 1u : 0u};
+        uint64_t h = 1469598103934665603ull;
+        for (DWORD i = 0; i < n; i++) h = session_hash((const char*)d->lpIn + i * d->dwInSize, 12, h);
+        session_gfx(SG_TRANSFORM, head, sizeof head, &h, sizeof h);
+    }
     // on the CPU, as D3D did: W x V x P, then the viewport mapping; clip codes for anything outside
     const D3DVIEWPORT2& vp = v->vp;
     float m[16], wv[16];
@@ -1161,6 +1261,7 @@ const void* for_check(D3DVERTEXTYPE vt, const void* v, DWORD n, bool textured, s
 }  // namespace
 
 HRESULT draw(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vtype, const void* verts, DWORD nverts, const WORD* idx, DWORD nidx) {
+    if (g_session_frames) hash_draw(pt, vtype, verts, nverts, idx, nidx);
     if (pt != D3DPT_TRIANGLELIST) {
         ::com_unsupported(idx ? "DrawIndexedPrimitive (not a triangle list)" : "DrawPrimitive (not a triangle list)");
         return DD_OK;

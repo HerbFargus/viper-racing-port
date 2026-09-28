@@ -27,6 +27,10 @@
 //   label=original             ; this run's trace: replays\<play>.<label>.trace
 //   dump_ticks=1200,1201       ; also write whole objects at these ticks to <trace>.dump (tick 0 always)
 //
+// A session (session.cpp, [session] record / play) owns every race of its run: each is recorded to, or replayed from,
+// the session's folder as race-<k> (restarts are races of their own), whatever [replay] says; [replay] record=1 still
+// gets its copy of each in replays\. The session also keeps the start-up seed, and the main thread's random numbers.
+//
 // v1.0 only (the hooks go through trampolines; see port.h).
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
@@ -37,6 +41,7 @@
 #include <intrin.h>
 #include "viperport.h"
 #include "port.h"
+#include "session.h"
 
 // ---- the game's globals ----------------------------------------------------------------------------------
 static void*** const PHOBS = (void***)0x00520bb4;     // PhobRoot** phobs
@@ -73,6 +78,9 @@ static uint32_t g_ticks, g_updates, g_first_diverged = UINT32_MAX, g_diverged_ti
 static char g_name[MAX_PATH];                         // this race's base name (record) / the recording (play)
 static uint32_t g_seed = UINT32_MAX;                  // the session's start-up seed (ij << 16 | kl)
 static long g_races_recorded;
+// this race's files: [replay]'s (g_dir, g_play, g_label), or a session's (session_race_file)
+static char g_cur_dir[MAX_PATH], g_cur_play[128], g_cur_label[96];
+static bool g_session_race;
 
 static bool on_physics_thread() { return g_active && GetCurrentThreadId() == g_physics_thread; }
 
@@ -85,6 +93,9 @@ static bool on_physics_thread() { return g_active && GetCurrentThreadId() == g_p
 // the race is left as the recording ended it, usually paused by its Esc menu, and the game shows its pause icon).
 static volatile LONG g_pause_wanted = -1;             // a main-thread pause (1) or unpause (0) for the next update
 static LONG g_game_wanted = -1;                       // replay: the game's own last request, left out while feeding
+// replay: that request, as PhysicsIsPaused answers the main thread until the next update -- the recording's main thread
+// saw its own request (g_pause_wanted) until the update took it, and the recording's flag from then on
+static volatile LONG g_replay_wanted = -1;
 static unsigned g_pauses_left_out;
 
 static void take_pause_wanted() {
@@ -103,7 +114,7 @@ static void stop_playing(const char* why) {
     if (!g_playing) return;
     g_playing = false;
     if (g_game_wanted >= 0) InterlockedExchange(&g_pause_wanted, g_game_wanted);   // taken at the next update
-    logf("replay: stopped feeding %s at update %u, tick %u: %s -- the player drives from here", g_play, g_updates, g_ticks, why);
+    logf("replay: stopped feeding %s at update %u, tick %u: %s -- the player drives from here", g_cur_play, g_updates, g_ticks, why);
 }
 
 // the next record, which must be of kind k (else the replay has desynced: stop feeding it)
@@ -239,7 +250,7 @@ static void make_name() {
 
 static FILE* open_in_dir(const char* name, const char* ext, const char* mode) {
     char path[MAX_PATH];
-    _snprintf(path, sizeof path, "%s\\%s%s", g_dir, name, ext);
+    _snprintf(path, sizeof path, "%s\\%s%s", g_cur_dir, name, ext);
     path[sizeof path - 1] = 0;
     return fopen(path, mode);
 }
@@ -267,48 +278,82 @@ static void begin_race() {
     g_physics_thread = GetCurrentThreadId();
     g_ticks = g_updates = g_diverged_ticks = 0;
     g_first_diverged = UINT32_MAX;
-    if (g_play[0]) {
+    // a session's race, or [replay]'s
+    char sname[64];
+    bool splay = false;
+    g_session_race = session_race_file(g_cur_dir, sizeof g_cur_dir, sname, sizeof sname, &splay, g_cur_label, sizeof g_cur_label);
+    bool record = g_record;
+    if (g_session_race) {
+        strcpy(g_cur_play, splay ? sname : "");
+        record = !splay;
+        if (record) strcpy(g_name, sname);
+    } else {
+        strcpy(g_cur_dir, g_dir);
+        strcpy(g_cur_play, g_play);
+        strcpy(g_cur_label, g_label);
+    }
+    if (g_cur_play[0]) {
         g_ref.clear();
         std::vector<uint8_t> ref;
-        if (!load_file(g_play, ".vpr", g_in) || g_in.size() < sizeof(StreamHeader) || memcmp(g_in.data(), "VPRP", 4)) {
-            logf("replay: can't read %s\\%s.vpr -- nothing replayed", g_dir, g_play);
+        if (!load_file(g_cur_play, ".vpr", g_in) || g_in.size() < sizeof(StreamHeader) || memcmp(g_in.data(), "VPRP", 4)) {
+            logf("replay: can't read %s\\%s.vpr -- nothing replayed", g_cur_dir, g_cur_play);
             return;
         }
         if (((const StreamHeader*)g_in.data())->version < 2) {
-            logf("replay: %s was recorded before recordings kept the AI drivers' seed -- record it again", g_play);
+            logf("replay: %s was recorded before recordings kept the AI drivers' seed -- record it again", g_cur_play);
             return;
         }
-        if (load_file(g_play, ".trace", ref) && ref.size() >= sizeof(TraceHeader)) {
+        if (load_file(g_cur_play, ".trace", ref) && ref.size() >= sizeof(TraceHeader)) {
             size_t n = (ref.size() - sizeof(TraceHeader)) / sizeof(TraceTick);
             g_ref.resize(n);
             memcpy(g_ref.data(), ref.data() + sizeof(TraceHeader), n * sizeof(TraceTick));
         }
         g_at = sizeof(StreamHeader);
         char out[MAX_PATH];
-        _snprintf(out, sizeof out, "%s.%s", g_play, g_label);
+        _snprintf(out, sizeof out, "%s.%s", g_cur_play, g_cur_label);
         open_trace(out);
         g_playing = g_active = true;
         g_game_wanted = -1;
-        logf("replay: playing %s (%u bytes; its trace has %u ticks) -> %s.trace", g_play, (unsigned)g_in.size(),
-             (unsigned)g_ref.size(), out);
-    } else if (g_record) {
-        make_name();
+        logf("replay: playing %s\\%s (%u bytes; its trace has %u ticks) -> %s.trace", g_cur_dir, g_cur_play,
+             (unsigned)g_in.size(), (unsigned)g_ref.size(), out);
+    } else if (record) {
+        if (!g_session_race) make_name();
         g_stream = open_in_dir(g_name, ".vpr", "wb");
-        if (!g_stream) { logf("replay: can't create %s\\%s.vpr -- not recording", g_dir, g_name); return; }
+        if (!g_stream) { logf("replay: can't create %s\\%s.vpr -- not recording", g_cur_dir, g_name); return; }
         StreamHeader h = {{'V', 'P', 'R', 'P'}, 2, 0x362de68c, g_seed};
         fwrite(&h, sizeof h, 1, g_stream);
         open_trace(g_name);
         g_active = true;
-        logf("replay: recording this race to %s\\%s.vpr", g_dir, g_name);
+        logf("replay: recording this race to %s\\%s.vpr", g_cur_dir, g_name);
     }
+}
+
+// [replay] record=1 alongside a session: the session's race recording copied into replays\ as ever
+static void copy_to_replays() {
+    char race[MAX_PATH];
+    strcpy(race, g_name);                                // the session's name for it (make_name writes g_name)
+    make_name();
+    char stamp[MAX_PATH];
+    strcpy(stamp, g_name);
+    strcpy(g_name, race);
+    for (const char* ext : {".vpr", ".trace"}) {
+        char from[MAX_PATH], to[MAX_PATH];
+        _snprintf(from, sizeof from, "%s\\%s%s", g_cur_dir, race, ext);
+        _snprintf(to, sizeof to, "%s\\%s%s", g_dir, stamp, ext);
+        from[sizeof from - 1] = to[sizeof to - 1] = 0;
+        CopyFileA(from, to, TRUE);
+    }
+    logf("replay: the session's %s copied to %s\\%s.vpr ([replay] record=1)", race, g_dir, stamp);
 }
 
 static void finish(const char* why) {
     if (!g_active) return;
-    if (g_stream) { put(K_END, 0, 0); fclose(g_stream); g_stream = 0; g_races_recorded++; }
+    bool recorded = false;
+    if (g_stream) { put(K_END, 0, 0); fclose(g_stream); g_stream = 0; g_races_recorded++; recorded = true; }
     if (g_trace) { fclose(g_trace); g_trace = 0; }
     if (g_dump) { fclose(g_dump); g_dump = 0; }
-    if (g_play[0]) {
+    if (recorded && g_session_race && g_record) copy_to_replays();
+    if (g_cur_play[0]) {
         bool fed_all = g_at < g_in.size() && g_in[g_at] == K_END;
         uint32_t compared = g_ticks < g_ref.size() ? g_ticks : (uint32_t)g_ref.size();
         if (g_first_diverged == UINT32_MAX)
@@ -323,7 +368,7 @@ static void finish(const char* why) {
     if (g_playing && g_game_wanted >= 0) g_pause_wanted = g_game_wanted;   // a replay: the game's own, as it ends
     take_pause_wanted();                               // a pause asked for as the race ended
     g_active = g_playing = false;
-    if (g_play[0]) {                                   // a replay drives one race; later races are the player's
+    if (g_cur_play[0] && !g_session_race) {           // a replay drives one race; later races are the player's
         logf("replay: done with %s -- the next races are yours (restart the game to replay it again)", g_play);
         g_play[0] = 0;
     }
@@ -344,22 +389,27 @@ static void __cdecl h_PhysTaskEnd(void) {
 }
 
 static void __cdecl h_PhysTaskRestart(void) {
-    bool was = g_active, playing = g_play[0] != 0;
+    bool was = g_active, playing = g_cur_play[0] != 0, session = g_session_race;
     finish("the race was restarted");
     o_PhysTaskRestart();
-    if (was && !playing) begin_race();                  // recording: the restarted race is a new recording
+    // recording: the restarted race is a new recording; a session's replay goes on to its next race file too
+    if (session || (was && !playing)) begin_race();
 }
 
 static void __cdecl h_PhysTaskUpdate(void) {
     g_physics_thread_id = GetCurrentThreadId();          // for shadow checks (port.h), race or not
+    bool granted;
+    if (!session_update_gate(&granted)) return;          // a session's lockstep: the update waits for the main thread
     if (on_physics_thread()) {
         take_pause_wanted();
+        InterlockedExchange(&g_replay_wanted, -1);          // (a replay: the game's request, now the recording's flag)
         uint8_t paused = *PHYSICS_PAUSED;
         if (g_stream) put(K_UPDATE, &paused, 1);
         else if (take(K_UPDATE, &paused, 1)) *PHYSICS_PAUSED = paused;
         g_updates++;
     }
     o_PhysTaskUpdate();
+    if (granted) session_update_done();
 }
 
 static Void_t o_PhysicsPause, o_PhysicsUnpause;
@@ -370,6 +420,7 @@ static bool pause_request(LONG want, void* from) {
     if (!g_active || GetCurrentThreadId() == g_physics_thread) return false;
     if (g_playing) {
         g_game_wanted = want;
+        InterlockedExchange(&g_replay_wanted, want);
         if (g_pauses_left_out++ < 8)
             logf("replay: the game asked to %s the physics during the replay (from %p) -- the recording's pause stands",
                  want ? "pause" : "unpause", from);
@@ -383,6 +434,7 @@ static void __cdecl h_PhysicsPause(void) { if (!pause_request(1, _ReturnAddress(
 static void __cdecl h_PhysicsUnpause(void) { if (!pause_request(0, _ReturnAddress())) o_PhysicsUnpause(); }
 static unsigned char __cdecl h_PhysicsIsPaused(void) {
     LONG w = g_pause_wanted;
+    if (w < 0 && g_playing) w = g_replay_wanted;
     if (w >= 0 && GetCurrentThreadId() != g_physics_thread) return (unsigned char)w;
     return o_PhysicsIsPaused();
 }
@@ -408,9 +460,14 @@ static void __cdecl h_Randomize(void) {
         uint32_t t = GetTickCount();
         g_seed = ((t % 30000) << 16) | ((t / 7) % 30000);
     }
+    const uint32_t chosen = g_seed;
+    g_seed = session_seed(g_seed);                      // a session keeps it; a session's replay takes its recording's
     rmarin((int)(g_seed >> 16), (int)(g_seed & 0xffff));
     logf("replay: random numbers seeded with %u/%u%s", g_seed >> 16, g_seed & 0xffff,
-         g_play[0] ? " -- the recording's, so the AI drivers are rolled as they were" : "");
+         session_playing() ? " -- the session's recording's, so the AI drivers are rolled as they were"
+         : g_play[0] ? " -- the recording's, so the AI drivers are rolled as they were" : "");
+    if (session_playing() && g_play[0] && chosen != g_seed)
+        logf("replay: [replay] play=%s is ignored: the session's replay owns the races", g_play);
 }
 
 // Random and the controls are also a shadow check's inputs (port.h): a check's rewrite pass is fed what
@@ -420,9 +477,12 @@ enum { IN_RANDOM = 1, IN_DRIVER = 2 };
 static int __cdecl h_Random(int range) {
     int v;
     if (shadow_feed(IN_RANDOM, &v, 4)) return v;
-    if (!(on_physics_thread() && g_playing && take(K_RANDOM, &v, 4))) {
+    const bool physics = on_physics_thread();
+    // the physics thread's in a race: the race recorder's; the main thread's: the session's
+    if (!(physics && g_playing && take(K_RANDOM, &v, 4)) && !(!physics && session_random_feed(range, &v))) {
         v = o_Random(range);
-        if (on_physics_thread() && g_stream) put(K_RANDOM, &v, 4);
+        if (physics && g_stream) put(K_RANDOM, &v, 4);
+        else if (!physics) session_random_saw(range, v);
     }
     shadow_saw(IN_RANDOM, &v, 4);
     return v;
@@ -496,8 +556,10 @@ void replay_install(const char* ini) {
     char dumps[256];
     GetPrivateProfileStringA("replay", "dump_ticks", "", dumps, sizeof dumps, ini);
     for (char* s = strtok(dumps, ", "); s; s = strtok(0, ", ")) g_dump_ticks.push_back(atoi(s));
-    // the input hooks (Random, DriverGet*, the clock) are also a shadow check's inputs, so they go in for either
-    const bool race = g_record || g_play[0];
+    // the input hooks (Random, DriverGet*, the clock) are also a shadow check's inputs, so they go in for either; a
+    // session (session_install, before this) needs the race hooks whatever [replay] says
+    const bool session = g_session_mode != SESSION_OFF;
+    const bool race = g_record || g_play[0] || session;
     if (!race && !shadow_on()) return;
     if (race && !g_label[0]) {
         SYSTEMTIME t;
@@ -507,7 +569,7 @@ void replay_install(const char* ini) {
     strcpy(g_dir, ini);
     char* slash = strrchr(g_dir, '\\');
     strcpy(slash ? slash + 1 : g_dir, "replays");
-    CreateDirectoryA(g_dir, 0);
+    if (g_record || g_play[0]) CreateDirectoryA(g_dir, 0);
     if (g_play[0]) {                                   // the seed must be known before start-up rolls the AI
         std::vector<uint8_t> v;
         if (load_file(g_play, ".vpr", v) && v.size() >= sizeof(StreamHeader) && !memcmp(v.data(), "VPRP", 4) &&
@@ -562,11 +624,13 @@ void replay_install(const char* ini) {
         return;
     }
     if (!race) logf("replay: input hooks in (random numbers, controls and the clock feed shadow checks)");
+    else if (session) logf("replay: the session's races are recorded or replayed in its folder%s", g_record || g_play[0]
+                           ? " ([replay] record=1 still copies each into replays\\; [replay] play is ignored: the session owns the races)" : "");
     else if (g_play[0]) logf("replay: will replay %s\\%s.vpr in the next race (this run's trace: %s)", g_dir, g_play, g_label);
     else logf("replay: recording every race to %s", g_dir);
 }
 
 void replay_report() {
     if (g_active) finish("the game closed");
-    if (g_play[0] && g_ticks == 0 && !g_active) logf("exit: replay: no race was replayed");
+    if (g_play[0] && g_ticks == 0 && !g_active && g_session_mode == SESSION_OFF) logf("exit: replay: no race was replayed");
 }

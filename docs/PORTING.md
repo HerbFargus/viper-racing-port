@@ -146,6 +146,11 @@ for a check on the main thread, where the physics can tick between the two passe
    same recording replayed with `default=original`, tick for tick; if it doesn't, a check leaks (a
    footprint misses something its function writes), and `dump_ticks` at the first differing tick names
    the field.
+5. **Main-thread code the races don't reach (the menus):** a session (`[session] record=1`) recorded
+   with the rewrite live (`default=new`), then replayed with `default=original`: it compares every frame
+   and must report "IDENTICAL over all N frames compared" with 0 reads fallen back. Play through what
+   the rewrite runs (the screens and dialogs that call it). This is the in-game check for `replay_only`
+   functions that only run in the menus.
 
 ## Fixes
 

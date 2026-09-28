@@ -27,7 +27,7 @@ go through the imports and need no tables.
 
 M3 replaces the game's own functions with C++, one at a time, against the v1.0 `race.exe`. The physics
 runs at x87 single precision (it sets that every tick), so a faithful rewrite can match the original bit
-for bit, and that is the bar. Two checks enforce it (`hook/port.h`, `port.cpp`, `replay.cpp`):
+for bit, and that is the bar. Three checks in game enforce it (`hook/port.h`, `port.cpp`, `replay.cpp`, `session.cpp`):
 
 - **Per function, `[port]`:** each rewrite is registered with `PORT_FN` and switched by its map name to
   `new`, `original` or `shadow`. In shadow mode, a check runs the original, then restores the starting
@@ -42,8 +42,20 @@ for bit, and that is the bar. Two checks enforce it (`hook/port.h`, `port.cpp`, 
   nobody driving. Both write a per-tick hash of every physics object; a replay compares itself to the
   recording live and logs the first tick where they part, and `tools/trace_diff.py` compares any two
   runs, field by field at the ticks `dump_ticks` names (tick 0 is always dumped).
+- **Per session, `[session]`** (`hook/session.cpp`): `record=1` records a whole run of the game, menus
+  included, to `sessions\<time>\`: everything the main thread reads that can differ between two runs, in
+  the order it reads it (the input the platform layer hands the game, every clock, the main thread's
+  random numbers and the start-up seed), and a per-frame hash of what the game hands the renderer (the 2D
+  page, also as a 4 x 4 grid of tiles, the surfaces it writes, the 3D state and the 3D work). The user
+  folder (`Config\`) is copied into the session when the game names it. `play=<name>` (with `label=`)
+  replays it on a fresh start, on its own copy of that folder, with real input ignored, and compares
+  every frame live: "IDENTICAL over all N frames" or the first frame where they part and what differed;
+  `tools/session_diff.py` compares any two traces. A race inside a session runs in lockstep (each physics
+  update waits for the main thread's sync points, and a replay lets the same updates run at the same
+  points), so its frames are compared too, and it is handed to the race recorder. This is the check for
+  code the menus run, which the race recorder doesn't reach.
 
-A third check runs outside the game: `test/fuzz.exe` (`test/build_fuzz.bat`) loads the v1.0 `race.exe`'s
+A fourth check runs outside the game: `test/fuzz.exe` (`test/build_fuzz.bat`) loads the v1.0 `race.exe`'s
 code at its own address, puts the FPU in the physics thread's single precision, and runs every rewrite
 whose footprint is pure against its original on millions of random inputs, NaN, infinity, denormals and
 overlapping arguments included.
@@ -154,11 +166,11 @@ main thread's buffers left out.
 
 - `hook/` — the DLL: `viperport.cpp` (M1 and install), `port.cpp` (M3's rewrites and shadow checks),
   `phys_*.cpp` (the rewritten physics),
-  `replay.cpp` (the race recorder), `platform.cpp` (window and input), `gl_core.cpp` (the OpenGL
+  `replay.cpp` (the race recorder), `session.cpp` (the session recorder), `platform.cpp` (window and input), `gl_core.cpp` (the OpenGL
   renderer, every GL call through `gl_table.cpp`), `ddraw_gl.cpp` (its DirectDraw / Direct3D facade),
   `dsound_sdl.cpp` (the audio core and its DirectSound facade); `build.bat` builds it (Visual Studio Build Tools,
   SDL2 2.32 in `../sdl2`).
 - `tools/` — the analysis: linker-map extraction, the function inventory, cross-build matching
   (`match_builds.py`, `propagate.py`, `port_sites.py`), type recovery for Ghidra (`recover_types.py`,
-  `type_names.py`, `names/`, `ApplyTypes.java`), generators (`gen_com_base.py`, `gen_texture_table.py`, `gen_port_tables.py`, `gen_leftovers.py`), `trace_diff.py`, and `disasm.py` (disassembly with every constant's value and width).
+  `type_names.py`, `names/`, `ApplyTypes.java`), generators (`gen_com_base.py`, `gen_texture_table.py`, `gen_port_tables.py`, `gen_leftovers.py`), `trace_diff.py`, `session_diff.py`, and `disasm.py` (disassembly with every constant's value and width).
 - `test/` — the offline fuzzer for pure rewrites (`fuzz.cpp`, `fuzz.h`, `build_fuzz.bat`) and a per-file compile check.

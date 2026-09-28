@@ -16,6 +16,10 @@
 //
 // Off unless viperport.ini (next to the DLL) has `[platform] sdl=1`. SDL2.dll is delay-loaded, so the DLL
 // still loads without it when the switch is off.
+//
+// A session (session.cpp) records what this layer hands the game -- each Win32Idle's events as "ops", the keys held,
+// the joystick -- and a session replay hands the game the recording's instead: the player's input is ignored (closing
+// the window still quits), and switching away really doesn't change the game (the recording's switches are applied).
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <stdint.h>
@@ -23,6 +27,7 @@
 #include "SDL.h"
 #include "SDL_syswm.h"
 #include "viperport.h"
+#include "session.h"
 
 namespace {
 
@@ -122,28 +127,37 @@ void clip_cursor(bool on) {                                      // restrict_cur
 // never passes SDL's message hook (which sees only what its loop takes from the queue): the window
 // procedure is subclassed for it.
 static WNDPROC g_sdl_wndproc;
+
+// what switching away or back does to the game: its inactive flag, and the switch-away pause
+void set_game_active(bool active) {
+    // (the physics clock: the original's physics runs on its own timer, so a race carries on while away)
+    int tick = *(volatile int*)0x0052161c;
+    if (!active) logf("platform: switched away (physics tick %d)", tick);
+    else if (*(uint8_t*)G.inactive) logf("platform: switched back (physics tick %d)", tick);
+    *(uint8_t*)G.inactive = active ? 0 : 1;
+    // FIX: the original's physics runs on its own timer, so a race carried on unseen while the game was away.
+    // A single-player race now pauses as the Esc menu pauses it (never a network race, which can't wait); the
+    // unpause resynchronises the physics clock, so nothing is caught up on the way back.
+    if (PhysicsPause && PhysicsUnpause && PhysicsIsPaused && MultiEnabled && g_phys_state) {
+        if (!active && !g_away_paused && *(volatile int32_t*)g_phys_state == 3 && !MultiEnabled() &&
+            !PhysicsIsPaused()) {
+            PhysicsPause();
+            g_away_paused = true;
+            logf("platform: the race is paused while the game is away");
+        } else if (active && g_away_paused) {
+            PhysicsUnpause();
+            g_away_paused = false;
+        }
+    }
+}
+
 static LRESULT CALLBACK game_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == WM_ACTIVATEAPP) {
         bool active = wparam != 0;
         if (active) g_n_activations++;
-        // (the physics clock: the original's physics runs on its own timer, so a race carries on while away)
-        int tick = *(volatile int*)0x0052161c;
-        if (!active) logf("platform: switched away (physics tick %d)", tick);
-        else if (*(uint8_t*)G.inactive) logf("platform: switched back (physics tick %d)", tick);
-        *(uint8_t*)G.inactive = active ? 0 : 1;
-        // FIX: the original's physics runs on its own timer, so a race carried on unseen while the game was away.
-        // A single-player race now pauses as the Esc menu pauses it (never a network race, which can't wait); the
-        // unpause resynchronises the physics clock, so nothing is caught up on the way back.
-        if (PhysicsPause && PhysicsUnpause && PhysicsIsPaused && MultiEnabled && g_phys_state) {
-            if (!active && !g_away_paused && *(volatile int32_t*)g_phys_state == 3 && !MultiEnabled() &&
-                !PhysicsIsPaused()) {
-                PhysicsPause();
-                g_away_paused = true;
-                logf("platform: the race is paused while the game is away");
-            } else if (active && g_away_paused) {
-                PhysicsUnpause();
-                g_away_paused = false;
-            }
+        if (!session_playing()) {                                // a session replay: the recording's switches, not these
+            session_active(active);
+            set_game_active(active);
         }
         clip_cursor(active);
         if (active && g_gl && g_window) SDL_RaiseWindow(g_window);
@@ -205,7 +219,7 @@ unsigned char __cdecl sdl_create_window(void* instance) {
 void __cdecl sdl_hook_keys(void) {}                              // the game's hook passed everything on anyway
 
 void __cdecl sdl_mouse_center(void) {                            // MouseCenter: the middle of the picture
-    if (!g_window) return;
+    if (!g_window || session_playing()) return;                  // (a replay leaves the player's mouse alone)
     int w = 0, h = 0;
     SDL_GetWindowSize(g_window, &w, &h);
     if (g_view.set) SDL_WarpMouseInWindow(g_window, g_view.x0 + g_view.w / 2, g_view.y0 + g_view.h / 2);
@@ -213,12 +227,26 @@ void __cdecl sdl_mouse_center(void) {                            // MouseCenter:
 }
 
 // ---- events ------------------------------------------------------------------------------------------
+// the game's input calls, each recorded in a session (an op of the Win32Idle call it's made in)
+void key_down(unsigned vk) { uint8_t b = (uint8_t)vk; session_op(SOP_KEY_DOWN, &b, 1); KeyDown(vk); }
+void key_up(unsigned vk) { uint8_t b = (uint8_t)vk; session_op(SOP_KEY_UP, &b, 1); KeyUp(vk); }
+void key_char(unsigned ch, unsigned char scan) { uint8_t b[2] = {(uint8_t)ch, scan}; session_op(SOP_KEY_CHAR, b, 2); KeyQueueChar(ch, scan); }
+void key_meta(unsigned vk, unsigned char scan) { uint8_t b[2] = {(uint8_t)vk, scan}; session_op(SOP_KEY_META, b, 2); KeyQueueMetaChar(vk, scan); }
+#pragma pack(push, 1)
+struct MouseOp { uint8_t type; int16_t x, y; uint8_t buttons; };
+#pragma pack(pop)
+void mouse_event(int type, int x, int y, int buttons) {
+    MouseOp m = {(uint8_t)type, (int16_t)x, (int16_t)y, (uint8_t)buttons};
+    session_op(SOP_MOUSE, &m, sizeof m);
+    MouseQueueEvent(type, x, y, buttons);
+}
+
 void queue_text(const char* utf8) {                              // typed text: the game's character set is ANSI
     wchar_t wide[32];
     int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, 32);
     char ansi[64];
     int m = n > 0 ? WideCharToMultiByte(CP_ACP, 0, wide, -1, ansi, sizeof ansi, 0, 0) : 0;
-    for (int i = 0; i + 1 < m; i++) KeyQueueChar((unsigned char)ansi[i], 0);
+    for (int i = 0; i + 1 < m; i++) key_char((unsigned char)ansi[i], 0);
 }
 
 void mouse(int type, int x, int y) {
@@ -228,12 +256,13 @@ void mouse(int type, int x, int y) {
         x = x < 0 ? 0 : x >= g_view.game_w ? g_view.game_w - 1 : x;
         y = y < 0 ? 0 : y >= g_view.game_h ? g_view.game_h - 1 : y;
     }
-    MouseQueueEvent(type, x, y, (int)g_mouse_buttons);
+    mouse_event(type, x, y, (int)g_mouse_buttons);
 }
 
 void handle(const SDL_Event& e) {
     switch (e.type) {
     case SDL_QUIT:                                               // WM_DESTROY, then WM_QUIT -> ExitProcess
+        session_op(SOP_QUIT);
         clip_cursor(false);
         SDL_ShowCursor(SDL_ENABLE);
         ExitProcess(0);
@@ -242,18 +271,18 @@ void handle(const SDL_Event& e) {
         const Key* k = key_for(e.key.keysym.scancode);
         if (!k) break;
         unsigned char scan = k->dik & 0x7f;
-        KeyDown(k->vk);
-        KeyQueueMetaChar(k->vk, scan);
+        key_down(k->vk);
+        key_meta(k->vk, scan);
         // the characters WM_CHAR delivered that SDL's text input doesn't: control keys and ctrl+letters
         if (k->vk == 0x08 || k->vk == 0x09 || k->vk == 0x0d || k->vk == 0x1b)
-            KeyQueueChar(k->vk, scan);
+            key_char(k->vk, scan);
         else if ((e.key.keysym.mod & KMOD_CTRL) && !(e.key.keysym.mod & KMOD_ALT) && k->vk >= 'A' && k->vk <= 'Z')
-            KeyQueueChar(k->vk - 0x40, scan);
+            key_char(k->vk - 0x40, scan);
         break;
     }
     case SDL_KEYUP: {
         const Key* k = key_for(e.key.keysym.scancode);
-        if (k) KeyUp(k->vk);
+        if (k) key_up(k->vk);
         break;
     }
     case SDL_TEXTINPUT:
@@ -289,22 +318,50 @@ void scan_update() {                                             // ScanUpdate: 
     *(uint8_t*)G.alt = state[0x38] | state[0xb8];
 }
 
+// a session: the keys held after a Win32Idle, as the DirectInput codes down
+void record_scan() {
+    if (!session_recording()) return;
+    const uint8_t* state = (const uint8_t*)G.dik;
+    uint8_t list[1 + 255];
+    int n = 0;
+    for (int i = 0; i < 256 && n < 255; i++)
+        if (state[i]) list[1 + n++] = (uint8_t)i;
+    list[0] = (uint8_t)n;
+    session_op(SOP_SCAN, list, (uint8_t)(n + 1 > 255 ? 255 : n + 1));
+}
+
 void __cdecl sdl_idle(void) {                                    // Win32Idle
     SDL_Event e;
+    if (session_playing()) {                                     // a session replay: the recording's input
+        while (SDL_PollEvent(&e))
+            if (e.type == SDL_QUIT) handle(e);                   // (closing the window still quits)
+        if (session_play_idle()) return;
+    }                                                            // (the recording ran out: the player's, from here)
+    session_idle_begin();
     if (*(uint8_t*)G.inactive) {                                 // switched away: wait to be switched back
         DWORD t0 = GetTickCount();
         if (g_gl) gfx_repaint();                                 // the taskbar's preview: the race, not a menu
         while (*(uint8_t*)G.inactive && SDL_WaitEvent(&e)) handle(e);
         logf("platform: the game loop waited %lu ms while switched away", GetTickCount() - t0);
+        session_op(SOP_CLEAR_BITS);
         KeyClearBits();
+        session_op(SOP_RESTORE);
         gxRestore();
     }
     while (SDL_PollEvent(&e)) handle(e);
     scan_update();
+    record_scan();
+    session_idle_end();
 }
 
 void __cdecl sdl_scan_begin(void) { memset((void*)G.dik, 0, 256); }
-void __cdecl sdl_scan_update(void) { scan_update(); }
+void __cdecl sdl_scan_update(void) {                             // (only the original Win32Idle calls it)
+    if (session_playing() && session_play_idle()) return;
+    session_idle_begin();
+    scan_update();
+    record_scan();
+    session_idle_end();
+}
 
 // ---- joysticks and wheels ----------------------------------------------------------------------------
 // JoyPos, as JoyGetPos fills it from DirectInput's DIJOYSTATE: axes X Y Z Rz Rx Ry in -1..1, 32 buttons,
@@ -349,7 +406,22 @@ void __cdecl sdl_joy_end(void) {
     g_haptic = 0, g_pad = 0, g_joy = 0, g_effect = -1;
 }
 
-unsigned char __cdecl sdl_joy_get_pos(JoyPos* p) {
+unsigned char joy_get_pos(JoyPos* p);
+struct JoyRec { uint8_t ok; JoyPos pos; };
+unsigned char __cdecl sdl_joy_get_pos(JoyPos* p) {               // in a session: recorded, and fed back
+    JoyRec r;
+    if (session_feed(SK_JOYPOS, &r, sizeof r)) {
+        if (r.ok) *p = r.pos;
+        return r.ok;
+    }
+    memset(&r, 0, sizeof r);
+    r.ok = joy_get_pos(&r.pos);
+    if (r.ok) *p = r.pos;
+    session_saw(SK_JOYPOS, &r, sizeof r);
+    return r.ok;
+}
+
+unsigned char joy_get_pos(JoyPos* p) {
     if (!g_joy) return 0;
     memset(p, 0, sizeof *p);
     if (g_pad) {
@@ -391,8 +463,19 @@ unsigned char __cdecl sdl_joy_get_pos(JoyPos* p) {
     return 1;
 }
 
-const char* __cdecl sdl_joy_get_name(void) { return g_joy_name; }
-unsigned char __cdecl sdl_joy_has_ff(void) { return g_effect >= 0; }
+char g_fed_joy_name[128];
+const char* __cdecl sdl_joy_get_name(void) {
+    if (session_feed(SK_JOYNAME, g_fed_joy_name, sizeof g_fed_joy_name)) return g_fed_joy_name;
+    session_saw(SK_JOYNAME, g_joy_name, sizeof g_joy_name);
+    return g_joy_name;
+}
+unsigned char __cdecl sdl_joy_has_ff(void) {
+    uint8_t v;
+    if (session_feed(SK_JOYFF, &v, 1)) return v;
+    v = g_effect >= 0;
+    session_saw(SK_JOYFF, &v, 1);
+    return v;
+}
 
 void __cdecl sdl_joy_enable_ff(unsigned char on) {
     if ((on != 0) == g_ff_on) return;
@@ -422,6 +505,40 @@ void __cdecl sdl_joy_set_force(float a, float b, float c) {
 }
 
 }  // namespace
+
+// a session replay: one recorded op of a Win32Idle call, handed to the game as the live code hands it (session.h)
+void platform_session_apply(uint8_t op, const uint8_t* p, uint8_t n) {
+    switch (op) {
+    case SOP_KEY_DOWN: if (n >= 1) KeyDown(p[0]); break;
+    case SOP_KEY_UP: if (n >= 1) KeyUp(p[0]); break;
+    case SOP_KEY_CHAR: if (n >= 2) KeyQueueChar(p[0], p[1]); break;
+    case SOP_KEY_META: if (n >= 2) KeyQueueMetaChar(p[0], p[1]); break;
+    case SOP_MOUSE:
+        if (n >= sizeof(MouseOp)) {
+            MouseOp m;
+            memcpy(&m, p, sizeof m);
+            MouseQueueEvent(m.type, m.x, m.y, m.buttons);
+        }
+        break;
+    case SOP_ACTIVE: if (n >= 1) set_game_active(p[0] != 0); break;
+    case SOP_CLEAR_BITS: KeyClearBits(); break;
+    case SOP_RESTORE: gxRestore(); break;
+    case SOP_SCAN: {
+        uint8_t* state = (uint8_t*)G.dik;
+        memset(state, 0, 256);
+        for (int i = 0; n >= 1 && i < p[0] && 1 + i < n; i++) state[p[1 + i]] = 0x80;
+        *(uint8_t*)G.shift = state[0x2a] | state[0x36];
+        *(uint8_t*)G.ctrl = state[0x1d] | state[0x9d];
+        *(uint8_t*)G.alt = state[0x38] | state[0xb8];
+        break;
+    }
+    case SOP_QUIT:
+        logf("platform: the recording closed the game here");
+        clip_cursor(false);
+        SDL_ShowCursor(SDL_ENABLE);
+        ExitProcess(0);
+    }
+}
 
 void platform_report() {
     if (g_window)

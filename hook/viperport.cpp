@@ -24,6 +24,7 @@
 #include <vector>
 #include "viperport.h"
 #include "port.h"
+#include "session.h"
 
 // ---- the one export, forwarded ---------------------------------------------------------------------
 typedef HRESULT(WINAPI* DirectInputCreateA_t)(HINSTANCE, DWORD, void**, void*);
@@ -676,6 +677,7 @@ static void install() {
     char* slash = strrchr(ini, '\\');
     lstrcpyA(slash ? slash + 1 : ini, "viperport.ini");
     port_install(ini);                          // M3: rewritten functions (Obstacle::Update, collide_phobs, ...)
+    session_install(ini);                       // M3: the session recorder (before the race recorder, which it drives)
     replay_install(ini);                        // M3: the race recorder and replayer
     platform_install(g_build->name);            // M2: SDL2 window and input, when viperport.ini asks
     install_diagnostics();
@@ -704,6 +706,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
             logf("exit: options items %ld (stock table 256), languages %ld (stock 8), open-file slots ever used %ld (stock 32)",
                  *(volatile LONG*)0x0055a05c, *(volatile LONG*)0x00509638, *(volatile LONG*)0x00505ea0);
         replay_report();
+        session_report();
         port_report();
         renderer_report();
         platform_report();
