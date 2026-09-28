@@ -60,7 +60,7 @@ code at its own address, puts the FPU in the physics thread's single precision, 
 whose footprint is pure against its original on millions of random inputs, NaN, infinity, denormals and
 overlapping arguments included.
 
-The rewrites so far, 5,189 functions (the physics and AI, 881 of them, in `hook/phys_*.cpp`, layouts in
+The rewrites so far, 5,647 functions (the physics and AI, 881 of them, in `hook/phys_*.cpp`, layouts in
 `hook/phys_types.h`):
 - **3.2, collisions:** the physics library's maths helpers, every collision volume (sphere, cube, sphere
   group, moveable sphere, cylinder, tube, box), the pairwise collision tests, and `collide.obj`'s crash
@@ -126,6 +126,15 @@ That is the whole physics and AI code, apart from the debug screens' drawing.
   checks every one against its original offline, and a race recorded with them replays identically on
   the original code. Still original: the 13 platform functions the SDL layer replaces, and `WinMain`,
   which comes with the main loop.
+- **The widget toolkit** (`hook/ui_*.cpp`, 458 more), the first of the UI stage: the text styles and word
+  wrap (`ui_style`), the widget windows (`ui_window`: creating and running them, focus, groups, the title
+  bar), the widgets themselves (`ui_widget`: buttons, check boxes, radio buttons, sliders, scroll bars,
+  list and drop-down boxes, text input, number fields, the control detector), and the dialogs and menus
+  built from them (`ui_dialog`: the OK / yes-no / input / open and save file boxes, `UIDoMenu`,
+  `UIDoDialog`), with their static initialisers generated (`ui_leftover.cpp`). Every menu is built from
+  them. `test/world_ui.cpp` checks all 458 against the originals offline on real windows made by the
+  game's own code; the modal ones, and those that allocate or reach menu code through a callback, are
+  checked in game by a session replay.
 
 Then a chosen set of the original's bugs is fixed, always on: the AI crash (a car losing its place on
 its racing line), degenerate racing lines, a ground-contact divide by zero, vrmod's obstacle wake, a single race on a
@@ -168,7 +177,7 @@ main thread's buffers left out.
   `phys_*.cpp` (the rewritten physics),
   `replay.cpp` (the race recorder), `session.cpp` (the session recorder), `platform.cpp` (window and input), `gl_core.cpp` (the OpenGL
   renderer, every GL call through `gl_table.cpp`), `ddraw_gl.cpp` (its DirectDraw / Direct3D facade),
-  `dsound_sdl.cpp` (the audio core and its DirectSound facade); `build.bat` builds it (Visual Studio Build Tools,
+  `dsound_sdl.cpp` (the audio core and its DirectSound facade), `ui_*.cpp` (the widget toolkit); `build.bat` builds it (Visual Studio Build Tools,
   SDL2 2.32 in `../sdl2`).
 - `tools/` — the analysis: linker-map extraction, the function inventory, cross-build matching
   (`match_builds.py`, `propagate.py`, `port_sites.py`), type recovery for Ghidra (`recover_types.py`,
