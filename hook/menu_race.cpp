@@ -13,6 +13,10 @@
 // Footprints (main thread): all replay_only -- the two menus run dialogs (modal) and read and write the options (and the
 // setup builds and destroys the choosers, which load cars and tracks); replay_cb runs the replay loader's dialog;
 // paintkit_cb the paint kit.
+//
+// Fixes (// FIX:, docs/FIXES.md "Menus"): MenuDoRaceMenu cuts the default player name (a translation) to its 16-byte
+// buffer; MenuDoRaceSetup's random track with only two rows in the track table takes the first row (it divided by 0).
+// The rest are FIX CANDIDATEs, left faithful.
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -47,8 +51,6 @@ static __forceinline void raw(void* p, uint32_t type, uint32_t id, uint32_t x, u
 // (no title, main.stp, no default), whose item list is set once, to the first call's frame.
 // FIX CANDIDATE: that list pointer (0x4f810c) is never set again -- a later call from a deeper or shallower stack would
 // run the old frame's contents; the game calls it from one place, at one depth.
-// FIX CANDIDATE: the default name (the Xlator's text) is copied into the 16-byte buffer unbounded; a translation longer
-// than 15 characters runs into the item list, which is built over it afterwards (the stock text is short).
 static int32_t __cdecl MenuDoRaceMenu_n() {
     Frame<0x438> fr;
     once_xl(S_RACEMENU_ONCE, 1, 0x00579e20, 0x004f8114, 0x004871d0);
@@ -60,7 +62,13 @@ static int32_t __cdecl MenuDoRaceMenu_n() {
     once_xl(S_RACEMENU_ONCE, 0x40, 0x00579e10, 0x004f81a0, 0x00487170);
     once_xl(S_RACEMENU_ONCE, 0x80, 0x00579d68, 0x004f81b4, 0x00487160);
     xl(0x00579e20);
-    crt_strcpy((char*)fr.at(0x438), UI_GP(const char, 0x00579e24));
+    // FIX: the default name (Main_Menu:DefaultPlayerName's translation, "Player" in English) was copied into the 16-byte
+    // buffer unbounded: a translation over 15 characters ran into the item list (built over it afterwards: with no saved
+    // name to replace it, the name was left unterminated, and the field and the option saved showed item bytes after
+    // it), and a long enough one into the saved registers and the return address. It's cut to 15 characters; one that
+    // fits is copied as before.
+    if (VP_FIX) ui_copy_bounded((char*)fr.at(0x438), UI_GP(const char, 0x00579e24), 16);
+    else crt_strcpy((char*)fr.at(0x438), UI_GP(const char, 0x00579e24));
     const char* global = UI_GP(const char, S_SEC_RACE_GLOBAL);
     ccall<void>(F_OptionsGetS, global, (const char*)0x004f81c4, (char*)fr.at(0x438), (int32_t)0xd);
     IC(0x428, 0xe, 0, 0x10, 0xe, 0, 0, 0x004f81d0, 0, 0, 0, 0, 0, 0, 0);
@@ -181,9 +189,11 @@ static uint8_t __cdecl MenuDoRaceSetup_n(char* car, char* track, void* game) {
         if (ccall<int>(F_strnicmp, name, (const char*)0x004f834c, (uint32_t)6) == 0) {
             const int32_t t = ccall<int32_t>(F_PTimeNow);
             const int32_t n = ccall<int32_t>(F_GetTrackCount) - 2;
-            // FIX CANDIDATE: a random track divides by the track count - 2 (a crash with only two tracks) and a
-            // negative time gives a negative index; the stock game has more tracks, and PTimeNow starts at 0
-            name = ccall<const char*>(F_GetTrackName, t % n);
+            // FIX: a random track is one of the rows before the last two (the stock table ends with random and the test
+            // track, hell), picked by the time modulo the track count - 2: a table of exactly two rows divided by 0 and
+            // crashed. There's no row to pick from, so it takes row 0, as a one-row table already did (t % -1 == 0).
+            // FIX CANDIDATE (left): a negative time gives a negative index; PTimeNow starts at 0
+            name = ccall<const char*>(F_GetTrackName, (VP_FIX && n == 0) ? 0 : t % n);
         } else {
             name = tcall<const char*>(F_TrackViewer_GetTrackName, fr.at(0x3d8));
         }

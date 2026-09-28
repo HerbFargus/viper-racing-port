@@ -312,4 +312,20 @@ static __forceinline void item_end(void* it) { uit::crt_copy(it, (const void*)(u
 // a LocaleInfo field (the static pointer read where the original reads it)
 static __forceinline uint8_t* locale() { return UI_GP(uint8_t, S_LOCALE); }
 
+// ---- the fixes' helpers (docs/PORTING.md, "Fixes"; each use is marked // FIX:) ----------------------------------------------
+// s as a format's %s argument where the text is formatted in a buffer of the rewrite's: s itself, or (the fix build only)
+// a copy of its first max characters in buf (max + 1 bytes) when it's longer, so what the format prints is bounded
+static __forceinline const char* fix_cut(const char* s, char* buf, uint32_t max) {
+    if (!VP_FIX || uit::ui_strnlen(s, max) <= max) return s;
+    uit::ui_copy_bounded(buf, s, max + 1);
+    return buf;
+}
+// the characters the game's %d prints for v (a '-' and the digits)
+static __forceinline uint32_t fix_dec_len(int32_t v) {
+    uint32_t n = v < 0 ? 2u : 1u;
+    uint32_t u = v < 0 ? 0u - (uint32_t)v : (uint32_t)v;
+    while (u >= 10u) { u /= 10u; n++; }
+    return n;
+}
+
 }  // namespace mview

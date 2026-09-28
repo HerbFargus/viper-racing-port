@@ -236,6 +236,75 @@ Past the toolkit's tables (a mod or menu code that adds too much):
   the error now comes first. A cycling text button with more than 8 choices wrote past itself; it keeps
   the first 8.
 
+The garage (the setup editor, hook/menu_car.cpp):
+
+- A car name over 27 characters (a mod's) was built into "<car>.car" in 32 bytes with the dialog's item list right
+  after it, so the items overwrote the end of the name and the garage unloaded the wrong resource set on the way out;
+  past 236 characters "<car>.cf" ran over the garage's return address too. Both names now have 240 bytes, and a car
+  name too long for them (no menu can pass one) is cut to its first 235 characters.
+- An unsaved setup is saved with a '*' before its name, made by moving the name one place on. A name of 62 characters
+  or more (the save dialog takes 63) was moved past the setup, so the setup was saved with a name that doesn't end.
+  The '*' and the name now stay inside the name's 64 bytes: a 62-character name comes out as before, a 63-character
+  one loses its last character when it's marked unsaved.
+- The save dialog copied the setup's name into its field with no limit, so a name that doesn't end (the '*' above, or
+  a damaged file) ran over the dialog's return address; it's held to the field's 64 bytes. (Typing a long name was
+  always safe: the field holds 63 characters and the original's frame had room for them.)
+- A car file with more than 6 gears made the gearbox page (which keeps each gear at least 0.04 below the one before)
+  work through that many ratios, so it changed the setup values after the six gears, and then memory past the setup;
+  a huge gear count sent it through the game's memory until it crashed. It now keeps the six gears the garage shows.
+
+The main menu and the single race's setup (hook/menu_race.cpp). Neither comes up with the stock game: one needs a
+language file's long text, the other a mod's track table.
+
+- The main menu's player name starts as the language file's default (Main_Menu:DefaultPlayerName, "Player" in
+  English), copied into a 16-byte buffer with no limit. A translation over 15 characters ran into the menu's item list.
+  If a name was already saved it replaced the default and nothing showed. The first time, with no saved name, the item
+  list was built over the name's tail and left it unterminated: the name field and the saved option carried item bytes
+  after it. A translation of about a thousand characters reached the return address. The default is now cut to its
+  first 15 characters. A text that fits is copied exactly as before.
+- Random Track picks one of the track table's rows before its last two (the stock table ends with the random entry and
+  the unused test track, hell), by the time modulo the track count minus 2. A table of exactly two rows (a mod's table
+  with one track and the random entry, say) divided by zero and crashed the game on the way into the race. It now
+  takes the first row, as a one-row table always did. Any other table picks as before. (A negative time would give a
+  negative row, but the game's clock starts at 0, so that one is left alone.)
+
+The race setup screen's choosers and the high score board (hook/menu_view.cpp, menu_board.cpp). None of these come up
+with the stock cars, tracks and English text; they are a mod car or track with a long name or big stats, or a long
+translation.
+
+- The track viewer: a track name (tracks.tab) of 75 or more characters overran the stack when "<name>.stp" was built
+  for its map. The name is cut to 74 characters. No map has that name, so none is shown, the same as for any missing map.
+- The car viewer loads "<car>0.mod" and cuts the name at the character before its first '.' to get "<car>" for the
+  paint job's texture. A name of 32 or more characters (a car name of 27 or more) overran the stack. It is now cut to 31
+  for the texture names, which are then too long to name a texture, so the car shows unpainted. The model and its .cf
+  still load by the whole name, and the .cf's name is held to its 256 bytes. The paint job's texture name
+  ("~<car>.tex") overran its 32 bytes. It then went into the model's 16-byte remap entry unbounded, and from 24
+  characters on it ran past the entry into an Xlator. The texture name now has room, and the entry keeps to its 0x18
+  bytes. The model reads the first 16 characters, as it always did. A name with no '.' wrote to address -1 (a crash),
+  and one with a '.' first wrote before its buffer. Neither is cut now.
+- The opponent viewer (a ghost car): a car name of 32 or more characters overran its field, over the label and the
+  stamps. It keeps 31 characters. Its model name, "<car>1.mod", overran the stack from 27 characters; the buffer now
+  holds it. The resource set name ("<car>.car") went into the viewer's 32 bytes. A name too long for them overran into
+  the car's name, and a 27-character one overran its texture name onto the return address. The set must be named in
+  full to load, so such a car isn't shown, the same as no car. A label translation of 35 or more characters overran the
+  stamps' pointers (a crash when they were freed); it keeps 34. MenuDoRaceSetup's ghost car is always "viper", so this is
+  only reachable by other callers.
+- The car details: the .tab's description (entry 6), at 32 or more characters, overran the car's stats and its car
+  list's callbacks; it keeps 31. The stats are printed into texts of 16 and 32 bytes. A big stat or a long translation
+  of a unit ran each text into the next, and the last one into the car viewer's vtable (a crash). Each text now keeps
+  what fits: 15 or 31 characters.
+- The race options: the summary ("<field>: <laps> <unit>", or the event's name) went into the setup screen's 32-byte
+  text, and a longer one ran into the option viewer's vtable. The laps text went into 36 bytes, and a longer one ran
+  into the opponent viewer. Each keeps what fits, 31 and 35 characters. The setup screen may be the original's, so the
+  summary is held to its 32 bytes.
+- The high score board: its title ("<race type>: <realism>") went into 64 bytes at the end of the frame, and a longer
+  one ran onto the return address. It keeps 63 characters.
+- The board's title, and the post-race board's "<race type> : <track>: <realism>", were drawn with the text as a printf
+  format, with nothing else passed. A '%' conversion or a '*' in a translation or track name read arguments from the
+  stack: garbage, or a crash for "%s" and "%n". Such a title is now drawn as written. Every other title is still the
+  format, so it draws exactly as before ("%%" as '%'). The check is the game's own printf state machine, run from its
+  table, and it agrees with the game's printf on every test text and 20,000 random ones.
+
 ## Limits lifted
 
 Like M1's limits, these move a table into the DLL for the original code and the rewrites alike, so
@@ -269,3 +338,10 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
   edge. Every control reads them as a width and height, so it's as the game was written, and stays. The
   upgrade catalogue (career) word-wraps an upgrade's description into a 2 KB buffer of its own, so a
   description of 2-4 KB still overruns it until the career stage's rewrite grows the buffer.
+- Menus, names no stock or known mod file has: the garage builds its setup files' paths in 256 bytes, and
+  the car viewer names a car's resource set ("<car>.car") in 32, so a car name of about 235 characters,
+  or of 28 to 31 for the viewer, still overruns; the choosers copy a car's or track's friendly name into
+  the setup screen's buffers unbounded. A damaged file or options file (a setup slot outside 0..7, a
+  negative saved track, an unknown opponent type or mixer, a gear ratio of 1e28), and the menus that set
+  a dialog's items once from their first call's stack frame (always the same depth), are left as the
+  game has them.

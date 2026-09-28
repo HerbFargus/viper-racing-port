@@ -32,11 +32,16 @@
 // the setup's gear ratios (kept 0.04 apart), AeroControl::Draw the running window's groups. Callback writes the
 // control and its CustomWidget. get_gear, tire_fn, shock_fn, power_fn write nothing but their own frames.
 //
-// FIX CANDIDATEs (left faithful, marked where they are): MenuEditCar's 32-byte "<car>.car" buffer and 240-byte
-// "<car>.cf" one, load_setup_set / save_setup_set / export_setup's 256-byte paths (a long user directory or name), the
-// save dialog's 64-character name field in a 48-byte buffer, a slot outside 0..7 (from a damaged .set) indexing past
-// the set, ChassisControl / AlignControl's page outside their text tables, DrivetrainControl::Draw's gear count past 6,
-// the '*' prefix shifting a 63-character name past the setup, and the sprintf buffers a huge value would overrun.
+// Fixes (// FIX:, docs/FIXES.md "Menus"): MenuEditCar builds "<car>.car" in 240 bytes, not 32 (a car name over 27
+// characters was overwritten by the item list before the resource set was unloaded), and cuts a name too long for its
+// two 240-byte buffers; it keeps the '*' it puts before an unsaved setup's name inside the name's 64 bytes (a 62- or
+// 63-character name was moved past the setup); the save dialog's name buffer is the field's 64 bytes and the setup's
+// name is copied into it bounded; DrivetrainControl::Draw keeps only the setup's six ratios apart (a car file with more
+// gears read and wrote past them). Every other input gives the original's bits.
+//
+// FIX CANDIDATEs (left faithful, marked where they are): load_setup_set / save_setup_set / export_setup's 256-byte
+// paths (a long user directory or name), a slot outside 0..7 (from a damaged .set) indexing past the set, ChassisControl
+// / AlignControl's page outside their text tables, and the sprintf buffers a huge value would overrun.
 #include <math.h>
 #include <stdint.h>
 #include <initializer_list>
@@ -313,8 +318,7 @@ static void fp_modal_i(Footprint& f, int32_t) { f.replay_only = "runs a dialog (
 static void fp_modal0(Footprint& f) { f.replay_only = "runs a dialog (modal: its own input loop)"; }
 
 // the save dialog: a name (the setup's, without its '*'), a list of the 8 slots; OK stores the setup in the slot picked
-// FIX CANDIDATE: the name field takes 64 characters (item i1c 0x40) into a 48-byte buffer, reachable by typing a long
-// name; a slot outside 0..7 (a damaged .set) stores the setup outside the set.
+// FIX CANDIDATE: a slot outside 0..7 (a damaged .set) stores the setup outside the set.
 static uint8_t __cdecl save_setup_dlg_n() {
     struct {
         volatile int32_t sel;                            // F+0x10
@@ -322,8 +326,10 @@ static uint8_t __cdecl save_setup_dlg_n() {
         UIStringList list;                               // F+0x28
         UIDialogItem items[6];                           // F+0x3c
         char tmp[0x20];                                  // F+0x18c
-        char name[0x30];                                 // F+0x1ac
-        char past[0x10];                                 // F+0x1dc: unused -- but the name field (64 bytes) reaches it
+        // FIX: the name field (item i1c 0x40: 63 characters and the terminator) writes 64 bytes. The original's frame
+        // gives it F+0x1ac up to its return address, exactly 64 bytes (48 of them a named buffer, 16 no other local
+        // uses), so typing never overran there; the rewrite declares the 64 bytes, so the field stays inside its buffer.
+        char name[0x40];                                 // F+0x1ac
     } fr;
     xl_once(M_ONCE_SAVE, 1, 0x0057a770, 0x004f974c, 0x00492a90);
     xl_once(M_ONCE_SAVE, 2, 0x0057aef0, 0x004f9764, 0x00492a80);
@@ -339,7 +345,11 @@ static uint8_t __cdecl save_setup_dlg_n() {
     }
     const char* prompt = xl_text(0x0057a770);
     const char* src = UI_G8(M_SETUP_NAME) == 0x2a ? (const char*)(uintptr_t)(M_SETUP_NAME + 1) : (const char*)(uintptr_t)M_SETUP_NAME;
-    crt_strcpy(fr.name, src);
+    // FIX: the setup's name was copied in with no bound: one with no end inside its 64 bytes (the original's '*' shift,
+    // MenuEditCar's, could leave a 63-character one ending past the setup, in whatever followed) ran on over the return
+    // address. It is held to the field's 64 bytes; a name that ends inside them is the same bytes.
+    if (VP_FIX) ui_copy_bounded(fr.name, src, sizeof fr.name);
+    else crt_strcpy(fr.name, src);
     it_set(&fr.items[0], 5, 0, 0xa0, 0x20, 0, 0, P(prompt), 0, 0, 0xe, 0, 0, 0, 0);
     it_set(&fr.items[1], 9, 0, 0x28, 0x23, 0xf0, 0x10, 1, 0x40, P(fr.name), 9, 0, 0, 0, 0);
     it_set(&fr.items[2], 0x14, 0, 0x32, 0x42, 0xdc, 0x82, 0, 0, P(&fr.list), 0, 0, 0, P((const void*)&fr.sel), 0);
@@ -602,11 +612,14 @@ PORT_FN(0x004932a0, "export_setup", export_setup_n, fp_export)
 // =====================================================================================================================
 // car: the car's name ("<car>.car" its resources, "<car>.cf" its car file); dir: the setup's (and the set's) name;
 // flags: CarFileLoad's; title: the dialog's (0: none). 1 if the dialog ended with the Race button (-2).
-// FIX CANDIDATE: "<car>.car" is sprintf'd into 32 bytes (the item list follows it, so a car name over 27 characters is
-// overwritten there before ResourceSetUnload reads it back), "<car>.cf" copied into 240 at the frame's top; the '*'
-// marking an unsaved setup shifts the whole name, and the byte after it, one place on -- a 62-character name moves it
-// past the setup.
+// (garage_cb's car is a 64-byte static, 0x505d38; the multiplayer chooser's its car viewer's 32-byte name.)
 static uint8_t __cdecl MenuEditCar_n(const char* car, const char* dir, uint8_t* flags, const char* title) {
+    // FIX: "<car>.car" was sprintf'd into 32 bytes with the item list after it, so a car name over 27 characters was
+    // overwritten there by the items before ResourceSetUnload read it back (the wrong resource set unloaded), and
+    // "<car>.cf" copied into 240 bytes at the frame's top (a name over 236 characters ran on over the return address).
+    // The rewrite's "<car>.car" buffer is 240 bytes like "<car>.cf"'s, and a name too long for them (no caller
+    // passes one, above) is cut to its first 235 characters in both. A name that fits is the same bytes.
+    enum : uint32_t { NAME_MAX = 0xeb };
     struct {
         volatile uint8_t ret;                            // F+0x13
         AlignControl align;                              // F+0x14
@@ -616,11 +629,17 @@ static uint8_t __cdecl MenuEditCar_n(const char* car, const char* dir, uint8_t* 
         DrivetrainControl drive;                         // F+0xa4 (its TorqueCurveControl at F+0xc4)
         AeroControl aero;                                // F+0xe8
         TorqueCurveControl spare;                        // F+0x110: never added (only its stamp is ever stored)
-        char res[0x20];                                  // F+0x12c "<car>.car"
+        char res[VP_FIX ? 0xf0 : 0x20];                  // F+0x12c "<car>.car" (FIX: above)
         UIDialogItem items[22];                          // F+0x14c
         char cf[0xf0];                                   // F+0x61c "<car>.cf"
     } fr;
-    UI_sprintf(fr.res, (const char*)0x004f94d0, car);                                // "%s.car"
+    const bool cut = VP_FIX && ui_strnlen(car, NAME_MAX) > NAME_MAX;                 // FIX: (above)
+    if (cut) {
+        ui_copy_bounded(fr.res, car, NAME_MAX + 1);
+        crt_copy(fr.res + NAME_MAX, (const void*)(uintptr_t)0x004f94d2, 5);           // ".car" (the format's tail)
+    } else {
+        UI_sprintf(fr.res, (const char*)0x004f94d0, car);                            // "%s.car"
+    }
     ccall<void>(F_ResourceSetMustLoad, (const char*)fr.res);
     UI_GP(const char, M_CAR_NAME) = car;
     UI_GP(const char, M_CAR_DIR) = dir;
@@ -643,7 +662,8 @@ static uint8_t __cdecl MenuEditCar_n(const char* car, const char* dir, uint8_t* 
     }
     ccall<void>(F_load_setup_set, car, dir, (void*)(uintptr_t)M_SET);
     UI_GF(M_SLOT_F) = (float)UI_G32(M_SET_SLOT);
-    crt_strcpy(fr.cf, car);
+    if (cut) ui_copy_bounded(fr.cf, car, NAME_MAX + 1);                              // FIX: (above)
+    else crt_strcpy(fr.cf, car);
     crt_copy(fr.cf + crt_strlen(fr.cf), (const void*)(uintptr_t)0x004f94f0, 4);     // ".cf"
     if (!ccall<uint8_t>(F_CarFileLoad_file, (void*)(uintptr_t)M_CARFILE, (const char*)fr.cf, flags)) {
         UI_LogReport((const char*)0x004f94f4, (const char*)fr.cf);                   // "Couldn't load carfile: %s"
@@ -732,7 +752,14 @@ static uint8_t __cdecl MenuEditCar_n(const char* car, const char* dir, uint8_t* 
     if (setup_changed()) {
         // unsaved: '*' before the name (the name and the byte after its end each moved one place on)
         int32_t n = (int32_t)crt_strlen((const char*)(uintptr_t)M_SETUP_NAME) + 2;
-        if (n > 0) {
+        // FIX: a name of 62 characters or more (the save dialog takes 63) moved its end past the setup's 64-byte name:
+        // 62 put the byte after the terminator past the setup, 63 the terminator too, so the setup was saved with a
+        // name that doesn't end. The name is kept inside its 64 bytes: '*', its first 62 characters, the terminator
+        // (a 62-character name comes out the same; a 63-character one loses its last character).
+        if (VP_FIX && n > 0x3f) {
+            for (uint32_t k = 0x3e; k != 0; k--) UI_G8(M_SETUP_NAME + k) = UI_G8(M_SETUP_NAME + k - 1);
+            UI_G8(M_SETUP_NAME + 0x3f) = 0;
+        } else if (n > 0) {
             do {
                 UI_G8(M_SETUP_NAME + (uint32_t)n) = UI_G8(M_SETUP_NAME - 1 + (uint32_t)n);
             } while (--n != 0);
@@ -1534,8 +1561,6 @@ static void __fastcall DrivetrainControl_Callback_n(DrivetrainControl* self, Edx
 }
 PORT_FN(0x00497e00, "DrivetrainControl::Callback", DrivetrainControl_Callback_n, fp_callback<DrivetrainControl>)
 
-// FIX CANDIDATE: the gears are kept 0.04 apart for the car file's gear count (0x57b140) minus one: a count past 6 reads
-// and writes on past the setup's six ratios (into the rest of the setup, then beyond it).
 static void __fastcall DrivetrainControl_Draw_n(DrivetrainControl* self, Edx, gxCanvas* canvas) {
     struct {
         volatile uint32_t ratio;                         // F+4
@@ -1546,7 +1571,11 @@ static void __fastcall DrivetrainControl_Draw_n(DrivetrainControl* self, Edx, gx
     stamp_at(self->stamp[0], self->x, self->y, 0);
     stamp_at(self->stamp[1], self->x + 0xf, self->y + 7, self->page);
     // each gear at least 0.04 below the one before it
-    const int32_t n = UI_G32(M_CARFILE_108) - 1;
+    int32_t n = UI_G32(M_CARFILE_108) - 1;
+    // FIX: this ran for the car file's gear count (0x57b140), so a car file with more than 6 gears read and raised the
+    // values after the setup's six ratios (the rest of the setup, then past it; a huge count wrapped the address): only
+    // the six are kept apart. The garage shows and edits six gears in any case.
+    if (VP_FIX && n > 5) n = 5;
     if (n > 0) {
         const double gap = KF(0x3d23d70au);
         uint32_t p = (uint32_t)n * 4u + 0x0057afb0u;

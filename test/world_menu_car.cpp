@@ -5,6 +5,7 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_menu_car.cpp
 //        /Fo<dir>\ /Fe<dir>\world_menu_car.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_menu_car.exe [rounds] [seed]          (VP_TRACE=1: one line per function; VP_ONLY=text: only those)
+//   the fix build: the same with /DVP_MENU_FIXES (below)
 //
 // Loads out\race_v10.exe at 0x400000 the way test/world_ui.cpp does (whose loader, memory comparison, input script,
 // 2D stubs and raw call this copies) and includes hook/menu_car.cpp, with PORT_FN redefined to list each function: its
@@ -58,6 +59,17 @@
 // original callbacks), CarFileCombine, Tire::GetForce, Damper, PowerCurve::Setup, UIDialogItem's and Xlator's
 // constructors, strncpy, __ftol -- and mcar.obj's own functions wherever a rewrite calls them by address (each rewrite
 // is checked against its original with the same callees).
+//
+// Built with /DVP_MENU_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Menus"). Every
+// function is still compared as above, on states kept clear of the fixed cases: the car file's gear count never past 6
+// (the random world's names -- the car's, the setup's up to 30 characters, at most 24 more typed -- never reach the
+// others: a car name over 27 characters, a setup name of 62 or more, one with no end). Then directed_fix_tests: for
+// each fix, the bad case run on the rewrite alone -- a clean return (no fault, the bytes popped, ebx / esi / edi / ebp
+// kept), what the fix promises, and all memory and the call logs compared with the ORIGINAL run on the nearest case it
+// gets right (the name cut where the fix cuts it, six gears, a short car name at the same address), with guard bytes
+// after the setup checked untouched -- and, where running it can't take this program down, that the original really
+// goes wrong there. (A name typed to the save dialog's limit is compared with the original outright: its frame holds
+// the field's 64 bytes.) Without it (VP_FAITHFUL) every rewrite must match its original bit for bit.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -71,8 +83,13 @@
 #include <utility>
 #include <vector>
 
+#ifndef VP_MENU_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
-#define UI_FIXES 0
+#define MENU_FIXES 0
+#else
+#define MENU_FIXES 1
+#endif
+#define UI_FIXES 0                  // (the toolkit here is the game's own code, in either build)
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------------
@@ -1003,7 +1020,7 @@ static void randomize_world() {
         if (chance(30)) UI_GU32(p[1]) = UI_GU32(p[0]);
     for (uint32_t a = 0x0057b120; a <= 0x0057b134; a += 4) UI_GF(a) = range(0.3f, 4.0f);
     if (chance(35)) UI_GF(0x0057b120) = chance(70) ? 0.0f : 1e-8f;
-    UI_G32(M_CARFILE_108) = chance(85) ? irange(4, 6) : irange(-1, 9);
+    UI_G32(M_CARFILE_108) = chance(85) ? irange(4, 6) : irange(-1, MENU_FIXES ? 6 : 9);   // (the fix build: never past 6)
     UI_G32(M_57A7C4) = chance(85) ? irange(4, 6) : irange(0, 8);
     if (chance(30)) UI_GF(0x0057b254) = 0.0f;
     if (chance(30)) UI_GF(0x0057b25c) = 0.0f;
@@ -1163,6 +1180,255 @@ static bool make_args(const Ent& f, uint32_t* w) {
     return true;
 }
 
+#if MENU_FIXES
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+// The rewrite alone on the case the original gets wrong (it would overrun this program's stack, or write past the setup),
+// from the pristine world with the case set up: it must return cleanly (no fault, the bytes popped, ebx / esi / edi / ebp
+// kept) and give what the fix promises. Nothing written outside: each is compared, all memory and the call logs, with a
+// reference run of the ORIGINAL on the nearest state it gets right (the same name ending inside its buffer, six gears, a
+// short car name), which is what the fix makes of the bad case; the bytes the fix leaves alone past the setup are guard
+// bytes, checked unchanged. (The faithful rewrites fail them, or bring this program down.)
+static int g_fx_bad, g_fx_n;
+static const Ent& fx_fn(const char* name) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, name)) return g_fns[i];
+    printf("  fix test: %s isn't listed\n", name);
+    fflush(stdout);
+    ExitProcess(4);
+}
+static Result fx_run(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w) {
+    uint32_t words[72] = {};
+    int i = 0;
+    for (uint32_t x : w) words[i++] = x;
+    g_pc = _PC_53;
+    return run(f, rewrite, words);
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0, uint32_t where = 0) {
+    g_fx_n++;
+    if (ok) return;
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, popped %u, ebx esi edi ebp %08x %08x %08x %08x)", r->fault, r->code, r->eip, r->pops, r->regs[0],
+                  r->regs[1], r->regs[2], r->regs[3]);
+    if (where) printf(" (first difference at %08x)", where);
+    printf("\n");
+}
+// the log holds `pre` followed by the string s as LS logs it
+static bool fx_logged(std::initializer_list<uint32_t> pre, const char* s) {
+    std::vector<uint32_t> want(pre);
+    uint32_t w = 0;
+    const int n = (int)strlen(s);
+    for (int i = 0; i < n; i++) {
+        w = w << 8 | (uint8_t)s[i];
+        if ((i & 3) == 3) { want.push_back(w); w = 0; }
+    }
+    want.push_back(w);
+    want.push_back((uint32_t)n);
+    const uint32_t ln = g_log.n < LOG_MAX ? g_log.n : LOG_MAX;
+    for (uint32_t i = 0; i + want.size() <= ln; i++)
+        if (!memcmp(&g_log.w[i], want.data(), 4 * want.size())) return true;
+    return false;
+}
+static bool fx_same_log() {
+    return g_log.n == g_log_orig.n && !memcmp(g_log.w, g_log_orig.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+}
+static void fx_keep_log() { memcpy(&g_log_orig, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX))); }
+static void fx_script(std::initializer_list<uint16_t> keys) {
+    int i = 0;
+    for (uint16_t k : keys) { HS->script[i][0] = OP_KEY; HS->script[i][1] = k; HS->script[i][2] = 0; i++; }
+    HS->script_n = i; HS->script_pos = 0; HS->frames = 0; HS->frame_limit = 40;
+}
+static void fx_name(uint32_t at, char c, int n, bool end) {   // n characters c at `at`, then a terminator if `end`
+    for (int i = 0; i < n; i++) UI_G8(at + (uint32_t)i) = (uint8_t)c;
+    if (end) UI_G8(at + (uint32_t)n) = 0;
+}
+static char g_fx_car[0x200];                                  // MenuEditCar's car name (this program's memory: not compared)
+
+static int directed_fix_tests() {
+    Result r;
+    uint32_t o;
+    char m[200];
+    // ---- 1. save_setup_dlg: the name field, and the setup's name copied into it ----
+    {
+        const Ent& f = fx_fn("save_setup_dlg");
+        // (a) a name typed to the field's limit (40 characters there, 30 more typed: the field stops at 63), OK: the
+        // original's bytes, which stay inside its frame
+        mem_load(g_pristine);
+        fx_name(M_SETUP_NAME, 'n', 40, true);
+        fx_script({'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q', 'q',
+                   'q', 'q', 'q', 'q', 'q', 0x124, 0xd});
+        mem_save(g_snap);
+        const Result ro = fx_run(f, false, {});
+        mem_save(g_after);
+        fx_keep_log();
+        mem_load(g_snap);
+        r = fx_run(f, true, {});
+        fx_check(fx_clean(f, r), "save_setup_dlg, a name typed to the field's limit: a clean return", &r);
+        char want[80];
+        memset(want, 'n', 40);
+        memset(want + 40, 'q', 23);
+        want[63] = 0;
+        fx_check(!memcmp((const void*)(uintptr_t)M_SETUP_NAME, want, 64), "save_setup_dlg, a name typed to the field's limit: the 63 characters saved");
+        o = mem_diff(g_after);
+        fx_check(!ro.fault && ro.ret == r.ret && o == 0 && fx_same_log(), "save_setup_dlg, a name typed to the field's limit: the original's result", 0, o);
+        // (b) the setup's name with no end in its 64 bytes (and 300 more bytes of it past the setup), OK: the reference is
+        // the original on the same name ending at its 63rd character
+        for (int star = 0; star < 2; star++) {
+            mem_load(g_pristine);
+            fx_name(M_SETUP_NAME, 'n', 0x40, false);
+            if (star) UI_G8(M_SETUP_NAME) = '*';
+            fx_name(M_SETUP + 0xd4, 'x', 300, true);
+            fx_script({0xd});
+            mem_save(g_snap);
+            UI_G8(M_SETUP_NAME + 0x3f) = 0;                        // the reference: the name ends inside the setup
+            if (star) {                                            // ('*' first: the name after it, 63 characters, ends
+                fx_name(M_SETUP + 0xd4, 'x', 300, true);           //  in the byte after the setup in the reference)
+                UI_G8(M_SETUP + 0xd4) = 0;
+                UI_G8(M_SETUP_NAME + 0x3f) = 'n';
+            }
+            const Result rr = fx_run(f, false, {});
+            if (star) UI_G8(M_SETUP + 0xd4) = 'x';
+            mem_save(g_after);
+            fx_keep_log();
+            mem_load(g_snap);
+            r = fx_run(f, true, {});
+            sprintf(m, "save_setup_dlg, the setup's name with no end%s: a clean return", star ? " ('*' first)" : "");
+            fx_check(fx_clean(f, r) && r.ret == 1, m, &r);
+            memset(want, 'n', 63);
+            want[63] = 0;
+            sprintf(m, "save_setup_dlg, the setup's name with no end%s: its first 63 characters saved", star ? " ('*' first)" : "");
+            fx_check(!memcmp((const void*)(uintptr_t)M_SETUP_NAME, want, 64), m);
+            o = mem_diff(g_after);
+            sprintf(m, "save_setup_dlg, the setup's name with no end%s: as the original on the name cut to 63", star ? " ('*' first)" : "");
+            fx_check(!rr.fault && rr.ret == r.ret && o == 0 && fx_same_log(), m, 0, o);
+        }
+    }
+    // ---- 2. DrivetrainControl::Draw: a car file of more than 6 gears ----
+    {
+        const Ent& f = fx_fn("DrivetrainControl::Draw");
+        for (int32_t count : {7, 9, 64, 0x40000001, 0x7fffffff}) {
+            // every float from the ratios to the end of the setup, and the 4 bytes after it, 1.0: all within 0.04 of each
+            // other, so every one the loop reaches is raised
+            mem_load(g_pristine);
+            for (uint32_t a = 0x0057afb0; a < M_SETUP + 0xd8; a += 4) UI_GF(a) = 1.0f;
+            UI_G32(M_57A7C4) = 6;
+            UI_G32(M_CARFILE_108) = 6;                           // the reference: six gears
+            mem_save(g_snap);
+            const Result rr = fx_run(f, false, {U(W.dr), 0, U(W.screen)});
+            mem_save(g_after);
+            fx_keep_log();
+            // (the original: is the case real? A count past 2^28 wraps its address and walks down through the game's
+            // code and data, so only the smaller ones are run)
+            bool real = true;
+            if (count <= 64) {
+                mem_load(g_snap);
+                UI_G32(M_CARFILE_108) = count;
+                const Result rb = fx_run(f, false, {U(W.dr), 0, U(W.screen)});
+                UI_G32(M_CARFILE_108) = 6;
+                real = rb.fault || mem_diff(g_after) != 0;
+            }
+            mem_load(g_snap);
+            UI_G32(M_CARFILE_108) = count;
+            r = fx_run(f, true, {U(W.dr), 0, U(W.screen)});
+            sprintf(m, "DrivetrainControl::Draw, %d gears: a clean return", count);
+            fx_check(fx_clean(f, r), m, &r);
+            UI_G32(M_CARFILE_108) = 6;
+            o = mem_diff(g_after);
+            sprintf(m, "DrivetrainControl::Draw, %d gears: as the original with 6 (nothing past the six ratios written)", count);
+            fx_check(!rr.fault && o == 0 && fx_same_log(), m, 0, o);
+            sprintf(m, "DrivetrainControl::Draw, %d gears: the original reads or writes past the six (the case is real)", count);
+            fx_check(real, m);
+        }
+    }
+    // ---- 3. MenuEditCar: a long car name; the '*' before a long setup name ----
+    {
+        const Ent& f = fx_fn("MenuEditCar");
+        // the set's file opens (so load_setup_set never builds its path from the car's name: its own FIX CANDIDATE)
+        char path[128];
+        sprintf(path, "%ssetups\\%s.set", HS->user_dir, W.dir);
+        const int32_t open_mask = (hash_str(path) & 1) ? 0 : 1;
+        for (int len : {28, 31, 100, 235, 236, 300}) {
+            // the reference: the original on "viper" at the same address (the name only reaches the stubs' log)
+            mem_load(g_pristine);
+            HS->file_open_mask = open_mask;
+            fx_script({0x1b});
+            strcpy(g_fx_car, "viper");
+            mem_save(g_snap);
+            const Result rr = fx_run(f, false, {U(g_fx_car), U(W.dir), U(W.flags), U(W.title)});
+            mem_save(g_after);
+            mem_load(g_snap);
+            memset(g_fx_car, 'c', (size_t)len);
+            g_fx_car[len] = 0;
+            for (int i = 0; i < len; i += 7) g_fx_car[i] = (char)('A' + (i / 7) % 26);
+            r = fx_run(f, true, {U(g_fx_car), U(W.dir), U(W.flags), U(W.title)});
+            sprintf(m, "MenuEditCar, a %d-character car name: a clean return", len);
+            fx_check(fx_clean(f, r), m, &r);
+            char res[0x200], cf[0x200];
+            const int keep = len < 0xeb ? len : 0xeb;
+            sprintf(res, "%.*s.car", keep, g_fx_car);
+            sprintf(cf, "%.*s.cf", keep, g_fx_car);
+            sprintf(m, "MenuEditCar, a %d-character car name: \"<car>.car\" loaded and unloaded, \"<car>.cf\" loaded (%s)", len,
+                    len > 0xeb ? "cut to 235" : "whole");
+            fx_check(fx_logged({'RSML'}, res) && fx_logged({'RSUL'}, res) && fx_logged({'CFLF', M_CARFILE}, cf), m);
+            o = mem_diff(g_after);
+            sprintf(m, "MenuEditCar, a %d-character car name: memory as the original's with a short name", len);
+            fx_check(!rr.fault && rr.ret == r.ret && o == 0, m, 0, o);
+        }
+        // the '*' of an unsaved setup before a 62- and a 63-character name (loaded as '*' + the name, so the garage
+        // strips it, and puts it back on the way out, the setup being unsaved); the 4 bytes after the setup guard bytes
+        for (int len : {61, 62, 63}) {
+            mem_load(g_pristine);
+            HS->file_open_mask = open_mask;
+            strcpy(g_fx_car, "viper");
+            uint8_t* t = HS->tmpl_setup;
+            memset(t, 0, 0xd4);
+            t[0x94] = '*';
+            memset(t + 0x95, 'm', (size_t)len);                   // 63: no terminator in the setup (the byte after it ends it)
+            UI_G8(M_SETUP + 0xd4) = len == 63 ? 0 : 0xee;
+            UI_G8(M_SETUP + 0xd5) = 0xee; UI_G8(M_SETUP + 0xd6) = 0xee; UI_G8(M_SETUP + 0xd7) = 0xee;
+            fx_script({0x1b});
+            mem_save(g_snap);
+            const Result ro = fx_run(f, false, {U(g_fx_car), U(W.dir), U(W.flags), U(W.title)});
+            const bool real = UI_G8(M_SETUP + 0xd4) != (len == 63 ? 0 : 0xee) || UI_G8(M_SETUP + 0xd5) != 0xee;
+            mem_save(g_after);
+            fx_keep_log();
+            mem_load(g_snap);
+            r = fx_run(f, true, {U(g_fx_car), U(W.dir), U(W.flags), U(W.title)});
+            sprintf(m, "MenuEditCar, '*' before a %d-character setup name: a clean return", len);
+            fx_check(fx_clean(f, r), m, &r);
+            char want[64];
+            want[0] = '*';
+            const int kept = len < 62 ? len : 62;
+            memset(want + 1, 'm', (size_t)kept);
+            want[1 + kept] = 0;
+            sprintf(m, "MenuEditCar, '*' before a %d-character setup name: '*' and %d characters, ending inside the setup", len, kept);
+            fx_check(!memcmp((const void*)(uintptr_t)M_SETUP_NAME, want, (size_t)(2 + kept)), m);
+            sprintf(m, "MenuEditCar, '*' before a %d-character setup name: the 4 bytes after the setup untouched", len);
+            fx_check(UI_G8(M_SETUP + 0xd4) == (len == 63 ? 0 : 0xee) && UI_G8(M_SETUP + 0xd5) == 0xee && UI_G8(M_SETUP + 0xd6) == 0xee &&
+                     UI_G8(M_SETUP + 0xd7) == 0xee, m);
+            // the original's result with what the fix changes put back (the bytes after the setup; a 63-character name's
+            // last character): the rest the same
+            uint8_t* a = g_after.data + (M_SETUP - 0x004e1000);
+            a[0xd4] = len == 63 ? 0 : 0xee; a[0xd5] = a[0xd6] = a[0xd7] = 0xee;
+            if (len == 63) a[0x94 + 0x3f] = 0;
+            o = mem_diff(g_after);
+            sprintf(m, "MenuEditCar, '*' before a %d-character setup name: otherwise the original's result%s", len,
+                    len == 63 ? "" : " (and its log)");
+            fx_check(!ro.fault && ro.ret == r.ret && o == 0 && (len == 63 || fx_same_log()), m, 0, o);
+            sprintf(m, "MenuEditCar, '*' before a %d-character setup name: the original writes past the setup%s", len,
+                    len == 61 ? " (it doesn't: the fix leaves this one alone)" : " (the case is real)");
+            fx_check(len == 61 ? !real : real, m);
+        }
+    }
+    printf("directed fix tests: %s (%d checks, %d failed)\n", g_fx_bad ? "FAILED" : "all passed", g_fx_n, g_fx_bad);
+    return g_fx_bad;
+}
+#endif
+
 // ---- main -----------------------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -1244,6 +1510,12 @@ int main(int argc, char** argv) {
                 printf("  listed twice: %08x %s / %08x %s\n", g_fns[i].v10, g_fns[i].name, g_fns[j].v10, g_fns[j].name);
                 dup++;
             }
+
+#if MENU_FIXES
+    const int fix_bad = directed_fix_tests();
+#else
+    const int fix_bad = 0;
+#endif
 
     static Footprint fp;
     long long checks = 0, poisoned_checks = 0, log_words = 0, both_fault = 0, both_hung = 0, faults_loaded = 0, faults_poisoned = 0;
@@ -1369,5 +1641,5 @@ int main(int argc, char** argv) {
     printf("faults by round kind: %lld as loaded, %lld poisoned; %lld dwords holding a return address into the function under "
            "test (a stock dialog's copy of its frame) taken as equal\n", faults_loaded, faults_poisoned, ret_pairs);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
-    return differ || fp_bad || dup ? 1 : 0;
+    return differ || fp_bad || dup || fix_bad ? 1 : 0;
 }

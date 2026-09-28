@@ -19,8 +19,10 @@
 // (fonts, palettes), BoardCreateControl (allocates, loads the records), BoardDo (a dialog), clear_cb (clears the records),
 // BoardControl::Added (builds a widget), the deleting destructors.
 //
-// FIX CANDIDATEs (left faithful): BoardCustomText::Draw passes its text to gxFontPrintf as the format (a '%' in a
-// translation would read garbage arguments); BoardDo formats "<race type>: <realism>" into 0x40 bytes unbounded.
+// Fixes (// FIX:, docs/FIXES.md "Menus"): BoardCustomText::Draw passes its text to gxFontPrintf as the format, as the
+// original, unless the game's C runtime would read an argument for it (nobody passes one: a '%' conversion or '*' in a
+// translation), when it's printed as it is ("%s"); BoardDo's "<race type>: <realism>" keeps to its 0x40 bytes. Every
+// other input gives the original's bits.
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -71,11 +73,41 @@ static void __fastcall BoardCustomText_dtor_c(BoardCustomText* self, Edx) {
 }
 PORT_FN(0x0048fdb0, "BoardCustomText::~BoardCustomText", BoardCustomText_dtor_c, fp_fonts0<BoardCustomText>)
 
+// FIX helper (BoardCustomText::Draw): whether the game's printf (output.obj, 0x4d22b0), given s as its format, would read an
+// argument. Its state machine run over s, from its own table (.rdata 0x4e0200: a character's class in the low nibble of
+// [c - ' '] for ' '..'x', else 0; the next state in the high nibble of [class * 8 + state]): a '*' taken as a width or
+// precision (states 3, 5) reads one; so does reaching a conversion (state 7) -- every one reads an argument but 'B', which
+// prints the stale locals instead. In the size state an 'I' skips a following "64", else it's printed and the state is
+// back to normal, as output does. (Its double-byte lead-byte step is left out: the game never leaves the "C" locale, whose
+// table has no lead bytes.)
+static bool fix_format_reads_args(const char* s) {
+    enum : uint32_t { T = 0x004e0200 };
+    uint32_t state = 0;
+    for (const volatile char* p = s; *p; p++) {
+        const int32_t c = (int8_t)*p;
+        const uint32_t cls = c < 0x20 || c > 0x78 ? 0u : (uint32_t)(UI_G8(T + (uint32_t)(c - 0x20)) & 0xf);
+        state = (uint32_t)(UI_G8(T + cls * 8 + state) >> 4) & 7u;
+        if ((state == 3 || state == 5) && c == '*') return true;
+        if (state == 7) return true;
+        if (state == 6 && c == 'I') {
+            if (p[1] == '6' && p[2] == '4') p += 2;
+            else state = 0;
+        }
+    }
+    return false;
+}
+
 // Draw: the text right-aligned at the item's right edge, its top at the item's
 static void __fastcall BoardCustomText_Draw_c(BoardCustomText* self, Edx, gxCanvas* c) {
     ccall<gxCanvas*>(F_gxSetCanvas, c);
-    // FIX CANDIDATE: the text is gxFontPrintf's format (a '%' in it reads arguments nobody passed)
-    gxFontPrintf((void*)self->font, (void*)self->pal, 0xa, self->x + self->w, (int32_t)self->y, (const char*)self->text);
+    // FIX: the text (BoardDo's "<race type>: <realism>", PostRaceDo's "<race type> : <track>: <realism>" -- translations
+    // and tracks.tab's names) is gxFontPrintf's format and nothing else is passed, so a '%' conversion or '*' in it read
+    // arguments from the stack (garbage; "%s" or "%n" could crash). Such a text is printed as it is, through "%s". Every
+    // other text is the format as before, so it prints exactly as it did ("%%" as '%').
+    if (VP_FIX && fix_format_reads_args((const char*)self->text))
+        gxFontPrintf((void*)self->font, (void*)self->pal, 0xa, self->x + self->w, (int32_t)self->y, CP(0x004f1e84), (const char*)self->text);
+    else
+        gxFontPrintf((void*)self->font, (void*)self->pal, 0xa, self->x + self->w, (int32_t)self->y, (const char*)self->text);
 }
 static void fp_BoardCustomText_Draw(Footprint& f, BoardCustomText*, Edx, gxCanvas* c) {
     UI_FP(f, S_GX_CANVAS, 4, "gfx.obj current canvas");
@@ -314,8 +346,17 @@ static void __cdecl BoardDo_c(const char* track, int32_t realism, int32_t race_t
     {
         const char* rs = ccall<const char*>(F_GetRealismString, realism);
         const char* ts = ccall<const char*>(F_GetRaceTypeString, race_type);
-        // FIX CANDIDATE: "<race type>: <realism>" (translations) into 0x40 bytes unbounded
-        game_sprintf(fr.title, CP(0x004f923c), ts, rs);
+        // FIX: "<race type>: <realism>" (translations) went into 0x40 bytes unbounded at the end of the frame, so a longer
+        // one ran onto the return address: a title that would pass 63 characters is formatted in a buffer of the
+        // rewrite's (each name cut to 64 characters) and its first 63 kept. Any other is formatted into the title as
+        // before.
+        if (VP_FIX && ui_strnlen(ts, 0x3f) + 2 + ui_strnlen(rs, 0x3f) > 0x3f) {
+            char t[0x100], c1[0x41], c2[0x41];
+            game_sprintf(t, CP(0x004f923c), fix_cut(ts, c1, 0x40), fix_cut(rs, c2, 0x40));
+            ui_copy_bounded(fr.title, t, sizeof fr.title);
+        } else {
+            game_sprintf(fr.title, CP(0x004f923c), ts, rs);
+        }
     }
     {
         const void* m = UI_GP(const void, S_BOARD_MGR);

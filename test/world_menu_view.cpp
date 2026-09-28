@@ -4,6 +4,7 @@
 //   build (x86 tools, from the repo root):
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_menu_view.cpp
 //        /Fo<dir>\ /Fe<dir>\world_menu_view.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
+//     (and with /DVP_MENU_FIXES: the fix build, below)
 //   run:   world_menu_view.exe [rounds] [seed]          (VP_TRACE=1: one line per function; VP_ONLY=text: those only;
 //          VP_DEBUG_WORLD=1: the world's objects and widgets, and every fault's registers)
 //
@@ -46,6 +47,19 @@
 // CreateMultiString, UIStyleDraw / Width, UIDeltaT), UIDialogItem's and Xlator's constructors, the matrix functions,
 // gxSetClip / gxRestoreClip, strchr / strrchr / __ftol, HackEnabled, GetCarFileNumber and the car list, and every function
 // of this group (each rewrite is checked against its original with the same callees).
+//
+// Built with /DVP_MENU_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Menus"). Every
+// function is still compared as above, with two kinds of round kept out of the comparison and counted (per function,
+// listed): one where only the original faults (a crash the fixes remove: SetModel's name with no '.'), and one where the
+// original's sprintf printed past the field it was given (sprintf's stub knows the fields of the world's objects: the
+// car chooser's stat texts, the option viewer's summary and laps text) -- huge stats and the longer translations do that
+// in ordinary rounds, and the fixed rewrite keeps to the field. sprintf's destination isn't logged (update_car formats
+// in a buffer of its own now; what lands in the field is compared in memory). Then directed_fix_tests: for each fix, the
+// bad case run on the rewrite alone -- no fault, the bytes popped and ebx / esi / edi / ebp kept, nothing written outside
+// the object or buffer (the memory around it compared), and the result the fix promises -- and its boundary case (the
+// longest input that fits) on both, compared bit for bit; and the board text's format check against the game's own
+// printf (run on every test text and on random ones with its arguments on a no-access page: it faults exactly when the
+// check says it reads one). Without it (VP_FAITHFUL) every rewrite must match its original bit for bit.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -59,7 +73,12 @@
 #include <utility>
 #include <vector>
 
+#ifndef VP_MENU_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#define MENU_FIXES 0
+#else
+#define MENU_FIXES 1
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------------
@@ -298,11 +317,31 @@ static void L_block(const void* p, int dwords) {                  // a frame / m
     const uint32_t* w = (const uint32_t*)p;
     for (int i = 0; i < dwords; i++) L(w[i]);
 }
+// the directed fix tests' hooks into the stubs (all off in the random rounds), and what the stubs last saw
+static const char* g_fx_track;                        // GetTrackName's answer
+static const char* g_fx_tab6;                         // a .tab's entry 6
+static const char* g_fx_xl;                           // every Xlator's text (when it's refreshed)
+static const char* g_fx_enum[8];                      // an enum's string
+static bool g_fx_real_tex;                            // WorldGetCarTexture's names as the game's (their lengths matter)
+static char g_rec_stamp[0x200], g_rec_cf[0x200], g_rec_mustload[0x200], g_rec_load[0x200], g_rec_remap_load[0x200], g_rec_fprf[0x400];
+static uint8_t g_rec_remap[0x28];
+static const char* g_rec_fprf_fmt;
+static uint32_t g_rec_fprf_a0;
+static char g_rec_mark;                               // gxFontPrintf: record only a format starting with it (0: any)
+// the fix build: whether the original's sprintf printed past a field of the world's objects (a fixed case)
+static bool g_overran;
+static uint32_t field_size(const char* p);
 static uint32_t hash_str(const char* s) {
     uint32_t h = 2166136261u;
     if (!s || !readable(s, 1)) return 0x5eed;
     for (; readable(s, 1) && *s; s++) h = (h ^ (uint8_t)*s) * 16777619u;
     return h;
+}
+static void rec(char* dst, uint32_t n, const char* s) {
+    uint32_t i = 0;
+    if (s && readable(s, 1))
+        for (; i + 1 < n && readable(s + i, 1) && s[i]; i++) dst[i] = s[i];
+    dst[i] = 0;
 }
 
 // ---- stubs: memory, logs, sync (world_ui.cpp's) --------------------------------------------------------------------------------
@@ -431,7 +470,7 @@ static int32_t fake_val(const void* p, int which) {
     const int32_t v[] = {(int32_t)(8 + h % 20), (int32_t)(6 + (h >> 8) % 20), (int32_t)(1 + (h >> 16) % 4), 1, 2, 8, 2, 6};
     return v[which];
 }
-static void* __cdecl stub_gxGetStamp(const char* name) { L('GSTP'); LS(name); return fake_for(name, 'STMP'); }
+static void* __cdecl stub_gxGetStamp(const char* name) { L('GSTP'); LS(name); rec(g_rec_stamp, sizeof g_rec_stamp, name); return fake_for(name, 'STMP'); }
 static void __cdecl stub_gxForgetStamp(void* s) { L('FSTP'); L(P(s)); }
 static int32_t __cdecl stub_gxStampWidth(const void* s) { L('STW '); L(P(s)); return fake_val(s, 0); }
 static int32_t __cdecl stub_gxStampHeight(const void* s) { L('STH '); L(P(s)); return fake_val(s, 1); }
@@ -459,6 +498,11 @@ static void __cdecl stub_gxFontPrintf(const void* f, const void* pal, uint32_t f
     L('FPRF'); L(P(f)); L(P(pal)); L(flags); L((uint32_t)x); L((uint32_t)y); LS(fmt);
     va_list ap;
     va_start(ap, fmt);
+    if (!g_rec_mark || (fmt && readable(fmt, 1) && fmt[0] == g_rec_mark)) {
+        g_rec_fprf_fmt = fmt;
+        g_rec_fprf_a0 = *(const uint32_t*)ap;
+        rec(g_rec_fprf, sizeof g_rec_fprf, fmt);
+    }
     L_va(fmt, (const uint32_t*)ap);
     va_end(ap);
     L_canvas();
@@ -508,11 +552,11 @@ static const char* xl_text(uint32_t key) {
 }
 static void __fastcall stub_xlate(uint32_t* xl, int) {
     L('XLAT'); L(P(xl));
-    xl[1] = (uint32_t)(uintptr_t)xl_text(xl[0]);
+    xl[1] = (uint32_t)(uintptr_t)(g_fx_xl ? g_fx_xl : xl_text(xl[0]));
     xl[2] = UI_GU32(S_XLATOR_COOKIE);
 }
 static int __cdecl stub_sprintf(char* buf, const char* fmt, ...) {
-    L('SPRF'); L(P(buf)); LS(fmt);
+    L('SPRF'); L(MENU_FIXES ? 'DEST' : P(buf)); LS(fmt);          // (the fix build: some format into a buffer of their own)
     va_list ap;
     va_start(ap, fmt);
     const uint32_t* w = (const uint32_t*)ap;
@@ -530,6 +574,10 @@ static int __cdecl stub_sprintf(char* buf, const char* fmt, ...) {
     const int r = vsprintf(buf, fmt, ap);
     va_end(ap);
     LS(buf);
+    if (MENU_FIXES) {
+        const uint32_t sz = field_size(buf);
+        if (sz && strlen(buf) >= sz) g_overran = true;
+    }
     return r;
 }
 static void __cdecl stub_LocaleConvertNumeric(char* s) { L('LCNV'); LS(s); }
@@ -564,7 +612,11 @@ static void __cdecl stub_OptionsGet(const char* sec, const char* key, int32_t* o
 }
 static void __cdecl stub_OptionsSet(const char* sec, const char* key, int32_t v) { L('OPTS'); LS(sec); LS(key); L((uint32_t)v); }
 static int32_t __cdecl stub_GetTrackCount() { L('TCNT'); return 8; }
-static const char* __cdecl stub_GetTrackName(int32_t t) { L('TNAM'); L((uint32_t)t); return t >= 0 && t <= 8 ? k_tracks[t] : "zzz"; }
+static const char* __cdecl stub_GetTrackName(int32_t t) {
+    L('TNAM'); L((uint32_t)t);
+    if (g_fx_track) return g_fx_track;
+    return t >= 0 && t <= 8 ? k_tracks[t] : "zzz";
+}
 static const char* __cdecl stub_GetTrackFriendlyName(int32_t t) { L('TFRN'); L((uint32_t)t); return g_friendly[(uint32_t)(t + 1) % 10]; }
 static const char* __cdecl stub_GetTrackText(int32_t t) { L('TTXT'); L((uint32_t)t); return g_text[(uint32_t)(t + 1) % 10]; }
 static int32_t __cdecl stub_GetTrackNumber(const char* name) {
@@ -579,8 +631,11 @@ static int32_t __cdecl stub_GetLapCountFromType(int32_t type, const char* name) 
     L('LAPS'); L((uint32_t)type); LS(name);
     return 1 + (int32_t)(((uint32_t)type + hash_str(name) + (uint32_t)HS->lap_seed) & 7u);
 }
-template <int K> static const char* __cdecl stub_enum_string(int32_t v) { L('ENUM'); L(K); L((uint32_t)v); return g_enum[K][(uint32_t)v & 7]; }
-static void __cdecl stub_ResourceSetMustLoad(const char* s) { L('RSML'); LS(s); }
+template <int K> static const char* __cdecl stub_enum_string(int32_t v) {
+    L('ENUM'); L(K); L((uint32_t)v);
+    return g_fx_enum[K] ? g_fx_enum[K] : g_enum[K][(uint32_t)v & 7];
+}
+static void __cdecl stub_ResourceSetMustLoad(const char* s) { L('RSML'); LS(s); rec(g_rec_mustload, sizeof g_rec_mustload, s); }
 static void __cdecl stub_ResourceSetUnload(const char* s) { L('RSUL'); LS(s); }
 static void __cdecl stub_LocaleFormatShortDate(char* buf, int32_t n, int32_t d, int32_t m, int32_t y) {
     L('DATE'); L(P(buf)); L((uint32_t)n); L((uint32_t)d); L((uint32_t)m); L((uint32_t)y);
@@ -593,6 +648,7 @@ static const char* __cdecl stub_StringTableGetEntry(const void* t, int32_t row, 
     L('STEN'); L(P(t)); L((uint32_t)row); L((uint32_t)col);
     uint32_t k = 0;
     for (int i = 0; i < 4; i++) if (t == g_tabs[i]) k = (uint32_t)i;
+    if (g_fx_tab6 && row == 6) return g_fx_tab6;
     return g_tabs_str[k][((uint32_t)row + (uint32_t)HS->tab_seed) & 15];
 }
 static const void* __cdecl stub_RecordMgrCreate(const char* name) { L('RMCR'); LS(name); return g_mgr; }
@@ -623,15 +679,19 @@ static void __cdecl stub_mrModelClearAlpha() { L('MRCA'); }
 static void __cdecl stub_mrModelDraw(int32_t m, const void* fr) { L('MRDR'); L((uint32_t)m); L_block(fr, 12); }
 static int32_t __cdecl stub_mrModelLoad(const char* name) {
     L('MRLD'); LS(name);
+    rec(g_rec_load, sizeof g_rec_load, name);
     return HS->model_zero ? 0 : 0x200 + (int32_t)(hash_str(name) & 0xff);
 }
 static int32_t __cdecl stub_mrModelLoadRemap(const char* name, const char* remap, int32_t n) {
     L('MRLR'); LS(name); LS(remap); LS(remap + 0x10); L_block(remap + 0x20, 2); L((uint32_t)n);
+    rec(g_rec_remap_load, sizeof g_rec_remap_load, name);
+    if (readable(remap, 0x28)) memcpy(g_rec_remap, remap, 0x28);
     return HS->model_zero ? 0 : 0x300 + (int32_t)(hash_str(name) & 0xff);
 }
 static void __cdecl stub_mrModelUnload(int32_t m) { L('MRUL'); L((uint32_t)m); }
 static void __cdecl stub_mrModelRemapTextures(int32_t m, const char* remap, int32_t n) {
     L('MRRT'); L((uint32_t)m); LS(remap); LS(remap + 0x10); L_block(remap + 0x20, 2); L((uint32_t)n);
+    if (readable(remap, 0x28)) memcpy(g_rec_remap, remap, 0x28);
 }
 static int32_t __cdecl stub_mrModelCopyTransform(int32_t m, const void* mat) { L('MRCT'); L((uint32_t)m); L_block(mat, 9); return 0x400 + HS->model_next++; }
 static void __cdecl stub_mrModelDestroyCopy(int32_t m) { L('MRDC'); L((uint32_t)m); }
@@ -642,10 +702,19 @@ static void __cdecl stub_mrModelGetExtents(int32_t m, float* a, float* b, float*
 }
 static void __cdecl stub_WorldGetCarTexture(char* out, const char* base, int32_t n) {
     L('WGCT'); L(P(out)); LS(base); L((uint32_t)n);
+    if (g_fx_real_tex) {                                            // (the game's: 0x462070)
+        if (!_stricmp(base, "viper")) {
+            if (n < 0) sprintf(out, "~paint%d.tex", -1 - n);
+            else sprintf(out, "%s%d.tex", base, n + 1);
+        } else if (n < 0) sprintf(out, "~%s.tex", base);
+        else sprintf(out, "%s.tex", base);
+        return;
+    }
     sprintf(out, "%s%d", HS->texname, n & 0xff);
 }
 static uint8_t __cdecl stub_CarFileLoad(void* cf, const char* name, void* p) {
     L('CFLD'); L(P(cf)); LS(name); L(P(p));
+    rec(g_rec_cf, sizeof g_rec_cf, name);
     static const uint32_t at[10] = {0x0057b9e0, 0x0057b9e4, 0x0057b9f8, 0x0057bb68, 0x0057bb6c, 0x0057bb70, 0x0057bb74, 0x0057bb78, 0x0057bb7c, 0x0057b9ec};
     for (int i = 0; i < 10; i++) UI_GF(at[i]) = HS->cf[i];
     return (uint8_t)HS->cf_ok;
@@ -798,6 +867,19 @@ struct World {
 };
 static World W;
 static std::vector<uint32_t> g_setup_e;
+// the fields of the world's objects the rewrites format into (their sizes): the car chooser's stat texts, the option
+// viewer's summary (MenuDoRaceSetup's is 0x20 bytes) and laps text
+static uint32_t field_size(const char* p) {
+    if (W.cc) {
+        CarChooser* c = W.cc;
+        const char* f16[] = {c->s18, c->s28, c->s38, c->s48, c->s58, c->s88, c->sd8};
+        for (const char* q : f16) if (p == q) return 0x10;
+        if (p == c->s98 || p == c->sb8) return 0x20;
+    }
+    if (p == W.summary) return 0x20;
+    if (W.rov && p == W.rov->text) return sizeof W.rov->text;
+    return 0;
+}
 
 static void read_inventory(const char* path) {
     FILE* f = fopen(path, "r");
@@ -1004,6 +1086,8 @@ static void randomize_world() {
     if (chance(50)) sprintf(ov->set, "%s.car", k_cars[rnd() % 6]);
     else ov->set[0] = 0;
     for (int i = 0; i < 3; i++) ov->body.p[i] = fval(-5, 5);
+    static const char* const bct_texts[] = {"Board text", "50%% off", "100%", "%%%%", "", "Arcade: Simulation"};
+    W.bct->text = bct_texts[rnd() % 6];                  // (a '%' the game's printf reads no argument for)
     RaceOptionViewer* rv = W.rov;
     rv->event = irange(0, 5);
     rv->ai_count = fval(0, 9);
@@ -1234,6 +1318,595 @@ static bool is_modal(const char* nm) {
            strstr(nm, "car_details_cb") || strstr(nm, "::paint");
 }
 
+#if MENU_FIXES
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+// The rewrite alone (the original would crash or overrun there -- this program's stack among what it would take), from the
+// pristine world with the case set up: it must return cleanly (no fault, the bytes popped, ebx / esi / edi / ebp kept),
+// write nothing outside what it's given (every other byte of .data/.bss/.idata and the arena compared with before) and
+// give what the fix promises. Each fix's boundary case (the longest input that fits) runs on the original and the rewrite
+// from the same state and must give the same memory, call logs and result.
+static int g_fx_bad, g_fx_n, g_fx_same_n;
+static const Ent& fx_fn(const char* name) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, name)) return g_fns[i];
+    printf("  fix test: %s isn't listed\n", name);
+    fflush(stdout);
+    ExitProcess(4);
+}
+struct Span { const void* p; uint32_t n; };
+// the first byte that changed since `before` outside the spans (the stubs' state block aside); 0 if none
+static uint32_t fx_outside(const Mem& before, std::initializer_list<Span> ok) {
+    auto in = [&](const uint8_t* q) {
+        for (const Span& sp : ok)
+            if (q >= (const uint8_t*)sp.p && q < (const uint8_t*)sp.p + sp.n) return true;
+        return false;
+    };
+    for (uint32_t i = 0; i < DATA_BYTES; i++)
+        if (before.data[i] != DATA[i] && !in(DATA + i)) return 0x004e1000 + i;
+    for (uint32_t i = 0; i < IDATA_BYTES; i++)
+        if (before.idata[i] != IDATA[i] && !in(IDATA + i)) return 0x005d7000 + i;
+    for (uint32_t i = sizeof(HState); i < ARENA_BYTES; i++)
+        if (before.arena[i] != g_arena[i] && !in(g_arena + i)) return U(g_arena + i);
+    return 0;
+}
+static Result fx_run(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w) {
+    uint32_t words[72] = {};
+    int i = 0;
+    for (uint32_t x : w) words[i++] = x;
+    g_pc = _PC_53;
+    return run(f, rewrite, words);
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0, uint32_t where = 0) {
+    g_fx_n++;
+    if (ok) return;
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, popped %u, ebx esi edi ebp %08x %08x %08x %08x)", r->fault, r->code, r->eip, r->pops, r->regs[0],
+                  r->regs[1], r->regs[2], r->regs[3]);
+    if (where) printf(" (wrote %08x)", where);
+    printf("\n");
+}
+static bool fx_logged(uint32_t tag) {
+    for (uint32_t i = 0; i < g_log.n && i < LOG_MAX; i++)
+        if (g_log.w[i] == tag) return true;
+    return false;
+}
+static CallLog g_fx_log;
+// the original and the rewrite from the same state: the rewrite clean; the same return, memory and call logs
+static void fx_same(const Ent& f, std::initializer_list<uint32_t> w, const char* what) {
+    g_fx_same_n++;
+    mem_save(g_snap);
+    const Result ro = fx_run(f, false, w);
+    mem_save(g_after);
+    memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+    mem_load(g_snap);
+    const Result rn = fx_run(f, true, w);
+    char m[256];
+    sprintf(m, "%s: a clean return", what);
+    fx_check(fx_clean(f, rn), m, &rn);
+    sprintf(m, "%s: the original's result, bit for bit", what);
+    const uint32_t where = mem_diff(g_after);
+    const bool same = !ro.fault && where == 0 && ro.ret == rn.ret && g_log.n == g_fx_log.n &&
+                      !memcmp(g_log.w, g_fx_log.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+    fx_check(same, m, &ro, where);
+}
+// a function-local Xlator built, with its text (fresh: read as it is; stale: refreshed through the stub)
+static void fx_xl(uint32_t xl, const char* text, bool fresh) {
+    for (auto& x : k_xl)
+        if (x[2] == xl) {
+            UI_G8(x[0]) = (uint8_t)(UI_G8(x[0]) | x[1]);
+            UI_GU32(x[2]) = x[3];
+            UI_GU32(x[2] + 4) = U(text ? text : xl_text(x[3]));
+            UI_GU32(x[2] + 8) = fresh ? UI_GU32(S_XLATOR_COOKIE) : ~UI_GU32(S_XLATOR_COOKIE);
+        }
+}
+static const char* const k_labels[3] = {"The pack", "Clock", "Ghost car"};
+// the tests' world: pristine, the stubs' hooks off, every function-local Xlator built (fresh), the statics the code follows
+static void fx_reset() {
+    mem_load(g_pristine);
+    g_fx_track = g_fx_tab6 = g_fx_xl = 0;
+    for (auto& e : g_fx_enum) e = 0;
+    g_fx_real_tex = false;
+    g_rec_mark = 0;
+    g_xl_seed = 0;
+    UI_GP(gxCanvas, S_GX_CANVAS) = W.screen;
+    UI_GP(WidgetWindow, S_ACTIVE) = W.win;
+    UI_GU32(S_DIALOG_IDLE) = 0;
+    UI_G8(S_EXIT) = 0;
+    UI_GP(void, S_CURSOR) = 0;
+    UI_GP(uint8_t, S_LOCALE) = W.locale;
+    *(float*)(W.locale + 0x1c) = 1.0f;
+    *(float*)(W.locale + 0x2c) = 1.0f;
+    W.locale[0x38] = 0;
+    UI_GP(const void, S_BOARD_MGR) = g_mgr;
+    UI_GP(void, S_BOARD_TABLE) = W.hs;
+    UI_GP(void, S_TRACK_CHOOSER) = W.tc;
+    UI_GP(void, S_CAR_CHOOSER) = W.cc;
+    UI_GP(void, S_OPP_VIEWER) = W.ov;
+    UI_G32(S_MR_DEVICE) = 2;
+    for (auto& x : k_xl) fx_xl(x[2], 0, true);
+    UI_G8(0x0057bd0c) = (uint8_t)(UI_G8(0x0057bd0c) | 8);
+    for (int i = 0; i < 3; i++) UI_GP(const char, S_OPP_LABELS + 4 * i) = k_labels[i];
+    UI_G8(0x0057b80c) = (uint8_t)(UI_G8(0x0057b80c) & ~0x40);
+    UI_G8(0x0057bc54) = (uint8_t)(UI_G8(0x0057bc54) & ~0x10);
+    HS->frame_limit = 40; HS->frames = 0; HS->script_n = HS->script_pos = 0;
+    HS->cf_ok = 1; HS->tab_null = 0; HS->model_zero = 0; HS->model_next = 0;
+}
+// a string of n c's and then tail (in one of eight buffers of this program's)
+static char g_fx_s[8][0x400];
+static const char* mk(int k, char c, int n, const char* tail = "") {
+    memset(g_fx_s[k], c, (size_t)n);
+    strcpy(g_fx_s[k] + n, tail);
+    return g_fx_s[k];
+}
+static Span widget_of(const void* ctl) { return {(const void*)((const MvCtl*)ctl)->widget, sizeof(CustomWidget)}; }
+// callees hooked to their rewrites, as in the DLL (a rewrite calls this group's functions by their v1.0 address, which
+// here is the original), for the test's lifetime
+struct FxHook {
+    struct Saved { uint32_t at; uint8_t b[5]; };
+    std::vector<Saved> saved;
+    FxHook(std::initializer_list<const char*> names) {
+        for (const char* n : names) {
+            const Ent& e = fx_fn(n);
+            Saved s;
+            s.at = e.v10;
+            memcpy(s.b, (const void*)(uintptr_t)e.v10, 5);
+            saved.push_back(s);
+            patch_jmp(e.v10, e.fn);
+        }
+    }
+    ~FxHook() { for (const Saved& s : saved) memcpy((void*)(uintptr_t)s.at, s.b, 5); }
+};
+// the remap entry (0x28 bytes: two 16-byte names, a value and a pointer) as the fixed SetModel leaves it: "<base>.tex"
+// from its start, the texture name's first 23 characters and a terminator from +0x10, +0x20 and +0x24 zeroed
+static void remap_expect(uint8_t* e, const uint8_t* before, const char* base, const char* tex) {
+    char t[0x80];
+    memcpy(e, before, 0x28);
+    sprintf(t, "%s.tex", base);
+    memcpy(e, t, strlen(t) + 1);
+    const size_t n = strlen(tex) < 0x17 ? strlen(tex) : 0x17;
+    memcpy(e + 0x10, tex, n);
+    e[0x10 + n] = 0;
+    memset(e + 0x20, 0, 8);
+}
+// the game's own printf (vsprintf, 0x4cf7c0) on fmt with its arguments on a no-access page: whether it reads one
+static uint8_t* g_noaccess;
+static bool game_reads_args(const char* fmt) {
+    static char out[0x2000];
+    typedef int(__cdecl * VSprintf_t)(char*, const char*, void*);
+    __try {
+        ((VSprintf_t)(uintptr_t)0x004cf7c0)(out, fmt, g_noaccess);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return true;
+    }
+    return false;
+}
+
+static int directed_fix_tests() {
+    Result r;
+    uint32_t o;
+    char m[256];
+    // ---- 6. TrackViewer::SetTrack: a long track name ----
+    {
+        const Ent& f = fx_fn("TrackViewer::SetTrack");
+        fx_reset();
+        g_fx_track = mk(0, 't', 200);
+        mem_save(g_snap);
+        r = fx_run(f, true, {U(W.tv), 0, 5});
+        fx_check(fx_clean(f, r), "TrackViewer::SetTrack, a 200-character name: a clean return", &r);
+        fx_check(!strcmp(g_rec_stamp, mk(1, 't', 74, ".stp")) && W.tv->track == 5,
+                 "TrackViewer::SetTrack, a 200-character name: the map asked for is its first 74 characters and .stp");
+        o = fx_outside(g_snap, {{W.tv, sizeof(TrackViewer)}, widget_of(W.tv)});
+        fx_check(o == 0, "TrackViewer::SetTrack, a 200-character name: nothing written but the viewer", 0, o);
+        fx_reset();
+        g_fx_track = mk(0, 't', 74);
+        fx_same(f, {U(W.tv), 0, 5}, "TrackViewer::SetTrack, a 74-character name (the longest that fits)");
+    }
+    // ---- 7. CarViewer3D::SetModel: no '.', a '.' first, long names, a long texture name ----
+    {
+        const Ent& f = fx_fn("CarViewer3D::SetModel");
+        CarViewer3D* v = W.cv;
+        const struct { const char* name; const char* base; const char* cf; bool orig_faults; } cases[] = {
+            {"viperxyz", "viperxyz", "viperxyz.cf", true},
+            {".mod", ".mod", ".mod.cf", false},
+            {mk(0, 'a', 55, "0.mod"), mk(1, 'a', 31), mk(2, 'a', 55, ".cf"), false},
+            {mk(3, 'b', 395, "0.mod"), mk(4, 'b', 31), mk(5, 'b', 251, ".cf"), false},
+        };
+        for (const auto& c : cases) {
+            fx_reset();
+            g_fx_real_tex = true;
+            v->model = 0;
+            v->paint = 0;
+            char tex[0x80];
+            sprintf(tex, "~%s.tex", c.base);
+            uint8_t before[0x28], want[0x28];
+            memcpy(before, (const void*)(uintptr_t)S_REMAP_CAR, 0x28);
+            remap_expect(want, before, c.base, tex);
+            const size_t len = strlen(c.name);
+            mem_save(g_snap);
+            if (c.orig_faults) {
+                r = fx_run(f, false, {U(v), 0, U(c.name)});
+                sprintf(m, "CarViewer3D::SetModel, \"%s\": the original faults (the case is real)", c.name);
+                fx_check(r.fault != 0, m);
+                mem_load(g_snap);
+            }
+            g_rec_cf[0] = g_rec_remap_load[0] = 0;
+            r = fx_run(f, true, {U(v), 0, U(c.name)});
+            sprintf(m, "CarViewer3D::SetModel, a %u-character name (%.12s...): a clean return", (unsigned)len, c.name);
+            fx_check(fx_clean(f, r), m, &r);
+            sprintf(m, "CarViewer3D::SetModel, a %u-character name (%.12s...): the model, the remap entry and the .cf as promised",
+                    (unsigned)len, c.name);
+            const bool ok = !strcmp(g_rec_remap_load, c.name) && !memcmp(g_rec_remap, want, 0x28) &&
+                            !memcmp((const void*)(uintptr_t)S_REMAP_CAR, want, 0x28) && !strcmp(g_rec_cf, c.cf) && v->model != 0;
+            fx_check(ok, m);
+            if (!ok) {
+                printf("    loaded \"%.40s\", .cf \"%.40s\", model %x; the remap entry / wanted:\n     ", g_rec_remap_load, g_rec_cf, v->model);
+                for (int i = 0; i < 0x28; i++) printf(" %02x", g_rec_remap[i]);
+                printf("\n     ");
+                for (int i = 0; i < 0x28; i++) printf(" %02x", want[i]);
+                printf("\n");
+            }
+            o = fx_outside(g_snap, {{v, sizeof(CarViewer3D)}, widget_of(v), {(void*)(uintptr_t)S_REMAP_CAR, 0x28},
+                                    {(void*)(uintptr_t)S_CARFILE, 0x1b8}});
+            sprintf(m, "CarViewer3D::SetModel, a %u-character name (%.12s...): nothing written past the remap entry or the viewer",
+                    (unsigned)len, c.name);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_reset();
+        g_fx_real_tex = true;
+        fx_same(f, {U(v), 0, U(mk(0, 'c', 18, "0.mod"))}, "CarViewer3D::SetModel, an 18-character base (\"~<base>.tex\" fills the entry)");
+    }
+    // ---- 7. OpponentViewer::SetModel ----
+    {
+        const Ent& f = fx_fn("OpponentViewer::SetModel");
+        OpponentViewer* ov = W.ov;
+        const struct { const char* name; const char* set; bool loads; bool orig_faults; } cases[] = {
+            {"viper", "viper.car", true, true},
+            {mk(0, 'e', 35, "1.mod"), "", false, false},
+            {mk(1, 'f', 28, "1.x"), "", false, false},
+            {mk(2, 'g', 27, "1.x"), mk(3, 'g', 27, ".car"), true, false},
+        };
+        for (const auto& c : cases) {
+            fx_reset();
+            g_fx_real_tex = true;
+            ov->model = 0;
+            ov->set[0] = 0;
+            char base[0x40], tex[0x80];
+            strcpy(base, c.set);
+            if (char* d = strrchr(base, '.')) *d = 0;
+            if (!_stricmp(base, "viper")) strcpy(tex, "~paint0.tex");
+            else sprintf(tex, "~%s.tex", base);
+            uint8_t before[0x28], want[0x28], car[0x20];
+            memcpy(before, (const void*)(uintptr_t)S_REMAP_OPP, 0x28);
+            memcpy(car, ov->car, 0x20);
+            remap_expect(want, before, base, tex);
+            if (!c.loads) memcpy(want, before, 0x28);
+            const size_t len = strlen(c.name);
+            mem_save(g_snap);
+            if (c.orig_faults) {
+                r = fx_run(f, false, {U(ov), 0, U(c.name)});
+                sprintf(m, "OpponentViewer::SetModel, \"%s\": the original faults (the case is real)", c.name);
+                fx_check(r.fault != 0, m);
+                mem_load(g_snap);
+            }
+            g_rec_mustload[0] = g_rec_load[0] = 0;
+            r = fx_run(f, true, {U(ov), 0, U(c.name)});
+            sprintf(m, "OpponentViewer::SetModel, a %u-character name (%.12s...): a clean return", (unsigned)len, c.name);
+            fx_check(fx_clean(f, r), m, &r);
+            if (c.loads) {
+                sprintf(m, "OpponentViewer::SetModel, a %u-character name (%.12s...): its set \"%s\" loaded, its model, its remap entry",
+                        (unsigned)len, c.name, c.set);
+                fx_check(!strcmp(ov->set, c.set) && !strcmp(g_rec_mustload, c.set) && !strcmp(g_rec_load, c.name) && ov->model != 0 &&
+                             !memcmp((const void*)(uintptr_t)S_REMAP_OPP, want, 0x28),
+                         m);
+            } else {
+                sprintf(m, "OpponentViewer::SetModel, a %u-character name (%.12s...): too long for its set: no car", (unsigned)len, c.name);
+                fx_check(ov->set[0] == 0 && ov->model == 0 && !fx_logged('RSML') && !fx_logged('MRLD'), m);
+            }
+            sprintf(m, "OpponentViewer::SetModel, a %u-character name (%.12s...): the car's name after the set untouched",
+                    (unsigned)len, c.name);
+            fx_check(!memcmp(car, ov->car, 0x20), m);
+            o = fx_outside(g_snap, {{ov->set, 0x20}, {(void*)&ov->model, 4}, widget_of(ov), {(void*)(uintptr_t)S_REMAP_OPP, 0x28}});
+            sprintf(m, "OpponentViewer::SetModel, a %u-character name (%.12s...): nothing written past the set or the remap entry",
+                    (unsigned)len, c.name);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_reset();
+        g_fx_real_tex = true;
+        ov->set[0] = 0;
+        fx_same(f, {U(ov), 0, U(mk(0, 'h', 18, "1.mod"))}, "OpponentViewer::SetModel, an 18-character base (\"~<base>.tex\" fills the entry)");
+    }
+    // ---- 7. OpponentViewer::SetCar ----
+    {
+        const Ent& f = fx_fn("OpponentViewer::SetCar");
+        OpponentViewer* ov = W.ov;
+        fx_reset();
+        ov->created = 0;
+        mem_save(g_snap);
+        r = fx_run(f, true, {U(ov), 0, U(mk(0, 'k', 100))});
+        fx_check(fx_clean(f, r) && !strcmp(ov->car, mk(1, 'k', 31)), "OpponentViewer::SetCar, a 100-character name: its first 31", &r);
+        o = fx_outside(g_snap, {{ov->car, 0x20}});
+        fx_check(o == 0, "OpponentViewer::SetCar, a 100-character name: nothing written past the car's name", 0, o);
+        {
+            FxHook h({"OpponentViewer::UpdateOpponent", "OpponentViewer::SetModel"});
+            fx_reset();                                     // created, a ghost car: UpdateOpponent, "<31 k>1.mod", no car
+            ov->created = 1;
+            ov->type = 2;
+            ov->set[0] = 0;
+            mem_save(g_snap);
+            r = fx_run(f, true, {U(ov), 0, U(mk(0, 'k', 100))});
+            fx_check(fx_clean(f, r) && ov->model == 0 && ov->set[0] == 0 && !fx_logged('RSML'),
+                     "OpponentViewer::SetCar, a 100-character ghost car (the fixed callees): a clean return, no car", &r);
+            o = fx_outside(g_snap, {{ov, sizeof(OpponentViewer)}, {W.opts, sizeof(GameOptions)}, widget_of(ov)});
+            fx_check(o == 0, "OpponentViewer::SetCar, a 100-character ghost car: nothing written past the viewer", 0, o);
+        }
+        fx_reset();
+        ov->created = 0;
+        fx_same(f, {U(ov), 0, U(mk(0, 'k', 31))}, "OpponentViewer::SetCar, a 31-character name (the longest that fits)");
+    }
+    // ---- 7, 10. OpponentViewer::UpdateOpponent: an unterminated car name, a long label ----
+    {
+        const Ent& f = fx_fn("OpponentViewer::UpdateOpponent");
+        OpponentViewer* ov = W.ov;
+        FxHook* h = new FxHook({"OpponentViewer::SetModel"});
+        fx_reset();
+        memset(ov->car, 'c', 0x20);
+        ov->type = 2;
+        ov->set[0] = 0;
+        mem_save(g_snap);
+        r = fx_run(f, true, {U(ov), 0});
+        fx_check(fx_clean(f, r) && ov->model == 0 && !strcmp(ov->label, k_labels[2]),
+                 "OpponentViewer::UpdateOpponent, a car name filling its field: a clean return, no car", &r);
+        o = fx_outside(g_snap, {{ov, sizeof(OpponentViewer)}, {W.opts, sizeof(GameOptions)}, widget_of(ov)});
+        fx_check(o == 0, "OpponentViewer::UpdateOpponent, a car name filling its field: nothing written past the viewer", 0, o);
+        fx_reset();
+        UI_GP(const char, S_OPP_LABELS) = mk(0, 'l', 100);
+        ov->type = 0;
+        mem_save(g_snap);
+        r = fx_run(f, true, {U(ov), 0});
+        fx_check(fx_clean(f, r) && !strcmp(ov->label, mk(1, 'l', 34)), "OpponentViewer::UpdateOpponent, a 100-character label: its first 34", &r);
+        o = fx_outside(g_snap, {{ov, offsetof(OpponentViewer, frame_stamp)}, {(void*)&ov->model, 4}, {W.opts, sizeof(GameOptions)}, widget_of(ov)});
+        fx_check(o == 0, "OpponentViewer::UpdateOpponent, a 100-character label: nothing written past it (the stamps kept)", 0, o);
+        delete h;
+        fx_reset();
+        UI_GP(const char, S_OPP_LABELS) = mk(0, 'l', 34);
+        ov->type = 0;
+        fx_same(f, {U(ov), 0}, "OpponentViewer::UpdateOpponent, a 34-character label (the longest that fits)");
+        fx_reset();
+        strcpy(ov->car, mk(0, 'c', 26));
+        ov->type = 2;
+        fx_same(f, {U(ov), 0}, "OpponentViewer::UpdateOpponent, a 26-character ghost car (\"<car>1.mod\" fills the original's buffer)");
+    }
+    // ---- 8. CarViewer3D::UpdateCar: a long .tab text ----
+    {
+        const Ent& f = fx_fn("CarViewer3D::UpdateCar");
+        CarViewer3D* v = W.cv;
+        fx_reset();
+        v->car = 0;
+        strcpy(v->set, "viper.car");
+        v->tab = g_tabs[0];
+        const CarCountFn cnt = v->count;
+        const CarNameFn nm = v->name_of;
+        g_fx_tab6 = mk(0, 'q', 100);
+        mem_save(g_snap);
+        r = fx_run(f, true, {U(v), 0});
+        fx_check(fx_clean(f, r) && !strcmp(v->text, mk(1, 'q', 31)) && v->count == cnt && v->name_of == nm,
+                 "CarViewer3D::UpdateCar, a 100-character text: its first 31, the car list's callbacks kept", &r);
+        o = fx_outside(g_snap, {{v, sizeof(CarViewer3D)}, widget_of(v), {(void*)(uintptr_t)S_REMAP_CAR, 0x28}, {(void*)(uintptr_t)S_CARFILE, 0x1b8}});
+        fx_check(o == 0, "CarViewer3D::UpdateCar, a 100-character text: nothing written past the viewer", 0, o);
+        fx_reset();
+        v->car = 0;
+        strcpy(v->set, "viper.car");
+        v->tab = g_tabs[0];
+        g_fx_tab6 = mk(0, 'q', 31);
+        fx_same(f, {U(v), 0}, "CarViewer3D::UpdateCar, a 31-character text (the longest that fits)");
+    }
+    // ---- 9. CarChooser::update_car: huge stats, long units ----
+    {
+        const Ent& f = fx_fn("CarChooser::update_car");
+        CarChooser* cc = W.cc;
+        CarViewer3D* v = &cc->viewer;
+        fx_reset();
+        const char* unit = mk(0, 'u', 300);
+        const char* lunit = mk(1, 'v', 300);
+        const char* punit = mk(2, 'w', 300);
+        g_fx_xl = unit;
+        for (uint32_t xl : {0x0057b8c0u, 0x0057b998u, 0x0057bc28u, 0x0057bc48u}) fx_xl(xl, 0, false);   // refreshed: the long unit
+        *(const char**)(W.locale + 0x18) = lunit;
+        *(const char**)(W.locale + 0x28) = punit;
+        const float big[5] = {1e30f, -3.4e38f, 123456789.0f, 2e20f, -7e37f};
+        for (int i = 0; i < 5; i++) { v->stat[i] = big[i]; v->stat2[i] = -big[4 - i]; }
+        v->istat = 2000000000;
+        strcpy(v->text, "Twenty characters ok");
+        const uint32_t vt = U(v->vtbl);
+        mem_save(g_snap);
+        r = fx_run(f, true, {U(cc), 0});
+        fx_check(fx_clean(f, r) && U(v->vtbl) == vt, "CarChooser::update_car, huge stats and 300-character units: a clean return, the viewer's vtable kept", &r);
+        static char want[0x1000];
+        const struct { const char* field; uint32_t size; } fields[] = {{cc->s18, 16}, {cc->s28, 16}, {cc->s38, 16}, {cc->s48, 16}, {cc->s58, 16},
+                                                                      {cc->s68, 32}, {cc->s88, 16}, {cc->s98, 32}, {cc->sb8, 32}, {cc->sd8, 16}};
+        for (int k = 0; k < 10; k++) {
+            switch (k) {
+            case 0: case 1: case 2: sprintf(want, "%3.1f %s", (double)v->stat[k], unit); break;
+            case 3: case 4: sprintf(want, "%1.0f %s", 1.0 * (double)v->stat[k], lunit); break;
+            case 5: strcpy(want, v->text); break;
+            case 6: sprintf(want, "%d %s", (int)2000000000, punit); break;
+            case 7: sprintf(want, "%1.0f %s@%1.0f %s", (double)v->stat2[0], unit, (double)v->stat2[1], unit); break;
+            case 8: sprintf(want, "%1.0f %s@%1.0f %s", (double)v->stat2[2], unit, (double)v->stat2[3], unit); break;
+            case 9: sprintf(want, "%1.0f %s", (double)v->stat2[4], unit); break;
+            }
+            want[fields[k].size - 1] = 0;
+            sprintf(m, "CarChooser::update_car, huge stats and 300-character units: text %d is the first %u characters (\"%s\" / \"%.40s\")", k,
+                    fields[k].size - 1, want, fields[k].field);
+            fx_check(!strcmp(fields[k].field, want), m);
+        }
+        o = fx_outside(g_snap, {{cc, offsetof(CarChooser, viewer)}, {W.car_name, 0x80}, {(void*)(uintptr_t)0x0057b8c0, 12},
+                                {(void*)(uintptr_t)0x0057b998, 12}, {(void*)(uintptr_t)0x0057bc28, 12}, {(void*)(uintptr_t)0x0057bc48, 12}});
+        fx_check(o == 0, "CarChooser::update_car, huge stats and 300-character units: nothing written past the texts", 0, o);
+        fx_reset();                                         // the first text exactly 15 characters, the others ordinary
+        fx_xl(0x0057b8c0, "s", true);
+        fx_xl(0x0057b998, "bhp", true);
+        fx_xl(0x0057bc28, "rpm", true);
+        fx_xl(0x0057bc48, "lb-ft", true);
+        v->stat[0] = 12345678848.0f;
+        for (int i = 1; i < 5; i++) { v->stat[i] = 100.0f; v->stat2[i] = 250.0f; }
+        v->stat2[0] = 250.0f;
+        v->istat = 300;
+        strcpy(v->text, "ok");
+        fx_same(f, {U(cc), 0}, "CarChooser::update_car, a 15-character text (the longest that fits)");
+    }
+    // ---- 11. RaceOptionViewer::Callback: the summary and the laps text ----
+    {
+        const Ent& f = fx_fn("RaceOptionViewer::Callback");
+        RaceOptionViewer* rv = W.rov;
+        const Span heap = {g_arena + A_HEAP, ARENA_BYTES - A_HEAP};   // the window's widgets (the groups shown and hidden)
+        for (int ev = 0; ev < 2; ev++) {
+            fx_reset();
+            W.flags[1] = (uint8_t)(ev ? 0 : 1);
+            W.opts->field = 1;
+            W.opts->laps = (int32_t)0x80000000u;
+            W.opts->event = 3;
+            g_fx_enum[6] = mk(0, 'F', 100);
+            g_fx_enum[7] = mk(1, 'E', 100);
+            g_fx_xl = mk(2, 'L', 100);
+            fx_xl(0x0057be88, 0, false);
+            memset(W.summary, 'Z', 0x100);
+            mem_save(g_snap);
+            r = fx_run(f, true, {U(rv), 0, 0, U(&W.opts->field)});
+            static char want[0x400], want2[0x400];
+            if (ev) strcpy(want, g_fx_enum[7]);
+            else sprintf(want, "%s: %d %s", g_fx_enum[6], (int)0x80000000u, g_fx_xl);
+            want[0x1f] = 0;
+            sprintf(want2, "%d %s", (int)0x80000000u, g_fx_xl);
+            want2[0x23] = 0;
+            bool ok = fx_clean(f, r) && !strcmp(W.summary, want);
+            for (int i = 0x20; i < 0x100; i++) ok &= W.summary[i] == 'Z';
+            fx_check(ok, ev ? "RaceOptionViewer::Callback, a 100-character event: the summary its first 31 characters, the rest of the caller's untouched"
+                            : "RaceOptionViewer::Callback, a 100-character field and unit: the summary its first 31 characters, the rest of the caller's untouched",
+                     &r);
+            if (!ev) fx_check(!strcmp(rv->text, want2), "RaceOptionViewer::Callback, the least lap count and a 100-character unit: the laps text its first 35");
+            o = fx_outside(g_snap, {{rv, sizeof(RaceOptionViewer)}, {W.summary, 0x20}, {W.opts, sizeof(GameOptions)},
+                                    {(void*)(uintptr_t)0x0057be88, 12}, heap});
+            fx_check(o == 0, ev ? "RaceOptionViewer::Callback, a 100-character event: nothing written past the summary"
+                                : "RaceOptionViewer::Callback, a 100-character field and unit: nothing written past the texts", 0, o);
+        }
+        fx_reset();                                         // "<22>: 12 Laps": 31 characters
+        W.flags[1] = 1;
+        W.opts->field = 1;
+        W.opts->laps = 12;
+        g_fx_enum[6] = mk(0, 'F', 22);
+        fx_xl(0x0057be88, "Laps", true);
+        fx_same(f, {U(rv), 0, 0, U(&W.opts->field)}, "RaceOptionViewer::Callback, a 31-character summary (the longest that fits)");
+        fx_reset();                                         // "F: -2147483648 <16 L>" 31, "-2147483648 <16 L>" 28 (the unit is
+        W.flags[1] = 1;                                     // shared: the laps text can't reach 35 while the summary fits)
+        W.opts->field = 1;
+        W.opts->laps = (int32_t)0x80000000u;
+        g_fx_enum[6] = mk(0, 'F', 1);
+        fx_xl(0x0057be88, mk(1, 'L', 16), true);
+        fx_same(f, {U(rv), 0, 0, U(&W.opts->field)}, "RaceOptionViewer::Callback, the least lap count, a 31-character summary");
+        fx_reset();
+        W.flags[1] = 0;
+        W.opts->event = 3;
+        g_fx_enum[7] = mk(0, 'E', 31);
+        fx_same(f, {U(rv), 0, 0, U(&W.opts->field)}, "RaceOptionViewer::Callback, a 31-character event (the longest that fits)");
+    }
+    // ---- 12. BoardDo: a long title ----
+    {
+        const Ent& f = fx_fn("BoardDo");
+        fx_reset();
+        g_fx_enum[1] = mk(0, 'R', 50);
+        g_fx_enum[0] = mk(1, 'S', 50);
+        HS->script[0][0] = OP_NOP; HS->script[1][0] = OP_NOP;
+        HS->script[2][0] = OP_KEY; HS->script[2][1] = 0x1b;
+        HS->script_n = 3;
+        g_rec_mark = 'R';
+        g_rec_fprf[0] = 0;
+        r = fx_run(f, true, {U("bemidji"), 1, 2, 0});
+        g_rec_mark = 0;
+        fx_check(fx_clean(f, r), "BoardDo, a 102-character title: a clean return", &r);
+        char want[0x80];
+        sprintf(want, "%s: %s", g_fx_enum[1], g_fx_enum[0]);
+        want[0x3f] = 0;
+        sprintf(m, "BoardDo, a 102-character title: its first 63 characters shown (\"%.70s\")", g_rec_fprf);
+        fx_check(!strcmp(g_rec_fprf, want), m);
+        fx_reset();
+        g_fx_enum[1] = mk(0, 'R', 30);
+        g_fx_enum[0] = mk(1, 'S', 31);
+        HS->script[0][0] = OP_NOP; HS->script[1][0] = OP_NOP;
+        HS->script[2][0] = OP_KEY; HS->script[2][1] = 0x1b;
+        HS->script_n = 3;
+        fx_same(f, {U("bemidji"), 1, 2, 0}, "BoardDo, a 63-character title (the longest that fits)");
+    }
+    // ---- 13. BoardCustomText::Draw: a text that reads arguments as a format ----
+    {
+        const Ent& f = fx_fn("BoardCustomText::Draw");
+        static const char* const reads[] = {"%d laps", "%s", "%n", "Race: %*d", "%.*f", "%5.2s", "%I64d", "%hB", "100%% %c", "%lx", "% +#08.3e",
+                                            "%%%p", "Arcade: 5%s"};
+        static const char* const plain[] = {"50%% off", "100%", "%%%%", "", "%I6x", "%-5", "%5.3 b", "%k", "%.", "%l", "Arcade: Simulation",
+                                            "a%%b%", "%I"};
+        for (const char* t : reads) {
+            fx_reset();
+            W.bct->text = t;
+            mem_save(g_snap);
+            g_rec_fprf_fmt = 0;
+            r = fx_run(f, true, {U(W.bct), 0, U(W.screen)});
+            sprintf(m, "BoardCustomText::Draw, \"%s\": printed as it is (\"%%s\", the text)", t);
+            fx_check(fx_clean(f, r) && U(g_rec_fprf_fmt) == 0x004f1e84u && g_rec_fprf_a0 == U(t), m, &r);
+            o = fx_outside(g_snap, {{W.screen, sizeof(gxCanvas)}, {(void*)(uintptr_t)S_GX_CANVAS, 4}});
+            sprintf(m, "BoardCustomText::Draw, \"%s\": nothing written but the canvas", t);
+            fx_check(o == 0, m, 0, o);
+        }
+        for (const char* t : plain) {
+            fx_reset();
+            W.bct->text = t;
+            g_rec_fprf_fmt = 0;
+            r = fx_run(f, true, {U(W.bct), 0, U(W.screen)});
+            sprintf(m, "BoardCustomText::Draw, \"%s\": the format, as the original", t);
+            fx_check(fx_clean(f, r) && g_rec_fprf_fmt == t, m, &r);
+        }
+        for (const char* t : {"50%% off", "100%", "%%%%", "", "a%%b%"}) {
+            fx_reset();
+            W.bct->text = t;
+            sprintf(m, "BoardCustomText::Draw, \"%s\"", t);
+            fx_same(f, {U(W.bct), 0, U(W.screen)}, m);
+        }
+        // the check against the game's printf: the test texts ('B' aside: it reads the stale locals, not an argument) and
+        // 20000 random ones
+        g_noaccess = (uint8_t*)VirtualAlloc(0, 0x1000, MEM_COMMIT, PAGE_NOACCESS);
+        fx_reset();
+        int agree = 0, n = 0;
+        auto cmp = [&](const char* t) {
+            const bool a = menu_board::fix_format_reads_args(t), b = game_reads_args(t);
+            n++;
+            agree += a == b;
+            if (a != b) printf("  the format check says %s, the game's printf %s: \"%s\"\n", a ? "reads" : "doesn't read", b ? "reads" : "doesn't", t);
+        };
+        for (const char* t : reads) if (!strchr(t, 'B')) cmp(t);
+        for (const char* t : plain) cmp(t);
+        static const char alpha[] = "%%%%%*.-+ #0123456789lhILNFsdxkq64cS";
+        char t[24];
+        for (int i = 0; i < 20000; i++) {
+            const int len = irange(1, 12);
+            for (int k = 0; k < len; k++) t[k] = alpha[rnd() % (sizeof alpha - 1)];
+            t[len] = 0;
+            cmp(t);
+        }
+        sprintf(m, "the board text's format check agrees with the game's printf (%d of %d)", agree, n);
+        fx_check(agree == n, m);
+        fx_check(menu_board::fix_format_reads_args("%B") && menu_board::fix_format_reads_args("%-5B"), "the format check takes a 'B' conversion as reading");
+        VirtualFree(g_noaccess, 0, MEM_RELEASE);
+    }
+    mem_load(g_pristine);
+    printf("directed fix tests: %s -- %d checks, %d failed (%d boundary cases compared with the original)\n", g_fx_bad ? "FAILED" : "all passed",
+           g_fx_n, g_fx_bad, g_fx_same_n);
+    return g_fx_bad;
+}
+#endif
+
 // ---- main -----------------------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -1326,6 +1999,11 @@ int main(int argc, char** argv) {
            (int)W.widgets.size(), (HS->heap_next - A_HEAP) / 1024);
 
     int dup = 0;
+#if MENU_FIXES
+    const int fix_bad = directed_fix_tests();
+#else
+    const int fix_bad = 0;
+#endif
     for (int i = 0; i < g_nfns; i++)
         for (int j = i + 1; j < g_nfns; j++)
             if (g_fns[i].v10 == g_fns[j].v10 || !strcmp(g_fns[i].name, g_fns[j].name)) {
@@ -1336,12 +2014,13 @@ int main(int argc, char** argv) {
     static Footprint fp;
     long long checks = 0, poisoned_checks = 0, log_words = 0;
     int differ = 0, fp_bad = 0, faults = 0, pure_n = 0, replay_n = 0, changed_fns = 0, still_fns = 0, bad_fns = 0, skipped = 0;
-    long long both_fault = 0;
+    long long both_fault = 0, orig_only = 0, overran = 0;
+    char fixed_fns[2048] = "";
     for (int fi = 0; fi < g_nfns; fi++) {
         const Ent& f = g_fns[fi];
         if (only && !strstr(f.name, only)) continue;
         bool fn_bad = false, fn_changed = false;
-        int fn_faults = 0, fn_checks = 0, fn_fpck = 0;
+        int fn_faults = 0, fn_checks = 0, fn_fpck = 0, fn_orig_only = 0, fn_overran = 0;
         const int nr = is_modal(f.name) ? rounds : rounds * 10;
         for (int rd = 0; rd < nr && !fn_bad; rd++) {
             const bool poisoned = rd & 1;
@@ -1356,7 +2035,9 @@ int main(int argc, char** argv) {
             fp.n = 0; fp.replay_only = 0; fp.pure = false;
             f.fp(fp, words);
             mem_save(g_snap);
+            g_overran = false;
             const Result ro = run(f, false, words);
+            const bool ro_overran = g_overran;
             const bool changed = mem_diff(g_snap) != 0;
             fn_changed |= changed;
             if (!fp.replay_only && !ro.fault) {
@@ -1380,6 +2061,12 @@ int main(int argc, char** argv) {
             memcpy(&g_log_orig, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
             mem_load(g_snap);
             const Result rn = run(f, true, words);
+            if (MENU_FIXES && ((ro.fault && !rn.fault) || ro_overran)) {   // a fixed case: not compared (counted)
+                if (ro.fault && !rn.fault) { orig_only++; fn_orig_only++; }
+                else { overran++; fn_overran++; }
+                if (rd == 0) { pure_n += fp.pure; replay_n += fp.replay_only != 0; }
+                continue;
+            }
             checks++;
             fn_checks++;
             poisoned_checks += poisoned;
@@ -1418,6 +2105,11 @@ int main(int argc, char** argv) {
         }
         bad_fns += fn_bad;
         (fn_changed ? changed_fns : still_fns)++;
+        if (fn_orig_only || fn_overran) {
+            char e[128];
+            sprintf(e, "%s%s %d/%d", fixed_fns[0] ? ", " : "", f.name, fn_orig_only, fn_overran);
+            if (strlen(fixed_fns) + strlen(e) < sizeof fixed_fns) strcat(fixed_fns, e);
+        }
         if (trace)
             printf("%08x %-52s %s%s (%d checks, %d with the footprint checked, %d faulted)\n", f.v10, f.name, fn_bad ? "BAD" : "ok",
                    fn_changed ? "" : " (never changed memory)", fn_checks, fn_fpck, fn_faults);
@@ -1429,5 +2121,8 @@ int main(int argc, char** argv) {
            "%d functions bad\n", g_nfns, pure_n, replay_n, g_nfns - pure_n - replay_n, dup, checks, poisoned_checks, log_words, differ,
            fp_bad, faults, both_fault, skipped, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
-    return differ || fp_bad || dup ? 1 : 0;
+    if (MENU_FIXES)
+        printf("fix build: %lld rounds where only the original faulted and %lld where its sprintf printed past a field, kept out of "
+               "the comparison (per function: faulted/printed past): %s\n", orig_only, overran, fixed_fns[0] ? fixed_fns : "none");
+    return differ || fp_bad || dup || fix_bad ? 1 : 0;
 }

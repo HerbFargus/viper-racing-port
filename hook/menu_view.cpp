@@ -26,13 +26,21 @@
 // adds or removes notifications (Create / Destroy), builds widgets (Added) or runs a dialog (details, the callbacks,
 // paint's paint shop).
 //
-// FIX CANDIDATEs (left faithful, marked in place): TrackViewer::Draw indexes its three difficulty names with what
-// GetTrackDifficulty returns (garbage for a track outside 0..7, the "no track" -1 among them); the constructor clamps a
-// too-big saved track_no but not a negative one; SetTrack / SetModel / UpdateOpponent copy names into fixed stack buffers
-// unbounded; UpdateOpponent reads its label table with the opponent type unchecked; the details dialogs' static UIDialog
-// keeps its items pointer from the first call (a later call from a different stack depth shows the first frame's
-// memory); CarChooser::update_car formats the stats into 16- and 32-byte texts (the last one just before its viewer)
-// unbounded; RaceOptionViewer::Callback formats into the caller's 0x20 bytes and its own 0x24 unbounded.
+// Fixes (// FIX:, docs/FIXES.md "Menus"): the names and texts copied or formatted into fixed buffers unbounded are held to
+// them -- TrackViewer::SetTrack's track name (cut to 74 characters, so "<name>.stp" fits), CarViewer3D::SetModel's model
+// name (31 for the texture names; the .cf's to 251) and texture name (a bigger buffer, then the remap entry's 0x18 bytes),
+// OpponentViewer::SetModel's (a name whose "<base>.car" can't fit the object's 32 bytes shows no car), SetCar's name and
+// UpdateOpponent's label (their fields), UpdateOpponent's "<car>1.mod" (a bigger buffer), UpdateCar's .tab text,
+// CarChooser::update_car's stat texts and RaceOptionViewer::Callback's summary (the caller's 0x20 bytes) and laps text
+// (each formatted in a buffer of the rewrite's where it could pass, then cut to its field) -- and the cut at the character
+// before a name's first '.' is skipped when there's none (a write to address -1) or it comes first. Every other input
+// gives the original's bits.
+//
+// FIX CANDIDATEs (left faithful, marked in place: damaged files, stale frames, out-of-range values): TrackViewer::Draw
+// indexes its three difficulty names with what GetTrackDifficulty returns (garbage for a track outside 0..7, the "no
+// track" -1 among them); the constructor clamps a too-big saved track_no but not a negative one; UpdateOpponent reads its
+// label table with the opponent type unchecked; the details dialogs' static UIDialog keeps its items pointer from the
+// first call (a later call from a different stack depth shows the first frame's memory).
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -186,8 +194,14 @@ static void __fastcall TrackViewer_SetTrack_c(TrackViewer* self, Edx, int32_t t)
         tcall<void>(F_TrackViewer_set_stamp, self, CP(0x004fa2e4));
         return;
     }
-    // FIX CANDIDATE: the track's name is copied into 0x50 bytes unbounded (the track table's names are short)
-    crt_strcpy(buf, ccall<const char*>(F_GetTrackName, t));
+    // FIX: the track's name (tracks.tab's) went into 0x50 bytes unbounded and ".stp" after it, so a name of 75 or more
+    // characters overran the stack: it's cut to 74, so "<name>.stp" fits (no such map exists: none is shown, as for any
+    // missing map). A name that fits is copied as before.
+    {
+        const char* tn = ccall<const char*>(F_GetTrackName, t);
+        if (VP_FIX) ui_copy_bounded(buf, tn, sizeof buf - 5);
+        else crt_strcpy(buf, tn);
+    }
     char* e = buf + crt_strlen(buf);
     *(volatile uint32_t*)e = UI_GU32(0x004fa2f4);                  // ".stp" and its terminator: a dword and a byte
     *(volatile uint8_t*)(e + 4) = UI_G8(0x004fa2f8);
@@ -457,6 +471,18 @@ PORT_FN(0x0049bd10, "TrackChooser::scalar deleting destructor", TrackChooser_vdd
 enum : uint32_t { S_CAR_SECTION = 0x004df098 };   // char const* "GLOBAL" (carview's option section)
 typedef void(__cdecl* Sprintf_v)(char*, const char*, ...);
 #define game_sprintf ((Sprintf_v)(uintptr_t)F_sprintf)
+// FIX helper (CarChooser::update_car): the game's sprintf into the rewrite's buffer t (0x400 bytes), then the field keeps
+// what fits it (size - 1 characters and a terminator) -- the same bytes as formatting into it, for a text that fits. Every
+// %s argument is fix_cut to 255 characters and a number prints at most 78 digits (a float times a float), so nothing
+// passes t. The faithful build formats into the field.
+template <typename... A> static __forceinline void fix_format(char* field, uint32_t size, char* t, const char* fmt, A... a) {
+    if (VP_FIX) {
+        game_sprintf(t, fmt, a...);
+        ui_copy_bounded(field, t, size);
+    } else {
+        game_sprintf(field, fmt, a...);
+    }
+}
 static __forceinline bool car_list_is_root(const CarViewer3D* v) {       // the root library's car list (read only)
     return (uint32_t)(uintptr_t)v->count == 0x00406920u && (uint32_t)(uintptr_t)v->name_of == 0x00406910u;
 }
@@ -667,7 +693,7 @@ PORT_FN(0x0049c680, "Hermite", Hermite_c, fp_Hermite)
 // SetModel(name): the old models freed; "<name>.mod" with the paint job's texture remapped; the car's .cf for the
 // wheels' sizes; wheel_1.mod scaled into the front and rear wheel copies
 static void __fastcall CarViewer3D_SetModel_c(CarViewer3D* self, Edx, const char* name) {
-    char base[0x20], tex[0x20], cfn[0x100];
+    char base[0x20], tex[VP_FIX ? 0x40 : 0x20], cfn[0x100];         // FIX: (below) tex has room for "~<base>.tex"
     volatile float S[9], ext[6];
     volatile float fa, fb, fc, fd, dx, dy, dz;
     if (self->model) {
@@ -677,18 +703,37 @@ static void __fastcall CarViewer3D_SetModel_c(CarViewer3D* self, Edx, const char
     }
     self->model = 0;
     if (name) {
-        // FIX CANDIDATE: the model's name is copied into 0x20 bytes unbounded, and cut at the character before its first
-        // '.' (none: a write to address -1); "<base>.tex" goes to a 16-byte static, the texture name to another
-        crt_strcpy(base, name);
-        *(volatile char*)(ccall<char*>(F_strchr, (const char*)base, (int)0x2e) - 1) = 0;
+        // FIX: a model name of 32 or more characters (a mod car's name of 27 or more, "<car>0.mod") overran the stack from
+        // its 0x20 bytes: it's cut to 31 for the texture names (too long to name a texture: the car shows unpainted); the
+        // model and the .cf are still loaded by the whole name. The name is cut at the character before its first '.' (UpdateCar's
+        // "<car>0.mod" -> "<car>"): with no '.' that wrote to address -1 (a crash), with a '.' first it wrote before
+        // the buffer; neither is cut now. WorldGetCarTexture's "~<base>.tex" (up to 37 bytes) overran the 0x20-byte
+        // texture name; it has 0x40. The texture name then went into the remap entry's 16-byte field unbounded, over
+        // its value and pointer and past the entry (into an Xlator) from 24 characters on: it keeps to the entry's
+        // 0x18 bytes, then the value and pointer are zeroed as before, so the model reads its first 16 characters, the
+        // most a texture name has. ("<base>.tex", at most 36 bytes now, keeps to the entry's 0x28 as it always did for
+        // a 31-character name: the texture name and the zeros go over its tail.) A name that fits is the same.
+        if (VP_FIX) ui_copy_bounded(base, name, sizeof base);
+        else crt_strcpy(base, name);
+        {
+            char* const dot = ccall<char*>(F_strchr, (const char*)base, (int)0x2e);
+            if (!(VP_FIX && (dot == 0 || dot == base))) *(volatile char*)(dot - 1) = 0;
+        }
         ccall<void>(F_WorldGetCarTexture, (char*)tex, (const char*)base, (int32_t)(-1 - self->paint));
         game_sprintf((char*)(uintptr_t)S_REMAP_CAR, CP(0x004fa4e8), (const char*)base);
-        crt_strcpy((char*)(uintptr_t)(S_REMAP_CAR + 0x10), tex);
+        if (VP_FIX) ui_copy_bounded((char*)(uintptr_t)(S_REMAP_CAR + 0x10), tex, 0x18);
+        else crt_strcpy((char*)(uintptr_t)(S_REMAP_CAR + 0x10), tex);
         UI_GU32(S_REMAP_CAR + 0x20) = 0;
         UI_GU32(S_REMAP_CAR + 0x24) = 0;
         self->model = ccall<int32_t>(F_mrModelLoadRemap, name, (void*)(uintptr_t)S_REMAP_CAR, (int32_t)1);
-        crt_strcpy(cfn, name);
-        *(volatile char*)(ccall<char*>(F_strrchr, (const char*)cfn, (int)0x2e) - 1) = 0;
+        // FIX: (above) the .cf's name: the name up to 251 characters, so "<name>.cf" fits the 0x100 bytes whether or not
+        // it's cut (a name of 255 or more characters overran them); cut as above
+        if (VP_FIX) ui_copy_bounded(cfn, name, sizeof cfn - 4);
+        else crt_strcpy(cfn, name);
+        {
+            char* const dot = ccall<char*>(F_strrchr, (const char*)cfn, (int)0x2e);
+            if (!(VP_FIX && (dot == 0 || dot == cfn))) *(volatile char*)(dot - 1) = 0;
+        }
         *(volatile uint32_t*)(cfn + crt_strlen(cfn)) = UI_GU32(0x004fa4f0);          // ".cf" and its terminator
         if (!ccall<uint8_t>(F_CarFileLoad, (void*)(uintptr_t)S_CARFILE, (const char*)cfn, (void*)0)) UI_LogPanic(CP(0x004fa4f4), (const char*)cfn);
         const float k001 = bits_f(0x3a83126f), k1e5 = bits_f(0x3727c5ad), k127 = bits_f(0x3c5013a9), k2 = bits_f(0x40000000);
@@ -761,8 +806,13 @@ static void __fastcall CarViewer3D_UpdateCar_c(CarViewer3D* self, Edx) {
             tcall<void>(F_CarViewer3D_SetModel, self, (const char*)mod);
         }
         for (int32_t i = 0; i < 5; i++) st_f(&self->stat[i], ccall<double>(F_atof, tab_entry(self, i + 1)));
-        // FIX CANDIDATE: the .tab's text (entry 6) is copied into 0x20 bytes unbounded
-        crt_strcpy(self->text, tab_entry(self, 6));
+        // FIX: the .tab's text (entry 6, shown in the details) went into 0x20 bytes unbounded, over the stats and the car
+        // list's callbacks after it: it keeps its first 31 characters. A text that fits is copied as before.
+        {
+            const char* e6 = tab_entry(self, 6);
+            if (VP_FIX) ui_copy_bounded(self->text, e6, sizeof self->text);
+            else crt_strcpy(self->text, e6);
+        }
         self->istat = ccall<int32_t>(F_atoi, tab_entry(self, 7));
         for (int32_t i = 0; i < 5; i++) st_f(&self->stat2[i], ccall<double>(F_atof, tab_entry(self, i + 8)));
     } else {
@@ -820,59 +870,63 @@ static void __fastcall CarChooser_update_car_c(CarChooser* self, Edx) {
         crt_copy(self->name, s, n);
     }
     CarViewer3D* v = &self->viewer;
-    // FIX CANDIDATE: the stats are formatted into texts of 16 and 32 bytes unbounded (a stat past 16 digits, a long
-    // translation of a unit): each runs into the next, the last (+0xd8) into the viewer's vtable
+    // FIX: the stats were formatted into their texts of 16 and 32 bytes unbounded, so a big stat (a mod car's .tab) or a
+    // long translation of a unit ran each into the next, and the last (+0xd8) into the viewer's vtable (the next call
+    // through it crashed): each is formatted in a buffer of the rewrite's and keeps what fits its text, 15 or 31
+    // characters (see fix_format). A text that fits is the same bytes.
+    char t[0x400], c1[0x100], c2[0x100];
     xl_once(0x0057b8a8, 1, 0x0057b8c0, 0x004fa540, 0x0049d240);
     xl_once(0x0057b8a8, 2, 0x0057b998, 0x004fa560, 0x0049d230);
     xl_once(0x0057b8a8, 4, 0x0057bc28, 0x004fa584, 0x0049d220);
     xl_once(0x0057b8a8, 8, 0x0057bc48, 0x004fa5ac, 0x0049d210);
     {
         const char* u = xlate(0x0057b8c0);
-        game_sprintf(self->s18, CP(0x004fa5c8), D(v->stat[0]), u);
+        fix_format(self->s18, sizeof self->s18, t, CP(0x004fa5c8), D(v->stat[0]), fix_cut(u, c1, 0xff));
         ccall<void>(F_LocaleConvertNumeric, (char*)self->s18);
     }
     {
         const char* u = xlate(0x0057b8c0);
-        game_sprintf(self->s28, CP(0x004fa5d4), D(v->stat[1]), u);
+        fix_format(self->s28, sizeof self->s28, t, CP(0x004fa5d4), D(v->stat[1]), fix_cut(u, c1, 0xff));
         ccall<void>(F_LocaleConvertNumeric, (char*)self->s28);
     }
     {
         const char* u = xlate(0x0057b8c0);
-        game_sprintf(self->s38, CP(0x004fa5e0), D(v->stat[2]), u);
+        fix_format(self->s38, sizeof self->s38, t, CP(0x004fa5e0), D(v->stat[2]), fix_cut(u, c1, 0xff));
         ccall<void>(F_LocaleConvertNumeric, (char*)self->s38);
     }
     {
         const uint8_t* L = locale();
         const double s = D(*(const volatile float*)(L + 0x1c)) * D(v->stat[3]);
-        game_sprintf(self->s48, CP(0x004fa5ec), s, *(const char* const volatile*)(L + 0x18));
+        fix_format(self->s48, sizeof self->s48, t, CP(0x004fa5ec), s, fix_cut(*(const char* const volatile*)(L + 0x18), c1, 0xff));
     }
     {
         const uint8_t* L = locale();
         const double s = D(*(const volatile float*)(L + 0x1c)) * D(v->stat[4]);
-        game_sprintf(self->s58, CP(0x004fa5f8), s, *(const char* const volatile*)(L + 0x18));
+        fix_format(self->s58, sizeof self->s58, t, CP(0x004fa5f8), s, fix_cut(*(const char* const volatile*)(L + 0x18), c1, 0xff));
     }
-    crt_strcpy(self->s68, v->text);
+    if (VP_FIX) ui_copy_bounded(self->s68, v->text, sizeof self->s68);   // FIX: (above; UpdateCar keeps it to 31 now)
+    else crt_strcpy(self->s68, v->text);
     {
         const uint8_t* L = locale();
         const double p = D(v->istat) * D(*(const volatile float*)(L + 0x2c));
         const char* u = *(const char* const volatile*)(L + 0x28);
-        game_sprintf(self->s88, CP(0x004fa604), x87_ftol(p), u);
+        fix_format(self->s88, sizeof self->s88, t, CP(0x004fa604), x87_ftol(p), fix_cut(u, c1, 0xff));
     }
     {
         xlate(0x0057bc28);
         xlate(0x0057b998);
-        game_sprintf(self->s98, CP(0x004fa60c), D(v->stat2[0]), UI_GP(const char, 0x0057b99c), D(v->stat2[1]),
-                     UI_GP(const char, 0x0057bc2c));
+        fix_format(self->s98, sizeof self->s98, t, CP(0x004fa60c), D(v->stat2[0]), fix_cut(UI_GP(const char, 0x0057b99c), c1, 0xff),
+                   D(v->stat2[1]), fix_cut(UI_GP(const char, 0x0057bc2c), c2, 0xff));
     }
     {
         xlate(0x0057bc28);
         xlate(0x0057bc48);
-        game_sprintf(self->sb8, CP(0x004fa620), D(v->stat2[2]), UI_GP(const char, 0x0057bc4c), D(v->stat2[3]),
-                     UI_GP(const char, 0x0057bc2c));
+        fix_format(self->sb8, sizeof self->sb8, t, CP(0x004fa620), D(v->stat2[2]), fix_cut(UI_GP(const char, 0x0057bc4c), c1, 0xff),
+                   D(v->stat2[3]), fix_cut(UI_GP(const char, 0x0057bc2c), c2, 0xff));
     }
     {
         const char* u = xlate(0x0057bc28);
-        game_sprintf(self->sd8, CP(0x004fa634), D(v->stat2[4]), u);
+        fix_format(self->sd8, sizeof self->sd8, t, CP(0x004fa634), D(v->stat2[4]), fix_cut(u, c1, 0xff));
     }
 }
 static void fp_CarChooser_update_car(Footprint& f, CarChooser* self, Edx) {
@@ -1245,8 +1299,10 @@ PORT_FN(0x0049e820, "OpponentViewer::Draw3D", OpponentViewer_Draw3D_c, fp_draw3d
 
 // SetCar: the ghost car's name; the opponent again once created
 static void __fastcall OpponentViewer_SetCar_c(OpponentViewer* self, Edx, const char* name) {
-    // FIX CANDIDATE: the name is copied into 0x20 bytes unbounded (MenuDoRaceSetup's is a constant)
-    crt_strcpy(self->car, name);
+    // FIX: the name went into 0x20 bytes unbounded, over the label and the stamps after it: it keeps its first 31
+    // characters (MenuDoRaceSetup's is the constant "viper": a name that fits is copied as before)
+    if (VP_FIX) ui_copy_bounded(self->car, name, sizeof self->car);
+    else crt_strcpy(self->car, name);
     if (self->created != 0) tcall<void>(F_OpponentViewer_UpdateOpponent, self);
 }
 static void fp_OpponentViewer_SetCar(Footprint& f, OpponentViewer* self, Edx, const char* name) {
@@ -1258,7 +1314,7 @@ PORT_FN(0x0049eaa0, "OpponentViewer::SetCar", OpponentViewer_SetCar_c, fp_Oppone
 
 // SetModel: the old model and its resource set freed; "<name>" loaded with its paint remapped, its set ("<car>.car")
 static void __fastcall OpponentViewer_SetModel_c(OpponentViewer* self, Edx, const char* name) {
-    char base[0x20], tex[0x20];
+    char base[0x20], tex[VP_FIX ? 0x40 : 0x20];                    // FIX: (below) tex has room for "~<base>.tex"
     if (const int32_t m = self->model) ccall<void>(F_mrModelUnload, m);
     char* set = self->set;
     self->model = 0;
@@ -1266,11 +1322,27 @@ static void __fastcall OpponentViewer_SetModel_c(OpponentViewer* self, Edx, cons
         ccall<void>(F_ResourceSetUnload, (const char*)set);
         *(volatile char*)set = 0;
     }
-    if (name && *(const volatile char*)name != 0) {
-        // FIX CANDIDATE: the name (and "<name>.car") is copied into 0x20 bytes unbounded, cut at the character before its
-        // first '.' (none: a write to address -1)
+    // FIX: the name went into the 0x20-byte set name unbounded, was cut at the character before its first '.' ("<car>1.mod"
+    // -> "<car>"; with no '.' that wrote to address -1, a crash; with a '.' first, before the object's field), and had
+    // ".car" put after it: a name of 32 or more characters, or one that's 28 or more cut, overran the field into the
+    // car's name after it, and one of 27 overran the 0x20-byte texture name "~<base>.tex" onto the return address. The
+    // resource set must be named in full to load, so such a name shows no car, as for none (nothing loaded); a name with
+    // no '.' (or one first) isn't cut; the texture name has 0x40 bytes and goes into the remap entry as CarViewer3D's
+    // (it overran the entry into the viewer's colour from 24 characters on). A name that fits is the same.
+    bool fits = name && *(const volatile char*)name != 0;
+    if (VP_FIX && fits) fits = ui_strnlen(name, sizeof self->set - 1) <= sizeof self->set - 1;
+    if (fits) {
         crt_strcpy(set, name);
-        *(volatile char*)(ccall<char*>(F_strchr, (const char*)set, (int)0x2e) - 1) = 0;
+        {
+            char* const dot = ccall<char*>(F_strchr, (const char*)set, (int)0x2e);
+            if (!(VP_FIX && (dot == 0 || dot == set))) *(volatile char*)(dot - 1) = 0;
+        }
+        if (VP_FIX && crt_strlen(set) > sizeof self->set - 5) {
+            *(volatile char*)set = 0;
+            fits = false;
+        }
+    }
+    if (fits) {
         crt_strcpy(base, set);
         char* e = set + crt_strlen(set);
         *(volatile uint32_t*)e = UI_GU32(0x004fa868);                 // ".car" and its terminator
@@ -1278,7 +1350,8 @@ static void __fastcall OpponentViewer_SetModel_c(OpponentViewer* self, Edx, cons
         ccall<void>(F_ResourceSetMustLoad, (const char*)set);
         ccall<void>(F_WorldGetCarTexture, (char*)tex, (const char*)base, (int32_t)-1);
         game_sprintf((char*)(uintptr_t)S_REMAP_OPP, CP(0x004fa870), (const char*)base);
-        crt_strcpy((char*)(uintptr_t)(S_REMAP_OPP + 0x10), tex);
+        if (VP_FIX) ui_copy_bounded((char*)(uintptr_t)(S_REMAP_OPP + 0x10), tex, 0x18);
+        else crt_strcpy((char*)(uintptr_t)(S_REMAP_OPP + 0x10), tex);
         UI_GU32(S_REMAP_OPP + 0x20) = 0;
         UI_GU32(S_REMAP_OPP + 0x24) = 0;
         const int32_t m = ccall<int32_t>(F_mrModelLoad, name);
@@ -1291,7 +1364,7 @@ PORT_FN(0x0049eae0, "OpponentViewer::SetModel", OpponentViewer_SetModel_c, fp_lo
 
 // UpdateOpponent: the label, the race's field, the model (a ghost car's is "<car>1.mod")
 static void __fastcall OpponentViewer_UpdateOpponent_c(OpponentViewer* self, Edx) {
-    char buf[0x20];
+    char buf[VP_FIX ? 0x40 : 0x20];                                // FIX: (below)
     xl_once(0x0057bd0c, 1, 0x0057bcf0, 0x004fa878, 0x0049ee60);
     xl_once(0x0057bd0c, 2, 0x0057bd20, 0x004fa890, 0x0049ee50);
     xl_once(0x0057bd0c, 4, 0x0057bd10, 0x004fa8a8, 0x0049ee40);
@@ -1302,8 +1375,11 @@ static void __fastcall OpponentViewer_UpdateOpponent_c(OpponentViewer* self, Edx
         UI_GP(const char, S_OPP_LABELS + 4) = xlate(0x0057bd10);
         UI_GP(const char, S_OPP_LABELS + 8) = xlate(0x0057bd20);
     }
-    // FIX CANDIDATE: the car's name and "1.mod" go into 0x20 bytes unbounded
-    crt_strcpy(buf, self->car);
+    // FIX: the car's name and "1.mod" went into 0x20 bytes unbounded, so a name of 27 or more characters overran the stack:
+    // the buffer has 0x40 bytes, and the name is read to its field's 31 characters at most, so "<car>1.mod" fits whole
+    // (SetModel then shows no car for a name too long for its set). A name that fits is the same.
+    if (VP_FIX) ui_copy_bounded(buf, self->car, sizeof self->car);
+    else crt_strcpy(buf, self->car);
     if (buf[0] != 0) {
         char* e = buf + crt_strlen(buf);
         const uint16_t tail = UI_G16(0x004fa8c4);
@@ -1311,9 +1387,14 @@ static void __fastcall OpponentViewer_UpdateOpponent_c(OpponentViewer* self, Edx
         *(volatile uint16_t*)(e + 4) = tail;
     }
     self->ghost = 0;
-    // FIX CANDIDATE: the opponent type (option "opponent") indexes the three labels unchecked, and the label (a
-    // translation) is copied into 0x23 bytes unbounded (then the stamps' pointers)
-    crt_strcpy(self->label, UI_GP(const char, S_OPP_LABELS + (uint32_t)self->type * 4u));
+    // FIX CANDIDATE: the opponent type (option "opponent") indexes the three labels unchecked
+    // FIX: the label (a translation) went into 0x23 bytes unbounded, over the stamps' pointers after it (freed and drawn
+    // later: a crash): it keeps its first 34 characters. A label that fits is copied as before.
+    {
+        const char* lbl = UI_GP(const char, S_OPP_LABELS + (uint32_t)self->type * 4u);
+        if (VP_FIX) ui_copy_bounded(self->label, lbl, sizeof self->label);
+        else crt_strcpy(self->label, lbl);
+    }
     switch (self->type) {
     case 0:
         self->opts->field = 1;
@@ -1537,15 +1618,32 @@ static void __fastcall RaceOptionViewer_Callback_c(RaceOptionViewer* self, Edx, 
             const char* u = UI_GP(const char, 0x0057be8c);
             const int32_t laps = p->laps;
             const char* fs = ccall<const char*>(F_GetFieldString, (int32_t)p->field);
-            // FIX CANDIDATE: formatted unbounded into the caller's text (MenuDoRaceSetup's: 0x20 bytes, just before this
-            // viewer in its frame: a longer field name or translation runs into the viewer's vtable)
-            game_sprintf(self->summary, CP(0x004faa88), fs, laps, u);
+            // FIX: "<field>: <laps> <unit>" went into the caller's text unbounded -- MenuDoRaceSetup's is 0x20 bytes just
+            // before this viewer in its frame, so a long translation ran into the viewer's vtable (the next call through
+            // it crashed). A text that would pass 31 characters is formatted in a buffer of the rewrite's (each %s cut to
+            // 64 characters) and its first 31 kept; the caller's buffer may be the original's, so 0x20 is all it's given.
+            // Any other is formatted into the caller's text as before.
+            if (VP_FIX && ui_strnlen(fs, 0x1f) + 2 + fix_dec_len(laps) + 1 + ui_strnlen(u, 0x1f) > 0x1f) {
+                char t[0x100], c1[0x41], c2[0x41];
+                game_sprintf(t, CP(0x004faa88), fix_cut(fs, c1, 0x40), laps, fix_cut(u, c2, 0x40));
+                ui_copy_bounded(self->summary, t, 0x20);
+            } else {
+                game_sprintf(self->summary, CP(0x004faa88), fs, laps, u);
+            }
         }
         {
             xlate(0x0057be88);
             const char* u = UI_GP(const char, 0x0057be8c);
-            // FIX CANDIDATE: "%d %s" (the laps) into the 0x24-byte text unbounded (then the OpponentViewer)
-            game_sprintf(self->text, CP(0x004faa94), (int32_t)self->opts->laps, u);
+            // FIX: "<laps> <unit>" into the 0x24-byte text unbounded (then the OpponentViewer, in MenuDoRaceSetup's frame):
+            // as the summary's, its first 35 characters
+            const int32_t laps = self->opts->laps;
+            if (VP_FIX && fix_dec_len(laps) + 1 + ui_strnlen(u, 0x23) > 0x23) {
+                char t[0x100], c1[0x41];
+                game_sprintf(t, CP(0x004faa94), laps, fix_cut(u, c1, 0x40));
+                ui_copy_bounded(self->text, t, sizeof self->text);
+            } else {
+                game_sprintf(self->text, CP(0x004faa94), laps, u);
+            }
         }
         return;
     }
@@ -1558,7 +1656,9 @@ static void __fastcall RaceOptionViewer_Callback_c(RaceOptionViewer* self, Edx, 
         else self->event = e;
     }
     const char* es = ccall<const char*>(F_GetEventString, (int32_t)self->opts->event);
-    game_sprintf(self->summary, CP(0x004faa9c), es);
+    // FIX: the event's name (a translation) into the caller's 0x20 bytes, as the summary above: its first 31 characters
+    if (VP_FIX && ui_strnlen(es, 0x1f) > 0x1f) ui_copy_bounded(self->summary, es, 0x20);
+    else game_sprintf(self->summary, CP(0x004faa9c), es);
 }
 static void fp_RaceOptionViewer_Callback(Footprint& f, RaceOptionViewer* self, Edx, int32_t, const void*) {
     if (!xl_built(0x0057be54, 1)) { f.replay_only = "the first call builds its Xlator (atexit)"; return; }

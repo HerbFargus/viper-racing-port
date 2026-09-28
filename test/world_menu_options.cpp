@@ -39,7 +39,20 @@
 // 1 MB arena (a dword where both passes left a pointer into this thread's stack counts as equal: each pass's frames
 // differ), the return value, the call logs of every stub, faults. Every byte the original changed must lie in the
 // rewrite's footprint (unless it's replay_only; the stubs' own state block excepted); a pure one changes nothing. The x87
-// runs at 24 or 53 bits (alternating rounds). VP_FAITHFUL (these files have no fixes).
+// runs at 24 or 53 bits (alternating rounds). Built as above, VP_FAITHFUL: every rewrite must match its original bit
+// for bit.
+//
+// Built with /DVP_MENU_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Menus": in
+// these files, MenuDoRaceMenu's default name and MenuDoRaceSetup's random track). Every function is still compared as
+// above, on states kept clear of the fixed cases: the track count is never 2 (the faithful build's 3% of rounds with two
+// tracks get 3..9), and the default player name's translation (Main_Menu:DefaultPlayerName, whose text this world's
+// Xlator::xlate otherwise gives as the 27-character key itself, so every faithful MenuDoRaceMenu round runs the overrun)
+// is a name that fits its 16 bytes: "Player" (the English), "" or one of exactly 15 characters. Then directed_fix_tests:
+// each fix's bad case on the rewrite -- no fault, the bytes popped and ebx / esi / edi / ebp kept, and the original's
+// result where it has a sensible one: the rewrite given a long name (16 to 4095 characters, a saved name present or
+// missing) against the original given its first 15 characters, and the rewrite with two tracks (where the original faults
+// dividing by zero, checked) against the original with one (t % -1 == 0, row 0); every byte of .data/.bss/.idata and the
+// arena and the call logs compared, the outputs' buffers pre-filled so a byte past the string shows.
 //
 // Stubbed (a jump to a logger; state in the arena so both passes see the same): world_ui.cpp's (MemAlloc / delete, the
 // logs, the input and the clock, the 2D calls, the fonts and stamps, the palettes, Xlator::xlate, sprintf, the controls'
@@ -67,7 +80,12 @@
 #include <utility>
 #include <vector>
 
+#ifndef VP_MENU_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#define MENU_FIXES 0
+#else
+#define MENU_FIXES 1
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------------
@@ -497,9 +515,13 @@ static void __cdecl stub_mrBeginFrame() { L('MRBF'); }
 static void __cdecl stub_mrEndFrame() { L('MREF'); }
 
 // ---- stubs: text, controls, files (world_ui.cpp's) ------------------------------------------------------------------------------
+// an Xlator's text: its key; in the fix build, Main_Menu:DefaultPlayerName's is the round's name (see the header)
+static const uint32_t K_DEFAULT_NAME = 0x004f8114;
+static const char* g_name_text;
+static uint32_t xl_text(uint32_t key) { return MENU_FIXES && key == K_DEFAULT_NAME && g_name_text ? (uint32_t)(uintptr_t)g_name_text : key; }
 static void __fastcall stub_xlate(uint32_t* xl_, int) {
     L('XLAT'); L(P(xl_));
-    xl_[1] = xl_[0];
+    xl_[1] = xl_text(xl_[0]);
     xl_[2] = UI_GU32(S_XLATOR_COOKIE);
 }
 static int __cdecl stub_sprintf(char* buf, const char* fmt, ...) {
@@ -978,7 +1000,11 @@ static void randomize_world() {
     HS->mix_volume = fbits_(ctl_float());
     for (int i = 0; i < 4; i++) { HS->mix_caps[i] = (uint8_t)(rnd() & 1); HS->mix_null[i] = (uint8_t)(chance(30) ? 1 : 0); }
     HS->ncars = irange(0, 8); HS->car_number = irange(-1, 7); HS->car_index = irange(0, 7);
-    HS->ntracks = chance(3) ? 2 : irange(3, 9);
+    HS->ntracks = chance(3) ? (MENU_FIXES ? irange(3, 9) : 2) : irange(3, 9);   // (the fix build: never two)
+#if MENU_FIXES
+    static const char* const names[3] = {"Player", "", "Fifteen chars.."};
+    g_name_text = names[rnd() % 3];
+#endif
     HS->track_name_sel = irange(0, 7);
     HS->bench = fbits_(chance(10) ? wildf() : range(0.0f, 60.0f));
     HS->replay_ret = (uint8_t)(chance(20) ? rnd() : rnd() & 1);
@@ -1063,7 +1089,7 @@ static void randomize_statics() {
             UI_G8(s.guard) = (uint8_t)(UI_G8(s.guard) | s.bit);
             UI_GU32(s.xl) = s.key;
             const bool fresh = chance(50);                    // translated since the last language change, or stale
-            UI_GU32(s.xl + 4) = fresh ? s.key : 0;
+            UI_GU32(s.xl + 4) = fresh ? xl_text(s.key) : 0;
             UI_GU32(s.xl + 8) = fresh ? UI_GU32(S_XLATOR_COOKIE) : ~UI_GU32(S_XLATOR_COOKIE);
         }
     }
@@ -1157,6 +1183,158 @@ static void tag_print() {
     printf("\nreturns: -2 %d, -1 %d, 0 %d, 1 %d, 0x77 (the watchdog) %d, other %d, faulted %d\n", g_ret_hist[0], g_ret_hist[1], g_ret_hist[2],
            g_ret_hist[3], g_ret_hist[4], g_ret_hist[5], g_ret_hist[7]);
 }
+
+#if MENU_FIXES
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+// The rewrite alone on the case the original gets wrong, from a round's world (fixed seeds, not poisoned): it must return
+// cleanly (no fault, the bytes popped, ebx / esi / edi / ebp kept) and give what the fix promises, checked against the
+// original run on the input the fix makes of the bad one: every byte of .data/.bss/.idata and the arena, the return and
+// the call logs.
+static int g_fx_bad, g_fx_n;
+static const Ent& fx_fn(const char* name) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, name)) return g_fns[i];
+    printf("  fix test: %s isn't listed\n", name);
+    fflush(stdout);
+    ExitProcess(4);
+}
+static Result fx_run(const Ent& f, bool rewrite, const uint32_t* w) {
+    uint32_t words[72] = {};
+    memcpy(words, w, 4 * (size_t)(f.nstack + (f.fast ? 2 : 0)));
+    g_pc = _PC_53;
+    return run(f, rewrite, words);
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0, uint32_t where = 0) {
+    g_fx_n++;
+    if (ok) return;
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, return %08x, popped %u, ebx esi edi ebp %08x %08x %08x %08x)", r->fault, r->code, r->eip,
+                  r->ret, r->pops, r->regs[0], r->regs[1], r->regs[2], r->regs[3]);
+    if (where) printf(" (first differs at %08x)", where);
+    printf("\n");
+}
+static CallLog g_fx_log;
+static bool fx_log_same() { return g_log.n == g_fx_log.n && !memcmp(g_log.w, g_fx_log.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)); }
+static void fx_keep_log() { memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX))); }
+static bool fx_logged(uint32_t tag, uint32_t next) {
+    for (uint32_t i = 0; i + 1 < g_log.n && i + 1 < LOG_MAX; i++)
+        if (g_log.w[i] == tag && g_log.w[i + 1] == next) return true;
+    return false;
+}
+// a round's world from a fixed seed (as the main loop makes one, not poisoned)
+static void fx_world(uint32_t seed, int ops) {
+    g_rng = seed * 2654435761u | 1;
+    mem_load(g_pristine);
+    randomize_world();
+    randomize_statics();
+    random_script(ops);
+}
+// the stubbed option `key` of `sec` present or missing (OptionsGet* finds it or not by a hash of the seed)
+static void fx_option(const char* sec, const char* key, bool present) {
+    while (opt_present(opt_h(sec, key)) != present) HS->opt_seed++;
+}
+
+static int directed_fix_tests() {
+    char m[200];
+    // ---- 4. MenuDoRaceSetup: a random track with two tracks ----
+    {
+        const Ent& f = fx_fn("MenuDoRaceSetup");
+        int orig_faults = 0, cases = 0;
+        for (int k = 0; k < 16; k++) {
+            fx_world(0x4000 + k, 0);
+            HS->script[0][0] = OP_KEY; HS->script[0][1] = 0xd; HS->script[0][2] = 0;   // Enter: the default button, -2 (race)
+            HS->script_n = 1; HS->script_pos = 0;
+            HS->ntracks = 2;
+            HS->track_name_sel = (k & 1) ? 0 : 6;                                       // "Random", "random x": both random
+            HS->time = k < 4 ? 16 * k : (int32_t)(rnd() & 0x7fffffff);
+            memset(W.car_buf, 0xa5, 0x100); memset(W.track_buf, 0xa5, 0x100); fill_random(W.game, 0x40);
+            const uint32_t w[3] = {U32(W.car_buf), U32(W.track_buf), U32(W.game)};
+            mem_save(g_snap);
+            const Result ro2 = fx_run(f, false, w);                                     // the original: divides by zero
+            orig_faults += ro2.fault && ro2.code == EXCEPTION_INT_DIVIDE_BY_ZERO;
+            mem_load(g_snap);
+            const Result rn = fx_run(f, true, w);
+            cases++;
+            sprintf(m, "MenuDoRaceSetup, two tracks (case %d): a clean return", k);
+            fx_check(fx_clean(f, rn), m, &rn);
+            sprintf(m, "MenuDoRaceSetup, two tracks (case %d): the race chosen, GetTrackName(0), row 0's name out, nothing past it", k);
+            fx_check(rn.ret == 1 && fx_logged('GTNM', 0) && !strcmp(W.track_buf, k_tracks[0]) &&
+                         (uint8_t)W.track_buf[strlen(k_tracks[0]) + 1] == 0xa5, m, &rn);
+            mem_save(g_after);
+            fx_keep_log();
+            mem_load(g_snap);
+            HS->ntracks = 1;                                                            // the original with one: t % -1 == 0
+            const Result ro1 = fx_run(f, false, w);
+            HS->ntracks = 2;
+            const uint32_t where = mem_diff(g_after);
+            sprintf(m, "MenuDoRaceSetup, two tracks (case %d): what the original does with one track", k);
+            fx_check(!ro1.fault && ro1.ret == rn.ret && where == 0 && fx_log_same(), m, &ro1, where);
+        }
+        sprintf(m, "MenuDoRaceSetup, two tracks: the original faults dividing by zero (%d of %d)", orig_faults, cases);
+        fx_check(orig_faults == cases, m);
+    }
+    // ---- 5. MenuDoRaceMenu: a default name over 15 characters ----
+    {
+        const Ent& f = fx_fn("MenuDoRaceMenu");
+        static char text[0x1000], cut[16];
+        for (int i = 0; i < 0xfff; i++) text[i] = (char)('A' + i % 26);
+        static const int lens[] = {16, 17, 27, 40, 300, 0x437, 0xfff};
+        int orig_differs = 0, orig_cases = 0;
+        for (int li = 0; li < (int)(sizeof lens / sizeof lens[0]); li++)
+            for (int k = 0; k < 6; k++) {
+                const int len = lens[li];
+                const bool present = k & 1;
+                fx_world(0x5000 + 16 * li + k, 16);
+                const char saved = text[len];
+                text[len] = 0;
+                memcpy(cut, text, 15); cut[15] = 0;
+                fx_option(UI_GP(const char, S_SEC_RACE_GLOBAL), (const char*)0x004f81c4, present);   // player_name
+                // the Xlator made and fresh, its text the long name
+                UI_G8(S_RACEMENU_ONCE) = (uint8_t)(UI_G8(S_RACEMENU_ONCE) | 1);
+                UI_GU32(0x00579e20) = K_DEFAULT_NAME;
+                UI_GU32(0x00579e24) = U32(text);
+                UI_GU32(0x00579e28) = UI_GU32(S_XLATOR_COOKIE);
+                g_name_text = text;
+                const uint32_t w[1] = {0};
+                mem_save(g_snap);
+                if (len == 27 || len == 40) {                                           // the original on the long name: wrong
+                    const Result rb = fx_run(f, false, w);
+                    fx_keep_log();
+                    mem_load(g_snap);
+                    fx_run(f, true, w);
+                    orig_cases++;
+                    orig_differs += rb.fault || !fx_log_same();
+                    mem_load(g_snap);
+                }
+                const Result rn = fx_run(f, true, w);
+                sprintf(m, "MenuDoRaceMenu, a %d-character name (%s saved name, case %d): a clean return", len, present ? "a" : "no", k);
+                fx_check(fx_clean(f, rn), m, &rn);
+                mem_save(g_after);
+                fx_keep_log();
+                mem_load(g_snap);
+                UI_GU32(0x00579e24) = U32(cut);                                         // the original on its first 15
+                g_name_text = cut;
+                const Result ro = fx_run(f, false, w);
+                UI_GU32(0x00579e24) = U32(text);
+                const uint32_t where = mem_diff(g_after);
+                sprintf(m, "MenuDoRaceMenu, a %d-character name (%s saved name, case %d): the original on its first 15 characters",
+                        len, present ? "a" : "no", k);
+                fx_check(!ro.fault && ro.ret == rn.ret && where == 0 && fx_log_same(), m, &ro, where);
+                text[len] = saved;
+                g_name_text = 0;
+            }
+        printf("  (MenuDoRaceMenu: the original on the long name itself went wrong -- faulted, or logged other bytes -- in %d of %d "
+               "cases of 27 and 40 characters)\n", orig_differs, orig_cases);
+    }
+    printf("directed fix tests: %s -- %d checks, %d failed\n", g_fx_bad ? "FAILED" : "all passed", g_fx_n, g_fx_bad);
+    return g_fx_bad;
+}
+#endif
 
 // ---- main -----------------------------------------------------------------------------------------------------------------------
 static bool is_modal(const char* nm) {
@@ -1260,6 +1438,12 @@ int main(int argc, char** argv) {
                 dup++;
             }
 
+#if MENU_FIXES
+    const int fix_bad = directed_fix_tests();
+#else
+    const int fix_bad = 0;
+#endif
+
     static Footprint fp;
     long long checks = 0, poisoned_checks = 0, log_words = 0;
     int differ = 0, fp_bad = 0, faults = 0, pure_n = 0, replay_n = 0, changed_fns = 0, still_fns = 0, bad_fns = 0, skipped = 0;
@@ -1361,5 +1545,5 @@ int main(int argc, char** argv) {
            "%d functions bad\n", g_nfns, n_e, pure_n, replay_n, g_nfns - pure_n - replay_n, dup, checks, poisoned_checks, log_words, differ,
            fp_bad, faults, both_fault, skipped, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
-    return differ || fp_bad || dup ? 1 : 0;
+    return differ || fp_bad || dup || fix_bad ? 1 : 0;
 }
