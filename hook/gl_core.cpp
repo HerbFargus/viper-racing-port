@@ -655,17 +655,53 @@ void read_page() {                               // Lock of the back buffer: the
     pg.under = pg.page;
 }
 
+// The 2D's pixels over the 3D: what the 2D changed is opaque (the page's colour, premultiplied RGBA), the rest clear so
+// the full-resolution 3D shows. Returns how many pixels the 2D changed (0: overlay untouched).
+// FIX: a pixel the 2D drew in exactly the colour of the shrunk 3D under it looked unchanged, and the 4K 3D showed through
+// it: a near-black dialog (fdialog.stp) over a dark replay view came out speckled with bits of the scene. A run of up to
+// PAGE_HOLE unchanged pixels with changed pixels at both ends, along a row or a column, is drawn as 2D too (its page
+// colour is the 3D's shrunk colour anyway). Only what is shown changes, never the page the game drew or its hash.
+constexpr int PAGE_HOLE = 8;
+size_t page_overlay(const uint16_t* page, const uint16_t* under, int w, int h, uint32_t* overlay) {
+    static std::vector<uint8_t> mark;            // 1: the 2D changed it; 2: a hole between changed pixels
+    static std::vector<int32_t> last;            // per column: the last changed row
+    const size_t n = (size_t)w * h;
+    mark.assign(n, 0);
+    size_t changed = 0;
+    for (size_t i = 0; i < n; i++)
+        if (page[i] != under[i]) mark[i] = 1, changed++;
+    if (!changed) return 0;
+    last.assign((size_t)w, -1);
+    for (int y = 0; y < h; y++) {
+        uint8_t* row = &mark[(size_t)y * w];
+        int prev = -1;                           // the last changed pixel in this row
+        for (int x = 0; x < w; x++) {
+            if (row[x] != 1) continue;
+            const int gap = x - prev - 1;
+            if (prev >= 0 && gap > 0 && gap <= PAGE_HOLE)
+                for (int k = prev + 1; k < x; k++) row[k] = row[k] ? row[k] : 2;
+            prev = x;
+            const int up = last[x], vgap = y - up - 1;
+            if (up >= 0 && vgap > 0 && vgap <= PAGE_HOLE)
+                for (int k = up + 1; k < y; k++) {
+                    uint8_t& m = mark[(size_t)k * w + x];
+                    if (!m) m = 2;
+                }
+            last[x] = y;
+        }
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (!mark[i]) { overlay[i] = 0; continue; }
+        const uint16_t c = page[i];
+        const uint32_t r = ((c >> 11) & 31) * 255 / 31, gg = ((c >> 5) & 63) * 255 / 63, b = (c & 31) * 255 / 31;
+        overlay[i] = 0xFF000000u | (b << 16) | (gg << 8) | r;
+    }
+    return changed;
+}
+
 void draw_page() {                               // Unlock: what the 2D drew, over the full-resolution 3D
     if (!on_gl_thread()) return;
-    size_t n = pg.page.size(), changed = 0;
-    for (size_t i = 0; i < n; i++) {
-        uint16_t c = pg.page[i];
-        if (c == pg.under[i]) { pg.overlay[i] = 0; continue; }
-        uint32_t r = ((c >> 11) & 31) * 255 / 31, gg = ((c >> 5) & 63) * 255 / 63, b = (c & 31) * 255 / 31;
-        pg.overlay[i] = 0xFF000000u | (b << 16) | (gg << 8) | r;
-        changed++;
-    }
-    if (!changed) return;
+    if (!page_overlay(pg.page.data(), pg.under.data(), st.w, st.h, pg.overlay.data())) return;
     glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
     int x0 = (int)floorf(st.ox + 0.5f), x1 = (int)floorf(st.ox + st.w * st.scale + 0.5f);
     glr::Viewport(x0, 0, x1 - x0, (int)floorf(st.h * st.scale + 0.5f));

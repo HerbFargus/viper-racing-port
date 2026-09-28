@@ -139,7 +139,7 @@ enum : uint32_t {
     S_ESC_SERVER = 0x004e3860,      // EscapeMenu: resume, restart, end race (multiplayer server)
     S_ESC_CLIENT = 0x004e3898,      // EscapeMenu: resume, disconnect (multiplayer client)
     S_TRI = 0x004f436c, S_GRID = 0x004f4368,   // u8: -tri, -grid (elsewhere)
-    S_BLIMP_TRACK = 0x00503fb0,     // char[]: -location's track (sscanf %s, unbounded)
+    S_BLIMP_TRACK = 0x00503fb0,     // char[0x20]: -location's track (sscanf %s; $E32's static follows at 0x503fd0)
     S_XL_END_RACE = 0x00503fd8, S_XL_DISCONNECT = 0x00503ff8, S_XL_RESTART = 0x00504008, S_XL_RESUME = 0x00504080,
     S_CAMERA_SAVED = 0x00504004,    // the camera before the race ended (option "race_camera")
     S_BLIMP_VEL = 0x00504018,       // float[3], function-local (guard 0x504094 bit 0)
@@ -152,16 +152,17 @@ enum : uint32_t {
     S_PAUSED = 0x005040b8,          // u8
     S_BLIMP_FRAME = 0x00521050,     // Frame blimp_frame
     // race.obj
-    S_CARLIST = 0x00504340,         // char (*)[0x20]: the *.car names (MemAlloc(0x400): 32, unchecked)
+    S_CARLIST = 0x00504340,         // char (*)[0x20]: the *.car names (MemAlloc(0x400): 32 of 31 characters)
     S_CARLIST_N = 0x00504344,
     S_TRACK_TAB = 0x00504624,       // StringTable* tracks.tab
-    S_EVENT_TEXT0 = 0x00504368, S_EVENT_TEXT1 = 0x00504438, S_EVENT_TEXT2 = 0x00504320,   // GetEventString's buffers
+    S_EVENT_TEXT0 = 0x00504368, S_EVENT_TEXT1 = 0x00504438, S_EVENT_TEXT2 = 0x00504320,   // GetEventString's buffers (0x20
+                                    // each: an Xlator follows the first two, the car list's pointer the third)
     S_LAP_TABLE = 0x004e4698,       // {char const* track; int laps[8];}[8] (to 0x4e47b8)
     // prerace.obj
-    S_PR_TRACK = 0x00505c48,        // char[]: the world's track name (strcpy, unbounded)
-    S_PR_CAR = 0x00505d38,          // char[]: the player's car name
+    S_PR_TRACK = 0x00505c48,        // char[0x40]: the world's track name ($E5's static follows at 0x505c88)
+    S_PR_CAR = 0x00505d38,          // char[0x40]: the player's car name
     S_PR_ARG = 0x00505d8c,          // PreRaceDo's third argument (garage_cb's)
-    S_PR_FRIENDLY = 0x00505d90,     // char[]: the track's friendly name
+    S_PR_FRIENDLY = 0x00505d90,     // char[0x40]: the track's friendly name (an Xlator follows at 0x505dd0)
     S_PR_GUARD0 = 0x00505d7c, S_PR_GUARD1 = 0x00505ddc, S_PR_GUARD2 = 0x00505d28,
     S_TPI_GUARD = 0x005d5858,
     // postrace.obj
@@ -269,6 +270,22 @@ static __forceinline void rb_xl_once(uint32_t guard, uint8_t bit, uint32_t xl, u
         uit::tcall<void*>(uit::F_Xlator_ctor, (void*)(uintptr_t)xl, (const char*)(uintptr_t)key);
         uit::ccall<int>(uit::F_atexit, dtor);
     }
+}
+
+// ---- the fixes' helpers (docs/PORTING.md, "Fixes"; each use is marked // FIX:) ----------------------------------------------
+// s as a format's %s argument where the text is formatted in a buffer of the rewrite's: s itself, or (the fix build only)
+// a copy of its first max characters in buf (max + 1 bytes) when it's longer, so what the format prints is bounded
+static __forceinline const char* fix_cut(const char* s, char* buf, uint32_t max) {
+    if (!VP_FIX || uit::ui_strnlen(s, max) <= max) return s;
+    uit::ui_copy_bounded(buf, s, max + 1);
+    return buf;
+}
+// the characters the game's %d prints for v (a '-' and the digits)
+static __forceinline uint32_t fix_dec_len(int32_t v) {
+    uint32_t n = v < 0 ? 2u : 1u;
+    uint32_t u = v < 0 ? 0u - (uint32_t)v : (uint32_t)v;
+    while (u >= 10u) { u /= 10u; n++; }
+    return n;
 }
 
 }  // namespace rootb

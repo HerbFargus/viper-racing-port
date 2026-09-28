@@ -33,10 +33,14 @@
 // clipboard (copy_blimp_to_clipboard) or the directory (AppProcessArgs), or builds a function-local static on its first
 // call (move_blimp's vectors register their destructors with atexit, process_keys' Xlators).
 //
-// FIX CANDIDATEs (left faithful, marked in place): AppProcessArgs' -d<dir> writes a terminator through strchr's result
-// unchecked (a -d with no space after it, last on the command line, writes to address 0); setup_blimp_jump's sscanf
-// reads the track's name into a static buffer unbounded, and blimp_jump copies it into its World's 0x20 bytes; DoRace's
-// Results holds 16 cars, the World's count unchecked, and it reads each car's race record without checking there is one.
+// Fixes (// FIX:, docs/FIXES.md "Race front end"; the command line's): AppProcessArgs' -d<dir> last on the command line,
+// with no space after it, takes the directory to the end (it wrote a terminator to address 0); setup_blimp_jump reads
+// -location's track into its 0x20-byte static and the frame's base64 into its 0x100 bytes only when they fit (a longer
+// track name is cut to 31 characters, a longer frame isn't read: the blimp starts at the identity, as for no frame), and
+// blimp_jump's World keeps its 0x20 bytes. Every other command line gives the original's bits.
+//
+// FIX CANDIDATEs (left faithful, marked in place): DoRace's Results holds 16 cars, the World's count unchecked, and it
+// reads each car's race record without checking there is one.
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -156,11 +160,18 @@ static uint8_t __cdecl AppProcessArgs_c(char* args) {
                             break;
                         case 'd' - 0x31: {                          // -d<dir>
                             char* dir = q + 1;
-                            // FIX CANDIDATE: no space after the directory (-d last on the command line) makes strchr
-                            // return 0, and the terminator is written to address 0
                             char* sp = ccall<char*>(uit::F_strchr, (const char*)dir, 0x20);
-                            *(volatile char*)sp = 0;
-                            p = sp;
+                            // FIX: the directory ends at the next space, cut there by a terminator written through
+                            // strchr's result. With no space after it (-d last on the command line) strchr returns 0
+                            // and the terminator went to address 0: the game crashed at start-up. The directory now
+                            // runs to the end of the command line, and the scan goes on from its last character (so
+                            // the next step reaches the end). With a space, as before.
+                            if (VP_FIX && !sp) {
+                                p = dir + crt_strlen(dir) - 1;
+                            } else {
+                                *(volatile char*)sp = 0;
+                                p = sp;
+                            }
                             if (!ccall<uint8_t>(F_FileChangeDir, (const char*)dir)) UI_LogPanic(CP(0x004e39cc), dir);
                             break;
                         }
@@ -253,15 +264,59 @@ static void __cdecl app_end_c() {
 }
 PORT_FN(0x004015a0, "app_end", app_end_c, fp_begin_end)
 
+// FIX helper (setup_blimp_jump): where the two words the game's sscanf reads for " ( %s %s )" start in a, and their
+// lengths (-1: sscanf doesn't reach that word). As the game's C runtime scans: the format's ' ' skips white space (' ' and
+// '\t'..'\r' -- the "C" locale's; a byte of 0x80 or more is a character), '(' must be the next character, and each %s
+// skips white space and takes the characters up to the next.
+static __forceinline bool fix_white(char c) { return c == ' ' || (c >= 9 && c <= 13); }
+static void fix_scan_words(const char* a, const char** w1, int32_t* n1, const char** w2, int32_t* n2) {
+    *w1 = *w2 = 0;
+    *n1 = *n2 = -1;
+    const volatile char* p = a;
+    while (fix_white(*p)) p++;
+    if (*p != '(') return;
+    p++;
+    while (fix_white(*p)) p++;
+    if (!*p) return;
+    *w1 = (const char*)p;
+    while (*p && !fix_white(*p)) p++;
+    *n1 = (int32_t)((const char*)p - *w1);
+    while (fix_white(*p)) p++;
+    if (!*p) return;
+    *w2 = (const char*)p;
+    while (*p && !fix_white(*p)) p++;
+    *n2 = (int32_t)((const char*)p - *w2);
+}
+
 // setup_blimp_jump: -location's "( <track> <base64 CompactFrame> )"; a track without a frame starts at the identity
 static void __cdecl setup_blimp_jump_c(const char* arg) {
     char b64[0x100];                                                // (the frame's local at +0x18 of 0x118)
     uint8_t cf[0x18];
     UI_G8(S_BLIMP_TRACK) = 0;
-    // FIX CANDIDATE: sscanf's %s writes the track's name into the static buffer at 0x503fb0 unbounded (the command line)
+    // FIX: sscanf's %s wrote the track's name (the command line's, any length) into the 0x20-byte static at 0x503fb0, and
+    // the frame's base64 into 0x100 bytes of the frame, unbounded: a longer word ran into the static after it (another
+    // object's) or over the return address. When either would, the words are measured as sscanf reads them and copied
+    // bounded instead: the track keeps its first 31 characters; a frame of 256 or more characters (a frame's base64 is
+    // 32) isn't read, so the blimp starts at the identity, as for a track with no frame. Otherwise sscanf reads them as
+    // before.
+    const char *w1 = 0, *w2 = 0;
+    int32_t n1 = -1, n2 = -1;
+    if (VP_FIX) fix_scan_words(arg, &w1, &n1, &w2, &n2);
     typedef int(__cdecl * Sscanf_t)(const char*, const char*, ...);
-    if (((Sscanf_t)(uintptr_t)F_sscanf)(arg, CP(0x004e3a58), (char*)(uintptr_t)S_BLIMP_TRACK, b64) == 2 &&
-        ccall<uint8_t>(F_Base64ToMem, (void*)cf, 0x18, (const char*)b64)) {
+    if (VP_FIX && (n1 > 0x1f || n2 > 0xff)) {
+        const uint32_t k = n1 > 0x1f ? 0x1fu : (uint32_t)n1;
+        crt_copy((void*)(uintptr_t)S_BLIMP_TRACK, w1, k);
+        UI_G8(S_BLIMP_TRACK + k) = 0;
+        if (n2 >= 0 && n2 <= 0xff) {
+            crt_copy(b64, w2, (uint32_t)n2);
+            b64[n2] = 0;
+            if (ccall<uint8_t>(F_Base64ToMem, (void*)cf, 0x18, (const char*)b64)) {
+                ccall<void>(F_convert_frame_in, (void*)(uintptr_t)S_BLIMP_START, (const void*)cf);
+                return;
+            }
+        }
+    } else if (((Sscanf_t)(uintptr_t)F_sscanf)(arg, CP(0x004e3a58), (char*)(uintptr_t)S_BLIMP_TRACK, b64) == 2 &&
+               ccall<uint8_t>(F_Base64ToMem, (void*)cf, 0x18, (const char*)b64)) {
         ccall<void>(F_convert_frame_in, (void*)(uintptr_t)S_BLIMP_START, (const void*)cf);
         return;
     }
@@ -996,7 +1051,11 @@ PORT_FN(0x00402d00, "dave_p", dave_p_c, fp_pure)
 
 // a one-car World on the stack (World::World, then the fields these two set), raced
 static void test_world(uint8_t* W, const char* track, int32_t car_type, const char* car, int32_t realism, uint8_t reverse) {
-    crt_strcpy((char*)(W + 8), track);
+    // FIX: (blimp_jump) -location's track was copied into the World's 0x20 bytes unbounded, a longer one running over the
+    // World's first car; it keeps its first 31 characters (setup_blimp_jump's static holds no more now anyway). dave_b's
+    // "uptown", and any name that fits, is copied as before.
+    if (VP_FIX) ui_copy_bounded((char*)(W + 8), track, 0x20);
+    else crt_strcpy((char*)(W + 8), track);
     *(volatile int32_t*)(W + 0xca8) = 1;
     *(volatile int32_t*)(W + 0x28) = car_type;
     crt_strcpy((char*)(W + 0x2c), CP(0x004e3b7c));                  // "Joe-Bob"
@@ -1014,8 +1073,7 @@ static void test_world(uint8_t* W, const char* track, int32_t car_type, const ch
 }
 static void __cdecl blimp_jump_c() {
     alignas(4) uint8_t W[0xcd4];
-    // FIX CANDIDATE: -location's track name (the command line's, any length) is copied into the World's 0x20 bytes
-    UI_G32(S_CAMERA) = 0xb;
+    UI_G32(S_CAMERA) = 0xb;                                         // (FIX: test_world keeps the track to 0x20 bytes)
     tcall<void*>(F_World_ctor, (void*)W);
     test_world(W, CP(S_BLIMP_TRACK), 0, CP(0x004e3b84), 0, 1);
     ccall<void>(F_app_begin);

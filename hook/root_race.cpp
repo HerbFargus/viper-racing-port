@@ -27,13 +27,16 @@
 // RaceBegin / RaceEnd, Create / Destroy -- notifications --, Added -- widgets --, the 3D draw), and the two screens (their
 // own dialog loops, the garage, the replay, the board).
 //
+// Fixes (// FIX:, docs/FIXES.md "Race front end"; none reached with the stock cars, tracks and English text):
+// GetEventString's three 0x20-byte texts keep to their 31 characters (a long translation); RaceBegin's car list keeps to
+// its 32 names of 31 characters (a longer name, or a car past the 32nd, is left out); CarPosition's texture remap names
+// keep to their 16 bytes (a car name of 12+ characters), and its model and texture names have room for a 31-character
+// car; PreRaceDo's track name and friendly name keep to their 64-byte statics. Every other input gives the original's bits.
+// (PreRaceDo's frame is the original's whole 0x1808 bytes: the track text is word-wrapped into its last 4 KB.)
+//
 // FIX CANDIDATEs (left faithful, marked in place; none reached in ordinary play unless noted): the option-name lookups
-// index their tables with the value unchecked (an out-of-range option reads their own stack); RaceBegin's car list holds
-// 32 names of 31 characters, neither checked (a Cars folder with more, or a longer name, overruns the heap block);
-// GetEventString's third buffer is 0x20 bytes (a long translation of the unit overruns it); CarPosition's texture remap
-// names are 0x10 bytes each, filled by sprintf / strcpy unbounded (a car name of 12+ characters); PreRaceDo copies the
-// track's and its friendly name into statics unbounded, word-wraps the track text into 0x100 bytes of its frame, and loads
-// the player's setup from the entry before the World's cars when no car is the player's (a race of AI cars only);
+// index their tables with the value unchecked (an out-of-range option reads their own stack); PreRaceDo loads the
+// player's setup from the entry before the World's cars when no car is the player's (a race of AI cars only);
 // LapsTable::next_car divides by the car count (0: a divide fault); PostRaceTable::Draw and PostRaceDo read a race
 // result (the first; the player's) without checking it exists.
 #include <math.h>
@@ -148,19 +151,37 @@ static const char* __cdecl GetFieldString_c(int32_t v) {            // three nam
 }
 PORT_FN(0x00406240, "GetFieldString", GetFieldString_c, (fp_xls<k_xl_field, 3>))
 
+// FIX: GetEventString's three texts ("<name> <n>" twice, "<n> <unit>": translations, and the drags' distances in the
+// locale's units) are 0x20-byte statics, formatted into unbounded: a long enough translation ran the first two into the
+// Xlators after them and the third into the car list's pointer (the car choosers then read the car names from wherever
+// the text's bytes pointed). A text that would pass 31 characters is formatted in a buffer of the rewrite's (the
+// translation cut to 64 characters) and its first 31 kept. Any other is formatted into the static as before.
+static void event_text(uint32_t dst, uint32_t fmt, const char* s, int32_t n, bool n_first) {
+    if (VP_FIX && ui_strnlen(s, 0x1f) + 1 + fix_dec_len(n) > 0x1f) {
+        char t[0x60], c[0x41];
+        const char* sc = fix_cut(s, c, 0x40);
+        if (n_first) SPRINTF(t, CP(fmt), n, sc);
+        else SPRINTF(t, CP(fmt), sc, n);
+        ui_copy_bounded((char*)(uintptr_t)dst, t, 0x20);
+    } else if (n_first) {
+        SPRINTF((char*)(uintptr_t)dst, CP(fmt), n, s);
+    } else {
+        SPRINTF((char*)(uintptr_t)dst, CP(fmt), s, n);
+    }
+}
+
 // GetEventString: the race, the two drags (a quarter mile / 0-60 in the locale's distance), 60-0, ...; the three with
 // numbers formatted into their static buffers
 static const char* __cdecl GetEventString_c(int32_t v) {
     int32_t n = 0x3c;
     if (*(volatile uint8_t*)(UI_GP(uint8_t, S_LOCALE) + 0x38))
         n = x87_ftol(D(*(volatile float*)(UI_GP(uint8_t, S_LOCALE) + 0x1c)) * D(bits_f(0x41d55555)));
-    SPRINTF((char*)(uintptr_t)S_EVENT_TEXT0, CP(0x004e4680), xlate(0x00504598), n);
+    event_text(S_EVENT_TEXT0, 0x004e4680, xlate(0x00504598), n, false);            // FIX: (event_text) "%s %d"
     n = 0x64;
     if (*(volatile uint8_t*)(UI_GP(uint8_t, S_LOCALE) + 0x38))
         n = x87_ftol(D(*(volatile float*)(UI_GP(uint8_t, S_LOCALE) + 0x1c)) * D(bits_f(0x4231c71c)));
-    SPRINTF((char*)(uintptr_t)S_EVENT_TEXT1, CP(0x004e4688), xlate(0x00504598), n);
-    // FIX CANDIDATE: 0x504320 is 0x20 bytes (the car list's pointer follows): a long translation of the unit overruns it
-    SPRINTF((char*)(uintptr_t)S_EVENT_TEXT2, CP(0x004e4690), n, xlate(0x00504508));
+    event_text(S_EVENT_TEXT1, 0x004e4688, xlate(0x00504598), n, false);            // FIX: (event_text) "%s %d"
+    event_text(S_EVENT_TEXT2, 0x004e4690, xlate(0x00504508), n, true);             // FIX: (event_text) "%d %s"
     const char* t[7];
     t[0] = xlate(0x005043c8);
     t[1] = CP(S_EVENT_TEXT0);
@@ -218,7 +239,12 @@ static void __cdecl RaceBegin_c() {
             char* s = ccall<char*>(uit::F_strrchr, (const char*)buf, 0x5c);
             s = s ? s + 1 : buf;
             *(volatile char*)ccall<char*>(uit::F_strchr, (const char*)s, 0x2e) = 0;
-            // FIX CANDIDATE: the list holds 32 names of 31 characters (MemAlloc(0x400)); neither is checked
+            // FIX: the list holds 32 names of 31 characters (MemAlloc(0x400)), neither checked: a longer name ran into the
+            // next entry (and was cut there by the next car's name), and a 33rd car ran off the heap block. Such a car is
+            // left out of the list, so the car choosers don't show it. (Cut, its name would no longer open its files --
+            // "<car>.car", "<car>.cf" --, which fails worse.) The cars kept are the first 32 the folder lists, sorted as
+            // before. Any other car goes in as before.
+            if (VP_FIX && (UI_G32(S_CARLIST_N) >= 0x20 || ui_strnlen(s, 0x1f) > 0x1f)) continue;
             const uint32_t n = crt_strlen(s) + 1;
             crt_copy(UI_GP(char, S_CARLIST) + ((uint32_t)UI_G32(S_CARLIST_N) << 5), s, n);
             UI_G32(S_CARLIST_N) = UI_G32(S_CARLIST_N) + 1;
@@ -325,7 +351,7 @@ PORT_FN(0x00410210, "ASSERT_MSG", ASSERT_MSG_c, fp_ASSERT_MSG)
 typedef uint8_t(__cdecl* PreRaceGarage_t)(int32_t);
 static int32_t __cdecl PreRaceDo_c(uint8_t* w, uint8_t garage_first, uint8_t* car_arg, uint8_t qualify, const uint32_t* times,
                                    const int32_t* prizes) {
-    alignas(8) uint8_t F[0x910];                                    // the original's frame, its offsets (the part used)
+    alignas(8) uint8_t F[0x1808];                                   // the original's frame (sub esp, 0x17f8; 4 pushes), its offsets
     ccall<void>(F_ResourceSetMustLoad, CP(0x004e5778));
     UI_GP(uint8_t, S_PR_ARG) = car_arg;
     rb_xl_once(S_PR_GUARD0, 0x01, 0x00505e10, 0x004e5788, 0x00410330);
@@ -346,10 +372,17 @@ static int32_t __cdecl PreRaceDo_c(uint8_t* w, uint8_t garage_first, uint8_t* ca
     rb_xl_once(S_PR_GUARD1, 0x80, 0x00505cd8, 0x004e58c0, 0x00410240);
     LW(F, 0x14) = 1;                                                // the radio buttons' variable (the page shown)
     LW(F, 0x2c) = U(w + 8);
-    // FIX CANDIDATE: the track's name and its friendly name go into statics unbounded
-    crt_strcpy((char*)(uintptr_t)S_PR_TRACK, (const char*)(w + 8));
-    crt_strcpy((char*)(uintptr_t)S_PR_FRIENDLY,
-               ccall<const char*>(F_GetTrackFriendlyName, ccall<int32_t>(F_GetTrackNumber, CP(S_PR_TRACK))));
+    // FIX: the track's name (the World's) and its friendly name (tracks.tab's key, translated: a mod track's or a language
+    // file's) were copied into 64-byte statics unbounded, a longer friendly name running into the Xlator after it (a longer
+    // track name, into another static). Each keeps its first 63 characters. (The garage and the best times board read
+    // them; the World's track name holds 31, so it's only ever cut in a damaged World.) One that fits is copied as before.
+    if (VP_FIX) ui_copy_bounded((char*)(uintptr_t)S_PR_TRACK, (const char*)(w + 8), 0x40);
+    else crt_strcpy((char*)(uintptr_t)S_PR_TRACK, (const char*)(w + 8));
+    {
+        const char* fr = ccall<const char*>(F_GetTrackFriendlyName, ccall<int32_t>(F_GetTrackNumber, CP(S_PR_TRACK)));
+        if (VP_FIX) ui_copy_bounded((char*)(uintptr_t)S_PR_FRIENDLY, fr, 0x40);
+        else crt_strcpy((char*)(uintptr_t)S_PR_FRIENDLY, fr);
+    }
     LW(F, 0x1c) = U(w + 0xcd1);
     {
         const uint32_t rev = (U(w + 0xcd1) & 0xffffff00u) | *(volatile uint8_t*)(w + 0xcd1);   // (al: the byte)
@@ -391,7 +424,10 @@ static int32_t __cdecl PreRaceDo_c(uint8_t* w, uint8_t garage_first, uint8_t* ca
     LW(F, 0x510) = 0;
     LW(F, 0x4fc) = VT_TrackPrizeInfo;
     LW(F, 0x514) = U(prizes);
-    // FIX CANDIDATE: the track text is word-wrapped into 0x100 bytes of the frame unbounded
+    // the track text word-wrapped into the frame's last 4 KB (0x808 .. 0x1808: UIStyleWordWrap copies at most 4095
+    // characters, its own fix), then cut to 255 characters (nothing reads it: the screen has no item for it). (Not a FIX:
+    // the U3 rewrite's frame stopped at 0x910, the part it used otherwise, so a description of 264 or more characters --
+    // the stock Ridge Valley's, hastings, is 276 -- ran past it; the frame is the original's size now.)
     ccall<void>(F_UIStyleWordWrap, 0xf, 0xe6, (char*)(F + 0x808),
                 ccall<const char*>(F_GetTrackText, ccall<int32_t>(F_GetTrackNumber, CP(S_PR_TRACK))));
     *(volatile uint8_t*)(F + 0x907) = 0;
@@ -498,9 +534,13 @@ PORT_FN(0x0040f140, "PreRaceDo", PreRaceDo_c, fp_PreRaceDo)
 // turned to face the camera 4.7 in front of it; the fonts, palettes and stamps
 static const double* const k_neg_half_pi = (const double*)(uintptr_t)0x004db318;
 static const double* const k_zero = (const double*)(uintptr_t)0x004db320;
+// FIX helper (CarPosition): the first 16 characters of s into a remap entry's 16-byte name, with no terminator -- the name
+// as the original left it once the rest of its overrun was written over, and as the model reads a 16-byte name
+static __forceinline void fix_name16(char* dst, const char* s) { crt_copy(dst, s, 0x10); }
+
 static CarPosition* __fastcall CarPosition_ctor_c(CarPosition* self, Edx, const char* car, const char* driver, int32_t drv,
                                                   uint32_t time, int32_t slot) {
-    char mod[0x20], tex[0x20];                                      // the frame's +0x54 and +0x34
+    char mod[VP_FIX ? 0x40 : 0x20], tex[VP_FIX ? 0x40 : 0x20];      // the frame's +0x54 and +0x34 (FIX: below)
     volatile float m[9];                                            // +0x10
     self->vtbl = (const void*)(uintptr_t)VT_UICustomControl;
     self->widget = 0;
@@ -510,11 +550,29 @@ static CarPosition* __fastcall CarPosition_ctor_c(CarPosition* self, Edx, const 
     self->odd = (uint8_t)(slot & 1);
     self->time = time;
     self->driver = driver;
-    SPRINTF(mod, CP(0x004e598c), car, 3);
-    ccall<void>(F_WorldGetCarTexture, (char*)tex, car, drv);
-    // FIX CANDIDATE: the remap's names are 0x10 bytes each, "<car>.tex" and the texture's name written unbounded
-    SPRINTF((char*)self->remap_from, CP(0x004e5984), car);
-    crt_strcpy((char*)self->remap_to, tex);
+    // FIX: "<car>3.mod" and WorldGetCarTexture's "~<car>.tex" went into 0x20 bytes of the frame each, so a car name of 27
+    // or more characters (a mod car's: the car list holds 31) ran over the frame's saved registers. Both have 0x40 bytes
+    // now, room for any name the World's car field holds (34 characters); a longer one (a damaged World, the field
+    // unterminated) is cut to 48 characters for these names. A name that fits is used as before.
+    char cut[0x31];
+    const char* cn = fix_cut(car, cut, 0x30);
+    SPRINTF(mod, CP(0x004e598c), cn, 3);
+    ccall<void>(F_WorldGetCarTexture, (char*)tex, cn, drv);
+    // FIX: the remap entry's names are 16 bytes each, "<car>.tex" and the texture's name written into them unbounded: a
+    // car name of 12 or more characters ran "<car>.tex" into the texture's name, and a texture name of 16 or more (a car
+    // name of 11 or more: "~<car>.tex") on over the entry's value and pointer, the model and the frame. The original wrote
+    // all of those again afterwards, so what the model got was each name's first 16 characters (the next field starting
+    // where the name's 16 bytes end, as the model reads a 16-character name). Now a name too long for its 16 bytes is
+    // written as just those 16 characters, and nothing past them is touched. A name that fits is written as before.
+    if (VP_FIX && ui_strnlen(cn, 0xb) > 0xb) {
+        char t[0x40];
+        SPRINTF(t, CP(0x004e5984), cn);
+        fix_name16((char*)self->remap_from, t);
+    } else {
+        SPRINTF((char*)self->remap_from, CP(0x004e5984), cn);
+    }
+    if (VP_FIX && ui_strnlen(tex, 0xf) > 0xf) fix_name16((char*)self->remap_to, tex);
+    else crt_strcpy((char*)self->remap_to, tex);
     self->remap_20 = 0;
     self->remap_24 = 0;
     self->model = ccall<int32_t>(F_mrModelLoadRemap, (const char*)mod, (void*)self->remap_from, 1);

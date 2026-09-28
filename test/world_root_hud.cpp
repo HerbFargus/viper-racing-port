@@ -7,6 +7,7 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_root_hud.cpp
 //        /Fo<dir>\ /Fe<dir>\world_root_hud.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_root_hud.exe [rounds] [seed]      (VP_TRACE=1: one line per function; VP_ONLY=name: just those)
+//     (and with /DVP_ROOT_FIXES: the fix build, below)
 //
 // Built as test/world_menu_options.cpp is (its loader, raw call, memory comparison and logs are copied here): out\race_v10.exe
 // loaded at 0x400000 (a child process with the range reserved), the three rewrite files included with PORT_FN redefined to
@@ -45,6 +46,17 @@
 // PhysicsGetTime, AICarCount, GetCarFileNumber and the options. The game's own code everywhere else: Xlator's constructor,
 // MainIsDone / MainSetCamera, GhostCarIncognito, MultiEnabled, PhysicsIsPaused, and every function of these objects (each
 // rewrite is checked against its original with the same callees).
+//
+// Built with /DVP_ROOT_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Race front
+// end"). Every function is still compared as above; one of the banners' translations is "Reset car? 100%% sure" (a '%'
+// that reads no argument: the fixed draw must still pass it as the format), and a round where a banner's translation
+// would make the game's printf read an argument (none of the harness's texts do) is kept out of the comparison and counted.
+// Then directed_fix_tests: TheRealDashboardDraw with translations that read arguments ("%s", "%n", '*'), on the rewrite
+// alone -- no fault, the bytes popped and ebx / esi / edi / ebp kept, nothing written outside its footprint, and each such
+// text printed through "%s" as it is --, the same with "%%" texts on both, compared bit for bit, and the format check
+// against the game's own printf (run on every test text and on random ones with its arguments on a no-access page: it
+// faults exactly when the check says it reads one). Without it (VP_FAITHFUL) every rewrite must match its original bit
+// for bit.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -58,7 +70,12 @@
 #include <utility>
 #include <vector>
 
+#ifndef VP_ROOT_FIXES
 #define VP_FAITHFUL
+#define ROOT_FIXES 0
+#else
+#define ROOT_FIXES 1
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------------
@@ -405,9 +422,23 @@ static int32_t __cdecl stub_gxFontStringWidth(const void* f, const char* s) {
     L('FSW '); L(P(f)); LS(s);
     return readable(s, 1) ? (int32_t)strlen(s) * fake_val(f, 5) : 0;
 }
+// (the fix tests: each print's format and, for "%s", its argument, recorded while g_fx_rec is on)
+struct FxPrint { char fmt[0x100]; char arg[0x100]; };
+static FxPrint g_fx_pr[32];
+static int g_fx_np;
+static bool g_fx_rec;
 static void __cdecl stub_gxFontPrintf(const void* f, const void* pal, uint32_t flags, int32_t x, int32_t y, const char* fmt, ...) {
     L('FPRF'); L(P(f)); L(P(pal)); L(flags); L((uint32_t)x); L((uint32_t)y);
-    va_list ap; va_start(ap, fmt); L_va(fmt, (const uint32_t*)ap); va_end(ap);
+    va_list ap; va_start(ap, fmt); L_va(fmt, (const uint32_t*)ap);
+    if (g_fx_rec && g_fx_np < 32 && readable(fmt, 1)) {
+        FxPrint& r = g_fx_pr[g_fx_np++];
+        strncpy(r.fmt, fmt, sizeof r.fmt - 1);
+        r.fmt[sizeof r.fmt - 1] = 0;
+        r.arg[0] = 0;
+        const char* a0 = (const char*)(uintptr_t)((const uint32_t*)ap)[0];
+        if (!strcmp(fmt, "%s") && readable(a0, 1)) { strncpy(r.arg, a0, sizeof r.arg - 1); r.arg[sizeof r.arg - 1] = 0; }
+    }
+    va_end(ap);
     L_canvas();
 }
 static void* __cdecl stub_gxPaletteCreate() { L('PCRE'); return (void*)(uintptr_t)(0x7a000000u + (uint32_t)(HS->pal_next++) * 16); }
@@ -473,8 +504,13 @@ static void __cdecl stub_UIRemoveStyle(int32_t s) { L('URMS'); L((uint32_t)s); }
 // An Xlator's translation: one of a few fixed texts, by its key. Not the key's own bytes: in a poisoned round a key's
 // string (in .data) is random, and TheRealDashboardDraw passes some translations to gxFontPrintf as the format -- a '%' in
 // one makes gxFontPrintf's stub log "arguments" that were never passed (the callers' stack past the real ones, which
-// differs between the two passes' frames). The game's translations have no '%' (FIX CANDIDATE in root_dash.cpp).
+// differs between the two passes' frames). The game's translations have no '%' (FIX in root_dash.cpp; the fix build's
+// second text has a "%%", which reads no argument).
+#if ROOT_FIXES
+static const char* const k_xl_texts[4] = {"Resume", "Reset car? 100%% sure", "Damaged", "Race results"};
+#else
 static const char* const k_xl_texts[4] = {"Resume", "Reset car? Press R", "Damaged", "Race results"};
+#endif
 static uint32_t xl_text(uint32_t key) { return (uint32_t)(uintptr_t)k_xl_texts[(key * 2654435761u) >> 30]; }
 static void __fastcall stub_xlate(uint32_t* xl_, int) {
     L('XLAT'); L(P(xl_));
@@ -903,6 +939,231 @@ static bool make_args(const Ent& f, uint32_t* w) {
     return true;
 }
 
+#if ROOT_FIXES
+// ---- the fix build: rounds kept out of the comparison ------------------------------------------------------------------------
+// A banner draw (TheRealDashboardDraw, and DashboardDraw / DashboardDrawDashNone, which call it) where one of the four
+// banner translations -- as the draw will read it: a fresh Xlator's text as it is, a stale one's as the xlate stub gives
+// it -- would make the game's printf read an argument (or can't be read): the fixed rewrite prints it through "%s".
+static bool fx_banner_case(const Ent& f) {
+    if (strcmp(f.name, "TheRealDashboardDraw") && strcmp(f.name, "DashboardDraw") && strcmp(f.name, "DashboardDrawDashNone"))
+        return false;
+    for (uint32_t xl : {0x005042a8u, 0x00504110u, 0x005040c8u, 0x00504290u}) {
+        const char* t = UI_GU32(xl + 8) == UI_GU32(S_XLATOR_COOKIE) ? (const char*)(uintptr_t)UI_GU32(xl + 4)
+                                                                        : (const char*)(uintptr_t)xl_text(UI_GU32(xl));
+        if (!readable(t, 1) || rdash::fix_format_reads_args(t)) return true;
+    }
+    return false;
+}
+
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+static int g_fx_bad, g_fx_n, g_fx_same_n;
+static const Ent& fx_fn(const char* name) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, name)) return g_fns[i];
+    printf("  fix test: %s isn't listed\n", name);
+    fflush(stdout);
+    ExitProcess(4);
+}
+static Result fx_run(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w) {
+    uint32_t words[72] = {};
+    int i = 0;
+    for (uint32_t x : w) words[i++] = x;
+    g_pc = _PC_53;
+    return run(f, rewrite, words);
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0, uint32_t where = 0) {
+    g_fx_n++;
+    if (ok) return;
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, popped %u, ebx esi edi ebp %08x %08x %08x %08x)", r->fault, r->code, r->eip, r->pops, r->regs[0],
+                  r->regs[1], r->regs[2], r->regs[3]);
+    if (where) printf(" (wrote %08x)", where);
+    printf("\n");
+}
+// the first byte that changed since `before` outside the function's footprint (the stubs' state block aside); 0 if none
+static uint32_t fx_outside(const Mem& before, const Footprint& fp) {
+    auto in = [&](const uint8_t* q) {
+        for (int k = 0; k < fp.n; k++)
+            if (q >= (const uint8_t*)fp.r[k].p && q < (const uint8_t*)fp.r[k].p + fp.r[k].n) return true;
+        return false;
+    };
+    for (uint32_t i = 0; i < DATA_BYTES; i++)
+        if (before.data[i] != DATA[i] && !in(DATA + i)) return 0x004e1000 + i;
+    for (uint32_t i = 0; i < IDATA_BYTES; i++)
+        if (before.idata[i] != IDATA[i]) return 0x005d7000 + i;
+    for (uint32_t i = sizeof(HState); i < ARENA_BYTES; i++)
+        if (before.arena[i] != g_arena[i] && !in(g_arena + i)) return U32(g_arena + i);
+    return 0;
+}
+static CallLog g_fx_log;
+// the original and the rewrite from the same state: the rewrite clean; the same return, memory and call logs
+static void fx_same(const Ent& f, std::initializer_list<uint32_t> w, const char* what) {
+    g_fx_same_n++;
+    mem_save(g_snap);
+    const Result ro = fx_run(f, false, w);
+    mem_save(g_after);
+    memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+    mem_load(g_snap);
+    const Result rn = fx_run(f, true, w);
+    char m[256];
+    sprintf(m, "%s: a clean return", what);
+    fx_check(fx_clean(f, rn), m, &rn);
+    sprintf(m, "%s: the original's result, bit for bit", what);
+    const uint32_t where = mem_diff(g_after);
+    const bool same = !ro.fault && where == 0 && ro.ret == rn.ret && g_log.n == g_fx_log.n &&
+                      !memcmp(g_log.w, g_fx_log.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+    fx_check(same, m, &ro, where);
+}
+// the tests' world: pristine; the dash's guards built (the gear names too), every banner's Xlator fresh with its text
+// (reset, damaged, the summary's two headings; the others "Resume"); no banner, no pause, the race not over; three cars
+static void fx_reset(const char* reset, const char* damaged, const char* head1, const char* head2) {
+    mem_load(g_pristine);
+    UI_G32(S_SCREEN_W) = 640;
+    UI_G32(S_SCREEN_H) = 480;
+    UI_GP(gxCanvas, S_GX_CANVAS) = W.canvas;
+    UI_GP(void, S_LOCALE) = W.locale;
+    UI_GP(void, S_DEITY) = W.deity;
+    RH_G8(S_DASH_ONCE) = 0xff; RH_G8(S_DASH_ONCE2) = 1; RH_G8(S_DRAW_ONCE) = 0xff; RH_G8(S_DRAW_ONCE2) = 3;
+    RH_GU32(S_GEAR_NAMES) = U32(W.texts + 0x230);
+    RH_GU32(S_GEAR_NAMES + 4) = U32(W.texts + 0x240);
+    for (uint32_t k = 0; k < 7; k++) RH_GU32(S_GEAR_NAMES + 8 + 4 * k) = 0x004e4084u + 4 * k;
+    for (uint32_t xl : {0x00504280u, 0x00504208u, 0x005042e0u, 0x00504220u, 0x00504168u, 0x005040d8u, 0x005042b8u}) {
+        if (!UI_GU32(xl) || !readable((void*)(uintptr_t)UI_GU32(xl), 1)) UI_GU32(xl) = U32(W.texts + 0x220);
+        UI_GU32(xl + 4) = U32(W.texts + 0x220);
+        UI_GU32(xl + 8) = UI_GU32(S_XLATOR_COOKIE);
+    }
+    const struct { uint32_t xl; const char* t; } banners[] = {{0x005042a8, reset}, {0x00504110, damaged}, {0x005040c8, head1},
+                                                              {0x00504290, head2}};
+    for (auto& b : banners) {
+        if (!UI_GU32(b.xl) || !readable((void*)(uintptr_t)UI_GU32(b.xl), 1)) UI_GU32(b.xl) = U32(W.texts + 0x220);
+        UI_GU32(b.xl + 4) = U32(b.t);
+        UI_GU32(b.xl + 8) = UI_GU32(S_XLATOR_COOKIE);
+    }
+    for (int k = 0; k < 6; k++) { RH_G8(S_SHOW + k) = 0; RH_G8(S_SHOW_NEXT + k) = 0; }
+    RH_G8(S_MAIN_DONE) = 0;
+    RH_G8(S_PAUSED) = 0;
+    RH_GP(S_ESC_MENU) = 0;
+    HS->count = 3; HS->focus = 0; HS->player = 0; HS->camera = 0; HS->race_state = 0; HS->finished = 0;
+    for (int i = 0; i < 16; i++) {
+        CarMgrInfo* c = (CarMgrInfo*)(uintptr_t)(S_CARMGR + 0x170u * i);
+        c->type = 0;
+        strcpy(c->name, k_names[i & 7]);
+        c->msg = &W.msgs[i];
+        c->info.place = i + 1;
+    }
+    g_fx_np = 0;
+}
+static const FxPrint* fx_print_of(const char* fmt, const char* arg) {
+    for (int i = 0; i < g_fx_np; i++)
+        if (!strcmp(g_fx_pr[i].fmt, fmt) && !strcmp(g_fx_pr[i].arg, arg)) return &g_fx_pr[i];
+    return 0;
+}
+// t printed as the format: a print whose format is t and isn't the fix's "%s" of one of the four texts
+static bool fx_print_as_format(const char* t, const char* const* texts) {
+    for (int i = 0; i < g_fx_np; i++) {
+        if (strcmp(g_fx_pr[i].fmt, t)) continue;
+        bool fixed = false;
+        for (int k = 0; k < 4; k++) fixed |= !strcmp(g_fx_pr[i].fmt, "%s") && !strcmp(g_fx_pr[i].arg, texts[k]);
+        if (!fixed) return true;
+    }
+    return false;
+}
+// the game's own printf (vsprintf, 0x4cf7c0) on fmt with its arguments on a no-access page: whether it reads one
+static uint8_t* g_noaccess;
+static bool game_reads_args(const char* fmt) {
+    static char out[0x2000];
+    typedef int(__cdecl * VSprintf_t)(char*, const char*, void*);
+    __try {
+        ((VSprintf_t)(uintptr_t)0x004cf7c0)(out, fmt, g_noaccess);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return true;
+    }
+    return false;
+}
+
+static int directed_fix_tests() {
+    const Ent& f = fx_fn("TheRealDashboardDraw");
+    static Footprint fp;
+    char m[256];
+    // ---- 1. TheRealDashboardDraw: banner translations that read arguments ----
+    static const char* const bad[][4] = {
+        {"Reset %s%n now", "Dmg *%d", "Results %n", "%s totals"},
+        {"%n", "%s", "100% done", "%*d"},
+        {"Press %I64d", "%5.2f", "%-*s", "x%c"},
+    };
+    for (auto& t : bad) {
+        for (int banner = 0; banner < 2; banner++) {                // the reset and damaged banners; the summary
+            fx_reset(t[0], t[1], t[2], t[3]);
+            if (banner == 0) { RH_G8(S_SHOW + 1) = 1; RH_G8(S_SHOW + 2) = 1; }
+            else RH_G8(S_SHOW) = 1;
+            fp.n = 0; fp.replay_only = 0; fp.pure = false;
+            uint32_t words[72] = {U32(W.canvas), 0};
+            f.fp(fp, words);
+            fx_check(!fp.replay_only, "TheRealDashboardDraw's banners: footprint-checked (not replay_only)");
+            mem_save(g_snap);
+            g_fx_rec = true;
+            const Result r = fx_run(f, true, {U32(W.canvas), 0});
+            g_fx_rec = false;
+            sprintf(m, "TheRealDashboardDraw, %s \"%s\" / \"%s\": a clean return", banner ? "the summary" : "reset and damaged",
+                    t[banner ? 2 : 0], t[banner ? 3 : 1]);
+            fx_check(fx_clean(f, r), m, &r);
+            const uint32_t o = fx_outside(g_snap, fp);
+            sprintf(m, "TheRealDashboardDraw, %s: nothing written outside its footprint", banner ? "the summary" : "reset and damaged");
+            fx_check(o == 0, m, 0, o);
+            for (int k = banner ? 2 : 0; k < (banner ? 4 : 2); k++) {
+                const bool reads = rdash::fix_format_reads_args(t[k]);
+                sprintf(m, "TheRealDashboardDraw: \"%s\" printed as it is through \"%%s\" (reads an argument: %d)", t[k], reads);
+                fx_check(reads ? fx_print_of("%s", t[k]) && !fx_print_as_format(t[k], t) : fx_print_as_format(t[k], t), m);
+            }
+        }
+    }
+    // the boundary: texts with "%%" and no conversion are still the format, on both
+    for (int banner = 0; banner < 2; banner++) {
+        fx_reset("Reset car? 100%% sure", "Damaged 50%%", "Results (100%%)", "%%%%");
+        if (banner == 0) { RH_G8(S_SHOW + 1) = 1; RH_G8(S_SHOW + 2) = 1; }
+        else RH_G8(S_SHOW) = 1;
+        fx_same(f, {U32(W.canvas), 0}, banner ? "TheRealDashboardDraw, the summary's \"%%\" headings" : "TheRealDashboardDraw, \"%%\" banners");
+    }
+    // the format check against the game's printf
+    {
+        g_noaccess = (uint8_t*)VirtualAlloc(0, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
+        // (a 'B' conversion prints the printf's stale locals and reads no argument; the check counts it as reading one, so
+        // such a text is printed as it is: the one disagreement allowed, and counted)
+        int agree = 0, n = 0, b_conv = 0;
+        auto one = [&](const char* s) {
+            n++;
+            const bool a = rdash::fix_format_reads_args(s), g = game_reads_args(s);
+            if (a == g) { agree++; return; }
+            if (a && !g && strchr(s, 'B')) { agree++; b_conv++; return; }
+            printf("  the format check says %s, the game's printf %s: \"%s\"\n", a ? "reads" : "doesn't read", g ? "reads" : "doesn't", s);
+        };
+        for (auto& t : bad) for (const char* s : t) one(s);
+        for (const char* s : {"Reset car? 100%% sure", "Damaged 50%%", "%%%%", "Resume", "", "%", "100%", "%%", "%I", "%I6", "%I64",
+                              "%I32d", "%-", "%B", "%lld", "%hB", "a%*", "%.*", "%Z"})
+            one(s);
+        static const char alpha[] = "%%%%%%%*-+ #0123456789.lhIL64BZSsdnpcCxXoegEGaAiu wq";
+        for (int i = 0; i < 20000; i++) {
+            char s[16];
+            const int len = irange(1, 12);
+            for (int k = 0; k < len; k++) s[k] = alpha[rnd() % (sizeof alpha - 1)];
+            s[len] = 0;
+            one(s);
+        }
+        sprintf(m, "the format check agrees with the game's printf (%d of %d texts)", agree, n);
+        fx_check(agree == n, m);
+        printf("the format check against the game's printf: %d texts, %d agree (%d with a 'B' conversion, printed as they are)\n", n,
+               agree, b_conv);
+    }
+    printf("fix tests: %d checks (%d run on both, compared bit for bit), %d failed\n", g_fx_n, g_fx_same_n, g_fx_bad);
+    return g_fx_bad;
+}
+#endif
+
 // ---- main -----------------------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -990,6 +1251,7 @@ int main(int argc, char** argv) {
     static Footprint fp;
     long long checks = 0, poisoned_checks = 0, log_words = 0, both_fault = 0;
     int differ = 0, fp_bad = 0, faults = 0, replay_n = 0, changed_fns = 0, still_fns = 0, bad_fns = 0, skipped = 0, fp_checked = 0;
+    int fixed_rounds = 0;                                          // (the fix build: rounds kept out, a fixed case)
     for (int fi = 0; fi < g_nfns; fi++) {
         const Ent& f = g_fns[fi];
         if (only && !strstr(f.name, only)) continue;
@@ -1005,6 +1267,13 @@ int main(int argc, char** argv) {
             randomize_world();
             uint32_t words[72];
             if (!make_args(f, words)) { skipped++; continue; }
+#if ROOT_FIXES
+            if (fx_banner_case(f)) {
+                fixed_rounds++;
+                if (trace) printf("    round %d: a fixed case (a banner's translation reads an argument), not compared\n", rd);
+                continue;
+            }
+#endif
             fp.n = 0; fp.replay_only = 0; fp.pure = false;
             f.fp(fp, words);
             if (fp.replay_only) replay_any = true;
@@ -1103,5 +1372,12 @@ int main(int argc, char** argv) {
            "(%lld in both, the same way), %d skipped; %d functions bad\n",
            g_nfns, n_e, dup, fp_checked, replay_n, checks, poisoned_checks, log_words, differ, fp_bad, faults, both_fault, skipped, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
-    return differ || fp_bad || dup ? 1 : 0;
+    int fix_bad = 0;
+#if ROOT_FIXES
+    printf("the fix build: %d rounds kept out of the comparison (a banner's translation reading an argument)\n", fixed_rounds);
+    if (!only) fix_bad = directed_fix_tests();
+#else
+    (void)fixed_rounds;
+#endif
+    return differ || fp_bad || dup || fix_bad ? 1 : 0;
 }

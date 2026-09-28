@@ -6,11 +6,12 @@
 //        /Fo<dir>\ /Fe<dir>\world_root_race.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_root_race.exe [rounds] [seed]          (VP_TRACE=1: one line per function; VP_ONLY=text: those only;
 //          VP_DEBUG_WORLD=1: the world's objects and every fault's registers; VP_DEBUG_LOG=1: each round's first logged words)
+//     (and with /DVP_ROOT_FIXES: the fix build, below)
 //
 // Loads out\race_v10.exe at 0x400000 the way test/world_menu_view.cpp does (a child process with the range reserved) and
 // includes the two rewrite files with PORT_FN redefined to list each function (its v1.0 address, the rewrite, its calling
 // convention -- __cdecl, __thiscall as __fastcall, WinMain's __stdcall --, stack arguments and return, its footprint).
-// VP_FAITHFUL (these files have no fixes): the rewrites exactly as the originals.
+// VP_FAITHFUL: the rewrites exactly as the originals.
 //
 // The world. Once: the $E static initialisers of libraries ui, menu and root (their Xlators, colours, tables), the game's
 // UIBegin (the styles); a locale; a fake StringTable for tracks.tab, a car list, a CarMgr (infos), race and lap records, a
@@ -44,6 +45,19 @@
 // UIAddDynamicStyle), UIDialogItem's, Xlator's, World's, BoardCustomText's constructors, gxSetClip / gxRestoreClip, the
 // CRT (sscanf, strstr, strncmp, qsort), Base64ToMem / MemToBase64, blimp_to_tv, Win32GetWindow, and every function of this
 // group (each rewrite is checked against its original with the same callees).
+//
+// Built with /DVP_ROOT_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Race front
+// end"). Every function is still compared as above, with the rounds that reach a fixed case kept out of the comparison
+// and counted (per function, listed), the rewrite still run on each and required to return cleanly: GetEventString's where
+// the original's sprintf printed past one of its three 0x20-byte texts (sprintf's stub knows them: a huge locale factor's
+// number with the longer translation does that), CarPosition::CarPosition's with a car name of 12 or more characters (the
+// fixed remap names stop at their 16 bytes, where the original's ran on over fields it then wrote again), and
+// AppProcessArgs' where only the original faults (a random text with a -d and no space after it: the original writes to
+// address 0). Then directed_fix_tests: for each fix, the bad case run on the rewrite alone -- no fault, the bytes popped
+// and ebx / esi / edi / ebp kept, nothing written outside what it may write (the memory around it compared), and the
+// result the fix promises -- and its boundary case (the longest input that fits) on both, compared bit for bit; and
+// setup_blimp_jump's word scan against the game's own sscanf (random command lines, every white-space byte). Without it
+// (VP_FAITHFUL) every rewrite must match its original bit for bit.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -55,9 +69,15 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <string>
 #include <vector>
 
+#ifndef VP_ROOT_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#define ROOT_FIXES 0
+#else
+#define ROOT_FIXES 1
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------------
@@ -333,8 +353,11 @@ static const char* g_rec_fprf_fmt;
 static uint32_t g_rec_fprf_a0;
 static char g_rec_mark;                               // gxFontPrintf: record only a format starting with it (0: any)
 // the fix build: whether the original's sprintf printed past a field of the world's objects (a fixed case)
-static bool g_overran;
-static uint32_t field_size(const char* p);
+static bool g_overran;                                 // sprintf printed past one of GetEventString's texts
+static const char* g_fx_xl_name;                      // a track's friendly name (a "Tracks:Name" key's text)
+static const char* g_fx_xl_text;                      // a track's text (a "Tracks:Text" key's)
+static const char* const* g_fx_find;                  // FileFindFirst / Next's names (g_fx_find_n of them)
+static int g_fx_find_n;
 static uint32_t hash_str(const char* s) {
     uint32_t h = 2166136261u;
     if (!s || !readable(s, 1)) return 0x5eed;
@@ -550,9 +573,16 @@ static const char* xl_text(uint32_t key) {
     const uint32_t h = (on_stack(key) ? 0x5eedu : hash_str((const char*)(uintptr_t)key)) ^ g_xl_seed;
     return k_xl_text[(h & 0xff) < 0xf0 ? h % 14 : 14 + (h & 1)];
 }
+static bool key_is(uint32_t key, const char* prefix) {
+    const char* k = (const char*)(uintptr_t)key;
+    return readable(k, 1) && readable(k, (uint32_t)strlen(prefix)) && !strncmp(k, prefix, strlen(prefix));
+}
 static void __fastcall stub_xlate(uint32_t* xl, int) {
     L('XLAT'); L(P(xl));
-    xl[1] = (uint32_t)(uintptr_t)(g_fx_xl ? g_fx_xl : xl_text(xl[0]));
+    const char* t = g_fx_xl ? g_fx_xl : xl_text(xl[0]);
+    if (g_fx_xl_name && key_is(xl[0], "Tracks:Name")) t = g_fx_xl_name;
+    if (g_fx_xl_text && key_is(xl[0], "Tracks:Text")) t = g_fx_xl_text;
+    xl[1] = (uint32_t)(uintptr_t)t;
     xl[2] = UI_GU32(S_XLATOR_COOKIE);
 }
 static void __cdecl stub_LocaleConvertNumeric(char* s) { L('LCNV'); LS(s); }
@@ -590,10 +620,18 @@ static int __cdecl stub_sprintf(char* buf, const char* fmt, ...) {
     const int r = vsprintf(buf, fmt, ap);
     va_end(ap);
     LS(buf);
+    const uint32_t b = (uint32_t)(uintptr_t)buf;
+    if ((b == S_EVENT_TEXT0 || b == S_EVENT_TEXT1 || b == S_EVENT_TEXT2) && strlen(buf) > 0x1f) g_overran = true;
     return r;
 }
 static void* __cdecl stub_FindFirst(const char* pat, char* buf, int n) {
     L('FFF '); LS(pat); L((uint32_t)n);
+    if (g_fx_find) {
+        if (g_fx_find_n <= 0) return (void*)(intptr_t)-1;
+        strcpy(buf, g_fx_find[0]);
+        HS->find_pos = 1;
+        return (void*)(uintptr_t)0x00f1f1f1;
+    }
     if (HS->find_n <= 0) return (void*)(intptr_t)-1;
     strcpy(buf, HS->find_names[0]);
     HS->find_pos = 1;
@@ -601,6 +639,11 @@ static void* __cdecl stub_FindFirst(const char* pat, char* buf, int n) {
 }
 static uint8_t __cdecl stub_FindNext(void* h, char* buf, int n) {
     L('FFN '); L((uint32_t)(uintptr_t)h); L((uint32_t)n);
+    if (g_fx_find) {
+        if (HS->find_pos >= g_fx_find_n) return 0;
+        strcpy(buf, g_fx_find[HS->find_pos++]);
+        return 1;
+    }
     if (HS->find_pos >= HS->find_n) return 0;
     strcpy(buf, HS->find_names[HS->find_pos++]);
     return 1;
@@ -698,10 +741,13 @@ static void* __fastcall stub_CenterLine_ctor(void* self, int, const uint8_t* rev
 static void __fastcall stub_CenterLine_dtor(void* self, int) { L('CLDT'); L(P(self)); }
 static void __cdecl stub_WorldGetCarTexture(char* out, const char* base, int32_t n) {
     L('WGCT'); L(P(out)); LS(base); L((uint32_t)n);
-    sprintf(out, "%.8s%d", readable(base, 1) ? base : "?", n & 0xff);
+    if (g_fx_real_tex) sprintf(out, n < 0 ? "~%s.tex" : "%s.tex", base);           // (the fix tests: the game's names)
+    else sprintf(out, "%.8s%d", readable(base, 1) ? base : "?", n & 0xff);
 }
 static int32_t __cdecl stub_mrModelLoadRemap(const char* name, const char* remap, int32_t n) {
     L('MRLR'); LS(name); LS(remap); LS(remap + 0x10); L_block(remap + 0x20, 2); L((uint32_t)n);
+    rec(g_rec_remap_load, sizeof g_rec_remap_load, name);                          // (for the fix tests)
+    if (readable(remap, 0x28)) memcpy(g_rec_remap, remap, 0x28);
     return 0x300 + (int32_t)(hash_str(name) & 0xff);
 }
 static gxCanvas* g_shadow;
@@ -1430,6 +1476,613 @@ static bool is_modal(const char* nm) {
     return false;
 }
 
+// ---- the fix build: rounds kept out of the comparison ------------------------------------------------------------------------
+// (before the original runs) CarPosition::CarPosition with a car name of 12 or more characters: the fixed remap names stop at
+// their 16 bytes, where the original's ran on over fields it then wrote again (so they differ in bytes nothing reads)
+static bool fx_pre_case(const Ent& f, const uint32_t* w) {
+    if (!strcmp(f.name, "CarPosition::CarPosition")) {
+        const char* car = (const char*)(uintptr_t)w[2];              // (ecx, edx, then the car)
+        return readable(car, 1) && strnlen(car, 12) > 11;
+    }
+    return false;
+}
+
+#if ROOT_FIXES
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+// The rewrite alone (the original would crash or overrun there -- this program's stack among what it would take), from the
+// pristine world with the case set up: it must return cleanly (no fault, the bytes popped, ebx / esi / edi / ebp kept),
+// write nothing outside what it may (every other byte of .data/.bss/.idata and the arena compared with before) and give
+// what the fix promises. Each fix's boundary case (the longest input that fits) runs on the original and the rewrite from
+// the same state and must give the same memory, call logs and result.
+static int g_fx_bad, g_fx_n, g_fx_same_n;
+static const Ent& fx_fn(const char* name) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, name)) return g_fns[i];
+    printf("  fix test: %s isn't listed\n", name);
+    fflush(stdout);
+    ExitProcess(4);
+}
+struct Span { const void* p; uint32_t n; };
+static uint32_t fx_outside_in(const Mem& before, bool (*in)(const uint8_t*, const void*), const void* ctx) {
+    for (uint32_t i = 0; i < DATA_BYTES; i++)
+        if (before.data[i] != DATA[i] && !in(DATA + i, ctx)) return 0x004e1000 + i;
+    for (uint32_t i = 0; i < IDATA_BYTES; i++)
+        if (before.idata[i] != IDATA[i] && !in(IDATA + i, ctx)) return 0x005d7000 + i;
+    for (uint32_t i = sizeof(HState); i < ARENA_BYTES; i++)
+        if (before.arena[i] != g_arena[i] && !in(g_arena + i, ctx)) return U(g_arena + i);
+    return 0;
+}
+// the first byte that changed since `before` outside the spans (the stubs' state block aside); 0 if none
+static uint32_t fx_outside(const Mem& before, std::initializer_list<Span> ok) {
+    struct C { const Span* b; const Span* e; } c = {ok.begin(), ok.end()};
+    return fx_outside_in(before, [](const uint8_t* q, const void* x) {
+        const C* c = (const C*)x;
+        for (const Span* sp = c->b; sp != c->e; sp++)
+            if (q >= (const uint8_t*)sp->p && q < (const uint8_t*)sp->p + sp->n) return true;
+        return false;
+    }, &c);
+}
+// ... outside the function's footprint
+static uint32_t fx_outside_fp(const Mem& before, const Footprint& fp) {
+    return fx_outside_in(before, [](const uint8_t* q, const void* x) {
+        const Footprint* fp = (const Footprint*)x;
+        for (int k = 0; k < fp->n; k++)
+            if (q >= (const uint8_t*)fp->r[k].p && q < (const uint8_t*)fp->r[k].p + fp->r[k].n) return true;
+        return false;
+    }, &fp);
+}
+static Result fx_run(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w) {
+    uint32_t words[72] = {};
+    int i = 0;
+    for (uint32_t x : w) words[i++] = x;
+    g_pc = _PC_53;
+    return run(f, rewrite, words);
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0, uint32_t where = 0) {
+    g_fx_n++;
+    if (ok) return;
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, popped %u, ebx esi edi ebp %08x %08x %08x %08x)", r->fault, r->code, r->eip, r->pops, r->regs[0],
+                  r->regs[1], r->regs[2], r->regs[3]);
+    if (where) printf(" (wrote %08x)", where);
+    printf("\n");
+}
+static bool fx_logged(uint32_t tag) {
+    for (uint32_t i = 0; i < g_log.n && i < LOG_MAX; i++)
+        if (g_log.w[i] == tag) return true;
+    return false;
+}
+static CallLog g_fx_log;
+// the original and the rewrite from the same state: the rewrite clean; the same return, memory and call logs
+static void fx_same(const Ent& f, std::initializer_list<uint32_t> w, const char* what) {
+    g_fx_same_n++;
+    mem_save(g_snap);
+    const Result ro = fx_run(f, false, w);
+    mem_save(g_after);
+    memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+    mem_load(g_snap);
+    const Result rn = fx_run(f, true, w);
+    char m[256];
+    sprintf(m, "%s: a clean return", what);
+    fx_check(fx_clean(f, rn), m, &rn);
+    sprintf(m, "%s: the original's result, bit for bit", what);
+    const uint32_t where = mem_diff(g_after);
+    const bool same = !ro.fault && where == 0 && ro.ret == rn.ret && g_log.n == g_fx_log.n &&
+                      !memcmp(g_log.w, g_fx_log.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+    fx_check(same, m, &ro, where);
+}
+// a callee replaced for a test (a jump to a recorder), put back after
+struct FxPatch {
+    uint32_t at;
+    uint8_t b[5];
+    FxPatch(uint32_t a, void* to) : at(a) { memcpy(b, (const void*)(uintptr_t)a, 5); patch_jmp(a, to); }
+    ~FxPatch() { memcpy((void*)(uintptr_t)at, b, 5); }
+};
+static char g_fx_dir[0x200];
+static int g_fx_dir_n;
+static uint8_t __cdecl fx_FileChangeDir(const char* d) { L('FCHD'); LS(d); rec(g_fx_dir, sizeof g_fx_dir, d); g_fx_dir_n++; return 1; }
+static uint8_t g_fx_world[0x40];
+static void __cdecl fx_LoadRace(const uint8_t* w) { L('LDRC'); memcpy(g_fx_world, w, sizeof g_fx_world); }
+static char g_fx_wrap[0x200];
+static uint32_t g_fx_wrap_len;
+static void __cdecl fx_WordWrap(int32_t, int32_t, char* out, const char* in) {
+    L('WRAP');
+    g_fx_wrap_len = (uint32_t)strlen(in);
+    rec(g_fx_wrap, sizeof g_fx_wrap, in);
+    rec(out, 0x100, in);
+}
+// the tests' world: pristine, the stubs' hooks off, every function-local Xlator built (fresh), the statics the code follows
+static void fx_reset() {
+    mem_load(g_pristine);
+    g_fx_xl = g_fx_xl_name = g_fx_xl_text = 0;
+    g_fx_find = 0;
+    g_fx_find_n = 0;
+    g_fx_real_tex = false;
+    g_xl_seed = 0;
+    UI_GP(gxCanvas, S_GX_CANVAS) = W.screen;
+    UI_GP(WidgetWindow, S_ACTIVE) = W.win;
+    UI_GU32(S_DIALOG_IDLE) = 0;
+    UI_G8(S_EXIT) = 0;
+    UI_GF(S_UI_DT) = 0.05f;
+    UI_GP(void, S_CURSOR) = 0;
+    UI_G32(S_MOUSE_X) = 320; UI_G32(S_MOUSE_Y) = 240;
+    UI_GP(uint8_t, S_LOCALE) = W.locale;
+    *(float*)(W.locale + 0x14) = 1.0f;
+    *(float*)(W.locale + 0x1c) = 1.0f;
+    W.locale[0x38] = 0;
+    UI_GP(void, S_DEITY) = g_deity;
+    UI_GP(char, S_CARLIST) = W.carlist;
+    UI_G32(S_CARLIST_N) = 8;
+    UI_GP(void, S_TRACK_TAB) = g_tab;
+    for (auto& x : k_xl) {
+        UI_G8(x[0]) = (uint8_t)(UI_G8(x[0]) | x[1]);
+        UI_GU32(x[2]) = x[3];
+        UI_GU32(x[2] + 4) = U(xl_text(x[3]));
+        UI_GU32(x[2] + 8) = UI_GU32(S_XLATOR_COOKIE);
+    }
+    HS->time = 1000; HS->frames = 0; HS->frame_limit = 40; HS->grab_fail_at = -1;
+    HS->mouse_x = 320; HS->mouse_y = 240;
+    HS->script_n = HS->script_pos = 0;
+    HS->rs = 0x1234567;
+    for (int i = 0; i < 8; i++) HS->scan_mask[i] = 0;
+    HS->menu_calls = 0; HS->menu_end = 2;
+    HS->state_calls = 0; HS->state_end = 3;
+    HS->player = 0; HS->car_count = 2; HS->tab_rows = 9; HS->deity_laps = 3;
+    HS->find_n = 0; HS->find_pos = 0; HS->board_next = 0;
+    UI_G8(0x004eb444) = 1;                                      // base64.obj: its table built on first use
+    HS->rec_mask = 0xffffffffu;
+    for (int i = 0; i < 16; i++) { HS->laps[i] = 3; HS->place[i] = i; }
+    HS->cl_len = 0x45800000u;                                   // 4096
+    HS->userdir_len = 20;
+    UI_G32(S_APP_MODE) = 0;
+    UI_G32(S_CAMERA) = 5;
+    UI_G32(S_DASH) = 0;
+    UI_G8(S_MAIN_DONE) = 0; UI_G8(S_PAUSED) = 0; UI_G8(S_RESTART) = 0; UI_G8(S_BLIMP_TV) = 0;
+    UI_G8(S_BLIMP_GUARD) = 3;
+    UI_G8(S_ESC_GUARD) = 0xff;
+    UI_GP(void, S_W32_SPLASH) = 0;
+    for (int d = 0; d < 5; d++) {                               // the dashboards: the stubs
+        DashType* t = (DashType*)(uintptr_t)(S_DASH_TABLE + 0x14u * (uint32_t)d);
+        t->update = &stub_dash_update;
+        t->draw2d = (void(__cdecl*)(void*)) & stub_dash_draw2d;
+        t->draw3d = &stub_dash_draw3d;
+        t->key = (uint8_t(__cdecl*)(uint32_t)) & stub_dash_key;
+        W.dash_keys[d][0] = 0xff;
+        t->keys = W.dash_keys[d];
+    }
+}
+static char g_fx_s[8][0x400];
+// a string of n c's and then tail (in one of eight buffers of this program's)
+static const char* mk(int k, char c, int n, const char* tail = "") {
+    memset(g_fx_s[k], c, (size_t)n);
+    strcpy(g_fx_s[k] + n, tail);
+    return g_fx_s[k];
+}
+// s's first n characters
+static std::string first(const char* s, size_t n) { return std::string(s, strnlen(s, n)); }
+static const uint32_t k_identity[12] = {0x3f800000, 0, 0, 0, 0x3f800000, 0, 0, 0, 0x3f800000, 0, 0, 0};
+
+static int directed_fix_tests() {
+    Result r;
+    uint32_t o;
+    char m[512];
+    static Footprint fp;
+    auto footprint = [&](const Ent& f, std::initializer_list<uint32_t> w) {
+        uint32_t words[72] = {};
+        int i = 0;
+        for (uint32_t x : w) words[i++] = x;
+        fp.n = 0; fp.replay_only = 0; fp.pure = false;
+        f.fp(fp, words);
+    };
+
+    // ---- 2. GetEventString: long translations ----
+    {
+        const Ent& f = fx_fn("GetEventString");
+        struct { const char* text; uint8_t metric; float k; int32_t n0, n1; const char* what; } cases[] = {
+            {mk(0, 'e', 60), 0, 1.0f, 60, 100, "a 60-character translation"},
+            {mk(1, 'f', 20), 1, 1.2e8f, 0, 0, "a 20-character translation and a big locale factor's number (11 characters)"},
+            {mk(2, 'g', 300), 0, 1.0f, 60, 100, "a 300-character translation"},
+        };
+        for (auto& c : cases) {
+            if (c.metric) {                                     // the numbers as __ftol makes them: the 64-bit integer's low dword
+                float k0, k1;
+                const uint32_t b0 = 0x41d55555, b1 = 0x4231c71c;
+                memcpy(&k0, &b0, 4);
+                memcpy(&k1, &b1, 4);
+                c.n0 = (int32_t)(uint32_t)(uint64_t)(int64_t)((double)c.k * (double)k0);
+                c.n1 = (int32_t)(uint32_t)(uint64_t)(int64_t)((double)c.k * (double)k1);
+            }
+            fx_reset();
+            g_fx_xl = c.text;
+            for (uint32_t a : root_race::k_xl_event) UI_GU32(a + 8) = ~UI_GU32(S_XLATOR_COOKIE);    // stale: refreshed with it
+            W.locale[0x38] = c.metric;
+            *(float*)(W.locale + 0x1c) = c.k;
+            footprint(f, {1});
+            mem_save(g_snap);
+            r = fx_run(f, true, {1});
+            sprintf(m, "GetEventString, %s: a clean return", c.what);
+            fx_check(fx_clean(f, r), m, &r);
+            o = fx_outside_fp(g_snap, fp);
+            sprintf(m, "GetEventString, %s: nothing written outside its three texts and Xlators", c.what);
+            fx_check(o == 0, m, 0, o);
+            char e[3][0x200];
+            sprintf(e[0], "%s %d", c.text, c.n0);
+            sprintf(e[1], "%s %d", c.text, c.n1);
+            sprintf(e[2], "%d %s", c.n1, c.text);
+            const uint32_t at[3] = {S_EVENT_TEXT0, S_EVENT_TEXT1, S_EVENT_TEXT2};
+            for (int k = 0; k < 3; k++) {
+                sprintf(m, "GetEventString, %s: text %d is the first 31 characters of \"%.40s...\"", c.what, k, e[k]);
+                fx_check(first(e[k], 31) == std::string((const char*)(uintptr_t)at[k]), m);
+            }
+            fx_check(r.ret == S_EVENT_TEXT0, "GetEventString(1): the quarter mile's text");
+        }
+        // the boundary: 27 characters ("<27> 100" and "100 <27>" are 31)
+        fx_reset();
+        g_fx_xl = mk(0, 'e', 27);
+        for (uint32_t a : root_race::k_xl_event) UI_GU32(a + 8) = ~UI_GU32(S_XLATOR_COOKIE);
+        fx_same(f, {5}, "GetEventString, a 27-character translation (texts of 31 characters)");
+    }
+
+    // ---- 3. RaceBegin: 40 cars; long names ----
+    {
+        const Ent& f = fx_fn("RaceBegin");
+        static char names[40][0x80];
+        static const char* ptrs[40];
+        for (int i = 0; i < 40; i++) {
+            sprintf(names[i], i % 3 == 0 ? "cars\\car%02d.car" : "car%02d.car", 39 - i);
+            ptrs[i] = names[i];
+        }
+        fx_reset();
+        g_fx_find = ptrs;
+        g_fx_find_n = 40;
+        mem_save(g_snap);
+        r = fx_run(f, true, {});
+        fx_check(fx_clean(f, r), "RaceBegin, 40 cars: a clean return", &r);
+        const char* list = UI_GP(const char, S_CARLIST);
+        const int32_t n = UI_G32(S_CARLIST_N);
+        sprintf(m, "RaceBegin, 40 cars: the list holds 32 (%d)", n);
+        fx_check(n == 32, m);
+        bool ok = readable(list, 0x400);
+        for (int k = 0; ok && k < 32; k++) {                    // the first 32 listed (car39 .. car08), sorted
+            char e[16];
+            sprintf(e, "car%02d", 8 + k);
+            ok = !strcmp(list + 32 * k, e);
+        }
+        fx_check(ok, "RaceBegin, 40 cars: the first 32 the folder lists, sorted");
+        o = fx_outside(g_snap, {{(void*)(uintptr_t)S_CARLIST, 8}, {(void*)(uintptr_t)S_TRACK_TAB, 4}, {list, 0x400}});
+        fx_check(o == 0, "RaceBegin, 40 cars: nothing written outside the list's 0x400 bytes and its statics", 0, o);
+        // names too long for an entry
+        static char lng[5][0x100];
+        sprintf(lng[0], "viper.car");
+        sprintf(lng[1], "%s.car", mk(0, 'a', 31));
+        sprintf(lng[2], "cars\\%s.car", mk(1, 'b', 32));
+        sprintf(lng[3], "%s.car", mk(2, 'c', 100));
+        sprintf(lng[4], "gts.car");
+        static const char* lp[5] = {lng[0], lng[1], lng[2], lng[3], lng[4]};
+        fx_reset();
+        g_fx_find = lp;
+        g_fx_find_n = 5;
+        mem_save(g_snap);
+        r = fx_run(f, true, {});
+        fx_check(fx_clean(f, r), "RaceBegin, names of 31, 32 and 100 characters: a clean return", &r);
+        list = UI_GP(const char, S_CARLIST);
+        fx_check(UI_G32(S_CARLIST_N) == 3 && readable(list, 0x400) && !strcmp(list, mk(3, 'a', 31)) && !strcmp(list + 32, "gts") &&
+                     !strcmp(list + 64, "viper"),
+                 "RaceBegin, names of 31, 32 and 100 characters: the 31-character name kept, the longer two left out");
+        o = fx_outside(g_snap, {{(void*)(uintptr_t)S_CARLIST, 8}, {(void*)(uintptr_t)S_TRACK_TAB, 4}, {list, 0x400}});
+        fx_check(o == 0, "RaceBegin, long names: nothing written outside the list and its statics", 0, o);
+        // the boundary: 32 names of 31 characters
+        static char full[32][0x40];
+        static const char* fp32[32];
+        for (int i = 0; i < 32; i++) {
+            sprintf(full[i], "x%030d.car", 31 - i);
+            fp32[i] = full[i];
+        }
+        fx_reset();
+        g_fx_find = fp32;
+        g_fx_find_n = 32;
+        fx_same(f, {}, "RaceBegin, 32 cars of 31 characters (the list full)");
+    }
+
+    // ---- 4. CarPosition::CarPosition: long car names ----
+    {
+        const Ent& f = fx_fn("CarPosition::CarPosition");
+        uint8_t* obj = W.scratch;
+        struct { const char* car; int32_t drv; } cases[] = {
+            {"abcdefghijkl", 2}, {"a_car_name_of_twenty", -1}, {"a_mod_car_with_a_long_name_of31", -1}, {mk(4, 'z', 60), 3},
+        };
+        for (auto& c : cases) {
+            const size_t len = strlen(c.car);
+            std::string cut = first(c.car, 48);
+            char mod[0x80], from[0x80], to[0x80];
+            sprintf(mod, "%s3.mod", cut.c_str());
+            sprintf(from, "%s.tex", cut.c_str());
+            sprintf(to, c.drv < 0 ? "~%s.tex" : "%s.tex", cut.c_str());
+            // the original, where its frame's names fit (26 characters): the names the model got
+            char o_from[17] = {}, o_to[17] = {};
+            uint8_t o_tail[8] = {};
+            const bool orig = len <= 26;
+            if (orig) {
+                fx_reset();
+                g_fx_real_tex = true;
+                memset(obj, 0xa5, 0x200);
+                r = fx_run(f, false, {U(obj), 0, U(c.car), U(W.texts[1]), (uint32_t)c.drv, 0, 1});
+                memcpy(o_from, g_rec_remap, 16);
+                memcpy(o_to, g_rec_remap + 0x10, 16);
+                memcpy(o_tail, g_rec_remap + 0x20, 8);
+            }
+            fx_reset();
+            g_fx_real_tex = true;
+            memset(obj, 0xa5, 0x200);
+            g_rec_remap_load[0] = 0;
+            mem_save(g_snap);
+            r = fx_run(f, true, {U(obj), 0, U(c.car), U(W.texts[1]), (uint32_t)c.drv, 0, 1});
+            sprintf(m, "CarPosition, a car name of %u characters: a clean return", (unsigned)len);
+            fx_check(fx_clean(f, r) && r.ret == U(obj), m, &r);
+            o = fx_outside(g_snap, {{obj, 0xa4}});
+            sprintf(m, "CarPosition, a car name of %u characters: nothing written outside the object", (unsigned)len);
+            fx_check(o == 0, m, 0, o);
+            sprintf(m, "CarPosition, a car name of %u characters: the model \"%s\"", (unsigned)len, mod);
+            fx_check(!strcmp(g_rec_remap_load, mod), m);
+            const CarPosition* cp = (const CarPosition*)obj;
+            auto name16 = [](const char* field, const char* want) {
+                return strlen(want) >= 16 ? !memcmp(field, want, 16) : !strcmp(field, want);
+            };
+            sprintf(m, "CarPosition, a car name of %u characters: the remap's names \"%.16s\" / \"%.16s\", then zeros", (unsigned)len, from, to);
+            fx_check(name16(cp->remap_from, from) && name16(cp->remap_to, to) && cp->remap_20 == 0 && cp->remap_24 == 0, m);
+            if (orig) {
+                char n_from[17] = {}, n_to[17] = {};
+                memcpy(n_from, g_rec_remap, 16);
+                memcpy(n_to, g_rec_remap + 0x10, 16);
+                sprintf(m, "CarPosition, a car name of %u characters: the model got the original's names (16 characters each)", (unsigned)len);
+                fx_check(!strcmp(o_from, n_from) && !strcmp(o_to, n_to) && !memcmp(o_tail, g_rec_remap + 0x20, 8), m);
+            }
+        }
+        // the boundaries: "<11>.tex" and "~<10>.tex" (15 characters)
+        fx_reset();
+        g_fx_real_tex = true;
+        memset(obj, 0xa5, 0x200);
+        fx_same(f, {U(obj), 0, U("abcdefghijk"), U(W.texts[1]), 2, 0, 1}, "CarPosition, an 11-character car (\"<car>.tex\" of 15)");
+        fx_reset();
+        g_fx_real_tex = true;
+        memset(obj, 0xa5, 0x200);
+        fx_same(f, {U(obj), 0, U("abcdefghij"), U(W.texts[1]), (uint32_t)-1, 0, 1}, "CarPosition, a 10-character car (\"~<car>.tex\" of 15)");
+    }
+
+    // ---- 5. PreRaceDo: a long friendly name; a damaged World's track name; long track texts (the frame's 4 KB) ----
+    {
+        const Ent& f = fx_fn("PreRaceDo");
+        uint8_t* w = W.world;
+        const std::initializer_list<uint32_t> args = {U(w), 0, U(W.flags), 0, U(W.times), U(W.prizes)};
+        uint8_t g_trk[8], g_fr[4], g_trk2[8];
+        // a track text of n characters, words of five
+        static char big[0x1100];
+        auto words = [](int n) {
+            for (int i = 0; i < n; i++) big[i] = i % 6 == 5 ? ' ' : (char)('a' + i % 23);
+            big[n] = 0;
+            return (const char*)big;
+        };
+        for (int pass = 0; pass < 2; pass++) {                  // with UIStyleWordWrap recorded, then the game's own
+            fx_reset();
+            strcpy((char*)w + 8, "uptown");
+            *(int32_t*)(w + 0xca8) = 2;
+            g_fx_xl_name = mk(0, 'n', 100);
+            g_fx_xl_text = pass == 0 ? mk(1, 't', 400, " the end") : words(4000);
+            memcpy(g_trk, (const void*)0x00505c88, 8);
+            memcpy(g_fr, (const void*)0x00505dd0, 4);
+            g_fx_wrap_len = 0;
+            if (pass == 0) {
+                FxPatch wrap(0x0047fb90, (void*)&fx_WordWrap);
+                r = fx_run(f, true, args);
+            } else {
+                r = fx_run(f, true, args);
+            }
+            sprintf(m, "PreRaceDo, a 100-character friendly name and a %s: a clean return",
+                    pass ? "4000-character text (the game's word wrap: the frame holds it)" : "408-character text (the word wrap recorded)");
+            fx_check(fx_clean(f, r), m, &r);
+            fx_check(first(g_fx_xl_name, 63) == std::string((const char*)(uintptr_t)S_PR_FRIENDLY),
+                     "PreRaceDo: the friendly name's first 63 characters");
+            fx_check(!strcmp((const char*)(uintptr_t)S_PR_TRACK, "uptown"), "PreRaceDo: the track's name");
+            fx_check(!memcmp(g_trk, (const void*)0x00505c88, 8) && !memcmp(g_fr, (const void*)0x00505dd0, 4),
+                     "PreRaceDo: the static after the track's name and the Xlator after the friendly name untouched");
+            if (pass == 0) {
+                sprintf(m, "PreRaceDo: the track text is wrapped whole, as the original does (%u characters)", g_fx_wrap_len);
+                fx_check(g_fx_wrap_len == 408 && std::string(g_fx_xl_text) == std::string(g_fx_wrap), m);
+            }
+        }
+        // a damaged World: its track name 70 characters, over the (no) cars
+        fx_reset();
+        memset(w + 8, 'w', 70);
+        w[8 + 70] = 0;
+        *(int32_t*)(w + 0xca8) = 0;
+        memcpy(g_trk2, (const void*)0x00505c88, 8);
+        r = fx_run(f, true, args);
+        fx_check(fx_clean(f, r), "PreRaceDo, a 70-character track name: a clean return", &r);
+        fx_check(std::string((const char*)(uintptr_t)S_PR_TRACK) == std::string(63, 'w') && !memcmp(g_trk2, (const void*)0x00505c88, 8),
+                 "PreRaceDo, a 70-character track name: its first 63 characters, the static after it untouched");
+        // the boundaries: a friendly name of 63 characters; a track text of 276 (the stock Ridge Valley's length: past the
+        // U3 rewrite's frame), and of 4095 (the frame's 4 KB, full)
+        for (int n : {276, 4095}) {
+            fx_reset();
+            strcpy((char*)w + 8, "uptown");
+            *(int32_t*)(w + 0xca8) = 2;
+            g_fx_xl_name = mk(0, 'n', 63);
+            g_fx_xl_text = words(n);
+            sprintf(m, "PreRaceDo, a friendly name of 63 characters and a track text of %d", n);
+            fx_same(f, args, m);
+        }
+    }
+
+    // ---- 6. AppProcessArgs: -d<dir> last, with no space after it ----
+    {
+        const Ent& f = fx_fn("AppProcessArgs");
+        struct { const char* cmd; const char* dir; } cases[] = {{"-z -dC:\\games\\viper", "C:\\games\\viper"}, {"-d", ""}, {"/Ub -d../mods", "../mods"}};
+        char* cmd = (char*)W.scratch;
+        for (auto& c : cases) {
+            fx_reset();
+            memset(cmd, 0x5a, 0x200);
+            strcpy(cmd, c.cmd);
+            g_fx_dir[0] = 0;
+            g_fx_dir_n = 0;
+            UI_G8(S_Z_FLAG) = 0;
+            UI_G32(S_APP_MODE) = 0;
+            mem_save(g_snap);
+            {
+                FxPatch cd(0x00411ce0, (void*)&fx_FileChangeDir);
+                r = fx_run(f, true, {U(cmd)});
+            }
+            sprintf(m, "AppProcessArgs \"%s\": a clean return", c.cmd);
+            fx_check(fx_clean(f, r) && r.ret == 1, m, &r);
+            sprintf(m, "AppProcessArgs \"%s\": the directory \"%s\" (\"%s\", %d changes)", c.cmd, c.dir, g_fx_dir, g_fx_dir_n);
+            fx_check(g_fx_dir_n == 1 && !strcmp(g_fx_dir, c.dir), m);
+            o = fx_outside(g_snap, {{(void*)(uintptr_t)S_Z_FLAG, 1}, {(void*)(uintptr_t)S_APP_MODE, 4}});
+            sprintf(m, "AppProcessArgs \"%s\": nothing else written (the command line untouched)", c.cmd);
+            fx_check(o == 0, m, 0, o);
+        }
+        fx_check(UI_G32(S_APP_MODE) == 1, "AppProcessArgs \"/Ub -d../mods\": -ub still read");
+        fx_reset();
+        memset(cmd, 0x5a, 0x200);
+        strcpy(cmd, "-dfoo -z");
+        fx_same(f, {U(cmd)}, "AppProcessArgs \"-dfoo -z\" (a space after the directory)");
+    }
+
+    // ---- 7. setup_blimp_jump / blimp_jump: -location's long words ----
+    {
+        const Ent& f = fx_fn("setup_blimp_jump");
+        char* arg = (char*)W.scratch;
+        // (base64.obj's alphabet: a-z, A-Z, 0-9, '#', '$': 32 'a's are a zero CompactFrame; kfr one at (1, 2, 3) turned 0.5
+        // about z, in that alphabet)
+        char kfr[33];
+        {
+            static const char al[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$";
+            const float cf[6] = {1.0f, 2.0f, 3.0f, 0.0f, 0.0f, 0.5f};
+            uint8_t b[24];
+            memcpy(b, cf, 24);
+            for (int i = 0; i < 8; i++) {
+                const uint32_t t = (uint32_t)b[3 * i] << 16 | (uint32_t)b[3 * i + 1] << 8 | b[3 * i + 2];
+                for (int k = 0; k < 4; k++) kfr[4 * i + k] = al[(t >> (18 - 6 * k)) & 63];
+            }
+            kfr[32] = 0;
+        }
+        const std::string A32(32, 'a'), T40(40, 't'), T31(31, 't');
+        // the frames the original makes of the two base64 frames
+        uint32_t ref_id[12], ref_k[12];
+        fx_reset();
+        sprintf(arg, "( uptown %s )", A32.c_str());
+        fx_run(f, false, {U(arg)});
+        memcpy(ref_id, (const void*)(uintptr_t)S_BLIMP_START, 0x30);
+        fx_reset();
+        sprintf(arg, "( kenyon %s )", kfr);
+        fx_run(f, false, {U(arg)});
+        memcpy(ref_k, (const void*)(uintptr_t)S_BLIMP_START, 0x30);
+        if (memcmp(ref_id, k_identity, 0x30) || getenv("VP_DEBUG_FIX")) {
+            printf("  the zero frame:");
+            for (int i = 0; i < 12; i++) printf(" %08x", ref_id[i]);
+            printf("\n  the kenyon frame:");
+            for (int i = 0; i < 12; i++) printf(" %08x", ref_k[i]);
+            printf("\n");
+        }
+        fx_check(!memcmp(ref_id, k_identity, 0x30), "setup_blimp_jump: the zero frame is the identity (the test's premise)");
+        struct { std::string a; std::string track; const uint32_t* frame; bool report; const char* what; } cases[] = {
+            {"( " + T40 + " " + A32 + " )", T31, ref_id, false, "a 40-character track and a frame"},
+            {"( uptown " + std::string(300, 'A') + " )", "uptown", k_identity, true, "a 300-character frame"},
+            {"\t(\x0b" + T40 + "\r\n" + kfr + "\f)", T31, ref_k, false, "a 40-character track and a frame, other white space"},
+            {"(" + std::string(300, 't'), T31, k_identity, true, "a 300-character track and no frame"},
+        };
+        for (auto& c : cases) {
+            fx_reset();
+            memset(arg, 0, 0x200);
+            strcpy(arg, c.a.c_str());
+            footprint(f, {U(arg)});
+            mem_save(g_snap);
+            r = fx_run(f, true, {U(arg)});
+            sprintf(m, "setup_blimp_jump, %s: a clean return", c.what);
+            fx_check(fx_clean(f, r), m, &r);
+            o = fx_outside_fp(g_snap, fp);
+            sprintf(m, "setup_blimp_jump, %s: nothing written outside the track's 0x20 bytes, the frame, base64's table", c.what);
+            fx_check(o == 0, m, 0, o);
+            sprintf(m, "setup_blimp_jump, %s: the track \"%s\"", c.what, c.track.c_str());
+            fx_check(c.track == std::string((const char*)(uintptr_t)S_BLIMP_TRACK), m);
+            sprintf(m, "setup_blimp_jump, %s: the frame%s", c.what, c.report ? " (the identity: not read), reported" : "");
+            fx_check(!memcmp(c.frame, (const void*)(uintptr_t)S_BLIMP_START, 0x30) && fx_logged('LOGR') == c.report, m);
+            if (getenv("VP_DEBUG_FIX")) {
+                printf("  %s:", c.what);
+                for (int i = 0; i < 12; i++) printf(" %08x", ((const uint32_t*)(uintptr_t)S_BLIMP_START)[i]);
+                printf(" (logged %d)\n", (int)fx_logged('LOGR'));
+            }
+        }
+        // the boundary: a 31-character track and a 255-character frame
+        fx_reset();
+        memset(arg, 0, 0x200);
+        sprintf(arg, "( %s %s )", T31.c_str(), std::string(255, 'A').c_str());
+        fx_same(f, {U(arg)}, "setup_blimp_jump, a 31-character track and a 255-character frame");
+        // the word scan against the game's own sscanf, on random command lines (every white-space byte, '(' or not)
+        {
+            typedef int(__cdecl * Sscanf_t)(const char*, const char*, ...);
+            static char b1[0x1000], b2[0x1000], a[0x400];
+            fx_reset();
+            int agree = 0, n = 0;
+            for (int i = 0; i < 5000; i++) {
+                int k = 0;
+                const int parts = irange(0, 7);
+                if (chance(80)) {
+                    while (chance(40)) a[k++] = (char)irange(1, 0x20);
+                    a[k++] = '(';
+                }
+                for (int p = 0; p < parts && k < 0x300; p++) {
+                    const int ws = irange(0, 3);
+                    for (int q = 0; q < ws; q++) a[k++] = (char)(chance(70) ? irange(9, 13) : chance(50) ? 0x20 : irange(1, 0x20));
+                    const int wl = chance(70) ? irange(1, 12) : irange(1, 300);
+                    for (int q = 0; q < wl && k < 0x3f0; q++) a[k++] = (char)(chance(90) ? irange(0x21, 0x7e) : irange(0x80, 0xff));
+                }
+                a[k] = 0;
+                const char* w1;
+                const char* w2;
+                int32_t n1, n2;
+                root_main::fix_scan_words(a, &w1, &n1, &w2, &n2);
+                b1[0] = b2[0] = 0;
+                const int ret = ((Sscanf_t)(uintptr_t)F_sscanf)(a, CP(0x004e3a58), b1, b2);
+                const int got = (n1 >= 0) + (n2 >= 0);
+                bool same = (ret < 0 ? 0 : ret) == got;
+                if (same && n1 >= 0) same = (int32_t)strlen(b1) == n1 && !memcmp(b1, w1, (size_t)n1);
+                if (same && n2 >= 0) same = (int32_t)strlen(b2) == n2 && !memcmp(b2, w2, (size_t)n2);
+                n++;
+                agree += same;
+                if (!same && n - agree <= 3) printf("  the word scan and the game's sscanf disagree (%d / %d words) on \"%.60s\"\n", got, ret, a);
+            }
+            sprintf(m, "setup_blimp_jump's word scan agrees with the game's sscanf (%d of %d command lines)", agree, n);
+            fx_check(agree == n, m);
+            printf("setup_blimp_jump's word scan against the game's sscanf: %d random command lines, %d agree\n", n, agree);
+        }
+        // blimp_jump: the track copied into its World (a 40-character one, as the original setup_blimp_jump left it)
+        {
+            const Ent& b = fx_fn("blimp_jump");
+            fx_reset();
+            memset((void*)(uintptr_t)S_BLIMP_TRACK, 't', 40);
+            UI_G8(S_BLIMP_TRACK + 40) = 0;
+            memset(g_fx_world, 0, sizeof g_fx_world);
+            {
+                FxPatch lr(0x0040a840, (void*)&fx_LoadRace);
+                r = fx_run(b, true, {});
+            }
+            fx_check(fx_clean(b, r), "blimp_jump, a 40-character track: a clean return", &r);
+            fx_check(!memcmp(g_fx_world + 8, T31.c_str(), 31) && g_fx_world[8 + 31] == 0 && *(int32_t*)(g_fx_world + 0x28) == 0,
+                     "blimp_jump, a 40-character track: the World's name its first 31 characters, its first car's type after it");
+            fx_reset();
+            strcpy((char*)(uintptr_t)S_BLIMP_TRACK, T31.c_str());
+            fx_same(b, {}, "blimp_jump, a 31-character track");
+        }
+    }
+    printf("fix tests: %d checks (%d run on both, compared bit for bit), %d failed\n", g_fx_n, g_fx_same_n, g_fx_bad);
+    return g_fx_bad;
+}
+#endif
+
 // ---- main -----------------------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -1528,11 +2181,12 @@ int main(int argc, char** argv) {
     long long checks = 0, poisoned_checks = 0, log_words = 0;
     int differ = 0, fp_bad = 0, faults = 0, pure_n = 0, replay_n = 0, changed_fns = 0, still_fns = 0, bad_fns = 0;
     long long both_fault = 0;
+    int fixed_rounds = 0, fixed_bad = 0;                           // (the fix build: rounds kept out, a fixed case)
     for (int fi = 0; fi < g_nfns; fi++) {
         const Ent& f = g_fns[fi];
         if (only && !strstr(f.name, only)) continue;
         bool fn_bad = false, fn_changed = false;
-        int fn_faults = 0, fn_checks = 0, fn_fpck = 0;
+        int fn_faults = 0, fn_checks = 0, fn_fpck = 0, fn_fixed = 0;
         const int nr = is_modal(f.name) ? rounds : rounds * 10;
         for (int rd = 0; rd < nr && !fn_bad; rd++) {
             const bool poisoned = rd & 1;
@@ -1547,7 +2201,26 @@ int main(int argc, char** argv) {
             fp.n = 0; fp.replay_only = 0; fp.pure = false;
             f.fp(fp, words);
             mem_save(g_snap);
+            g_overran = false;
+            const bool pre_fixed = ROOT_FIXES && fx_pre_case(f, words);
             const Result ro = run(f, false, words);
+#if ROOT_FIXES
+            if (pre_fixed || g_overran) {                           // a fixed case: the rewrite run alone, clean
+                mem_load(g_snap);
+                const Result rf = run(f, true, words);
+                fixed_rounds++;
+                fn_fixed++;
+                if (rd == 0) { pure_n += fp.pure; replay_n += fp.replay_only != 0; }
+                if (rf.fault) {
+                    printf("  %08x %s: round %d, a fixed case: the rewrite faulted (%08x at %08x)\n", f.v10, f.name, rd, rf.code, rf.eip);
+                    fixed_bad++;
+                    fn_bad = true;
+                }
+                continue;
+            }
+#else
+            (void)pre_fixed;
+#endif
             const bool changed = mem_diff(g_snap) != 0;
             fn_changed |= changed;
             if (!fp.replay_only && !ro.fault) {
@@ -1575,6 +2248,14 @@ int main(int argc, char** argv) {
             fn_checks++;
             poisoned_checks += poisoned;
             log_words += g_log_orig.n;
+#if ROOT_FIXES
+            if (ro.fault && !rn.fault && !strcmp(f.name, "AppProcessArgs")) {   // a crash the fix removes
+                fixed_rounds++;
+                fn_fixed++;
+                if (rd == 0) { pure_n += fp.pure; replay_n += fp.replay_only != 0; }
+                continue;
+            }
+#endif
             if (ro.fault || rn.fault) { faults++; fn_faults++; }
             if (ro.fault && rn.fault) both_fault++;
             if (getenv("VP_DEBUG_LOG")) {
@@ -1619,6 +2300,8 @@ int main(int argc, char** argv) {
         if (trace)
             printf("%08x %-52s %s%s (%d checks, %d with the footprint checked, %d faulted)\n", f.v10, f.name, fn_bad ? "BAD" : "ok",
                    fn_changed ? "" : " (never changed memory)", fn_checks, fn_fpck, fn_faults);
+        if (fn_fixed) printf("  %08x %s: %d rounds reached a fixed case (kept out of the comparison; the rewrite clean in each)\n", f.v10,
+                             f.name, fn_fixed);
         if (differ >= 40) { printf("stopping after 40 differences\n"); break; }
     }
     mem_load(g_pristine);
@@ -1627,5 +2310,13 @@ int main(int argc, char** argv) {
            "%d functions bad\n", g_nfns, pure_n, replay_n, g_nfns - pure_n - replay_n, dup, checks, poisoned_checks, log_words, differ,
            fp_bad, faults, both_fault, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
-    return differ || fp_bad || dup ? 1 : 0;
+    int fix_bad = 0;
+#if ROOT_FIXES
+    printf("the fix build: %d rounds reached a fixed case (kept out of the comparison), %d where the rewrite faulted\n", fixed_rounds,
+           fixed_bad);
+    if (!only) fix_bad = directed_fix_tests();
+#else
+    (void)fixed_rounds; (void)fixed_bad;
+#endif
+    return differ || fp_bad || dup || fix_bad || fixed_bad ? 1 : 0;
 }

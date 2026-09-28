@@ -159,7 +159,8 @@ its racing line), degenerate racing lines, a ground-contact divide by zero, vrmo
 track with no AI racing line (it runs without AI cars instead of crashing), sound crashes (Doppler at
 the speed of sound, no sound device, mod sounds and engine files), the menus' widget crashes (divides by
 zero, text and file-name overruns, overflowing widget and style tables), the menus' own (a mod car with
-more than six gears, a random race with two tracks, long car, track and setup names and translations), and
+more than six gears, a random race with two tracks, long car, track and setup names and translations), the race front end's (long mod car and track names
+and translations, the command line), dialogs over the 3D replay view drawn speckled by the renderer, and
 buffer overruns that long mod-car, driver and track names could trigger. A fix only changes what happens
 where the original would crash, hang or overrun, so a race replays identically on the original code
 until one of those comes up. The AI crash is the one that comes up in ordinary racing (after the

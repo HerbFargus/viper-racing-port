@@ -24,12 +24,14 @@
 // (the pause and loading banners: generic_splash) or begin the 3D alpha rectangles (mrBeginAlphaRects can load a
 // texture), the check is left to the session replays (replay_only). DashboardBegin / End load and free (replay_only).
 //
+// Fixes (// FIX:, docs/FIXES.md "Race front end"): TheRealDashboardDraw passes translations (the reset / damaged banners,
+// the summary's two headings) to gxFontPrintf as the format, as the original, unless the game's printf would read an
+// argument for one (nobody passes any: a '%' conversion or '*' in a translation), when it's printed as it is ("%s").
+//
 // FIX CANDIDATEs (left faithful):
 //   - DashboardUpdate formats the best / last lap ("%1.1f @ %1.0f %s") and the test track's distance into a 64-byte frame
 //     buffer: a time or speed over about 1e25 (never in play) runs past it into the speed's buffer and the saved registers.
 //   - TheRealDashboardDraw indexes the gear names with the car's gear unchecked (-1..7 in play).
-//   - TheRealDashboardDraw passes translations (the reset / damaged banners, the summary's two headings) to gxFontPrintf
-//     as the format: a '%' in a translation reads garbage arguments.
 //   - clear_rect with no bit set loops forever (LogPanic each time); a bit past 8 indexes past the nine rectangles. Only
 //     constants are passed.
 #include <stdint.h>
@@ -611,6 +613,38 @@ PORT_FN(0x00404bc0, "show_loading", show_loading_n, fp_none)
 // =========================================================================================================================
 // TheRealDashboardDraw
 // =========================================================================================================================
+// FIX helper (as hook/menu_board.cpp's, U2): whether the game's printf (output.obj, 0x4d22b0), given s as its format, would
+// read an argument. Its state machine run over s, from its own table (.rdata 0x4e0200: a character's class in the low
+// nibble of [c - ' '] for ' '..'x', else 0; the next state in the high nibble of [class * 8 + state]): a '*' taken as a
+// width or precision (states 3, 5) reads one; so does reaching a conversion (state 7) -- every one reads an argument but
+// 'B', which prints the stale locals instead. In the size state an 'I' skips a following "64", else it's printed and the
+// state is back to normal, as output does. (Its double-byte lead-byte step is left out: the game never leaves the "C"
+// locale, whose table has no lead bytes.)
+static bool fix_format_reads_args(const char* s) {
+    enum : uint32_t { T = 0x004e0200 };
+    uint32_t state = 0;
+    for (const volatile char* p = s; *p; p++) {
+        const int32_t c = (int8_t)*p;
+        const uint32_t cls = c < 0x20 || c > 0x78 ? 0u : (uint32_t)(UI_G8(T + (uint32_t)(c - 0x20)) & 0xf);
+        state = (uint32_t)(UI_G8(T + cls * 8 + state) >> 4) & 7u;
+        if ((state == 3 || state == 5) && c == '*') return true;
+        if (state == 7) return true;
+        if (state == 6 && c == 'I') {
+            if (p[1] == '6' && p[2] == '4') p += 2;
+            else state = 0;
+        }
+    }
+    return false;
+}
+// FIX: a banner's translation (the reset and damaged banners, the summary's two headings) is gxFontPrintf's format and
+// nothing else is passed, so a '%' conversion or '*' in one (a language file's) read arguments from the stack: garbage,
+// or a crash for "%s" / "%n". Such a text is printed as it is, through dash.obj's own "%s". Every other text is the format
+// as before, so it prints exactly as it did ("%%" as '%').
+static __forceinline void print_text(void* font, void* pal, uint32_t flags, int32_t x, int32_t y, const char* t) {
+    if (VP_FIX && fix_format_reads_args(t)) RH_gxFontPrintf(font, pal, flags, x, y, RH_CP(0x004e4124), t);
+    else RH_gxFontPrintf(font, pal, flags, x, y, t);
+}
+
 static void __cdecl TheRealDashboardDraw_n(gxCanvas* c, uint8_t full) {
     CarMsg* m = car_info(ccall<int32_t>(F_WorldGetFocusCar))->msg;
     ccall<void*>(F_gxSetCanvas, c);
@@ -668,7 +702,7 @@ static void __cdecl TheRealDashboardDraw_n(gxCanvas* c, uint8_t full) {
         int32_t x = (int32_t)((uint32_t)RH_G32(S_SCREEN_W) - (uint32_t)(w + 0x14));
         ccall<int32_t>(F_gxFontHeight, font);
         x += 0xa;
-        RH_gxFontPrintf(font, PAL(S_P_WHITE), 9, x, 0x43, t);
+        print_text(font, PAL(S_P_WHITE), 9, x, 0x43, t);          // FIX: (print_text)
     }
     if (ccall<uint8_t>(F_show_damaged)) {
         xlate(0x00504110);
@@ -676,7 +710,7 @@ static void __cdecl TheRealDashboardDraw_n(gxCanvas* c, uint8_t full) {
         void* font = FONT(S_F_EURO9);
         ccall<int32_t>(F_gxFontStringWidth, font, t);
         ccall<int32_t>(F_gxFontHeight, font);
-        RH_gxFontPrintf(font, PAL(S_P_WHITE), 9, 0xa, 0x43, t);
+        print_text(font, PAL(S_P_WHITE), 9, 0xa, 0x43, t);        // FIX: (print_text)
     }
     if (ccall<uint8_t>(F_show_award)) {
         const int32_t y = RH_G32(S_SCREEN_H) / 2 - 0x82;
@@ -699,9 +733,9 @@ static void __cdecl TheRealDashboardDraw_n(gxCanvas* c, uint8_t full) {
         }
         int32_t row = (RH_G32(S_SCREEN_H) - 0xb4) / 2 - 3;
         const char* t1 = xlate(0x005040c8);
-        RH_gxFontPrintf(FONT(S_F_EURO9), PAL(S_P_SUM_ME), 0x24, cx, row - 5, t1);
+        print_text(FONT(S_F_EURO9), PAL(S_P_SUM_ME), 0x24, cx, row - 5, t1);      // FIX: (print_text)
         const char* t2 = xlate(0x00504290);
-        RH_gxFontPrintf(FONT(S_F_EURO9), PAL(S_P_SUM_ME), 0x24, cx, row + 0xc2, t2);
+        print_text(FONT(S_F_EURO9), PAL(S_P_SUM_ME), 0x24, cx, row + 0xc2, t2);   // FIX: (print_text)
         row += 0x14;
         int32_t p = 0;
         if (ccall<int32_t>(F_CarMgrCount) > 0) {

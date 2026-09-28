@@ -137,6 +137,18 @@ dozen places and the game dies.
   over 300 characters, and the best grip over 100. The line's buffer now holds the longest any of its formats can print,
   and the line is drawn whole, running off the edge as the original drew it. Lines that fitted are unchanged.
 
+- The OpenGL renderer (not the game) laid the 2D over the 3D by what the 2D changed: a pixel of the page that kept
+  the colour it was handed (the 3D, shrunk to 640x480) let the full-resolution 3D show. A pixel the 2D drew in exactly
+  that colour looked unchanged too, so a dialog over a live 3D view came out speckled with bits of the scene: the
+  replay's save and load boxes, whose background (`fdialog.stp`) is almost all near-black, lost 5-20% of their pixels
+  over a dark replay view. A run of up to 8 such pixels with changed pixels at both ends, along a row or a column, is
+  now drawn as 2D as well (its colour is the shrunk 3D's anyway). Large transparent areas still show the 3D; a small
+  gap inside or between 2D elements (the inside of a HUD digit, the cursor's) shows the 3D at 640x480 instead of the
+  window's resolution. The page the game draws is unchanged, and so is the session recorder's hash of it, except
+  where a later Lock reads back a picture with filled pixels in it: the cursor's grab in the same frame of a dialog
+  (the UI's windows run with 3D widgets), and the next frame's Lock where no 3D was drawn over them. Sessions
+  recorded before this can part from a replay there, in the 2D page; record them again.
+
 ## Switching away
 
 - Alt-Tab during a race: the original stops drawing and reading keys while it's away, but its physics
@@ -305,6 +317,48 @@ translation.
   format, so it draws exactly as before ("%%" as '%'). The check is the game's own printf state machine, run from its
   table, and it agrees with the game's printf on every test text and 20,000 random ones.
 
+## Race front end
+
+The dashboard and the screens before and after a race (hook/root_dash.cpp, root_race.cpp, root_main.cpp). None of these
+come up with the stock cars, tracks and English text; they are a mod car or track with a long name or text, a long
+translation, or the command line.
+
+- The dashboard's banners (the reset and damaged messages, the race summary's two headings) were drawn with their
+  translation as the printf format and nothing else passed. A '%' conversion or a '*' in a language file's text read
+  arguments from the stack: garbage, or a crash for "%s" and "%n". Such a text is now drawn as written. Every other text is
+  still the format, so it draws exactly as before ("%%" as '%'). The check is the game's own printf state machine, as for
+  the high score board's title, and it agrees with the game's printf on every test text and 20,000 random ones (a "%B",
+  which prints garbage without reading an argument, is drawn as written too).
+- The drag events' names ("<event> <distance>" twice, "<distance> <unit>", in the locale's units) were formatted into three
+  32-byte texts. A long enough translation ran the first two into the translations after them, and the third into the car
+  list's pointer, so the car choosers then read the car names from wherever the text pointed. Each keeps its first 31
+  characters.
+- The car list holds 32 cars of 31 characters, neither checked. A longer name ran into the next car's entry (both names
+  came out wrong), and a 33rd car ran off the end of the list's memory. Such a car is now left out, so the car choosers
+  don't show it; cut, its name would no longer find its files. With more than 32 cars, the ones kept are the first 32 the
+  Cars folder lists. (The menus look "viper" up by name: if it isn't among them they stop with "Can't find car viper".)
+- The starting grid built each car's model name ("<car>3.mod") and its paint job's texture name ("~<car>.tex") in 32 bytes
+  each, so a car name of 27 or more characters overran the stack; both have room now. It then wrote "<car>.tex" and the
+  texture's name into the model's remap entry, 16 bytes each, with no limit: from a car name of 12 characters (11 for
+  "~<car>.tex") they ran on over the entry and the grid slot's other fields. The original wrote those fields again
+  afterwards, so the model got each name's first 16 characters; the grid now writes just those 16, the same names, and
+  nothing past them.
+- The pre-race screen copied the track's name and its friendly name (a mod track's, or a translation) into 64-byte buffers
+  with no limit, a friendly name of 64 or more characters running into the translation after it. Each keeps its first 63
+  characters. (It also word-wraps the track's description into 4 KB of its stack and cuts it to 255 characters; that was
+  always safe, and a description past 4 KB is cut by the word wrap's own fix, under "Menus".)
+
+The command line (the programmers' switches; the game as installed is started with none of these):
+
+- -d<dir> changes to the directory up to the next space, cut there by writing a terminator where the space was found. With
+  no space after it (-d last on the command line) that write went to address 0 and the game crashed at start-up. The
+  directory now runs to the end of the command line. With a space, as before.
+- -location "( <track> <frame> )" (the blimp test mode) read the track's name into 32 bytes and the frame's base64 into 256
+  bytes of the stack with no limit, then copied the track into the race's 32-byte field. A longer track name is cut to 31
+  characters; a frame of 256 or more characters (a frame is 32) isn't read, and the blimp starts where it does for a track
+  given no frame. The words are measured as the game's sscanf reads them (checked against it on 5,000 random command
+  lines); a command line whose words fit is read by sscanf as before.
+
 ## Limits lifted
 
 Like M1's limits, these move a table into the DLL for the original code and the rewrites alike, so
@@ -345,3 +399,13 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
   negative saved track, an unknown opponent type or mixer, a gear ratio of 1e28), and the menus that set
   a dialog's items once from their first call's stack frame (always the same depth), are left as the
   game has them.
+- Race front end, what a player doesn't meet (damaged files, corrupt option values, network races, values the game never
+  makes): the option names' and tracks' difficulty tables are indexed unchecked (an option out of range, the "no track"
+  -1); the pre-race screen loads the player's setup into the entry before the cars when no car is the player's (a race of
+  AI cars only); the post-race screens read the first and the player's race result without checking there is one, and
+  step through the cars dividing by their count (0); the race's results hold 16 cars, unchecked; a replay or ghost file's
+  track name, packet count and version are trusted (a damaged file overruns the stack or the ghost), and a network race
+  with two cars repeated numbers its ghosts past the table; the dashboard formats lap times into 64 bytes (a time over
+  1e25) and indexes the gear names by the gear (-1..7) unchecked; the escape menus' selection, a splash's timeout, a
+  replay graph narrower than 4 pixels and clear_rect's rectangle are only ever given values in range. All are as the game
+  has them.
