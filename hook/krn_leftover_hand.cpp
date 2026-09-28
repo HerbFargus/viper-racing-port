@@ -6,7 +6,7 @@
 //   dsounderr2str (ds.obj)             a DirectSound error's name: LIVE (wave.obj calls it on its error paths), the one
 //                                      ds.obj function kept -- the rest of ds.obj / ds3d_x.obj is the dead hardware mixer
 //   QuarterCarControl::Draw            the suspension rig's debug dashboard (carpart.obj): axes, the load plot, and
-//                                      four lines of text
+//                                      four lines of text (fixed: a large value no longer overruns the line's buffer)
 //   TubeVolume::scalar deleting destructor   the inlined destructor stores the base vtable through eax, three times
 //   CollisionVolume::GetExtents        the base class's stub: LogPanic("GetExtents not defined"). viperport.cpp's
 //                                      broad phase compares vtable slots with its ADDRESS (0x436080); a hook there
@@ -91,7 +91,12 @@ static_assert(sizeof(LhGraphInfo) == 0x24, "LhGraphInfo");
 static void __fastcall QuarterCarControl_Draw_h(uint8_t* self, LhEdx, void* canvas) {
     const float k_rate = lh_bits(0x432f3264);       // 175.19684f (0x4dc7c0, 0x4dc7c4)
     const float k_half = lh_bits(0x3f000000);       // 0.5f (0x4dc6e8)
-    char text[0x50];                                // FIX CANDIDATE: 80 bytes for "%1.3f = %1.1f%% (at %1.0f)" of any float
+    // FIX: the original formats each line into 80 bytes with the game's unbounded sprintf, and a large value overruns
+    // them onto the stack: a ratio's %1.2f of a double runs to 313 characters (a zero mass or rate makes it infinite or
+    // huge), Best Grip's three to about 150. The buffer is made big enough for the longest any of the four formats can
+    // print (under 0x160), so every line is formatted and drawn whole, as the original drew it when it survived; a line
+    // that fits in 80 bytes is the same either way. gxText's points are clipped, so a long line runs off the canvas.
+    char text[VP_FIX ? 0x400 : 0x50];
     LH_F32(self + 0x20) = *(float*)(self + 0x4060) * k_rate;
     lh_gxSetCanvas(canvas);
     const int32_t x = *(int32_t*)(self + 4), y = *(int32_t*)(self + 8);

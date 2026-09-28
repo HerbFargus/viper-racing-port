@@ -34,6 +34,11 @@
 // Extra rounds (x250) for the functions whose arguments matter: dsounderr2str (every case value, its neighbours,
 // random codes), QuarterCarControl::Draw (random rigs: settings, masses and rates, sometimes NaN / infinite / zero /
 // negative), the deleting destructors (random flags).
+//
+// Built with /DVP_LEFTOVER_FIXES, the rewrites have their fix on (docs/PORTING.md, "Fixes"): every function is still
+// compared as above (the rigs' values print in under 80 bytes, where the fix changes nothing), and a directed test
+// first runs QuarterCarControl::Draw, the rewrite alone, on rigs whose lines overran the original's 80 bytes (see
+// directed_fix_tests). Without it (VP_FAITHFUL) the rewrites must match the originals bit for bit.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -46,7 +51,9 @@
 #include <type_traits>
 #include <utility>
 
-#define VP_FAITHFUL
+#ifndef VP_LEFTOVER_FIXES
+#define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------
@@ -102,9 +109,9 @@ static float bitsf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 static float uni() { return (float)(rnd() & 0xffffff) / 16777216.0f; }
 static float range(float a, float b) { return a + (b - a) * uni(); }
 static bool chance(int pct) { return (int)(rnd() % 100) < pct; }
-// NaN, infinities, zero, negative, denormal -- but nothing huge: QuarterCarControl::Draw prints its values into an
-// 80-byte buffer, and a 30-digit number overflows it (in the original too: a FIX CANDIDATE), which would take the
-// harness's own stack with it
+// NaN, infinities, zero, negative, denormal -- but nothing huge: the original QuarterCarControl::Draw prints its values
+// into an 80-byte buffer, and a 30-digit number overflows it, which would take the harness's own stack with it (the
+// rewrite's fix is tested on its own: directed_fix_tests)
 static float wildf() {
     switch (rnd() % 7) {
     case 0: return bitsf(0x7fc00000u);
@@ -206,14 +213,20 @@ static void __cdecl stub_axes(const uint32_t* g, int a, int b, uint32_t color) {
     for (int i = 0; i < 9; i++) log_word(g[i]);
     log_word((uint32_t)a); log_word((uint32_t)b); log_word(color);
 }
+static float g_plot_grip, g_plot_at;             // with g_plot_poke: what the plot "finds" (graph_fn's best grip / where)
+static bool g_plot_poke;
 static void __cdecl stub_line_plot(const uint32_t* g, uint32_t fn, void* data, uint32_t color) {
+    if (g_plot_poke) { setf((uint8_t*)data + 0x406c, g_plot_grip); setf((uint8_t*)data + 0x4070, g_plot_at); }
     log_word('PLOT');
     for (int i = 0; i < 9; i++) log_word(g[i]);
     log_word(fn); log_word((uint32_t)(uintptr_t)data); log_word(color);
 }
+static uint32_t g_text_longest;                  // the longest line gxText was given since it was last zeroed
 static void __cdecl stub_text(int x, int y, const char* s, uint32_t color) {
+    if (strlen(s) > g_text_longest) g_text_longest = (uint32_t)strlen(s);
     log_word('TEXT'); log_word((uint32_t)x); log_word((uint32_t)y); log_word(color); log_str(s);
 }
+static uint32_t g_sprf_longest;                  // the longest text sprintf made since it was last zeroed
 static int __cdecl stub_sprintf(char* buf, const char* fmt, ...) {
     int nconv = 0;                                   // the Draw formats: %f conversions only, a double each
     for (const char* p = fmt; *p; p++)
@@ -225,6 +238,7 @@ static int __cdecl stub_sprintf(char* buf, const char* fmt, ...) {
     for (int i = 0; i < 2 * nconv; i++) log_word(w[i]);
     int r = vsprintf(buf, fmt, ap);
     va_end(ap);
+    if (r > (int)g_sprf_longest) g_sprf_longest = (uint32_t)r;
     return r;
 }
 template <uint32_t A> static void __fastcall stub_dtor(void* self, int) { log_word('DTOR'); log_word(A); log_word((uint32_t)(uintptr_t)self); }
@@ -353,6 +367,72 @@ static void random_rig(uint8_t* q) {
     *(uint8_t**)(q + 0x28) = chance(80) ? damper : q + 0x4078;
 }
 
+#ifdef VP_LEFTOVER_FIXES
+// ---- the fix: QuarterCarControl::Draw on values whose lines overran the original's 80 bytes ---------------------------
+// Only the rewrite runs: the original would overrun this program's stack. Each rig makes at least one line longer than
+// 79 characters -- Best Grip / Best Contact from floats near FLT_MAX (the plot "finds" them, as graph_fn would), the
+// damping ratios from denormal masses and rates under huge damper rates (a ratio near 1e82) -- and the rewrite must
+// return normally (4 bytes popped, ebx / esi / edi / ebp kept) and draw every line whole: gxText gets each text as
+// sprintf made it, the longest over 79 characters.
+static int directed_fix_tests() {
+    const LoEntry* f = 0;
+    for (int i = 0; i < g_nfns; i++) if (g_fns[i].v10 == F_QCC_DRAW) f = &g_fns[i];
+    if (!f) { printf("  fix test: QuarterCarControl::Draw isn't listed\n"); return 1; }
+    int bad = 0, n = 0;
+    uint32_t longest = 0;
+    for (int t = 0; t < 400; t++) {
+        mem_load(g_pristine);
+        random_arena();
+        uint8_t* q = g_arena + 0x100;
+        random_rig(q);
+        const float big = bitsf(0x7f000000u | (rnd() & 0x7fffff)) * ((rnd() & 1) ? 1.0f : -1.0f);   // 1.7e38 .. 3.4e38
+        // the damper: base and slope each a quarter of FLT_MAX-ish and positive, so a rate (their sum) stays finite
+        const float rate = fabsf(big) * 0.25f;
+        uint8_t* damper = g_arena + 0xc000;
+        switch (t % 3) {
+        case 0:                                         // Best Grip / Best Contact
+            g_plot_grip = big; g_plot_at = -big;
+            setf(q + 0x4074, big);
+            break;
+        case 1:                                         // the damping ratios
+            setf(q + 0x18, bitsf(1 + rnd() % 0x100)); setf(q + 0x1c, bitsf(1 + rnd() % 0x100));
+            setf(q + 0x4060, bitsf(1 + rnd() % 0x100)); setf(q + 0x24, bitsf(1 + rnd() % 0x100));
+            for (int i = 0; i < 4; i++) setf(damper + 4 * i, rate);
+            *(uint8_t**)(q + 0x28) = damper;
+            g_plot_grip = range(0, 1); g_plot_at = range(0, 200);
+            break;
+        default:                                        // all of them
+            g_plot_grip = big; g_plot_at = big;
+            setf(q + 0x4074, -big);
+            setf(q + 0x18, bitsf(1)); setf(q + 0x1c, bitsf(1)); setf(q + 0x4060, bitsf(1)); setf(q + 0x24, bitsf(1));
+            for (int i = 0; i < 4; i++) setf(damper + 4 * i, rate);
+            *(uint8_t**)(q + 0x28) = damper;
+        }
+        uint32_t words[3] = {(uint32_t)(uintptr_t)q, rnd(), rnd()};
+        g_pc = (t >> 1) & 1 ? _PC_24 : _PC_53;
+        g_plot_poke = true;
+        g_text_longest = g_sprf_longest = 0;
+        const Result r = run(*f, true, words);
+        g_plot_poke = false;
+        const bool ok = !r.fault && r.pops == 4 && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+                        r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e && g_sprf_longest >= 0x50 &&
+                        g_text_longest == g_sprf_longest;
+        if (!ok) {
+            printf("  fix test: QuarterCarControl::Draw, rig %d (kind %d): fault %d (%08x at %08x), popped %u, ebx esi edi ebp "
+                   "%08x %08x %08x %08x, longest text %u (drawn %u)\n", t, t % 3, r.fault, r.code, r.eip, r.pops, r.regs[0],
+                   r.regs[1], r.regs[2], r.regs[3], g_sprf_longest, g_text_longest);
+            if (++bad >= 5) break;
+        }
+        if (g_sprf_longest > longest) longest = g_sprf_longest;
+        n++;
+    }
+    mem_load(g_pristine);
+    printf("directed fix tests: %s -- QuarterCarControl::Draw: %d rigs with lines past 79 characters (the longest %u), "
+           "drawn whole, no overrun\n", bad ? "FAILED" : "all passed", n, longest);
+    return bad;
+}
+#endif
+
 // ---- main ---------------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -393,6 +473,12 @@ int main(int argc, char** argv) {
                 printf("  listed twice: %08x %s / %08x %s\n", g_fns[i].v10, g_fns[i].name, g_fns[j].v10, g_fns[j].name);
                 dup++;
             }
+
+#ifdef VP_LEFTOVER_FIXES
+    const int fix_bad = directed_fix_tests();
+#else
+    const int fix_bad = 0;
+#endif
 
     static Footprint fp;
     long long checks = 0, poisoned_checks = 0, log_words = 0;
@@ -475,5 +561,5 @@ int main(int argc, char** argv) {
            fp_bad, faults, bad_fns);
     printf("%d functions changed memory in some round, %d never did (bare rets, stubs, jumps to rcfunc_is_internal or to a bare ret)\n",
            changed_fns, still_fns);
-    return differ || fp_bad || dup ? 1 : 0;
+    return differ || fp_bad || dup || fix_bad ? 1 : 0;
 }

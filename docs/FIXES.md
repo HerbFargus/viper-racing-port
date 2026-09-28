@@ -132,6 +132,10 @@ dozen places and the game dies.
   overrunning the stack.
 - `CarObject::DrawWheel`: a wheel detail level above 2 in a car's `L.tab` draws the lowest-detail wheel
   instead of a garbage model handle.
+- `QuarterCarControl::Draw`, the suspension rig's debug dashboard, printed each of its four lines into
+  80 bytes, so a large value overran the stack. A damping ratio from a zero or tiny mass or rate can print
+  over 300 characters, and the best grip over 100. The line's buffer now holds the longest any of its formats can print,
+  and the line is drawn whole, running off the edge as the original drew it. Lines that fitted are unchanged.
 
 ## Switching away
 
