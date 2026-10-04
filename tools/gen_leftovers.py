@@ -5,6 +5,7 @@
     python tools/gen_leftovers.py --lib menu [--list]
     python tools/gen_leftovers.py --lib root [--list]
     python tools/gen_leftovers.py --lib career [--list]  (U4: libraries career, paintkit and intro, one file)
+    python tools/gen_leftovers.py --lib multi [--list]   (N1: the multiplayer library -> hook/net_leftover.cpp)
 
 M3 UI stage, step U0. The libraries whose stages are done -- physics, world, gx, ai, kernel, useful, state, sound --
 still hold functions no hook/*.cpp registers: the $E static initialisers, empty virtual stubs, compiler-generated
@@ -48,6 +49,10 @@ the intro (libraries career, paintkit and intro, one stage, `--lib career`, into
 thirteen object files (career's nine, paintkit.obj, tga.obj, intro's credits.obj and intro.obj); stubs, deleting
 destructors and destructor helpers of group A's seven (career, chooser, events, postseas, ranking, season, testing) only
 -- upgrade.obj, both credits.obj, intro.obj, paintkit.obj and tga.obj are written by hand in groups B and C's files.
+N1, the multiplayer library (`--lib multi`, into hook/net_leftover.cpp): the $E of all sixteen object files; stubs and
+deleting destructors of group B's six (dataport, hostent, datamod, delqueue, nettypes, session) and of N2's four
+(client, server, multi, ded: until N2's hand-written files take theirs out) -- group A's transports (socket, line,
+linechek, linepkt, tapidbg, crc) write theirs by hand.
 
 Left out on purpose (listed with --list): ds.obj / ds3d_x.obj except dsounderr2str (the dead hardware DirectSound
 mixer), M2's SDL platform functions (platform.cpp detours them), WinMain (the main-loop stage).
@@ -86,6 +91,11 @@ STAGES = {
                                       "// stubs, deleting destructors and destructor helpers of career.obj, chooser.obj, events.obj,\n"
                                       "// postseas.obj, ranking.obj, season.obj and testing.obj",
                "hook/career_*.cpp, hook/paint_*.cpp", "test/world_career.cpp"),
+    "multi": ("net_leftover.cpp", "Multiplayer stage N1: the $E static initialisers of all sixteen object files of the\n"
+                                  "// multiplayer library (`multi`, N2's client.obj, server.obj, multi.obj and ded.obj included), and\n"
+                                  "// the stubs and deleting destructors of dataport.obj, hostent.obj, datamod.obj, delqueue.obj,\n"
+                                  "// nettypes.obj, session.obj, client.obj, server.obj, multi.obj and ded.obj",
+              "hook/net_*.cpp", "test/world_net_core.cpp"),
 }
 # --lib: the libraries a stage covers (absent: the one it's named after)
 STAGE_LIBS = {"career": ("career", "paintkit", "intro")}
@@ -93,7 +103,13 @@ STAGE_LIBS = {"career": ("career", "paintkit", "intro")}
 STAGE_FULL = {"menu": ("moptions.obj", "mrace.obj", "mmixer.obj"),
               "root": ("dash.obj", "gxdash.obj", "countdwn.obj", "escape.obj", "splash.obj", "hack.obj"),
               "career": ("career.obj", "chooser.obj", "events.obj", "postseas.obj", "ranking.obj", "season.obj",
-                         "testing.obj")}
+                         "testing.obj"),
+              # N1: group B's six and N2's four; group A's (socket, line, linechek, linepkt, tapidbg, crc) are by hand
+              "multi": ("dataport.obj", "hostent.obj", "datamod.obj", "delqueue.obj", "nettypes.obj", "session.obj",
+                        "client.obj", "server.obj", "multi.obj", "ded.obj")}
+# --lib: objects a LATER stage writes by hand (N2: the client, the server, the lobby, the dedicated server): their
+# mechanical functions are generated now, the rest left out (not refused) until that stage's files take them
+STAGE_LATER = {"multi": ("client.obj", "server.obj", "multi.obj", "ded.obj")}
 GENERATED = ["krn_leftover.cpp"] + [s[0] for s in STAGES.values()]
 DEAD_OBJECTS = ("ds.obj", "ds3d_x.obj")                  # the hardware DirectSound mixer: dead in every build
 DEAD_KEEP = {0x004756B0}                                  # dsounderr2str: live (wave.obj's error paths), by hand
@@ -259,6 +275,7 @@ def parse_e(img: Image, inv: dict, va: int, size: int, obj: str) -> tuple[list[s
     ecxv: str | None = None                                   # what ecx holds, loaded by mov ecx, [A]: a local's name
     pushes: list[int] = []
     nload = 0
+    byte_regs: dict[str, str] = {}                            # N1: what al / cl / dl hold, for byte stores (server.obj's $E59)
     while True:
         if i >= len(code):
             raise Refused("ran off the end")
@@ -306,7 +323,30 @@ def parse_e(img: Image, inv: dict, va: int, size: int, obj: str) -> tuple[list[s
             i += 2
         elif b == 0xB9:                                        # mov ecx, C
             ecx, ecxv = struct.unpack_from("<I", code, i + 1)[0], None
+            byte_regs["cl"] = f"0x{ecx & 0xFF:02x}"
             i += 5
+        elif b in (0xB8, 0xBA):                                # mov eax / edx, imm32 (for byte stores)
+            v = struct.unpack_from("<I", code, i + 1)[0]
+            byte_regs["al" if b == 0xB8 else "dl"] = f"0x{v & 0xFF:02x}"
+            eax = None if b == 0xB8 else eax
+            i += 5
+        elif b == 0xA0:                                        # mov al, [A]
+            a = struct.unpack_from("<I", code, i + 1)[0]
+            nload += 1
+            byte_regs["al"] = f"v{nload}"
+            eax = None
+            lines.append(f"const uint8_t v{nload} = LO_G8(0x{a:08x});")
+            i += 5
+        elif b == 0xA2 or (b == 0x88 and code[i + 1] in (0x0D, 0x15)):   # mov byte [A], al / cl / dl
+            r8 = "al" if b == 0xA2 else ("cl" if code[i + 1] == 0x0D else "dl")
+            if r8 not in byte_regs:
+                raise Refused(f"stores {r8} without knowing it")
+            k = 1 if b == 0xA2 else 2
+            a = struct.unpack_from("<I", code, i + k)[0]
+            lines.append(f"LO_G8(0x{a:08x}) = {byte_regs[r8]};")
+            if r8 == "cl" and not pushes:
+                ecx = None                                     # (a value, not a constructor's this)
+            i += k + 4
         elif b == 0xE8:                                        # call F: a static's constructor
             f = rel32(code, i, va)
             fr = inv.get(f)
@@ -689,7 +729,10 @@ def main() -> int:
             counts[kind] = counts.get(kind, 0) + 1
             out.append((va, oname, code))
         except Refused as e:
-            refused.append((va, r, str(e)))
+            if stage and obj in STAGE_LATER.get(stage, ()) and not r["demangled"].startswith("$E"):
+                left_out.append((va, r, f"a later stage's, by hand (fits no shape: {e})"))
+            else:
+                refused.append((va, r, str(e)))
 
     if list_only or refused:
         for va, r, why in left_out:

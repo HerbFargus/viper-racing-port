@@ -233,7 +233,8 @@ refused by the game's single-instance check, and becomes **copy 2**:
   "Viper Racing (copy 2)". For the windows you need `[platform] sdl=1` and `renderer=gl`, because DirectDraw
   takes the whole screen.
 - A copy keeps running while the other one is in front: the game's switched-away wait is skipped, so a
-  network game goes on in both windows. The mouse isn't held inside either window. A single-player race in the
+  network game goes on in both windows. The mouse isn't held inside either window (nor in the screen's top-left
+  640x480, where the game's own start-up clip would put it). A single-player race in the
   copy behind still pauses, and the copy behind is silent, as DirectSound made it (only the copy in front is heard).
 - A third start while both run is refused, as usual.
 

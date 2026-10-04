@@ -24,6 +24,7 @@
 #include <windows.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include "SDL.h"
 #include "SDL_syswm.h"
 #include "viperport.h"
@@ -122,6 +123,24 @@ void clip_cursor(bool on) {                                      // restrict_cur
     SDL_SetWindowMouseRect(g_window, on ? &r : 0);
 }
 
+// [test] two_copies: the game's own cursor clip, left out. app_begin ends with Win32RestrictCursor, which clips the
+// cursor to the SCREEN's top-left 640x480 (restrict_cursor, through the game's ClipCursor import -- the rewrite's call
+// reads the same slot). Full screen, SDL replaces that clip with the window's own (SDL_SetWindowMouseRect, re-applied
+// every few seconds). In two_copies there is no window clip, and SDL only ever frees a clip it made itself, so the
+// game's stayed until Windows dropped it at the next switch between programs: the mouse reached only the part of a
+// window inside the screen's top-left 640x480 (copy 1: its top-left corner; copy 2, on the right half: none of it)
+// until Alt-Tab. A clip request is ignored; freeing goes through.
+BOOL WINAPI copies_clip_cursor(const RECT* r) {
+    if (!r) return ClipCursor(0);
+    static bool said;
+    if (!said) {
+        said = true;
+        logf("two_copies: the game's cursor clip (%ld,%ld)-(%ld,%ld) left out -- the mouse goes between the windows",
+             r->left, r->top, r->right, r->bottom);
+    }
+    return TRUE;
+}
+
 // Switching away and back: the game pauses on exactly WM_ACTIVATEAPP, as win32_event did. SDL's own
 // focus events don't line up with it while DirectDraw holds the screen, and drawing on after the
 // switch meets lost surfaces (DDERR_WRONGMODE) and crashes. WM_ACTIVATEAPP is sent, not posted, so it
@@ -203,6 +222,14 @@ void place_copy_window(SDL_Window* win, int* w, int* h) {
     SDL_SetWindowPosition(win, x, y);
     SDL_ShowWindow(win);
     *w = best_w, *h = best_h;
+    // the mouse's map until the renderer's first frame hands over its own (platform_set_view): the game's 640x480 as
+    // make_target fits it into the window (gl_core.cpp) -- without it the moves before that frame reached the game in
+    // window pixels (a 1106,992 on a 640x480 screen)
+    float scale = best_h / 480.0f;
+    if (640 * scale > best_w) scale = best_w / 640.0f;
+    const float ox = (best_w - 640 * scale) * 0.5f;
+    const int vx0 = (int)floorf(ox + 0.5f), vx1 = (int)floorf(ox + 640 * scale + 0.5f);
+    g_view = {vx0, 0, vx1 - vx0, (int)floorf(480 * scale + 0.5f), 640, 480, true};
     logf("two_copies: copy %d's window %dx%d at (%d, %d), on the %s half of %dx%d at (%d, %d)", vp_copy(), best_w,
          best_h, x, y, vp_copy() == 2 ? "right" : "left", area.w, area.h, area.x, area.y);
 }
@@ -722,6 +749,8 @@ void platform_install(const char* build) {
     if (g_gl && !renderer_install()) g_gl = false;               // M2 stage 2: OpenGL in place of DirectDraw
     if (vp_two_copies() && !g_gl)
         logf("two_copies: the windows need [platform] renderer=gl -- DirectDraw takes the whole screen for itself");
+    if (vp_two_copies() && !patch_import("USER32.dll", "ClipCursor", (void*)copies_clip_cursor))
+        logf("two_copies: the game's ClipCursor import wasn't found -- its cursor clip stays until a switch away");
     if (!g_gl && platform_plans_gl(ini))
         logf("platform: the OpenGL renderer isn't on after all, but the dd.obj rewrites expect it: set [port] "
              "default=original for dd.obj's functions, or fix what the log says above");

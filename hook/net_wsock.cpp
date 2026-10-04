@@ -102,6 +102,9 @@ const MsgHook_t o_async_hook = (MsgHook_t)0x004adc00;    // async_msg_hook (sock
 #endif
 enum : uint16_t { GAME_PORT = 2001, COPY2_PORT = 2002 }; // UDPSocket(0x7d1): host and client alike
 
+// which of the call sites net_install patched (the net_ entry points do what those sites do)
+bool g_site_clock, g_site_random, g_site_lobby, g_site_hook;
+
 // ---- state -----------------------------------------------------------------------------------------------------------------
 CRITICAL_SECTION g_cs;
 struct Role { SOCKET s; int role; };
@@ -829,7 +832,10 @@ void net_install(const char* ini) {
             const size_t np = sizeof k_ptimenow_sites / 4, nr = sizeof k_random_sites / 4, ng = sizeof k_grab_sites / 4,
                          nl = sizeof k_release_sites / 4;
             int ok = patch_sites(k_ptimenow_sites, np, 0x00413b40, (void*)h_PTimeNow, "PTimeNow");
-            ok += patch_sites(k_random_sites, nr, 0x0041b6e0, (void*)h_Random, "Random");
+            g_site_clock = ok > 0;
+            const int okr = patch_sites(k_random_sites, nr, 0x0041b6e0, (void*)h_Random, "Random");
+            g_site_random = okr > 0;
+            ok += okr;
             // the lobby's gates first: Grab / Release wait for a lobby at a gate, so they're hooked only with all four
             int gates = 0;
             for (int i = 0; i < 2; i++) {
@@ -846,10 +852,12 @@ void net_install(const char* ini) {
                 ok += patch_sites(k_suspend_sites, 2, 0x00414df0, (void*)h_lobby_suspend_me, "TaskSuspendMe (the lobby task)");
                 ok += patch_sites(k_grab_sites, ng, 0x004a2d10, (void*)h_Grab, "LiveMultiInfo::Grab");
                 ok += patch_sites(k_release_sites, nl, 0x004a2e50, (void*)h_Release, "LiveMultiInfo::Release");
+                g_site_lobby = true;
             } else {
                 logf("net: LiveMultiInfo::thread isn't stock -- the lobby task is NOT in lockstep (the menus' frames will part)");
             }
             const bool hook = patch_push_hook();
+            g_site_hook = hook;
             if (!hook) logf("net: NOT hooking async_msg_hook (winsock_grab isn't stock): host lookups by name won't be recorded");
             logf("net: the multiplayer code patched at %d of %u call sites (its clock, random numbers, Grab / Release, the"
                  " lobby task's gates)%s", ok, (unsigned)(np + nr + ng + nl + 4), hook ? ", and its winsock message hook" : "");
@@ -859,6 +867,35 @@ void net_install(const char* ini) {
     logf("net: the wsock32 imports go through net_wsock.cpp -- %s", g_session_mode == SESSION_RECORD ? "recorded"
          : session ? "a replay: no real socket call, the recording's values are fed" : "straight through (two_copies)");
 }
+
+// ---- the patched sites, for the rewrites of the functions that hold them (net_wsock.h) ---------------------------------------
+#ifdef SESSION_TEST
+#define VP_SITE(flag) true                                    // the harness: every site "patched"
+#else
+#define VP_SITE(flag) (flag)
+#endif
+int __cdecl net_PTimeNow() { return VP_SITE(g_site_clock) ? h_PTimeNow() : o_PTimeNow(); }
+int __cdecl net_Random(int range) { return VP_SITE(g_site_random) ? h_Random(range) : o_Random(range); }
+void __fastcall net_Grab(void* lmi, void*) {
+    if (VP_SITE(g_site_lobby)) h_Grab(lmi, 0);
+    else o_Grab(lmi);
+}
+void __fastcall net_Release(void* lmi, void*) {
+    if (VP_SITE(g_site_lobby)) h_Release(lmi, 0);
+    else o_Release(lmi);
+}
+void __cdecl net_lobby_sleep(int ms) {
+    if (VP_SITE(g_site_lobby)) h_lobby_sleep(ms);
+    else o_TaskSleep(ms);
+}
+void __cdecl net_lobby_suspend_me() {
+    if (VP_SITE(g_site_lobby)) h_lobby_suspend_me();
+    else o_TaskSuspendMe();
+}
+uint32_t net_async_hook_for_winsock_grab() {
+    return VP_SITE(g_site_hook) ? (uint32_t)(uintptr_t)h_async_hook : (uint32_t)(uintptr_t)o_async_hook;
+}
+#undef VP_SITE
 
 #ifdef SESSION_TEST
 // test/world_net_session.cpp: the "real" side (a fake winsock, the game's functions) in, the wrapper out
