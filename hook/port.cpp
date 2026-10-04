@@ -114,9 +114,16 @@ void* detour_front(uint32_t v10, void* to, const char* what) {
 // constant it reads. On a race.exe with vrmod's patches (the hornball, say) a patched function stays
 // original, so the patch keeps working. vrmod's two engine fixes (obstacle wake, the AI bead guard) are
 // the exception: the rewrites carry those fixes themselves, so a function patched with exactly vrmod's fix
-// (`vrmod`, the fingerprint of stock + that patch) is replaced like a stock one. Checked before anything
-// is patched.
+// (`vrmod`, the fingerprint of stock + that patch) is replaced like a stock one. So is one with vrmod's car-list
+// patch, whose values the rewrite reads from the patched instructions (HackOptionsControl::Added): its `vrmod`
+// fingerprint is taken with those bytes as zeros (VP_STOCK_MASKS). Checked before anything is patched.
 struct StockConst { uint32_t va, width; };
+struct StockMask { uint32_t v10, at, bits; };
+static const StockMask k_stock_masks[] = {
+#define VP_STOCK_MASKS
+#include "stock.inc"
+#undef VP_STOCK_MASKS
+};
 static const StockConst k_stock_consts[] = {
 #define VP_STOCK_CONSTS
 #include "stock.inc"
@@ -142,9 +149,25 @@ void port_check_stock() {
             uint32_t hc = fnv((const uint8_t*)st.v10, st.size, 2166136261u), h = hc;
             for (uint32_t i = st.first; i < st.first + st.nconst; i++)
                 h = fnv((const uint8_t*)k_stock_consts[i].va, k_stock_consts[i].width, h);
-            if (st.vrmod && h == st.vrmod) {
-                logf("port: %s has vrmod's engine fix; the rewrite fixes the same bug and replaces it (docs/FIXES.md)", f->name);
-            } else if (h != st.hash) {
+            uint32_t hv = h;                                   // the vrmod fingerprint: masked bytes as zeros
+            bool mask = false;
+            for (const StockMask& m : k_stock_masks) {
+                if (m.v10 != st.v10) continue;
+                hv = 2166136261u;
+                for (uint32_t i = 0; i < st.size; i++) {
+                    const uint8_t b = i >= m.at && i < m.at + 32 && (m.bits >> (i - m.at) & 1) ? 0 : ((const uint8_t*)st.v10)[i];
+                    hv = (hv ^ b) * 16777619u;
+                }
+                for (uint32_t i = st.first; i < st.first + st.nconst; i++)
+                    hv = fnv((const uint8_t*)k_stock_consts[i].va, k_stock_consts[i].width, hv);
+                mask = true;
+                break;
+            }
+            if (h == st.hash) {
+            } else if (st.vrmod && hv == st.vrmod) {
+                if (mask) logf("port: %s has vrmod's patched values; the rewrite reads them and replaces it", f->name);
+                else logf("port: %s has vrmod's engine fix; the rewrite fixes the same bug and replaces it (docs/FIXES.md)", f->name);
+            } else {
                 f->patched = true;
                 logf("port: %s stays original -- the installed race.exe has %s patched (a vrmod fix?)", f->name,
                      hc != st.hash_code ? "its code" : "a constant it reads");

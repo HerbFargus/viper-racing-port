@@ -5,11 +5,13 @@
 //
 //   build (x86 tools, e.g. after vcvarsall.bat x86), from the repository root:
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC /I..\sdl2\SDL2-2.32.10\include
-//        test\world_gx_dd.cpp hook\gl_table.cpp hook\gl_core.cpp hook\ddraw_gl.cpp /Fo%TEMP%\g2dd\
+//        test\world_gx_dd.cpp hook\gl_table.cpp hook\gl_core.cpp hook\gl_dxgi.cpp hook\ddraw_gl.cpp
+//        /Fo%TEMP%\g2dd\
 //        /Fe%TEMP%\g2dd\world_gx_dd.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //        ..\sdl2\SDL2-2.32.10\lib\x86\SDL2.lib delayimp.lib /DELAYLOAD:SDL2.dll dxguid.lib
 //   run:   world_gx_dd.exe [rounds] [seed] [isolated|chain|both]      (from the repository root: out\race_v10.exe)
 //   (SDL2 is delay-loaded and never called: the renderer is started headless, so SDL2.dll isn't needed.)
+//   (gl_dxgi.cpp, the DXGI present, is linked but never started: start_headless leaves gl_api.SwapWindow the fake.)
 //
 // Loads out\race_v10.exe at 0x400000 in a child process as world_gx_dx does, resolves KERNEL32's imports into the game's
 // own import slots and points its DDRAW imports at what ddraw_gl.cpp's emu_DirectDrawCreate / emu_DirectDrawEnumerateA
@@ -76,6 +78,7 @@
 #define VP_PORT_NEEDS_RENDERER(NEW)      // PORT_FN_GL: no PortFn to mark here (the registry below replaces PORT_FN)
 #include "../hook/port.h"
 #include "../hook/gx_gl.h"
+#include "../hook/gl_dxgi.h"
 
 // ---- the registry: every PORT_FN, with a uniform caller (every argument is one stack dword) ----------------------------
 struct Reg {
@@ -134,6 +137,14 @@ namespace gxdx {
 void logf(const char*, ...) {}                                  // (the renderer's log lines: not compared)
 SDL_Window* platform_window() { return (SDL_Window*)(uintptr_t)0x5d100; }   // never dereferenced: the fakes take it
 void platform_set_view(int, int, int, int, int, int) {}
+// the session recorder (session.cpp), off: what gl_core.cpp reads of it
+volatile int g_session_mode = 0;                                 // SESSION_OFF
+bool g_session_frames = false;
+void session_gfx(uint8_t, const void*, size_t, const void*, size_t, const void*, size_t) {}
+void session_gfx_state(uint32_t, const void*, size_t) {}
+void session_gfx_page(const uint16_t*, int, int) {}
+void session_frame() {}
+uint64_t session_hash(const void*, size_t, uint64_t h) { return h; }
 
 // port.h's check interface, as port.cpp has it (see the header)
 static int g_com_phase;                                         // 0 outside a check's passes, 1 original, 2 rewrite
@@ -1172,6 +1183,10 @@ static void reset_world(int round) {
         gpu::install();
         gfx::check_hooks_install();                      // gl_core.cpp's ShadowState -> shadow_set_state
         if (!gfx::start_headless()) { printf("the renderer didn't start\n"); ExitProcess(2); }
+        if (dxgi::active() || gl_api.SwapWindow != &gpu::swap_window) {   // the DXGI present stays off headless
+            printf("the DXGI present started headless\n");
+            ExitProcess(2);
+        }
         g_started = true;
     }
     W = World();

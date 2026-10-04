@@ -39,6 +39,7 @@ void platform_report();                       // the exit log's input line
 bool renderer_install();
 bool platform_plans_gl(const char* ini);     // will platform_install switch to the OpenGL renderer?
 bool platform_switched_away();                // the game's inactive flag (win32.obj): DirectSound goes quiet while it's set
+void gfx_capture_install(const char* ini);   // [debug] capture: frames written to log\capture (gl_core.cpp)
 void gfx_repaint();                           // the OpenGL renderer shows its picture again (gl_core.cpp)
 void renderer_report();
 

@@ -148,6 +148,17 @@ dozen places and the game dies.
   where a later Lock reads back a picture with filled pixels in it: the cursor's grab in the same frame of a dialog
   (the UI's windows run with 3D widgets), and the next frame's Lock where no 3D was drawn over them. Sessions
   recorded before this can part from a replay there, in the 2D page; record them again.
+- The same colour test still failed where no 3D was drawn at all: a whole menu screen, the dash band. The picture
+  under the 2D there is whatever the screens before left (drawn at the window's resolution), so a black area of a new
+  screen kept faint outlines of the last one's widgets wherever their shrunk colour came out black too (the Hacks tab
+  after the Controls tab). The renderer now notes where 3D is drawn each frame (a 3D scene's viewport; for
+  screen-space triangles, such as the translucent banners, only their bounds; clears don't count, a cleared colour
+  shrinks to itself), and everywhere else the 2D page is drawn whole. The colour test is kept only over the 3D. The
+  page the game draws is unchanged; sessions recorded before this can part from a replay where a later Lock reads the
+  picture back (as above).
+- The 2D page was stretched to the window with a plain linear filter, which blurred it (at 4K each game pixel spans
+  4.5 screen pixels). It's now drawn sharp: each game pixel is a solid block, blended only across the one screen pixel
+  where two blocks meet, as fits the game's 640x480 art. (Display only, `gl_core.cpp`.)
 
 ## Switching away
 
@@ -161,6 +172,14 @@ dozen places and the game dies.
 - The taskbar's preview showed the last menu instead of the race: a full-screen window's frames bypass
   the desktop's compositor, so it kept whatever it last composited. The race's picture is shown once more
   when the game starts waiting, by which time the window is composited. (Cosmetic; `gfx::repaint`.)
+- Screenshots (PrintScreen, Win+Shift+S, the Game Bar) and the taskbar's preview showed a stale frame on
+  NVIDIA, for the same reason: the OpenGL renderer's full-screen window bypassed the compositor. Where the
+  driver offers `WGL_NV_DX_interop2` (NVIDIA), each frame is now handed to Windows through a DXGI flip-model
+  swap chain, which the compositor always sees, so screenshots and the preview show the live game. The
+  NVIDIA control panel's workaround ("Vulkan/OpenGL present method: Prefer layered on DXGI swapchain") is no
+  longer needed; set it back to Auto for the game. The picture, its timing (vsync) and the mouse are
+  unchanged. Elsewhere (AMD, Intel, Wine), or if any step fails, the log says so in one line and the game
+  presents as before. (Cosmetic; `gl_dxgi.cpp`.)
 
 ## Sound
 
@@ -333,11 +352,17 @@ translation, or the command line.
   32-byte texts. A long enough translation ran the first two into the translations after them, and the third into the car
   list's pointer, so the car choosers then read the car names from wherever the text pointed. Each keeps its first 31
   characters.
-- The car list holds 32 cars of 31 characters, neither checked. A longer name ran into the next car's entry (both
-  names came out wrong), and a 33rd car ran off the end of the list's memory. Such a car is now left out, so the Hacks
-  screen's Vehicle list (the only place to change cars) doesn't show it; cut, its name would no longer find its files.
-  With more than 32 cars, the ones kept are the first 32 the Cars folder lists. (The menus look "viper" up by name: if
-  it isn't among them they stop with "Can't find car viper".)
+- The car list held 32 cars of 31 characters, neither checked. A longer name ran into the next car's entry (both
+  names came out wrong), and a 33rd car ran off the end of the list's memory. The list now grows as the Cars folder is
+  read, so every car is in it however many there are. A name over 31 characters is still left out, so the Hacks
+  screen's Vehicle list doesn't show it (cut, its name would no longer find its files; every screen that shows a car's
+  name is built for 31 characters at most). Up to 32 cars nothing changes.
+- The Hacks screen's Vehicle list (Options, Hacks: the only place to change cars) had no scroll bar. It showed its first
+  13 cars (17 with vrmod's taller list), in alphabetical order, and any car after them couldn't be chosen. It now has a
+  scroll bar down its right edge, inside the list's old outline, so nothing else on the screen moves; drag it, click its
+  arrows, or drag a selection past the list's top or bottom. The list opens scrolled to the chosen car. A race.exe with
+  vrmod's car-list patch (the list moved up and made taller) is recognised: the list and its bar go where the patch puts
+  them.
 - The starting grid built each car's model name ("<car>3.mod") and its paint job's texture name ("~<car>.tex") in 32 bytes
   each, so a car name of 27 or more characters overran the stack; both have room now. It then wrote "<car>.tex" and the
   texture's name into the model's remap entry, 16 bytes each, with no limit: from a car name of 12 characters (11 for

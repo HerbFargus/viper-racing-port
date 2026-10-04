@@ -207,7 +207,7 @@ main thread's buffers left out.
 - `hook/` — the DLL: `viperport.cpp` (M1 and install), `port.cpp` (M3's rewrites and shadow checks),
   `phys_*.cpp` (the rewritten physics),
   `replay.cpp` (the race recorder), `session.cpp` (the session recorder), `platform.cpp` (window and input), `gl_core.cpp` (the OpenGL
-  renderer, every GL call through `gl_table.cpp`), `ddraw_gl.cpp` (its DirectDraw / Direct3D facade),
+  renderer, every GL call through `gl_table.cpp`; `gl_dxgi.cpp` presents it through a DXGI swap chain on NVIDIA), `ddraw_gl.cpp` (its DirectDraw / Direct3D facade),
   `dsound_sdl.cpp` (the audio core and its DirectSound facade), `ui_*.cpp` (the widget toolkit), `menu_*.cpp` (the menus), `root_*.cpp` (the race front end),
   `career_*.cpp` and `paint_*.cpp` (the career and the paint kit); `build.bat` builds it (Visual Studio Build Tools,
   SDL2 2.32 in `../sdl2`).

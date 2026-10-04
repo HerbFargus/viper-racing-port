@@ -4,9 +4,11 @@
 #include <string.h>
 #include <math.h>
 #include <unordered_map>
+#include <algorithm>
 #include "viperport.h"
 #include "port.h"
 #include "session.h"
+#include "gl_dxgi.h"
 
 SDL_Window* platform_window();
 
@@ -75,7 +77,15 @@ void main() { vUV = vec2(aPos.x * 0.5 + 0.5, aPos.y * 0.5 + 0.5); gl_Position = 
 )";
 const char* COMP_FS = R"(
 in vec2 vUV; uniform sampler2D uTex; out vec4 frag;
-void main() { frag = texture(uTex, vUV); }    // premultiplied: only what the 2D drew is opaque
+// premultiplied: only what the 2D drew is opaque. Sharp bilinear: each game pixel is a solid block, blended only across
+// the one screen pixel where blocks meet (the page is 640x480 art; a plain linear stretch blurred it at 4K).
+void main() {
+    vec2 size = vec2(textureSize(uTex, 0)), texel = vUV * size;
+    vec2 scale = max(1.0 / fwidth(texel), vec2(1.0));          // screen pixels per game pixel
+    vec2 base = floor(texel), d = texel - base - 0.5, edge = 0.5 - 0.5 / scale;
+    vec2 f = (d - clamp(d, -edge, edge)) * scale + 0.5;
+    frag = texture(uTex, (base + f) / size);
+}
 )";
 
 struct Program {
@@ -559,6 +569,7 @@ void set_mode(int w, int h) {
     pg.page.assign((size_t)w * h, 0);
     pg.under.assign((size_t)w * h, 0);
     pg.overlay.assign((size_t)w * h, 0);
+    pg.drawn3d.assign((size_t)w * h, 0);
     if (!in.ready) return;
     if (st.small_fbo) glr::DeleteFramebuffers(1, &st.small_fbo), glr::DeleteTextures(1, &st.small_color);
     glr::GenTextures(1, &st.small_color);
@@ -574,6 +585,13 @@ void set_mode(int w, int h) {
 }
 
 bool started() { return in.ready; }
+
+namespace {
+// gl_api.SwapWindow's live function once the DXGI swap chain is up (gl_dxgi.h): glr::SwapWindow stays the recorded
+// point, so the call stream a check compares is the same either way, and a check's rewrite pass (no live calls) and
+// the harness's fakes never get here. The render target as it stands: present() and repaint() swap before make_target.
+void swap_live(SDL_Window* win) { dxgi::present(win, st.fbo, st.rt_w, st.rt_h); }
+}  // namespace
 
 bool start() {
     if (in.ready) return true;
@@ -600,6 +618,9 @@ bool start() {
     SDL_GL_SetSwapInterval(1);
     in.thread = GetCurrentThreadId();
     logf("renderer: OpenGL %s on %s", (const char*)gl_api.GetString(GL_VERSION), (const char*)gl_api.GetString(GL_RENDERER));
+    // FIX: present through a DXGI flip-model swap chain where the driver allows (gl_dxgi.h), so screenshots and the
+    // taskbar's preview see the game on NVIDIA; anything else presents through SDL_GL_SwapWindow as before
+    if (dxgi::start(win)) gl_api.SwapWindow = swap_live;
     make_program(in.smooth, false);
     make_program(in.flat, true);
     in.comp = link("#version 330 core\n", COMP_VS, COMP_FS, false);
@@ -661,15 +682,20 @@ void read_page() {                               // Lock of the back buffer: the
 // it: a near-black dialog (fdialog.stp) over a dark replay view came out speckled with bits of the scene. A run of up to
 // PAGE_HOLE unchanged pixels with changed pixels at both ends, along a row or a column, is drawn as 2D too (its page
 // colour is the 3D's shrunk colour anyway). Only what is shown changes, never the page the game drew or its hash.
+// FIX: telling the 2D from the 3D by colour alone works only where 3D was drawn. Elsewhere (a whole menu screen, the
+// dash band) a pixel the 2D drew in the colour already there let the full-resolution picture under it show: thin
+// leftovers of the screen before (a tab's widgets, a dialog) speckled the black. Where no 3D was drawn this frame
+// (drawn3d; clears don't count, a cleared colour shrinks to itself) the page is drawn whole; the colour test is kept
+// for where the 3D is.
 constexpr int PAGE_HOLE = 8;
-size_t page_overlay(const uint16_t* page, const uint16_t* under, int w, int h, uint32_t* overlay) {
-    static std::vector<uint8_t> mark;            // 1: the 2D changed it; 2: a hole between changed pixels
+size_t page_overlay(const uint16_t* page, const uint16_t* under, const uint8_t* drawn3d, int w, int h, uint32_t* overlay) {
+    static std::vector<uint8_t> mark;            // 1: the 2D changed it (or no 3D is there); 2: a hole between changed pixels
     static std::vector<int32_t> last;            // per column: the last changed row
     const size_t n = (size_t)w * h;
     mark.assign(n, 0);
     size_t changed = 0;
     for (size_t i = 0; i < n; i++)
-        if (page[i] != under[i]) mark[i] = 1, changed++;
+        if (page[i] != under[i] || !drawn3d[i]) mark[i] = 1, changed++;
     if (!changed) return 0;
     last.assign((size_t)w, -1);
     for (int y = 0; y < h; y++) {
@@ -701,7 +727,7 @@ size_t page_overlay(const uint16_t* page, const uint16_t* under, int w, int h, u
 
 void draw_page() {                               // Unlock: what the 2D drew, over the full-resolution 3D
     if (!on_gl_thread()) return;
-    if (!page_overlay(pg.page.data(), pg.under.data(), st.w, st.h, pg.overlay.data())) return;
+    if (!page_overlay(pg.page.data(), pg.under.data(), pg.drawn3d.data(), st.w, st.h, pg.overlay.data())) return;
     glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
     int x0 = (int)floorf(st.ox + 0.5f), x1 = (int)floorf(st.ox + st.w * st.scale + 0.5f);
     glr::Viewport(x0, 0, x1 - x0, (int)floorf(st.h * st.scale + 0.5f));
@@ -720,11 +746,81 @@ void draw_page() {                               // Unlock: what the 2D drew, ov
 
 }  // namespace
 
+// ---- frame capture (viperport.ini [debug] capture=<seconds>, 0 = off) ----------------------------------------------
+// A tool for the hi-res 2D work: every <seconds>, the frame being presented is written to log\capture\ twice, as the
+// game's 640x480 page (the 2D over the shrunk 3D, as the game drew it) and as the full-resolution picture shown.
+// Outside the game's frame: nothing recorded, nothing changed but the pack alignment read_page sets for itself.
+namespace {
+uint32_t g_capture_ms, g_capture_next, g_capture_n;
+
+bool write_bmp(const char* name, int w, int h, const uint32_t* rgba, bool top_down) {
+    char path[MAX_PATH];                         // <race.exe's folder>\log\capture\<name> (any build: plain Win32)
+    DWORD n = GetModuleFileNameA(0, path, MAX_PATH);
+    while (n && path[n - 1] != '\\') n--;
+    if (!n || n + 20 + strlen(name) >= MAX_PATH) return false;
+    memcpy(path + n, "log", 4);
+    CreateDirectoryA(path, 0);
+    memcpy(path + n + 3, "\\capture", 9);
+    CreateDirectoryA(path, 0);
+    _snprintf(path + n + 11, MAX_PATH - n - 11, "\\%s", name);
+    path[MAX_PATH - 1] = 0;
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    const uint32_t row = (uint32_t)w * 3, pad = (4 - row % 4) % 4, img = (row + pad) * h;
+    uint8_t hd[54] = {'B', 'M'};
+    *(uint32_t*)(hd + 2) = 54 + img; *(uint32_t*)(hd + 10) = 54; *(uint32_t*)(hd + 14) = 40;
+    *(int32_t*)(hd + 18) = w; *(int32_t*)(hd + 22) = h; *(uint16_t*)(hd + 26) = 1; *(uint16_t*)(hd + 28) = 24;
+    *(uint32_t*)(hd + 34) = img;
+    fwrite(hd, 1, 54, f);
+    std::vector<uint8_t> line(row + pad, 0);
+    for (int y = h - 1; y >= 0; y--) {               // a BMP's rows run bottom-up
+        const uint32_t* src = rgba + (size_t)(top_down ? y : h - 1 - y) * w;
+        for (int x = 0; x < w; x++) {
+            const uint32_t c = src[x];
+            line[x * 3] = (uint8_t)(c >> 16), line[x * 3 + 1] = (uint8_t)(c >> 8), line[x * 3 + 2] = (uint8_t)c;
+        }
+        fwrite(line.data(), 1, line.size(), f);
+    }
+    fclose(f);
+    return true;
+}
+
+void capture_frame() {                           // with st.fbo bound for reading
+    if (!g_capture_ms || shadow_com_check()) return;
+    const uint32_t now = GetTickCount();
+    if (g_capture_next && (int32_t)(now - g_capture_next) < 0) return;
+    g_capture_next = now + g_capture_ms;
+    if (g_capture_n >= 500) return;
+    glr::Direct direct;
+    char name[64];
+    std::vector<uint32_t> px((size_t)st.rt_w * st.rt_h);
+    glr::PixelStorei(GL_PACK_ALIGNMENT, 4);
+    glr::ReadPixels(0, 0, st.rt_w, st.rt_h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    glr::PixelStorei(GL_PACK_ALIGNMENT, 2);
+    _snprintf(name, sizeof name, "%04u_screen_%dx%d.bmp", g_capture_n, st.rt_w, st.rt_h);
+    write_bmp(name, st.rt_w, st.rt_h, px.data(), true);     // the target's row 0 is the top of the picture
+    px.resize((size_t)st.w * st.h);
+    for (size_t i = 0; i < px.size() && i < pg.page.size(); i++) {
+        const uint16_t c = pg.page[i];
+        px[i] = (((c >> 11) & 31) * 255 / 31) | ((((c >> 5) & 63) * 255 / 63) << 8) | (((c & 31) * 255 / 31) << 16);
+    }
+    _snprintf(name, sizeof name, "%04u_page.bmp", g_capture_n);
+    write_bmp(name, st.w, st.h, px.data(), true);
+    logf("capture: frame %u written (%dx%d and the %dx%d page)", g_capture_n, st.rt_w, st.rt_h, st.w, st.h);
+    g_capture_n++;
+}
+}  // namespace
+
+void capture_install(const char* ini) {
+    g_capture_ms = (uint32_t)GetPrivateProfileIntA("debug", "capture", 0, ini) * 1000u;
+}
+
 void present() {
     if (g_session_mode != SESSION_OFF) session_frame();   // a frame ends (the session recorder)
     if (!on_gl_thread()) return;
     glr::BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glr::BindFramebuffer(GL_READ_FRAMEBUFFER, st.fbo);
+    capture_frame();
     glr::Disable(GL_SCISSOR_TEST);
     // the target's row 0 is the top of the picture; the window's is the bottom
     glr::BlitFramebuffer(0, 0, st.rt_w, st.rt_h, 0, st.rt_h, st.rt_w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
@@ -740,6 +836,7 @@ void present() {
     glr::Scissor(x1, 0, st.rt_w - x1, st.rt_h);
     glr::Clear(GL_COLOR_BUFFER_BIT);
     make_target();                               // follows the window if it changed size
+    std::fill(pg.drawn3d.begin(), pg.drawn3d.end(), (uint8_t)0);   // a new frame: no 3D drawn yet
     touch_state();
     st.frames++;
 }
@@ -1296,6 +1393,28 @@ const void* for_check(D3DVERTEXTYPE vt, const void* v, DWORD n, bool textured, s
 
 }  // namespace
 
+namespace {
+// what a draw covers, in the game's pixels, marked in pg.drawn3d: the viewport for a 3D scene; for screen-space (TL)
+// vertices only their bounds within it (a translucent banner, a name tag), so the 2D around them stays the 2D's
+void mark_drawn3d(bool tl, const void* verts, DWORD nverts) {
+    if (pg.drawn3d.size() != (size_t)st.w * st.h || !nverts) return;
+    float x0 = (float)st.vp.dwX, y0 = (float)st.vp.dwY, x1 = x0 + st.vp.dwWidth, y1 = y0 + st.vp.dwHeight;
+    if (tl) {
+        float a = 1e30f, b = 1e30f, c = -1e30f, d = -1e30f;
+        for (DWORD i = 0; i < nverts; i++) {
+            const float* v = (const float*)((const char*)verts + i * 32);
+            a = v[0] < a ? v[0] : a; c = v[0] > c ? v[0] : c;
+            b = v[1] < b ? v[1] : b; d = v[1] > d ? v[1] : d;
+        }
+        x0 = a > x0 ? a : x0; y0 = b > y0 ? b : y0; x1 = c + 1 < x1 ? c + 1 : x1; y1 = d + 1 < y1 ? d + 1 : y1;
+    }
+    const int ix0 = x0 < 0 ? 0 : (int)x0, iy0 = y0 < 0 ? 0 : (int)y0;
+    const int ix1 = x1 > st.w ? st.w : (int)ceilf(x1), iy1 = y1 > st.h ? st.h : (int)ceilf(y1);
+    for (int y = iy0; y < iy1; y++)
+        if (ix1 > ix0) memset(&pg.drawn3d[(size_t)y * st.w + ix0], 1, (size_t)(ix1 - ix0));
+}
+}  // namespace
+
 HRESULT draw(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vtype, const void* verts, DWORD nverts, const WORD* idx, DWORD nidx) {
     if (g_session_frames) hash_draw(pt, vtype, verts, nverts, idx, nidx);
     if (pt != D3DPT_TRIANGLELIST) {
@@ -1310,6 +1429,7 @@ HRESULT draw(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vtype, const void* verts, DWORD 
     glr::UseProgram(pr.id);
     glr::BindVertexArray(in.vao);
     bool tl = vtype == D3DVT_TLVERTEX;
+    mark_drawn3d(tl, verts, nverts);
     // viewport: D3D maps into the viewport rect and clips to it, TL vertices included
     Rect r = map_rect(st.vp.dwX, st.vp.dwY, st.vp.dwWidth, st.vp.dwHeight);
     if (tl) glr::Viewport(0, 0, st.rt_w, st.rt_h);
@@ -1411,3 +1531,4 @@ bool start_headless() {
 }  // namespace gfx
 
 void gfx_repaint() { gfx::repaint(); }
+void gfx_capture_install(const char* ini) { gfx::capture_install(ini); }

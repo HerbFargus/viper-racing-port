@@ -679,6 +679,7 @@ static void install() {
     port_install(ini);                          // M3: rewritten functions (Obstacle::Update, collide_phobs, ...)
     session_install(ini);                       // M3: the session recorder (before the race recorder, which it drives)
     replay_install(ini);                        // M3: the race recorder and replayer
+    gfx_capture_install(ini);                   // [debug] capture=<seconds>: frames for the hi-res 2D work
     platform_install(g_build->name);            // M2: SDL2 window and input, when viperport.ini asks
     install_diagnostics();
 }

@@ -57,7 +57,8 @@
 // and ebx / esi / edi / ebp kept, nothing written outside what it may write (the memory around it compared), and the
 // result the fix promises -- and its boundary case (the longest input that fits) on both, compared bit for bit; and
 // setup_blimp_jump's word scan against the game's own sscanf (random command lines, every white-space byte). Without it
-// (VP_FAITHFUL) every rewrite must match its original bit for bit.
+// (VP_FAITHFUL) every rewrite must match its original bit for bit. In both builds car_list_tests runs RaceBegin on 0, 13,
+// 17, 33 and 200 cars (see there).
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -1487,6 +1488,153 @@ static bool fx_pre_case(const Ent& f, const uint32_t* w) {
     return false;
 }
 
+// ---- RaceBegin's car list: 0, 13, 17, 33 and 200 cars (both builds) --------------------------------------------------------
+// The folder lists the cars in a scrambled order, some with a directory ("cars\c007.car"), from the pristine world.
+// Faithful build: the original against the rewrite, bit for bit (memory, call logs, return, registers) -- past 32 the
+// original's list runs off its block into the stubs' heap, the same in both. Fix build: up to 32 the same; past 32 the
+// rewrite alone: a clean return, every car in the list, sorted, 32 bytes apart, nothing written outside the list's blocks
+// and its statics, the list grown by doubling (MemAlloc 0x800, 0x1000 ... each block's names copied, the old one passed to
+// Delete); then the ORIGINAL readers by their v1.0 addresses on it -- GetMaxCarFileNames, GetCarFileName for every car,
+// GetCarFileNumber for the first, the last and "viper" -- and the original RaceEnd, which frees the current block.
+static int g_cl_bad, g_cl_n;
+static void cl_check(bool ok, const char* what) {
+    g_cl_n++;
+    if (ok) return;
+    g_cl_bad++;
+    printf("  CAR LIST TEST FAILED: %s\n", what);
+}
+static int car_list_tests() {
+    const Ent* f = 0;
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, "RaceBegin")) f = &g_fns[i];
+    if (!f) { printf("  RaceBegin isn't listed\n"); return 1; }
+    static char names[200][32];
+    static const char* ptrs[200];
+    static const int counts[] = {0, 13, 17, 33, 200};
+    char m[300];
+    for (int n : counts) {
+        int viper = n > 5 ? n / 3 : -1;                        // one of them "viper"
+        for (int i = 0; i < n; i++) {
+            const int k = (i * 37 + 11) % n;                    // a scrambled order (37 is prime to every count here)
+            if (k == viper) sprintf(names[i], "viper.car");
+            else sprintf(names[i], k % 4 == 0 ? "cars\\c%03d.car" : "c%03d.car", k);
+            ptrs[i] = names[i];
+        }
+        mem_load(g_pristine);
+        g_fx_find = ptrs;
+        g_fx_find_n = n;
+        const uint32_t heap0 = HS->heap_next;
+        uint32_t w[72] = {};
+        mem_save(g_snap);
+        const Result ro = run(*f, false, w);
+        mem_save(g_after);
+        memcpy(&g_log_orig, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+        mem_load(g_snap);
+        const Result rn = run(*f, true, w);
+        if (!ROOT_FIXES || n <= 32) {
+            const uint32_t where = mem_diff(g_after);
+            const bool logs = g_log.n == g_log_orig.n && !memcmp(g_log.w, g_log_orig.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+            sprintf(m, "RaceBegin, %d cars: the original's result bit for bit (fault %d/%d, memory differs at %08x, logs %s)", n, ro.fault,
+                    rn.fault, where, logs ? "same" : "differ");
+            cl_check(!ro.fault && !rn.fault && ro.ret == rn.ret && ro.pops == rn.pops && !memcmp(ro.regs, rn.regs, sizeof ro.regs) &&
+                         where == 0 && logs, m);
+            if (!ROOT_FIXES) continue;
+        }
+        sprintf(m, "RaceBegin, %d cars: a clean return", n);
+        cl_check(!rn.fault && rn.pops == 0 && rn.regs[0] == 0x0b0b0b0b && rn.regs[1] == 0x05050505 && rn.regs[2] == 0x0d0d0d0d &&
+                     rn.regs[3] == 0x0e0e0e0e, m);
+        const char* list = UI_GP(const char, S_CARLIST);
+        const int32_t got = UI_G32(S_CARLIST_N);
+        uint32_t cap = 0x20;
+        while (cap < (uint32_t)n) cap *= 2;
+        sprintf(m, "RaceBegin, %d cars: all of them in the list (%d), readable for its %u entries", n, got, cap);
+        cl_check(got == n && readable(list, cap * 0x20), m);
+        if (got != n || !readable(list, cap * 0x20)) continue;
+        bool sorted = true;
+        for (int i = 0; i + 1 < n; i++) sorted &= _stricmp(list + 32 * i, list + 32 * (i + 1)) < 0;
+        int seen = 0;
+        for (int i = 0; i < n; i++) {
+            char e[32];
+            if (i == viper) strcpy(e, "viper");
+            else sprintf(e, "c%03d", i);
+            for (int j = 0; j < n; j++) seen += !strcmp(list + 32 * j, e);
+        }
+        sprintf(m, "RaceBegin, %d cars: every name once, sorted, 32 bytes apart", n);
+        cl_check(sorted && seen == n, m);
+        // where it wrote: the statics, the first block (0x400, where the stubs' heap was) and each block it grew into
+        uint32_t blocks[16][2];
+        int nb = 0;
+        blocks[nb][0] = (heap0 + 7) & ~7u; blocks[nb][1] = 0x400; nb++;
+        int grows = 0, frees = 0;
+        uint32_t expect = 0x800;
+        bool sizes = true;
+        for (uint32_t i = 0; i + 1 < g_log.n && i + 1 < LOG_MAX; i++) {
+            if (g_log.w[i] == 'ALOC' && g_log.w[i + 1] != 0x400) {
+                sizes &= g_log.w[i + 1] == expect;
+                expect *= 2;
+                grows++;
+            }
+            if (g_log.w[i] == 'DEL ') frees++;
+        }
+        uint32_t a = blocks[0][0] + 0x400;
+        for (uint32_t sz = 0x800; sz <= cap * 0x20 && nb < 16; sz *= 2) {
+            a = (a + 7) & ~7u;
+            blocks[nb][0] = a; blocks[nb][1] = sz; nb++;
+            a += sz;
+        }
+        int expect_grows = 0;
+        for (uint32_t c = 0x20; c < cap; c *= 2) expect_grows++;
+        sprintf(m, "RaceBegin, %d cars: grown %d times by doubling, each old block freed (%d grows, %d frees)", n, expect_grows, grows, frees);
+        cl_check(sizes && grows == expect_grows && frees == expect_grows && U(list) == U(g_arena) + blocks[nb - 1][0], m);
+        uint32_t out = 0;
+        for (uint32_t i = 0; i < DATA_BYTES && !out; i++)
+            if (g_snap.data[i] != DATA[i] && !(0x004e1000 + i >= S_CARLIST && 0x004e1000 + i < S_CARLIST + 8) &&
+                !(0x004e1000 + i >= S_TRACK_TAB && 0x004e1000 + i < S_TRACK_TAB + 4))
+                out = 0x004e1000 + i;
+        for (uint32_t i = sizeof(HState); i < ARENA_BYTES && !out; i++) {
+            if (g_snap.arena[i] == g_arena[i]) continue;
+            bool in = false;
+            for (int b = 0; b < nb; b++) in |= i >= blocks[b][0] && i < blocks[b][0] + blocks[b][1];
+            if (!in) out = U(g_arena + i);
+        }
+        sprintf(m, "RaceBegin, %d cars: nothing written outside the list's blocks and its statics (%08x)", n, out);
+        cl_check(out == 0, m);
+        // the original readers, by their v1.0 addresses
+        call_orig(F_GetMaxCarFileNames, 0, {});
+        bool names_ok = (int32_t)g_setup_ret == n;
+        for (int i = 0; i < n && names_ok; i++) {
+            call_orig(F_GetCarFileName, 0, {(uint32_t)i});
+            names_ok = g_setup_ret == U(list) + 32u * (uint32_t)i;
+        }
+        sprintf(m, "RaceBegin, %d cars: the original GetMaxCarFileNames and GetCarFileName read every car", n);
+        cl_check(names_ok, m);
+        const char* look[3] = {list, list + 32 * (n - 1), "viper"};
+        for (int k = 0; k < 3; k++) {
+            int want = k == 0 ? 0 : k == 1 ? n - 1 : -1;
+            if (k == 2)
+                for (int j = 0; j < n; j++)
+                    if (!_stricmp(list + 32 * j, "viper")) want = j;
+            if (want < 0) continue;
+            char key[32];
+            strcpy(key, look[k]);
+            call_orig(0x00406930, 0, {U(key)});                     // GetCarFileNumber
+            sprintf(m, "RaceBegin, %d cars: the original GetCarFileNumber(\"%s\") finds car %d (%d)", n, key, want, (int32_t)g_setup_ret);
+            cl_check((int32_t)g_setup_ret == want, m);
+        }
+        call_orig(F_RaceEnd, 0, {});
+        bool freed = false;
+        for (uint32_t i = 0; i + 1 < g_log.n && i + 1 < LOG_MAX; i++) freed |= g_log.w[i] == 'DEL ' && g_log.w[i + 1] == U(list);
+        sprintf(m, "RaceBegin, %d cars: the original RaceEnd frees the grown list", n);
+        cl_check(freed && UI_GP(void, S_CARLIST) == 0 && UI_G32(S_CARLIST_N) == 0, m);
+    }
+    g_fx_find = 0;
+    g_fx_find_n = 0;
+    mem_load(g_pristine);
+    printf("car list tests (RaceBegin, %s): %s -- %d checks, %d failed\n", ROOT_FIXES ? "the list grows" : "faithful",
+           g_cl_bad ? "FAILED" : "all passed", g_cl_n, g_cl_bad);
+    return g_cl_bad;
+}
+
 #if ROOT_FIXES
 // ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
 // The rewrite alone (the original would crash or overrun there -- this program's stack among what it would take), from the
@@ -1728,7 +1876,7 @@ static int directed_fix_tests() {
         fx_same(f, {5}, "GetEventString, a 27-character translation (texts of 31 characters)");
     }
 
-    // ---- 3. RaceBegin: 40 cars; long names ----
+    // ---- 3. RaceBegin: 40 cars (the list grows: car_list_tests has more); long names ----
     {
         const Ent& f = fx_fn("RaceBegin");
         static char names[40][0x80];
@@ -1740,22 +1888,23 @@ static int directed_fix_tests() {
         fx_reset();
         g_fx_find = ptrs;
         g_fx_find_n = 40;
+        uint8_t* first_block = g_arena + ((HS->heap_next + 7) & ~7u);     // where the stubs' MemAlloc puts the 0x400
         mem_save(g_snap);
         r = fx_run(f, true, {});
         fx_check(fx_clean(f, r), "RaceBegin, 40 cars: a clean return", &r);
         const char* list = UI_GP(const char, S_CARLIST);
         const int32_t n = UI_G32(S_CARLIST_N);
-        sprintf(m, "RaceBegin, 40 cars: the list holds 32 (%d)", n);
-        fx_check(n == 32, m);
-        bool ok = readable(list, 0x400);
-        for (int k = 0; ok && k < 32; k++) {                    // the first 32 listed (car39 .. car08), sorted
+        sprintf(m, "RaceBegin, 40 cars: the list holds 40 (%d)", n);
+        fx_check(n == 40, m);
+        bool ok = readable(list, 0x800);
+        for (int k = 0; ok && k < 40; k++) {                    // all of them, sorted
             char e[16];
-            sprintf(e, "car%02d", 8 + k);
+            sprintf(e, "car%02d", k);
             ok = !strcmp(list + 32 * k, e);
         }
-        fx_check(ok, "RaceBegin, 40 cars: the first 32 the folder lists, sorted");
-        o = fx_outside(g_snap, {{(void*)(uintptr_t)S_CARLIST, 8}, {(void*)(uintptr_t)S_TRACK_TAB, 4}, {list, 0x400}});
-        fx_check(o == 0, "RaceBegin, 40 cars: nothing written outside the list's 0x400 bytes and its statics", 0, o);
+        fx_check(ok, "RaceBegin, 40 cars: every car the folder lists, sorted");
+        o = fx_outside(g_snap, {{(void*)(uintptr_t)S_CARLIST, 8}, {(void*)(uintptr_t)S_TRACK_TAB, 4}, {first_block, 0x400}, {list, 0x800}});
+        fx_check(o == 0, "RaceBegin, 40 cars: nothing written outside the list's two blocks (0x400, grown to 0x800) and its statics", 0, o);
         // names too long for an entry
         static char lng[5][0x100];
         sprintf(lng[0], "viper.car");
@@ -2311,6 +2460,7 @@ int main(int argc, char** argv) {
            fp_bad, faults, both_fault, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
     int fix_bad = 0;
+    const int cl_bad = !only || strstr("RaceBegin", only) ? car_list_tests() : 0;
 #if ROOT_FIXES
     printf("the fix build: %d rounds reached a fixed case (kept out of the comparison), %d where the rewrite faulted\n", fixed_rounds,
            fixed_bad);
@@ -2318,5 +2468,5 @@ int main(int argc, char** argv) {
 #else
     (void)fixed_rounds; (void)fixed_bad;
 #endif
-    return differ || fp_bad || dup || fix_bad || fixed_bad ? 1 : 0;
+    return differ || fp_bad || dup || fix_bad || fixed_bad || cl_bad ? 1 : 0;
 }

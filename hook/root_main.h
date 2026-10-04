@@ -152,7 +152,7 @@ enum : uint32_t {
     S_PAUSED = 0x005040b8,          // u8
     S_BLIMP_FRAME = 0x00521050,     // Frame blimp_frame
     // race.obj
-    S_CARLIST = 0x00504340,         // char (*)[0x20]: the *.car names (MemAlloc(0x400): 32 of 31 characters)
+    S_CARLIST = 0x00504340,         // char (*)[0x20]: the *.car names (MemAlloc(0x400), doubled by the fixed RaceBegin past 32 cars; 31 characters each)
     S_CARLIST_N = 0x00504344,
     S_TRACK_TAB = 0x00504624,       // StringTable* tracks.tab
     S_EVENT_TEXT0 = 0x00504368, S_EVENT_TEXT1 = 0x00504438, S_EVENT_TEXT2 = 0x00504320,   // GetEventString's buffers (0x20

@@ -67,6 +67,9 @@
 // destructors, SetCar, TrackViewer::GetTrackName and CarViewer3D::GetName log). The game's own code runs everywhere else:
 // the whole widget toolkit (UIDoDialog, _UIAddItems, the widgets, UIDoYesNoBox, CreateMultiString, UICustomControl),
 // UIDialogItem's and Xlator's constructors, HackEnabled, the Vid* queries, strnicmp, __ftol.
+//
+// In both builds hack_list_tests then runs HackOptionsControl::Added on stock and vrmod-moved Vehicle lists of 0 to 200
+// cars (see there); the fix build leaves that function out of the random rounds (its scroll bar is always added).
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -77,6 +80,7 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1336,6 +1340,163 @@ static int directed_fix_tests() {
 }
 #endif
 
+// ---- the Hacks tab's Vehicle list (both builds): HackOptionsControl::Added -----------------------------------------------------
+// The rewrite builds the list where the installed race.exe's own `push h / push w / push y / push x` (0x48635f) put it:
+// stock (300, 200, 100, 200), vrmod's car-list patch (390, 124, 111, 255) and custom sizes, written into the loaded image's
+// code for the test; and 0, 13, 17, 33 and 200 cars, the chosen car first, in the middle, last, or past the end.
+// Faithful build: the rewrite against the original, bit for bit (memory, call logs, return, registers), on each.
+// Fix build: the original and the rewrite from the same state, the stamps given their real sizes (uscroll / dscroll.stp
+// 15 x 18, vslider.stp 16 x 400 with its hot spot at 4, 7): the rewrite returns cleanly and adds the original's widgets,
+// the same, in order, but for the ListBox, which is 18 pixels narrower and has a scroll axis, followed by a ScrollBar
+// and two ScrollButtons on that same axis; the axis counts the cars and the ListBox's rows (the original's); every bar
+// widget (and the track the ScrollBar draws round itself) lies in the list's right 16 pixels, the ListBox left of them,
+// so nothing is outside the original list's rectangle; the chosen car is in view. A list too small for a bar (h 40)
+// gives the original's result bit for bit.
+static int g_hl_bad, g_hl_n;
+static void hl_check(bool ok, const char* what) {
+    g_hl_n++;
+    if (ok) return;
+    g_hl_bad++;
+    printf("  VEHICLE LIST TEST FAILED: %s\n", what);
+}
+static void hl_set_geometry(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    uint8_t* p = (uint8_t*)(uintptr_t)0x0048635f;
+    memcpy(p + 1, &h, 4);
+    p[6] = (uint8_t)w;
+    memcpy(p + 8, &y, 4);
+    memcpy(p + 13, &x, 4);
+}
+static char g_hl_names[200][16];
+// the pristine world, the running window, the Hacks tab's list of n cars (its own constructor's UIStringList), car sel chosen
+static void hl_world(int n, int32_t sel) {
+    mem_load(g_pristine);
+    g_rng = 0x5eed1234u | 1;
+    UI_GP(WidgetWindow, S_ACTIVE) = W.win;
+    UI_G8(S_EXIT) = 0;
+    HackOptionsControl* h = W.hack;
+    call_orig(F_UIStringList_ctor, 1, {U32(&h->cars), 0, (uint32_t)(n + 1), 0x10});
+    for (int i = 0; i < n; i++) call_orig(F_UIStringList_AddEntry, 1, {U32(&h->cars), 0, U32(g_hl_names[i])});
+    h->car_index = sel;
+}
+static bool hl_same(const Result& a, const Result& b) {
+    return a.fault == b.fault && a.code == b.code && a.ret == b.ret && a.pops == b.pops && !memcmp(a.regs, b.regs, sizeof a.regs);
+}
+static bool hl_inside(const Widget* w, int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t mx = 0, int32_t my = 0) {
+    return w->x0 - mx >= x0 && w->y0 - my >= y0 && w->x1 + mx <= x1 && w->y1 + my <= y1;
+}
+static int hack_list_tests() {
+    const Ent* f = 0;
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, "HackOptionsControl::Added")) f = &g_fns[i];
+    if (!f) { printf("  HackOptionsControl::Added isn't listed\n"); return 1; }
+    for (int i = 0; i < 200; i++) sprintf(g_hl_names[i], "car%03d", i);
+    uint8_t saved[20];
+    memcpy(saved, (const void*)(uintptr_t)0x0048635f, sizeof saved);
+    Fake saved_fakes[3];
+    Fake* fk[3] = {fake_for("uscroll.stp", 'STMP'), fake_for("dscroll.stp", 'STMP'), fake_for("vslider.stp", 'STMP')};
+    for (int i = 0; i < 3; i++) saved_fakes[i] = *fk[i];
+    if (MENU_FIXES) {
+        for (int i = 0; i < 2; i++) { fk[i]->w = 15; fk[i]->h = 18; fk[i]->hx = 0; fk[i]->hy = 0; fk[i]->count = 2; }
+        fk[2]->w = 16; fk[2]->h = 400; fk[2]->hx = 4; fk[2]->hy = 7; fk[2]->count = 1;
+    }
+    struct G { uint32_t x, y, w, h; const char* what; } geoms[] = {
+        {0, 0, 0, 0, "stock (the image's own bytes)"}, {390, 124, 111, 255, "vrmod's car-list patch"},
+        {200, 40, 127, 400, "a custom vrmod size"}, {300, 200, 100, 40, "a custom size too small for a bar"},
+    };
+    static const int counts[] = {0, 13, 17, 33, 200};
+    char m[300];
+    uint32_t w[72] = {};
+    w[0] = U32(W.hack);
+    for (const G& g : geoms) {
+        memcpy((void*)(uintptr_t)0x0048635f, saved, sizeof saved);
+        if (g.w) hl_set_geometry(g.x, g.y, g.w, g.h);
+        const int32_t gx = g.w ? (int32_t)g.x : 300, gy = g.w ? (int32_t)g.y : 200, gw = g.w ? (int32_t)g.w : 100,
+                      gh = g.w ? (int32_t)g.h : 200;
+        const bool bar = MENU_FIXES && gh >= 0x40;
+        for (int n : counts) {
+            const int32_t sels[4] = {0, n / 2, n - 1, n + 3};
+            for (int32_t sel : sels) {
+                hl_world(n, sel);
+                const int before = W.win->count;
+                mem_save(g_snap);
+                const Result ro = run(*f, false, w);
+                mem_save(g_after);
+                memcpy(&g_log_orig, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+                Widget* ow[64];
+                int32_t orows = -1;
+                const int on = W.win->count - before;
+                for (int i = 0; i < on && i < 64; i++) {
+                    ow[i] = (Widget*)W.win->widgets[before + i];
+                    if (U32(ow[i]->vtbl) == VT_ListBox) orows = ((ListBox*)ow[i])->rows;
+                }
+                Widget orig_w[64];                              // the original's widgets, as it left them
+                for (int i = 0; i < on && i < 64; i++) memcpy(&orig_w[i], ow[i], sizeof(Widget));
+                mem_load(g_snap);
+                const Result rn = run(*f, true, w);
+                const char* cs = sel == n + 3 ? "past the end" : sel == 0 ? "the first" : sel == n - 1 ? "the last" : "the middle one";
+                if (!bar) {
+                    const uint32_t where = mem_diff(g_after);
+                    const bool logs = g_log.n == g_log_orig.n && !memcmp(g_log.w, g_log_orig.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+                    sprintf(m, "%s, %d cars, %s chosen: the original's result bit for bit (fault %d/%d, memory differs at %08x, logs %s)",
+                            g.what, n, cs, ro.fault, rn.fault, where, logs ? "same" : "differ");
+                    hl_check(!ro.fault && hl_same(ro, rn) && where == 0 && logs, m);
+                    continue;
+                }
+                sprintf(m, "%s, %d cars, %s chosen", g.what, n, cs);
+                std::string what = m;
+                hl_check(!ro.fault && !rn.fault && hl_same(ro, rn), (what + ": a clean return, the original's registers").c_str());
+                const int nn = W.win->count - before;
+                hl_check(nn == on + 3, (what + ": the original's widgets and three more").c_str());
+                if (nn != on + 3 || on > 60) continue;
+                int k = 0;
+                ListBox* lb = 0;
+                bool order = true;
+                for (int i = 0; i < on; i++, k++) {
+                    const Widget* a = &orig_w[i];
+                    const Widget* b = (Widget*)W.win->widgets[before + k];
+                    if (a->vtbl != b->vtbl) { order = false; break; }
+                    if (U32(a->vtbl) == VT_ListBox) {
+                        lb = (ListBox*)b;
+                        order &= b->x0 == a->x0 && b->y0 == a->y0 && b->y1 == a->y1 && b->x1 == a->x1 - 18;
+                        order &= a->x0 == gx && a->y0 == gy && a->x1 == gx + gw && a->y1 == gy + gh;
+                        k += 3;                                     // the bar's three follow it
+                    } else {
+                        order &= b->x0 == a->x0 && b->y0 == a->y0 && b->x1 == a->x1 && b->y1 == a->y1;
+                    }
+                }
+                hl_check(order && lb, (what + ": the same widgets in order, the ListBox 18 pixels narrower in the original's place").c_str());
+                if (!lb) continue;
+                int li = 0;
+                while (W.win->widgets[before + li] != (Widget*)lb) li++;
+                const ScrollBar* sb = (const ScrollBar*)W.win->widgets[before + li + 1];
+                const ScrollButton* up = (const ScrollButton*)W.win->widgets[before + li + 2];
+                const ScrollButton* dn = (const ScrollButton*)W.win->widgets[before + li + 3];
+                const UIScrollAxis* a = lb->axis;
+                hl_check(U32(sb->vtbl) == VT_ScrollBar && U32(up->vtbl) == VT_ScrollButton && U32(dn->vtbl) == VT_ScrollButton && a &&
+                             sb->axis == a && up->axis == a && dn->axis == a && sb->type == 0 && up->dir == -1 && dn->dir == 1,
+                         (what + ": a vertical ScrollBar and its up and down buttons, on the ListBox's axis").c_str());
+                if (!a) continue;
+                sprintf(m, "%s: the axis counts the cars and the original's rows (%d %d / %d %d)", what.c_str(), a->total, a->visible, n, orows);
+                hl_check(a->total == n && a->visible == orows && lb->rows == orows, m);
+                int32_t want = 0;
+                if (sel >= a->visible && a->visible > 0) { want = sel; if (want > n - a->visible) want = n - a->visible; if (want < 0) want = 0; }
+                sprintf(m, "%s: scrolled to %d (%d)", what.c_str(), a->pos, want);
+                hl_check(a->pos == want && (sel < 0 || sel >= n || (a->pos <= sel && sel < a->pos + a->visible)), (std::string(m) + ", the chosen car in view").c_str());
+                const int32_t bx = gx + gw - 16;
+                hl_check(hl_inside(sb, bx, gy, gx + gw, gy + gh, 4, 7) && hl_inside(up, bx, gy, gx + gw, gy + gh) &&
+                             hl_inside(dn, bx, gy, gx + gw, gy + gh) && lb->x1 <= bx,
+                         (what + ": the bar in the list's right 16 pixels, the ListBox left of it").c_str());
+            }
+        }
+    }
+    memcpy((void*)(uintptr_t)0x0048635f, saved, sizeof saved);
+    for (int i = 0; i < 3; i++) *fk[i] = saved_fakes[i];
+    mem_load(g_pristine);
+    printf("vehicle list tests (HackOptionsControl::Added, %s): %s -- %d checks, %d failed\n", MENU_FIXES ? "the scroll bar" : "faithful",
+           g_hl_bad ? "FAILED" : "all passed", g_hl_n, g_hl_bad);
+    return g_hl_bad;
+}
+
 // ---- main -----------------------------------------------------------------------------------------------------------------------
 static bool is_modal(const char* nm) {
     return strstr(nm, "MenuDo") == nm || !strcmp(nm, "adjust_ctls") || !strcmp(nm, "tune_default") || strstr(nm, "::Added");
@@ -1452,6 +1613,9 @@ int main(int argc, char** argv) {
     for (int fi = 0; fi < g_nfns; fi++) {
         const Ent& f = g_fns[fi];
         if (only && !strstr(f.name, only)) continue;
+        // the fix build: HackOptionsControl::Added always adds the Vehicle list's scroll bar, so it's checked by
+        // hack_list_tests (below) instead
+        if (MENU_FIXES && !strcmp(f.name, "HackOptionsControl::Added")) { skipped++; continue; }
         n_e += f.name[0] == '$';
         bool fn_bad = false, fn_changed = false;
         int fn_faults = 0, fn_checks = 0;
@@ -1539,11 +1703,12 @@ int main(int argc, char** argv) {
         if (differ >= 40) { printf("stopping after 40 differences\n"); break; }
     }
     mem_load(g_pristine);
+    const int hl_bad = !only || strstr("HackOptionsControl::Added", only) ? hack_list_tests() : 0;
     if (tags) tag_print();
     printf("%d functions (%d static initialisers; %d pure, %d replay_only, %d others), %d listed twice; %lld checks (%lld on poisoned .data), "
            "%lld logged words compared: %d differ, %d footprint violations, %d checks faulted (%lld in both, the same way), %d skipped; "
            "%d functions bad\n", g_nfns, n_e, pure_n, replay_n, g_nfns - pure_n - replay_n, dup, checks, poisoned_checks, log_words, differ,
            fp_bad, faults, both_fault, skipped, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
-    return differ || fp_bad || dup || fix_bad ? 1 : 0;
+    return differ || fp_bad || dup || fix_bad || hl_bad ? 1 : 0;
 }

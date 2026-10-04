@@ -242,6 +242,7 @@ struct Page {                                    // the back buffer as the game'
     std::vector<uint16_t> page;                  // (565)
     std::vector<uint16_t> under;                 // the page as it was handed out: what the 2D changed shows
     std::vector<uint32_t> overlay;               // the 2D's pixels, premultiplied RGBA
+    std::vector<uint8_t> drawn3d;                // 1: 3D was drawn there this frame (display only: never saved or compared)
 };
 extern Page pg;
 extern std::set<Surface*> handles;               // live texture surfaces, to validate texture handles (K_HANDLES)

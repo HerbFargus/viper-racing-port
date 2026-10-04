@@ -28,8 +28,8 @@
 // own dialog loops, the garage, the replay, the board).
 //
 // Fixes (// FIX:, docs/FIXES.md "Race front end"; none reached with the stock cars, tracks and English text):
-// GetEventString's three 0x20-byte texts keep to their 31 characters (a long translation); RaceBegin's car list keeps to
-// its 32 names of 31 characters (a longer name, or a car past the 32nd, is left out); CarPosition's texture remap names
+// GetEventString's three 0x20-byte texts keep to their 31 characters (a long translation); RaceBegin's car list keeps its
+// names to 31 characters (a longer name is left out) and grows past 32 cars; CarPosition's texture remap names
 // keep to their 16 bytes (a car name of 12+ characters), and its model and texture names have room for a 31-character
 // car; PreRaceDo's track name and friendly name keep to their 64-byte statics. Every other input gives the original's bits.
 // (PreRaceDo's frame is the original's whole 0x1808 bytes: the track text is word-wrapped into its last 4 KB.)
@@ -233,6 +233,7 @@ static void __cdecl RaceBegin_c() {
     char buf[0x104];
     UI_GP(void, S_CARLIST) = ccall<void*>(uit::F_MemAlloc, 0x400);
     UI_G32(S_CARLIST_N) = 0;
+    uint32_t cap = 0x20;                                     // FIX: (below) the list's room, in names
     void* h = ccall<void*>(uit::F_FileFindFirst, CP(0x004e4828), (char*)buf, 0x104);
     if (h != (void*)(intptr_t)-1) {
         do {
@@ -240,11 +241,23 @@ static void __cdecl RaceBegin_c() {
             s = s ? s + 1 : buf;
             *(volatile char*)ccall<char*>(uit::F_strchr, (const char*)s, 0x2e) = 0;
             // FIX: the list holds 32 names of 31 characters (MemAlloc(0x400)), neither checked: a longer name ran into the
-            // next entry (and was cut there by the next car's name), and a 33rd car ran off the heap block. Such a car is
-            // left out of the list, so the Hacks screen's Vehicle list (the only place to change cars) doesn't show it.
-            // (Cut, its name would no longer open its files -- "<car>.car", "<car>.cf" --, which fails worse.) The cars
-            // kept are the first 32 the folder lists, sorted as before. Any other car goes in as before.
-            if (VP_FIX && (UI_G32(S_CARLIST_N) >= 0x20 || ui_strnlen(s, 0x1f) > 0x1f)) continue;
+            // next entry (and was cut there by the next car's name), and a 33rd car ran off the heap block. A longer name
+            // is left out of the list (cut, it would no longer open its files -- "<car>.car", "<car>.cf" --, which fails
+            // worse), so the Hacks screen's Vehicle list doesn't show it. The 33rd car grows the list instead: a block
+            // twice the size (MemAlloc), the names copied over, the old one freed (Delete), so every car the folder lists
+            // goes in (RaceEnd frees whichever block is current). The entries stay 32 bytes apart: the original's
+            // GetCarFileName, sort_carlist and every name buffer downstream count on 31 characters at most. Only if the
+            // memory runs out (or past 0x100000 cars) is a car left out. Up to 32 cars, every call is the original's.
+            if (VP_FIX && ui_strnlen(s, 0x1f) > 0x1f) continue;
+            if (VP_FIX && (uint32_t)UI_G32(S_CARLIST_N) >= cap) {
+                if (cap >= 0x100000u) continue;
+                void* grown = ccall<void*>(uit::F_MemAlloc, (int32_t)(cap * 2u * 0x20u));
+                if (!grown) continue;
+                crt_copy(grown, UI_GP(void, S_CARLIST), cap * 0x20u);
+                ccall<void>(uit::F_Delete, UI_GP(void, S_CARLIST));
+                UI_GP(void, S_CARLIST) = grown;
+                cap *= 2u;
+            }
             const uint32_t n = crt_strlen(s) + 1;
             crt_copy(UI_GP(char, S_CARLIST) + ((uint32_t)UI_G32(S_CARLIST_N) << 5), s, n);
             UI_G32(S_CARLIST_N) = UI_G32(S_CARLIST_N) + 1;

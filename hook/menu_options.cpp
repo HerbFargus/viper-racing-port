@@ -25,6 +25,8 @@
 // HackOptionsControl::Create and MixerChooser::Callback (driver unchanged) the running window's groups;
 // SoundOptionsControl::Callback's strings (once its Xlators exist) the object and the two Xlators.
 //
+// Fixes (// FIX:): the Hacks tab's Vehicle list gets a scroll bar (HackOptionsControl::Added). It is built where the
+// installed race.exe puts the list (stock, or moved by vrmod's car-list patch), read from the original's instructions.
 // FIX CANDIDATEs (left faithful): see each `// FIX CANDIDATE:`.
 #include <stdint.h>
 #include <string.h>
@@ -667,15 +669,53 @@ static void __fastcall Hack_Finalize_n(HackOptionsControl* self, Edx) {
 }
 PORT_FN(0x00486170, "HackOptionsControl::Finalize", Hack_Finalize_n, fp_replay_options0)
 
+// The Vehicle list's place and size: the four immediates of the original's `push h / push w (imm8) / push y / push x`
+// at 0x48635f, read from the installed race.exe's own instructions (as m1_operand reads M1's values: docs/PORTING.md rule
+// 12). Stock v1.0 has (300, 200, 100, 200); vrmod's car-list patch (viper-mod-manager vrmod/carlist.py) rewrites the four
+// values -- (390, 124, 111, 255) by default, the community race.bin builds' --, and port_check_stock accepts a
+// HackOptionsControl::Added that differs from stock only there (stock.inc's VP_STOCK_MASKS), so this rewrite runs in
+// game either way and builds the list where the installed game would. Anything else at those bytes: stock's.
+struct ListGeom { uint32_t x, y, w, h; };
+static ListGeom vehicle_list_geometry() {
+    const volatile uint8_t* p = (const volatile uint8_t*)(uintptr_t)0x0048635f;
+    auto d32 = [](const volatile uint8_t* q) { return (uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24; };
+    if (p[0] == 0x68 && p[5] == 0x6a && p[7] == 0x68 && p[12] == 0x68 && p[17] == 0x51 && p[18] == 0x6a && p[19] == 0x14)
+        return {d32(p + 13), d32(p + 8), (uint32_t)(int32_t)(int8_t)p[6], d32(p + 1)};   // push imm8: sign-extended
+    return {0x12c, 0xc8, 0x64, 0xc8};
+}
+
+// FIX: the Vehicle list (the only place to change cars) had no scroll bar, so it showed its first h / 15 cars (13 stock,
+// 17 with vrmod's taller list) and any car after them in the sorted list couldn't be chosen. It gets one, built as the
+// game's own scrolling lists are (UIDoOpenFileBox's): a UIScrollAxis given to the 0x14 ListBox as its text, then a 0x11
+// item (a vertical ScrollBar and its two ScrollButtons, uscroll.stp / dscroll.stp 15 x 18, the track vslider.stp 16
+// wide) on the same axis. The bar takes the list's right 16 pixels and the list keeps the rest less a 2-pixel gap, so
+// nothing else on the screen moves: the list's rectangle is the original's. The axis lives here (the tab's object has no
+// room; it sits in MenuDoOptions's frame among the other tabs), one at a time as the Options screen is. When the chosen
+// car is below the first page the list opens scrolled to show it at the top (kept to the last page). A list too small
+// for a bar (only a custom vrmod size under 64 x 32) is built as before.
+static UIScrollAxis s_vehicle_axis;
+enum : uint32_t { BAR_W = 0x10, BAR_GAP = 2 };
+
 static void __fastcall Hack_Added_n(HackOptionsControl* self, Edx) {
-    Frame<0x1c0> fr;
+    Frame<VP_FIX ? 0x1f8 : 0x1c0> fr;                     // FIX: (above) room for one more item
+    const ListGeom g = vehicle_list_geometry();
+    const bool bar = VP_FIX && (int32_t)g.h >= 0x40 && (int32_t)g.w >= 0x20;
+    const uint32_t k = bar ? 0x38u : 0u;                  // the items before the bar sit one item further up the frame
     once_xl(S_HACK_ADDED_ONCE, 1, 0x005d5bb0, 0x004f80ac, 0x00486630);
     once_xl(S_HACK_ADDED_ONCE, 2, 0x005d5bd0, 0x004f8094, 0x00486620);
     once_xl(S_HACK_ADDED_ONCE, 4, 0x005d5be0, 0x004f8078, 0x00486610);
     once_xl(S_HACK_ADDED_ONCE, 8, 0x005d5bc0, 0x004f8064, 0x00486600);
     xl(0x005d5bb0);
-    RAW(0x1c0, 5, 0, 0x122, 0x82, 0, 0, G(0x005d5bb4), 0, 0, 0xb, 0, 0, 0, 0);
-    IC(0x188, 0x14, 0, 0x12c, 0xc8, 0x64, 0xc8, 0, 0, S(0x28), 0, 0, 0, S(0x3c), 0);
+    RAW(0x1c0 + k, 5, 0, 0x122, 0x82, 0, 0, G(0x005d5bb4), 0, 0, 0xb, 0, 0, 0, 0);
+    if (bar) {
+        s_vehicle_axis.total = 0;
+        s_vehicle_axis.visible = 0;
+        s_vehicle_axis.pos = 0;
+        IC(0x188 + k, 0x14, 0, g.x, g.y, g.w - BAR_W - BAR_GAP, g.h, U(&s_vehicle_axis), 0, S(0x28), 0, 0, 0, S(0x3c), 0);
+        IC(0x188, 0x11, 0, g.x + g.w - BAR_W, g.y, BAR_W, g.h, S_EMPTY, 0, U(&s_vehicle_axis), 0, 0, 0, 0, 0);
+    } else {
+        IC(0x188, 0x14, 0, g.x, g.y, g.w, g.h, 0, 0, S(0x28), 0, 0, 0, S(0x3c), 0);
+    }
     xl(0x005d5bc0);
     IC(0x150, 5, 0, 0x28, 0x82, 0, 0, G(0x005d5bc4), 0, 0, sty1(S_COL_BF4), 0, 0, 0, 0);
     xl(0x005d5bd0);
@@ -687,7 +727,17 @@ static void __fastcall Hack_Added_n(HackOptionsControl* self, Edx) {
     xl(0x00579b20);
     RAW(0x70, 0xa, 0, 0x8c, 0xc8, 0x50, 0x10, G(0x00579b24), 0, S(0x40), 9, 0, 0, 0, 0);
     item_end(fr.at(0x38));
-    add_items(self, fr.at(0x1c0));
+    add_items(self, fr.at(0x1c0 + k));
+    if (bar) {                                            // FIX: (above) the chosen car in view
+        UIScrollAxis* a = &s_vehicle_axis;
+        const int32_t sel = self->car_index;
+        if (sel >= a->visible && a->visible > 0) {
+            int32_t p = sel;
+            const int32_t last = a->total - a->visible;
+            if (p > last) p = last;
+            a->pos = p < 0 ? 0 : p;
+        }
+    }
 }
 PORT_FN(0x00486230, "HackOptionsControl::Added", Hack_Added_n, fp_replay_items0)
 
