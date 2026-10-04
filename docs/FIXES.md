@@ -342,6 +342,12 @@ The dashboard and the screens before and after a race (hook/root_dash.cpp, root_
 come up with the stock cars, tracks and English text; they are a mod car or track with a long name or text, a long
 translation, or the command line.
 
+- An add-on track under a name of its own (a new row in tracks.tab, not a stock track's slot) couldn't be raced: the
+  laps table knows only the 8 stock tracks by name, and any other name panicked "GetLapCountFromType: Can't match"
+  when a race was set up (single race, the multiplayer lobby, the dedicated server). Every row of that table holds the
+  same laps (1, 3, 8 and 20 for the four race types), so such a track now takes them. Its difficulty, read from an
+  8-entry table by row, came from the stack for a row past the 8th (and the track viewer then read outside its three
+  difficulty names); it now counts as medium. Stock tracks, and mods in a stock track's slot, are unchanged.
 - The dashboard's banners (the reset and damaged messages, the race summary's two headings) were drawn with their
   translation as the printf format and nothing else passed. A '%' conversion or a '*' in a language file's text read
   arguments from the stack: garbage, or a crash for "%s" and "%n". Such a text is now drawn as written. Every other text is

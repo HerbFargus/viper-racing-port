@@ -1437,7 +1437,14 @@ static bool make_args(const Ent& f, uint32_t* w) {
     else if (IS("GetFieldString")) a[0] = (uint32_t)irange(0, 5);
     else if (IS("GetEventString")) a[0] = (uint32_t)irange(0, 6);
     else if (IS("GetCameraName")) a[0] = (uint32_t)irange(0, 11);
-    else if (IS("GetLapCountFromType")) { a[0] = (uint32_t)irange(0, 7); a[1] = chance(90) ? U(k_tracks[rnd() % 9]) : U(W.texts[0]); }
+    else if (IS("GetLapCountFromType")) {
+        a[0] = (uint32_t)irange(0, 7);
+#ifdef VP_ROOT_FIXES
+        a[1] = U(k_tracks[rnd() % 8]);                  // stock names only: an unknown one is fix test 8's
+#else
+        a[1] = chance(90) ? U(k_tracks[rnd() % 9]) : U(W.texts[0]);
+#endif
+    }
     else if (IS("GetTrackDifficulty")) a[0] = (uint32_t)irange(0, 7);
     else if (IS("sort_f")) { a[0] = U(W.carlist + 32 * (rnd() % 8)); a[1] = U(W.carlist + 32 * (rnd() % 8)); }
     else if (IS("GetTrackName") || IS("GetTrackFriendlyName") || IS("GetTrackText")) a[0] = (uint32_t)irange(-1, 12);
@@ -2225,6 +2232,43 @@ static int directed_fix_tests() {
             fx_reset();
             strcpy((char*)(uintptr_t)S_BLIMP_TRACK, T31.c_str());
             fx_same(b, {}, "blimp_jump, a 31-character track");
+        }
+    }
+
+    // ---- 8. GetLapCountFromType: a track not in the laps table (an add-on track's own name) ----
+    {
+        const Ent& f = fx_fn("GetLapCountFromType");
+        static const int32_t laps[4] = {1, 3, 8, 20};
+        for (int32_t type = 0; type < 4; type++) {
+            fx_reset();
+            mem_save(g_snap);
+            r = fx_run(f, true, {(uint32_t)type, U("arena")});
+            snprintf(m, sizeof m, "GetLapCountFromType(%d, \"arena\"): a clean return", type);
+            fx_check(fx_clean(f, r), m, &r);
+            snprintf(m, sizeof m, "GetLapCountFromType(%d, \"arena\"): %d laps (every row's), not a panic", type, laps[type]);
+            fx_check((int32_t)r.ret == laps[type], m, &r);
+            fx_check(!(o = fx_outside(g_snap, {})), "GetLapCountFromType(\"arena\"): nothing written", &r, o);
+        }
+        for (int32_t type = 0; type < 4; type++) {
+            fx_reset();
+            snprintf(m, sizeof m, "GetLapCountFromType(%d, \"kenyon\") (a stock track)", type);
+            fx_same(f, {(uint32_t)type, U("kenyon")}, m);
+        }
+    }
+
+    // ---- 9. GetTrackDifficulty: a track outside 0..7 ----
+    {
+        const Ent& f = fx_fn("GetTrackDifficulty");
+        for (int32_t t : {8, 12, -1, 0x7fffffff}) {
+            fx_reset();
+            r = fx_run(f, true, {(uint32_t)t});
+            snprintf(m, sizeof m, "GetTrackDifficulty(%d): a clean return, medium (1)", t);
+            fx_check(fx_clean(f, r) && r.ret == 1, m, &r);
+        }
+        for (int32_t t = 0; t < 8; t++) {
+            fx_reset();
+            snprintf(m, sizeof m, "GetTrackDifficulty(%d) (a stock track)", t);
+            fx_same(f, {(uint32_t)t}, m);
         }
     }
     printf("fix tests: %d checks (%d run on both, compared bit for bit), %d failed\n", g_fx_n, g_fx_same_n, g_fx_bad);

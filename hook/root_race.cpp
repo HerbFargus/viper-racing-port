@@ -208,11 +208,15 @@ static const char* __cdecl GetCameraName_c(int32_t v) {
 PORT_FN(0x00406450, "GetCameraName", GetCameraName_c, (fp_xls<k_xl_camera, 12>))
 
 // GetLapCountFromType: the track's row of the laps table (8 tracks), the race type's column; a track not there panics
+// FIX: a track not in the table (an add-on track under a name of its own) panicked "GetLapCountFromType: Can't match";
+// every row of the table holds the same laps (1, 3, 8, 20 for the four race types), so such a track takes the first
+// row's. A race type outside the row's 8 columns still reads as the original did.
 static int32_t __cdecl GetLapCountFromType_c(int32_t type, const char* name) {
     int32_t i = 0;
     for (uint32_t e = S_LAP_TABLE; e < 0x004e47b8; e += 0x24, i++)
         if (ccall<int>(F_stricmp_c, name, UI_GP(const char, e)) == 0)
             return UI_G32(0x004e469c + (uint32_t)(i * 9 + type) * 4u);
+    if (VP_FIX) return UI_G32(0x004e469c + (uint32_t)type * 4u);
     UI_LogPanic(CP(0x004e47fc), name);
     return -1;
 }
@@ -220,9 +224,11 @@ static void fp_GetLapCountFromType(Footprint&, int32_t, const char*) {}
 PORT_FN(0x004065f0, "GetLapCountFromType", GetLapCountFromType_c, fp_GetLapCountFromType)
 
 static int32_t __cdecl GetTrackDifficulty_c(int32_t t) {
-    // FIX CANDIDATE: a track outside 0..7 (the "no track" -1 among them) reads the function's own stack
+    // FIX: a track outside 0..7 (an add-on track's row past the stock 8, or the "no track" -1) read the function's own
+    // stack; it now counts as medium (1)
     int32_t d[8];
     d[0] = 2; d[1] = 2; d[2] = 1; d[3] = 2; d[4] = 1; d[5] = 0; d[6] = 1; d[7] = 0;
+    if (VP_FIX && (uint32_t)t > 7u) return 1;
     return d[t];
 }
 static void fp_GetTrackDifficulty(Footprint& f, int32_t) { f.pure = true; }

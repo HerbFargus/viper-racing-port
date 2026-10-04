@@ -38,7 +38,7 @@
 //
 // FIX CANDIDATEs (left faithful, marked in place: damaged files, stale frames, out-of-range values): TrackViewer::Draw
 // indexes its three difficulty names with what GetTrackDifficulty returns (garbage for a track outside 0..7, the "no
-// track" -1 among them); the constructor clamps a too-big saved track_no but not a negative one; UpdateOpponent reads its
+// track" -1 among them -- FIXED in GetTrackDifficulty, root_race.cpp); the constructor clamps a too-big saved track_no but not a negative one; UpdateOpponent reads its
 // label table with the opponent type unchecked; the details dialogs' static UIDialog keeps its items pointer from the
 // first call (a later call from a different stack depth shows the first frame's memory).
 #include <stdint.h>
@@ -133,8 +133,9 @@ static void __fastcall TrackViewer_Draw_c(TrackViewer* self, Edx, gxCanvas* c) {
     loc[1] = xlate(0x0057b818);
     loc[2] = xlate(0x0057b800);
     loc[3] = xlate(0x0057b888);
-    // FIX CANDIDATE: GetTrackDifficulty's result indexes the three names unchecked (a track outside 0..7 -- none, -1,
-    // among them -- gives garbage from its own stack, then this reads outside the array)
+    // GetTrackDifficulty's result indexes the three names unchecked: a track outside 0..7 (none, -1, among them) gave
+    // garbage from its own stack, read outside the array here. FIX (in GetTrackDifficulty, root_race.cpp): such a
+    // track counts as medium (1).
     const int32_t d = ccall<int32_t>(F_GetTrackDifficulty, (int32_t)self->track);
     const char* diff = loc[1 + d];
     ccall<gxCanvas*>(F_gxSetCanvas, c);
