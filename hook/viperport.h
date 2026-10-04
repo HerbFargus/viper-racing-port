@@ -3,8 +3,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// viperport.log, one timestamped line per call
+// viperport.log, one timestamped line per call (beside the DLL; the second of two copies: <race.exe's folder>\log-2\)
 void logf(const char* fmt, ...);
+
+// viperport.ini [test] two_copies=1 (README, "Testing multiplayer on one PC"), decided when the DLL loads: a second
+// start while a copy runs becomes copy 2, with its own Config-2\ and log-2\ and its window on the right half.
+int vp_copy();                                // 1, or 2 for the second copy (always 1 without the key)
+const char* vp_copy_suffix();                 // "" or "-2": the suffix for copy 2's own folders (Config-2, log-2, ...)
+bool vp_two_copies();                         // the key is set and this process is one of the two copies
 
 // M1 (viperport.cpp, relocate_res_tables): the options, language and open-file tables moved into the DLL, v1.0 only,
 // and their capacities there (stock: 256 options, 8 languages, 32 open files -- each loaded resource set keeps one).

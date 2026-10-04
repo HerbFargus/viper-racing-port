@@ -116,6 +116,7 @@ const Key* key_for(SDL_Scancode sc) {
 // ---- the window --------------------------------------------------------------------------------------
 void clip_cursor(bool on) {                                      // restrict_cursor: the game's picture
     if (!g_window) return;
+    if (vp_two_copies()) on = false;                             // [test] two_copies: the mouse goes between the windows
     SDL_Rect r = {0, 0, 640, 480};                               // DirectDraw: the top-left 640x480
     if (g_view.set) r = {g_view.x0, g_view.y0, g_view.w, g_view.h};
     SDL_SetWindowMouseRect(g_window, on ? &r : 0);
@@ -171,6 +172,41 @@ void SDLCALL raw_message(void*, void*, unsigned int msg, Uint64 wparam, Sint64 l
         if (hooks[i]) hooks[i](msg, (int)wparam, (int)lparam);
 }
 
+// [test] two_copies (viperport.ini; README, "Testing multiplayer on one PC"): both copies are windows side by side on
+// the primary display's usable area (without the taskbar), copy 1 on the left half and copy 2 on the right, each
+// the largest 4:3 or 16:9 picture that fits its half with the window's frame, centred in it. The OpenGL renderer
+// follows the window's size (gl_core.cpp make_target, Hor+ for 16:9) and hands the picture's place back through
+// platform_set_view, which the mouse is mapped by. *w, *h: the picture's size.
+void place_copy_window(SDL_Window* win, int* w, int* h) {
+    SDL_Rect area = {0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    SDL_GetDisplayUsableBounds(0, &area);
+    int top = 0, left = 0, bottom = 0, right = 0;
+    if (SDL_GetWindowBordersSize(win, &top, &left, &bottom, &right) != 0) {
+        RECT r = {0, 0, 640, 480};                               // (SDL can't tell yet: ask Windows for the frame)
+        AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX), FALSE, 0);
+        top = -r.top, left = -r.left, bottom = r.bottom - 480, right = r.right - 640;
+    }
+    const int half = area.w / 2;
+    const int aw = half - left - right, ah = area.h - top - bottom;   // the room for the picture
+    int best_w = 0, best_h = 0;
+    static const int aspect[2][2] = {{4, 3}, {16, 9}};
+    for (const auto& a : aspect) {
+        int cw = aw, ch = aw * a[1] / a[0];
+        if (ch > ah) ch = ah, cw = ah * a[0] / a[1];
+        if (cw > 0 && ch > 0 && cw * ch > best_w * best_h) best_w = cw, best_h = ch;
+    }
+    if (best_w < 320 || best_h < 240) best_w = 640, best_h = 480;   // (a tiny screen: the game's own size)
+    const int x0 = area.x + (vp_copy() == 2 ? half : 0);
+    const int x = x0 + (half - (best_w + left + right)) / 2 + left;
+    const int y = area.y + (area.h - (best_h + top + bottom)) / 2 + top;
+    SDL_SetWindowSize(win, best_w, best_h);
+    SDL_SetWindowPosition(win, x, y);
+    SDL_ShowWindow(win);
+    *w = best_w, *h = best_h;
+    logf("two_copies: copy %d's window %dx%d at (%d, %d), on the %s half of %dx%d at (%d, %d)", vp_copy(), best_w,
+         best_h, x, y, vp_copy() == 2 ? "right" : "left", area.w, area.h, area.x, area.y);
+}
+
 unsigned char __cdecl sdl_create_window(void* instance) {
     *(HWND*)G.prev_foreground = GetForegroundWindow();
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");  // DirectInput had the joystick in background mode
@@ -189,11 +225,18 @@ unsigned char __cdecl sdl_create_window(void* instance) {
     SDL_SetWindowsMessageHook(raw_message, 0);
     const char* title = *(const char**)G.title;
     int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
-    g_window = SDL_CreateWindow(title ? title : "Viper Racing", 0, 0, w, h,
-                                SDL_WINDOW_BORDERLESS | SDL_WINDOW_SHOWN |
-                                // DirectDraw minimised the game when it lost focus, so "on top" was harmless;
-                                // an OpenGL window stays put, and on top it would cover whatever you switch to
-                                (g_gl ? SDL_WINDOW_OPENGL : SDL_WINDOW_ALWAYS_ON_TOP));
+    if (vp_two_copies()) {                                       // [test] two_copies: a window on its half
+        // (the first copy keeps the game's title, which start_unique_instance's FindWindow looks for)
+        g_window = SDL_CreateWindow(vp_copy() == 2 ? "Viper Racing (copy 2)" : title ? title : "Viper Racing", 0, 0,
+                                    640, 480, SDL_WINDOW_HIDDEN | (g_gl ? SDL_WINDOW_OPENGL : 0));
+        if (g_window) place_copy_window(g_window, &w, &h);
+    } else {
+        g_window = SDL_CreateWindow(title ? title : "Viper Racing", 0, 0, w, h,
+                                    SDL_WINDOW_BORDERLESS | SDL_WINDOW_SHOWN |
+                                    // DirectDraw minimised the game when it lost focus, so "on top" was harmless;
+                                    // an OpenGL window stays put, and on top it would cover whatever you switch to
+                                    (g_gl ? SDL_WINDOW_OPENGL : SDL_WINDOW_ALWAYS_ON_TOP));
+    }
     if (!g_window) {
         logf("SDL: can't create the window: %s", SDL_GetError());
         return 0;
@@ -338,7 +381,19 @@ void __cdecl sdl_idle(void) {                                    // Win32Idle
         if (session_play_idle()) return;
     }                                                            // (the recording ran out: the player's, from here)
     session_idle_begin();
-    if (*(uint8_t*)G.inactive) {                                 // switched away: wait to be switched back
+    if (vp_two_copies()) {
+        // [test] two_copies: a copy switched away doesn't wait -- the other copy is the one in front, and a network
+        // game has to keep running in both. What the wait did on the way back happens when the copy is switched back.
+        static bool away;
+        if (*(uint8_t*)G.inactive) away = true;
+        else if (away) {
+            away = false;
+            session_op(SOP_CLEAR_BITS);
+            KeyClearBits();
+            session_op(SOP_RESTORE);
+            gxRestore();
+        }
+    } else if (*(uint8_t*)G.inactive) {                          // switched away: wait to be switched back
         DWORD t0 = GetTickCount();
         if (g_gl) gfx_repaint();                                 // the taskbar's preview: the race, not a menu
         while (*(uint8_t*)G.inactive && SDL_WaitEvent(&e)) handle(e);
@@ -665,6 +720,8 @@ void platform_install(const char* build) {
         logf("platform: joysticks stay on DirectInput in %s (its joystick code isn't v1.0's)", build);
     logf("platform: SDL2 window, keyboard and mouse%s", joy ? ", joystick" : "");
     if (g_gl && !renderer_install()) g_gl = false;               // M2 stage 2: OpenGL in place of DirectDraw
+    if (vp_two_copies() && !g_gl)
+        logf("two_copies: the windows need [platform] renderer=gl -- DirectDraw takes the whole screen for itself");
     if (!g_gl && platform_plans_gl(ini))
         logf("platform: the OpenGL renderer isn't on after all, but the dd.obj rewrites expect it: set [port] "
              "default=original for dd.obj's functions, or fix what the log says above");

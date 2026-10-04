@@ -14,6 +14,7 @@
 //   inputs the fixes are for instead of the scenarios (fix_tests, at the end): the user directory next to a fake
 //   race.exe and its one migration (from the VirtualStore's copies, the real folder, vrmod's relative "Config\"; the
 //   old files untouched; never twice; the 200-character guard), the log's folder and FileVerifyNoOpenFiles,
+//   viperport.ini [test] two_copies' second copy (Config-2 seeded from Config, log-2, the single-instance check),
 //   FileReadLine on CRLF files (against the original), bare-LF and mixed ones (against a model) and exact lengths, and
 //   the open-file table as M1 moves it: 300 files through the rewrites (256 open at once, the 257th panics, every
 //   byte read back), the originals on the moved table (127 slots, then reuse, then their panic; their footprints
@@ -2369,6 +2370,88 @@ static void fix_file_table_tests() {
     g_granges[sizeof g_granges / sizeof *g_granges - 1] = {0, 0, "the open-file table, moved"};
 }
 
+// viperport.ini [test] two_copies=1 (fix_paths.h; viperport.cpp decides it at load): the second copy's user directory
+// <game>\Config-2\, seeded from <game>\Config\ first (else the usual old ones), once; its log in <game>\log-2\; and the
+// single-instance check, which lets a copy holding a slot start beside the running one and is the original's without
+static void fix_two_copies_tests() {
+    const auto copy2 = [](bool on) {
+        vp_g_two_copies = on;
+        vp_g_copy = on ? 2 : 1;
+        vp_g_copy_suffix = on ? "-2" : "";
+    };
+    // 1. Config\ and an old VirtualStore folder there: Config-2\ is Config\'s copy; neither is touched; then once only
+    {
+        fix_begin();
+        copy2(true);
+        const std::string game = g_fx + "game\\", cfg1 = game + "Config\\", cfg2 = game + "Config-2\\";
+        const std::string vs1 = g_fx + "appdata\\VirtualStore\\Program Files\\MGI\\Viper98\\";
+        make_old(cfg1, "copy1");
+        make_old(vs1, "vs1");
+        const auto before1 = tree(cfg1, true), before_vs = tree(vs1, true);
+        FIX_CHECK(user_dir_with(k_stock_dir) == 1 && ud() == cfg2, "(copy 2): the user directory is %s, not %s", ud().c_str(),
+                  cfg2.c_str());
+        FIX_CHECK(tree(cfg2) == tree(cfg1), "(copy 2): Config-2 isn't Config's copy:\n    new:\n%s    Config:\n%s",
+                  join(tree(cfg2)).c_str(), join(tree(cfg1)).c_str());
+        FIX_CHECK(tree(cfg1, true) == before1 && tree(vs1, true) == before_vs, "(copy 2): an old user directory changed");
+        FIX_CHECK(logged("fix: user directory " + cfg2 + " (copied 6 files from " + cfg1 + ")"), "(copy 2) logged: %s",
+                  g_logf_text.c_str());
+        put_abs(cfg1 + "later.txt", "x");
+        FIX_CHECK(user_dir_with(k_stock_dir) == 1 && ud() == cfg2 && !is_file(cfg2 + "later.txt"),
+                  "(copy 2, second run): the user directory is %s, or copied again", ud().c_str());
+        FIX_CHECK(logged("fix: user directory " + cfg2 + " (already there)"), "(copy 2, second run) logged: %s", g_logf_text.c_str());
+        copy2(false);                                  // copy 1 beside it: Config\, as always
+        FIX_CHECK(user_dir_with(k_stock_dir) == 1 && ud() == cfg1, "(copy 1): the user directory is %s", ud().c_str());
+        fix_end();
+    }
+    // 2. no Config\ yet: the usual old user directory seeds Config-2\ (and Config\ isn't made)
+    {
+        fix_begin();
+        copy2(true);
+        const std::string game = g_fx + "game\\", cfg2 = game + "Config-2\\";
+        const std::string vs1 = g_fx + "appdata\\VirtualStore\\Program Files\\MGI\\Viper98\\";
+        make_old(vs1, "vs1");
+        FIX_CHECK(user_dir_with(k_stock_dir) == 1 && ud() == cfg2, "(copy 2, no Config): the user directory is %s", ud().c_str());
+        FIX_CHECK(tree(cfg2) == tree(vs1) && !is_dir(game + "Config"), "(copy 2, no Config): not the VirtualStore's copy");
+        FIX_CHECK(logged("(copied 6 files from " + vs1 + ")"), "(copy 2, no Config) logged: %s", g_logf_text.c_str());
+        copy2(false);
+        fix_end();
+    }
+    // 3. the log: <game>\log-2\log.log, the folder made; FileVerifyNoOpenFiles still skips it
+    {
+        fix_begin();
+        copy2(true);
+        const std::string path = g_fx + "game\\log-2\\log.log";
+        FIX_CHECK(log_file_begin_rw() == 1, "(copy 2) log_file_begin failed");
+        const int f = g_log_file;
+        FIX_CHECK(f > 0 && is_file(path) && path == file_at(m1_operand(0x00411583), f - 1)->name, "(copy 2) the log isn't %s",
+                  path.c_str());
+        FIX_CHECK(!is_dir(g_fx + "game\\log"), "(copy 2) log\\ was made");
+        g_texts.clear();
+        FileVerifyNoOpenFiles_rw();
+        FIX_CHECK(g_texts.empty(), "(copy 2) FileVerifyNoOpenFiles reported: %s", g_texts.c_str());
+        copy2(false);
+        fix_end();
+    }
+    // 4. the single-instance check with the semaphore already there: a copy holding a slot starts (no FindWindow), one
+    //    without is refused as always (the running copy's window found and restored)
+    for (int on = 0; on < 2; on++) {
+        fix_begin();
+        copy2(on != 0);
+        g_si = 0;
+        g_script[0] = 1;                               // CreateSemaphoreA: a handle, ERROR_ALREADY_EXISTS
+        g_script[1] = 1;                               // FindWindowA: a window
+        g_script[2] = 1;                               // ShowWindow
+        const size_t a0 = g_api.size();
+        const uint8_t r = start_unique_instance_rw();
+        int finds = 0;
+        for (size_t i = a0; i < g_api.size(); i++) finds += g_api[i].kind == L_FindWindowA;
+        if (on) FIX_CHECK(r == 1 && finds == 0, "(two copies) start_unique_instance returned %d, %d FindWindow calls", r, finds);
+        else FIX_CHECK(r == 0 && finds == 1, "(one copy) start_unique_instance returned %d, %d FindWindow calls", r, finds);
+        copy2(false);
+        fix_end();
+    }
+}
+
 static int fix_tests() {
     g_logf_quiet = true;
     GetTempPathA(MAX_PATH, g_tmp);
@@ -2377,6 +2460,9 @@ static int fix_tests() {
     const int c0 = g_fix_checks, b0 = g_fix_bad;
     fix_log_tests();
     printf("fix build: the log: %d checks, %d failed\n", g_fix_checks - c0, g_fix_bad - b0);
+    const int c3 = g_fix_checks, b3 = g_fix_bad;
+    fix_two_copies_tests();
+    printf("fix build: [test] two_copies: %d checks, %d failed\n", g_fix_checks - c3, g_fix_bad - b3);
     const int c1 = g_fix_checks, b1 = g_fix_bad;
     fix_read_line_tests();
     printf("fix build: FileReadLine: %d checks, %d failed\n", g_fix_checks - c1, g_fix_bad - b1);

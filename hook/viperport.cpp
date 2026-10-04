@@ -25,6 +25,7 @@
 #include "viperport.h"
 #include "port.h"
 #include "session.h"
+#include "fix_paths.h"
 
 // ---- the one export, forwarded ---------------------------------------------------------------------
 typedef HRESULT(WINAPI* DirectInputCreateA_t)(HINSTANCE, DWORD, void**, void*);
@@ -50,6 +51,58 @@ void logf(const char* fmt, ...) {
     fprintf(g_log, "%02d:%02d:%02d.%03d  ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
     va_list ap; va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap);
     fputc('\n', g_log); fflush(g_log);
+}
+
+// ---- [test] two_copies: two copies of the game on one PC ------------------------------------------------
+// viperport.ini `[test] two_copies=1` (README, "Testing multiplayer on one PC"). Decided here, when the DLL loads,
+// before any game code: two named mutexes are the two copies' slots, held for the life of the process. The first free
+// one is this copy: slot 1 is copy 1 -- the game's folders, unchanged --, slot 2 is copy 2, with <race.exe's
+// folder>\Config-2\ and log-2\ (fix_paths.h) and its window on the right half (platform.cpp). Holding a slot lets the
+// game's single-instance check pass (krn_file.cpp, start_unique_instance). A third start finds both taken and is the
+// game's own: the check refuses it as always. Without the key nothing here runs.
+static HANDLE g_copy_slot;
+static const char* g_copy_note = "";
+int vp_copy() { return vp_g_copy; }
+const char* vp_copy_suffix() { return vp_g_copy_suffix; }
+bool vp_two_copies() { return vp_g_two_copies; }
+
+static void decide_copy(const char* ini) {
+    if (!GetPrivateProfileIntA("test", "two_copies", 0, ini)) return;
+    for (int c = 1; c <= 2; c++) {
+        HANDLE h = CreateMutexA(0, FALSE, c == 1 ? "viperport two_copies 1" : "viperport two_copies 2");
+        if (!h) continue;
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            CloseHandle(h);
+            continue;
+        }
+        g_copy_slot = h;
+        vp_g_two_copies = true;
+        vp_g_copy = c;
+        vp_g_copy_suffix = c == 2 ? "-2" : "";
+        g_copy_note = c == 2 ? "two_copies: this is copy 2 (Config-2\\, log-2\\, the right half of the screen)"
+                             : "two_copies: this is copy 1 (Config\\, log\\, the left half of the screen)";
+        return;
+    }
+    g_copy_note = "two_copies: two copies already run; this start is the game's own (its single-instance check decides)";
+}
+
+// the DLL's own log: viperport.log beside the DLL; copy 2's in <race.exe's folder>\log-2\ (made)
+static FILE* open_dll_log() {
+    char path[MAX_PATH];
+    if (vp_g_copy == 2) {
+        const DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+        char* slash = n && n < MAX_PATH ? strrchr(path, '\\') : 0;
+        if (slash && (size_t)(slash + 1 - path) + 20 < MAX_PATH) {
+            lstrcpyA(slash + 1, "log-2");
+            CreateDirectoryA(path, 0);
+            lstrcatA(path, "\\viperport.log");
+            if (FILE* f = fopen(path, "w")) return f;
+        }
+    }
+    GetModuleFileNameA(g_self, path, MAX_PATH);
+    char* slash = strrchr(path, '\\');
+    lstrcpyA(slash ? slash + 1 : path, "viperport.log");
+    return fopen(path, "w");
 }
 
 // ---- which engine build ------------------------------------------------------------------------------
@@ -688,12 +741,14 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = inst;
         DisableThreadLibraryCalls(inst);
-        char path[MAX_PATH];
-        GetModuleFileNameA(inst, path, MAX_PATH);
-        char* slash = strrchr(path, '\\');
-        lstrcpyA(slash ? slash + 1 : path, "viperport.log");
-        g_log = fopen(path, "w");
+        char ini[MAX_PATH];                     // viperport.ini, beside this DLL: [test] two_copies, before the log
+        GetModuleFileNameA(inst, ini, MAX_PATH);
+        char* slash = strrchr(ini, '\\');
+        lstrcpyA(slash ? slash + 1 : ini, "viperport.ini");
+        decide_copy(ini);
+        g_log = open_dll_log();
         logf("viperport loaded (M1: object limits, texture limit + table, options + language + open-file tables; M3: rewritten functions, race recorder)");
+        if (*g_copy_note) logf("%s", g_copy_note);
         install();
     } else if (reason == DLL_PROCESS_DETACH) {
         logf("exit: new Obstacle::Update ran %ld times, woke obstacles %ld times, put them to sleep %ld times",

@@ -39,6 +39,7 @@ enum : uint8_t {
     SOP_RESTORE,             //                            gxRestore
     SOP_SCAN,                // u8 n, n x u8 DIK codes     ScanUpdate: the keys held (DirectInput codes)
     SOP_QUIT,                //                            the window closed: ExitProcess
+    SOP_NET,                 //                            a winsock reply (WSAAsyncGetHostByName's message): net_wsock.cpp
 };
 void session_idle_begin();
 void session_op(uint8_t op, const void* p = 0, uint8_t n = 0);
@@ -75,9 +76,44 @@ enum : uint8_t {
     SG_CLEAR,                // a viewport clear
     SG_TRANSFORM,            // TransformVertices (the game's input vertices)
     SG_DRAW,                 // a DrawPrimitive / DrawIndexedPrimitive
+    SG_NET_SEND,             // a sendto (session.cpp, from net_wsock.cpp): its socket, destination and bytes
 };
 void session_gfx(uint8_t kind, const void* a, size_t na, const void* b = 0, size_t nb = 0, const void* c = 0, size_t nc = 0);
 void session_gfx_state(uint32_t what, const void* p, size_t n);
 void session_gfx_page(const uint16_t* page, int w, int h);
 void session_frame();
 uint64_t session_hash(const void* p, size_t n, uint64_t h = 1469598103934665603ull);
+
+// ---- the network (net_wsock.cpp; multiplayer stage N0) ------------------------------------------------------------------
+// What the game reads from winsock, recorded per thread (the main thread, the lobby task, the physics thread) as records
+// of these ops, and fed back on the same thread's channel in a replay, which makes no real socket call.
+enum : uint8_t {
+    NOP_STARTUP = 1, NOP_CLEANUP, NOP_SOCKET, NOP_BIND, NOP_SETSOCKOPT, NOP_IOCTL, NOP_GETSOCKOPT, NOP_CLOSE,
+    NOP_RECVFROM, NOP_LASTERROR, NOP_HOSTNAME, NOP_HOSTBYNAME, NOP_INET_ADDR, NOP_ASYNC_HOST, NOP_ASYNC_CANCEL,
+    NOP_ASYNC_REPLY, NOP_SENDTO, NOP_CLOCK, NOP_RANDOM,
+    NOP_PARK,                // the lobby task, running free (its lockstep dropped), suspends here: its channel resyncs
+    NOP_QPC,                 // the physics thread's clock (QueryPerformanceCounter) in a network race's physics task
+};
+bool session_net_live();                       // the real winsock is called (no session, or recording)
+bool session_net_recording();
+bool session_net_main();                       // on the session's main thread
+bool session_net_lobby();                      // on the lobby task's thread
+// a replay: the next record of `op` on this thread's channel (false: none -- the caller makes up a failure)
+bool session_net_take(uint8_t op, const uint8_t** p, uint32_t* n);
+void session_net_put(uint8_t op, const void* p, size_t n);        // recording: a value read
+// a sendto: recorded (role = the socket's creation order), or compared with the recording's; hashed into the frame.
+// Returns what the game gets back: live_ret, or (a replay) the recording's
+int session_net_sent(uint8_t role, const void* to, int tolen, const void* buf, int len, int live_ret);
+void session_net_async_event();                // recording: a winsock reply just arrived (an op of this Win32Idle)
+void net_session_report();
+// the lobby task (LiveMultiInfo::thread) in lockstep: its two sleeps and two self-suspensions, and Grab / Release
+void session_lobby_sleep(int ms, void(__cdecl* real)(int));
+void session_lobby_suspend_me(void(__cdecl* real)(void));
+void session_lobby_grab(void* lmi, bool after);
+void session_lobby_release(void* lmi, bool after);
+// the physics task's entries in a network race (replay.cpp: PhysTaskBegin / Update / Restart / End, on the physics
+// thread): between on and off every clock read there (QueryPerformanceCounter -- PTimeNow: TimerConditioner::GetTicks'
+// resync base, PhysicsDeviation, PhysReplayAddEvent, the multiplayer code's) is recorded on the physics channel / fed
+bool session_phys_clock(bool on);                 // returns the previous state, for
+void session_phys_clock_restore(bool was);         // a nested entry (a restart from inside an update)
+bool session_phys_clock_on();                  // (net_wsock.cpp: this thread's PTimeNow is already the session's)

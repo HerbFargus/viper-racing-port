@@ -69,7 +69,37 @@
 //     physics doesn't come -- it's dropped for the rest of that race and logged (a 'K' record, so the replay drops it at
 //     the same point): its frames aren't compared, its reads are fed by Win32Idle call (tolerant), and at its end the
 //     stream skips to the recording's end of the race and comparing starts again.
-// Not covered: the network (the multiplayer screens read sockets; a network race can't be gated either).
+//
+// THE NETWORK (multiplayer stage N0; net_wsock.cpp): the game's 18 wsock32 imports go through net_wsock.cpp, and every
+// value the game reads from them -- recvfrom (its return, the bytes, the sender's address), WSAGetLastError,
+// gethostname, gethostbyname (the hostent), inet_addr, getsockopt, socket / bind / setsockopt / ioctlsocket /
+// closesocket / WSAStartup / WSACleanup's results, WSAAsyncGetHostByName's handle and its reply (a window message,
+// recorded as an op of the Win32Idle call it arrives in) -- is a record ('C') on the channel of the thread that read
+// it: the main thread (menus, MultiFGTick), the lobby task (LiveMultiInfo::thread) or the physics thread (MultiBGRecv
+// / MultiBGSend). So are the clock (PTimeNow) and random numbers the multiplayer code reads off the main thread. Each
+// channel is fed in its own order; a replay makes no real socket call at all. Every sendto is an output: its socket
+// (by creation order), destination, length and a hash of its bytes are stored on the channel, compared by the replay
+// ("the 3rd send on the lobby task differs ...") and hashed into the frame as an event ("network send").
+// Threads, in lockstep like the race's physics:
+//   * the lobby task ticks (SessionMgr / client / server) every 250 ms on its own thread. It is gated where it sleeps
+//     and where it wakes from a suspension: a step (from leaving one gate to the next) runs only when let, and whoever
+//     lets it waits for it. The main thread lets one at a Win32Idle once it has waited 250 ms ('Y' records, before
+//     that call's 'I'; a replay lets the same steps run at the same calls). LiveMultiInfo::Grab (main or physics
+//     thread) suspends it at once instead of polling for up to 3 s with Win32Idle; Release lets its first step (the
+//     tick right after waking) run at once. A request to suspend or end the task always lets it go on.
+//     If the lobby waits 5 s at a gate (a main-thread stall) its lockstep is dropped ('Y' 0xff, at the next
+//     Win32Idle; the replay drops it there): it runs free, the frames aren't compared, until the next Grab parks it.
+//   * a network race runs in lockstep like any other (the physics' network reads happen inside its granted updates);
+//     the 3 s rule drops it as before. The live peer keeps sending while one side is stalled: its packets wait in the
+//     socket's buffer and are read (and recorded) when the physics next runs, so a replay is unaffected.
+//     In a network race the physics task's own clock reads are recorded on the physics channel too ('C' NOP_QPC, in
+//     replay.cpp's PhysTaskBegin / Update / Restart / End, session_phys_clock): TimerConditioner::GetTicks' resync
+//     base (which ConvertPTimeToPhysicsTime converts the packets' times against), PhysicsDeviation (which gates
+//     RaceClient::SendAll), PhysReplayAddEvent, the multiplayer code's PTimeNow. A single-player race has none (the
+//     race recorder feeds its ticks), so its recording is as before.
+//   * a send is compared without the bytes the game never writes (stack garbage, by packet kind: net_send_mask in
+//     net_wsock.cpp); its record keeps the compared bytes, so a replay names the bytes that differ.
+// A session with no winsock call (a single-player run) has none of these records.
 //
 // Shadow checks can run alongside: what a check's rewrite pass reads or draws is never really read or drawn, so it goes
 // past the session (live, unrecorded, unhashed); the original's pass is the game's own.
@@ -84,6 +114,7 @@
 #include "viperport.h"
 #include "port.h"
 #include "session.h"
+#include "net_wsock.h"
 #ifndef SESSION_TEST
 #include "SDL.h"
 SDL_Window* platform_window();
@@ -101,7 +132,12 @@ enum : uint8_t {
     K_IDLE = 'I', K_ACTIVE = 'A', K_FRAME = 'F', K_RACE_BEGIN = 'B', K_RACE_END = 'E', K_END = 'X',
     K_LOST = 'K',                                                     // the race's lockstep was dropped here
     K_INFO = 'G',                                                     // the window's size: not a read
+    K_NET = 'C',                                                      // a network read or send: u8 channel, u8 op, data
+    K_LOBBY = 'Y',                                                    // the lobby steps let run at this Win32Idle (0xff: dropped)
+    K_NET_ASYNC = 'V',                                                // an async winsock reply outside a Win32Idle
 };
+enum { CH_MAIN, CH_LOBBY, CH_PHYS, CH_N };                            // the network's channels, by thread
+const char* const CH_NAME[CH_N] = {"the main thread", "the lobby task", "the physics thread"};
 
 const char* kind_name(uint8_t k) {
     switch (k) {
@@ -122,6 +158,9 @@ const char* kind_name(uint8_t k) {
     case K_RACE_BEGIN: return "a race's start";
     case K_RACE_END: return "a race's end";
     case K_END: return "the end of the recording";
+    case K_NET: return "a network read";
+    case K_LOBBY: return "a lobby step (the multiplayer task)";
+    case K_NET_ASYNC: return "a winsock reply";
     }
     return "?";
 }
@@ -155,10 +194,11 @@ enum { MAX_EVENTS = 4096 };                                        // event hash
 
 const char* const PART_NAME[SP_N] = {"the 2D page", "the surfaces (textures, offscreen images)",
                                      "the 3D state (render states, matrices, viewports, materials)",
-                                     "the 3D work (draws, clears, transforms)"};
+                                     "the 3D work (draws, clears, transforms) and the network sends"};
 const char* event_name(uint32_t k) {
     static const char* const n[] = {"?", "2D page (Unlock)", "surface made", "surface written (Unlock)", "blit",
-                                    "texture load", "colour key", "display mode", "clear", "TransformVertices", "draw"};
+                                    "texture load", "colour key", "display mode", "clear", "TransformVertices", "draw",
+                                    "network send (sendto)"};
     return k < sizeof n / sizeof n[0] ? n[k] : "?";
 }
 uint8_t part_of(uint8_t kind) {
@@ -167,7 +207,7 @@ uint8_t part_of(uint8_t kind) {
     case SG_SURFACE: case SG_UNLOCK: case SG_BLIT: case SG_TEXLOAD: case SG_KEY: return SP_SURFACES;
     case SG_MODE: return SP_STATE;
     }
-    return SP_DRAWS;
+    return SP_DRAWS;                                                  // (the draws, and the network sends)
 }
 
 // ---- state ---------------------------------------------------------------------------------------------------------------
@@ -227,6 +267,32 @@ uint32_t g_last_tgt;
 // the session's thread -- and not a shadow check's rewrite pass (port.h), whose reads are never really made: they go
 // live, unrecorded, so a recording with shadow checks on holds only what the game really read
 inline bool on_main() { return GetCurrentThreadId() == g_main && shadow_com_phase() != 2; }
+
+// the network (net_wsock.cpp): the stream is written from the lobby and physics threads too (while the main thread
+// waits for them, in lockstep -- or not, once a lockstep is dropped), so writing takes a lock
+CRITICAL_SECTION g_put_cs;
+bool g_put_cs_ok;
+std::vector<uint32_t> g_ch[CH_N];               // play: each channel's records (indexes into g_recs)
+size_t g_ch_at[CH_N];
+bool g_ch_parted[CH_N];
+unsigned long g_ch_fed[CH_N], g_ch_short[CH_N], g_ch_skipped[CH_N], g_ch_recorded[CH_N];
+unsigned long g_sends, g_sends_differ, g_sends_hashed;
+bool g_net_seen;                                // record: any network record written
+
+// the lobby task's lockstep (see THE NETWORK above)
+enum { LB_NONE, LB_RUNNING, LB_SLEEP, LB_RESUME, LB_SUSPENDING };
+volatile LONG g_lb_state;                       // where the lobby's thread is
+volatile LONG g_lb_task;                        // its task id (LiveMultiInfo +0x30), once it came to a gate
+volatile DWORD g_lb_tid;                        // its thread
+volatile LONG g_lb_on;                          // its steps are let run at main-thread points
+volatile LONG g_lb_lost;                        // record: it gave up waiting (its thread); noted at the next Win32Idle
+volatile LONG g_lb_free;                        // dropped and not yet parked again: frames aren't compared
+volatile LONG g_lb_grants, g_lb_left;           // steps let run; gates left
+volatile DWORD g_lb_arrived;                    // when it came to its gate (GetTickCount)
+HANDLE g_ev_lb_grant, g_ev_lb_park;
+unsigned long g_lb_steps, g_lb_implied, g_lb_drops, g_lb_free_frames;
+// a lobby step or physics update the main thread is waiting for: its sends are hashed into the frame
+__declspec(thread) bool t_stepping;
 
 // ---- hashing -------------------------------------------------------------------------------------------------------------
 inline uint64_t mix(uint64_t h, uint64_t v) {
@@ -293,17 +359,21 @@ bool load_file(const char* path, std::vector<uint8_t>& out) {
 // ---- the stream: writing (record) ------------------------------------------------------------------------------------------
 void put(uint8_t kind, const void* p, size_t n) {
     if (!g_stream) return;
+    if (g_put_cs_ok) EnterCriticalSection(&g_put_cs);
     uint32_t len = (uint32_t)n;
     fputc(kind, g_stream);
     fwrite(&len, 4, 1, g_stream);
     if (n) fwrite(p, 1, n, g_stream);
     g_records++;
+    if (g_put_cs_ok) LeaveCriticalSection(&g_put_cs);
 }
 
 // ---- the stream: reading (play) ----------------------------------------------------------------------------------------------
 void end_of_recording(const char* why);
 void lose(const char* why);
 void apply_idle(const Rec& r);
+void lobby_play(uint8_t v);
+void frame_lobby_free();
 
 bool index_stream() {
     if (g_in.size() < sizeof(StreamHeader) || memcmp(g_in.data(), "VPSS", 4)) return false;
@@ -314,6 +384,7 @@ bool index_stream() {
         memcpy(&r.len, &g_in[at + 1], 4);
         r.off = (uint32_t)(at + 5);
         if (r.off + (size_t)r.len > g_in.size()) break;               // cut short (a crash): what's whole is kept
+        if (r.kind == K_NET && r.len >= 2 && g_in[r.off] < CH_N) g_ch[g_in[r.off]].push_back((uint32_t)g_recs.size());
         g_recs.push_back(r);
         at = r.off + r.len;
     }
@@ -327,13 +398,15 @@ void apply_active(const Rec& r) {
     if (r.len >= 1) platform_session_apply(SOP_ACTIVE, payload(r), 1);
 }
 
-// past the records already taken and what's no read (the window's size); a switch away or back is applied on the way.
-// Tolerant, a frame's end is passed too (only strict reading checks them).
+// past the records already taken and what's no read (the window's size, the network's records, which their channels
+// take); a switch away or back, and a winsock reply outside a Win32Idle, are applied on the way. Tolerant, a frame's
+// end is passed too (only strict reading checks them).
 void settle() {
     while (g_ri < g_recs.size()) {
         const Rec& r = g_recs[g_ri];
-        if (g_used[g_ri] || r.kind == K_INFO || (g_tolerant && r.kind == K_FRAME)) { g_ri++; continue; }
+        if (g_used[g_ri] || r.kind == K_INFO || r.kind == K_NET || (g_tolerant && r.kind == K_FRAME)) { g_ri++; continue; }
         if (r.kind == K_ACTIVE) { apply_active(r); g_used[g_ri++] = 1; continue; }
+        if (r.kind == K_NET_ASYNC) { g_used[g_ri++] = 1; net_play_async(); continue; }
         break;
     }
 }
@@ -346,6 +419,8 @@ void pass_to(size_t to, bool race_end = false) {
         if (g_used[g_ri]) continue;
         const Rec& r = g_recs[g_ri];
         if (r.kind == K_ACTIVE) apply_active(r);
+        else if (r.kind == K_NET_ASYNC) net_play_async();
+        else if (r.kind == K_LOBBY && r.len >= 1) lobby_play(payload(r)[0]);   // (the lobby keeps its steps)
         else if (is_value(r.kind)) g_left_over++, count_kind(g_lo_kind, g_lo_first, r.kind, g_frame);
         else if (r.kind == K_IDLE && race_end) {
             const uint8_t* p = payload(r);                            // events that never reached the replay
@@ -469,8 +544,36 @@ void align_clocks() {
     }
 }
 
+// the physics thread's clock in a network race's physics task (session_phys_clock): its own channel
+bool net_take(uint8_t op, const uint8_t** p, uint32_t* n);
+void net_put(uint8_t op, const void* p, size_t n);
+volatile LONG g_net_race;                       // a network race of a session: its physics task's clock is recorded
+__declspec(thread) bool t_phys_clock;           // this thread is in that physics task (replay.cpp's entries)
+unsigned long g_phys_clock_reads, g_phys_clock_short;
+
 BOOL WINAPI h_QPC(LARGE_INTEGER* p) {
     const int mode = g_session_mode;
+    if (t_phys_clock && GetCurrentThreadId() != g_main) {
+        QpcRec r;
+        g_phys_clock_reads++;
+        if (mode == SESSION_PLAY || mode == SESSION_ENDED) {
+            const uint8_t* q;
+            uint32_t n;
+            if (net_take(NOP_QPC, &q, &n) && n == sizeof r) {
+                memcpy(&r, q, sizeof r);
+                p->QuadPart = r.v;
+                return r.ok;
+            }
+            g_phys_clock_short++;
+            BOOL ok = o_QPC(p);                                       // (the recording has none here: the live one)
+            if (ok && g_have_qpc_off) p->QuadPart += g_qpc_off;
+            return ok;
+        }
+        BOOL ok = o_QPC(p);
+        r.v = p->QuadPart, r.ok = ok;
+        net_put(NOP_QPC, &r, sizeof r);
+        return ok;
+    }
     if (!on_main()) {
         BOOL ok = o_QPC(p);
         if (ok && mode != SESSION_RECORD && g_have_qpc_off) p->QuadPart += g_qpc_off;
@@ -538,6 +641,8 @@ void end_of_recording(const char* why) {
     if (g_session_mode != SESSION_PLAY) return;
     align_clocks();                                                   // the player's clocks carry on from the recording's
     g_session_mode = SESSION_ENDED;
+    InterlockedExchange(&g_lb_on, 0);                                 // nobody lets the lobby's steps run from here
+    if (g_ev_lb_grant) SetEvent(g_ev_lb_grant);
     logf("session: %s at frame %u (%.3f s in) -- the player has control from here", why, g_frame, game_ms() / 1000.0);
 }
 
@@ -548,7 +653,8 @@ void apply_idle(const Rec& r) {
         uint8_t op = p[i], n = p[i + 1];
         if (i + 2 + n > r.len) break;
         if (op != SOP_SCAN) g_events++;
-        platform_session_apply(op, p + i + 2, n);
+        if (op == SOP_NET) net_play_async();                          // a winsock reply (net_wsock.cpp)
+        else platform_session_apply(op, p + i + 2, n);
         i += 2 + n;
     }
     g_idles++;
@@ -557,6 +663,7 @@ void apply_idle(const Rec& r) {
 // ---- lockstep: the race's physics updates at the main thread's sync points ---------------------------------------------
 #ifdef SESSION_TEST
 volatile int32_t* g_phys_state_ptr;                  // the harness's
+bool g_test_network_race;
 #define PHYS_STATE (*g_phys_state_ptr)
 #else
 #define PHYS_STATE (*(volatile int32_t*)0x004ecf88)  // physics.obj's task state: 3 and 6 run an update each tick
@@ -681,6 +788,323 @@ bool play_idle_tolerant() {
     return true;
 }
 
+// ---- the lobby task's lockstep (LiveMultiInfo::thread; net_wsock.cpp patches its sleeps and suspensions here) -----------
+// task.obj's table (krn_core.cpp): 8 tasks of 0x1c bytes, ids 1-based
+#pragma pack(push, 1)
+struct TaskInfo {
+    const char* name;
+    uint32_t thread_id;
+    int32_t period;
+    HANDLE handle;
+    int32_t parent, _14;
+    uint8_t suspend_req, kill, flags, _1b;     // flags: 1 suspended, 2 dead
+};
+#pragma pack(pop)
+static_assert(sizeof(TaskInfo) == 0x1c, "TaskInfo");
+#ifdef SESSION_TEST
+TaskInfo* g_test_tasks;                                  // the harness's table, LiveMultiInfo pointer and TaskSuspend
+uint8_t* volatile* g_test_lmi;
+void(__cdecl* g_test_task_suspend)(int);
+#define TASKS g_test_tasks
+#define LMI_NOW (*g_test_lmi)
+#define TASK_SUSPEND g_test_task_suspend
+#else
+#define TASKS ((TaskInfo*)0x00508668)
+#define LMI_NOW (*(uint8_t* volatile*)0x0057d1f4)        // LiveMultiInfo's instance
+#define TASK_SUSPEND ((void(__cdecl*)(int))0x00414d00)
+#endif
+enum { LMI_TASK = 0x30 };                                // LiveMultiInfo: its task's id
+
+inline bool lobby_gating() { return g_session_mode == SESSION_RECORD || g_session_mode == SESSION_PLAY; }
+volatile TaskInfo* task_info(LONG id) { return id >= 1 && id <= 8 ? &TASKS[id - 1] : 0; }
+int lmi_task(const void* lmi) { return lmi ? *(const int32_t*)((const uint8_t*)lmi + LMI_TASK) : 0; }
+bool task_gone(const volatile TaskInfo* t) {
+    return !t || !t->name || (t->flags & 2) || (t->handle && WaitForSingleObject(t->handle, 0) == WAIT_OBJECT_0);
+}
+// really suspended (TaskSuspendMe sets the flag just before SuspendThread): its suspend count, looked at and put back
+bool task_suspended(const volatile TaskInfo* t) {
+    if (!t || !(t->flags & 1) || !t->handle) return false;
+    const DWORD c = SuspendThread(t->handle);
+    if (c == (DWORD)-1) return false;
+    ResumeThread(t->handle);
+    return c >= 1;
+}
+
+enum Leave { LV_GRANT, LV_SUSPEND, LV_KILL, LV_FREE };
+// the lobby's thread at a gate: wait until a step is let run, or the task is asked to suspend or end (whoever asks
+// waits for it), or its lockstep is dropped (record: after 5 s; it then runs free)
+Leave lobby_wait(LONG where) {
+    volatile TaskInfo* t = task_info(g_lb_task);
+    t_stepping = false;
+    g_lb_arrived = GetTickCount();
+    InterlockedExchange(&g_lb_state, where);
+    SetEvent(g_ev_lb_park);
+    const DWORD limit = g_session_mode == SESSION_RECORD ? 5000 : 60000;
+    Leave r;
+    for (;;) {
+        const LONG g = g_lb_grants;
+        if (g > 0 && InterlockedCompareExchange(&g_lb_grants, g - 1, g) == g) { r = LV_GRANT; break; }
+        if (t && t->kill) { r = LV_KILL; break; }
+        if (t && t->suspend_req) { r = LV_SUSPEND; break; }
+        if (!g_lb_on) { r = LV_FREE; break; }
+        if (GetTickCount() - g_lb_arrived > limit) {
+            InterlockedExchange(&g_lb_on, 0);
+            if (g_session_mode == SESSION_RECORD) InterlockedExchange(&g_lb_lost, 1);
+            r = LV_FREE;
+            break;
+        }
+        WaitForSingleObject(g_ev_lb_grant, 2);
+    }
+    InterlockedExchange(&g_lb_state, LB_RUNNING);
+    t_stepping = r != LV_FREE;
+    InterlockedIncrement(&g_lb_left);
+    SetEvent(g_ev_lb_park);
+    return r;
+}
+
+// the lobby's thread: who it is (its LiveMultiInfo's task); a new lobby starts in lockstep
+void lobby_note_self() {
+    const DWORD me = GetCurrentThreadId();
+    if (g_lb_tid == me) return;
+    uint8_t* lmi = LMI_NOW;
+    const int id = lmi_task(lmi);
+    volatile TaskInfo* t = task_info(id);
+    if (!t || t->thread_id != me) return;
+    InterlockedExchange(&g_lb_state, LB_RUNNING);
+    InterlockedExchange(&g_lb_task, id);
+    g_lb_tid = me;
+    InterlockedExchange(&g_lb_grants, 0);
+    InterlockedExchange(&g_lb_free, 0);
+    InterlockedExchange(&g_lb_on, lobby_gating() ? 1 : 0);
+}
+
+// another thread: wait until the lobby `id` is parked -- at a gate, really suspended, or gone. -1: it didn't in time
+LONG lobby_park(int id, DWORD limit) {
+    const DWORD t0 = GetTickCount();
+    for (;;) {
+        volatile TaskInfo* t = task_info(id);
+        if (task_gone(t)) return LB_NONE;
+        if (g_lb_task == id) {
+            const LONG s = g_lb_state;
+            if (s == LB_SLEEP || s == LB_RESUME) return s;
+            if (s == LB_SUSPENDING && task_suspended(t)) return s;
+        }
+        if (GetTickCount() - t0 > limit) return -1;
+        WaitForSingleObject(g_ev_lb_park, 2);
+    }
+}
+
+// another thread: let the parked lobby take one step and wait until it's parked again
+bool lobby_step(int id, bool implied, DWORD limit) {
+    const LONG left0 = g_lb_left;
+    InterlockedIncrement(&g_lb_grants);
+    SetEvent(g_ev_lb_grant);
+    const DWORD t0 = GetTickCount();
+    while (g_lb_left == left0) {
+        if (GetTickCount() - t0 > limit || !g_lb_on) { InterlockedExchange(&g_lb_grants, 0); return false; }
+        WaitForSingleObject(g_ev_lb_park, 2);
+    }
+    if (lobby_park(id, limit) < 0) return false;
+    if (implied) g_lb_implied++;
+    else g_lb_steps++;
+    return true;
+}
+
+// another thread: ask the parked lobby to suspend itself, and wait until it has (Grab, without its polling)
+void lobby_suspend_now(int id) {
+    const LONG s = lobby_park(id, 3000);
+    if (s != LB_SLEEP && s != LB_RESUME) return;
+    const LONG left0 = g_lb_left;
+    TASK_SUSPEND(id);                                                 // the request: it leaves its gate on it
+    SetEvent(g_ev_lb_grant);
+    const DWORD t0 = GetTickCount();
+    while (g_lb_left == left0 && GetTickCount() - t0 < 3000) WaitForSingleObject(g_ev_lb_park, 2);
+    lobby_park(id, 3000);
+    g_lb_implied++;
+}
+
+// the main thread at a Win32Idle (record): a step let run if the lobby has waited its 250 ms; or note it dropped
+void lobby_sync_record() {
+    if (!lobby_gating()) return;
+    if (g_lb_lost) {
+        InterlockedExchange(&g_lb_lost, 0);
+        const uint8_t v = 0xff;
+        put(K_LOBBY, &v, 1);
+        InterlockedExchange(&g_lb_free, 1);
+        frame_lobby_free();
+        g_lb_drops++;
+        logf("session: the lobby task waited 5 s for the main thread -- its lockstep is dropped at frame %u: it runs free"
+             " and the frames aren't compared until the next Grab parks it", g_frame);
+    }
+    if (!g_lb_on || g_lb_state != LB_SLEEP || GetTickCount() - g_lb_arrived < 250) return;
+    if (lobby_step(g_lb_task, false, 2000)) {
+        const uint8_t v = 1;
+        put(K_LOBBY, &v, 1);
+    }
+}
+
+// a replay: the recording's 'Y' -- its steps let run here, or its lockstep dropped here
+void lobby_play(uint8_t v) {
+    if (v == 0xff) {
+        InterlockedExchange(&g_lb_on, 0);
+        SetEvent(g_ev_lb_grant);
+        InterlockedExchange(&g_lb_free, 1);
+        frame_lobby_free();
+        g_lb_drops++;
+        logf("session: the recording dropped the lobby task's lockstep here (frame %u) -- it runs free, frames aren't"
+             " compared until the next Grab parks it", g_frame);
+        return;
+    }
+    for (uint8_t i = 0; i < v && g_lb_on; i++) {
+        const LONG s = lobby_park(g_lb_task, 15000);
+        if (s != LB_SLEEP) {
+            logf("session: frame %u: the recording let the lobby task tick here, but the replay's isn't waiting to (%s)",
+                 g_frame, s < 0 ? "it didn't come in 15 s" : s == LB_NONE ? "it's gone" : "it's suspended or waking");
+            break;
+        }
+        if (!lobby_step(g_lb_task, false, 15000))
+            logf("session: frame %u: the replayed lobby task didn't finish its tick in 15 s", g_frame);
+    }
+}
+
+// ---- the network's channels (net_wsock.cpp) ----------------------------------------------------------------------------------
+int channel() {
+    const DWORD t = GetCurrentThreadId();
+    if (t == g_main) return CH_MAIN;
+    if (t == g_lb_tid) return CH_LOBBY;
+    return CH_PHYS;
+}
+
+const char* nop_name(uint8_t op) {
+    static const char* const n[] = {"?", "WSAStartup", "WSACleanup", "socket", "bind", "setsockopt", "ioctlsocket",
+                                    "getsockopt", "closesocket", "recvfrom", "WSAGetLastError", "gethostname",
+                                    "gethostbyname", "inet_addr", "WSAAsyncGetHostByName", "WSACancelAsyncRequest",
+                                    "the async host reply", "sendto", "the clock (PTimeNow)", "a random number",
+                                    "the lobby task parking", "the physics task's clock"};
+    return op < sizeof n / sizeof n[0] ? n[op] : "?";
+}
+
+// the next record of `op` on this thread's channel: strictly the next one; once a channel has parted, the next of
+// that op within 256 records (the ones passed over are skipped)
+bool net_take(uint8_t op, const uint8_t** p, uint32_t* n) {
+    if (g_session_mode != SESSION_PLAY && g_session_mode != SESSION_ENDED) return false;
+    const int ch = channel();
+    if (g_put_cs_ok) EnterCriticalSection(&g_put_cs);
+    std::vector<uint32_t>& c = g_ch[ch];
+    size_t& at = g_ch_at[ch];
+    bool ok = false;
+    // a lobby running free (its lockstep dropped) reads only up to where the recording's parked again
+    const bool fenced = ch == CH_LOBBY && !g_lb_on;
+    if (at < c.size()) {
+        const Rec& r = g_recs[c[at]];
+        if (payload(r)[1] == op) {
+            ok = true;
+        } else if (fenced && payload(r)[1] == NOP_PARK) {
+            ok = false;
+        } else {
+            if (!g_ch_parted[ch]) {
+                g_ch_parted[ch] = true;
+                logf("session: frame %u: the network reads part on %s: the game read %s where the recording has %s (its"
+                     " record %u) -- that channel is fed by kind from here", g_frame, CH_NAME[ch], nop_name(op),
+                     nop_name(payload(r)[1]), (unsigned)at);
+                if (g_first_part == UINT32_MAX) {
+                    g_first_part = g_frame;
+                    _snprintf(g_first_part_what, sizeof g_first_part_what, "the network reads part on %s: %s where the"
+                              " recording has %s", CH_NAME[ch], nop_name(op), nop_name(payload(r)[1]));
+                    g_first_part_what[sizeof g_first_part_what - 1] = 0;
+                }
+            }
+            for (size_t j = at + 1; j < c.size() && j < at + 256; j++) {
+                if (fenced && payload(g_recs[c[j]])[1] == NOP_PARK) break;
+                if (payload(g_recs[c[j]])[1] == op) {
+                    g_ch_skipped[ch] += (unsigned long)(j - at);
+                    at = j;
+                    ok = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (ok) {
+        const Rec& r = g_recs[c[at++]];
+        *p = payload(r) + 2;
+        *n = r.len - 2;
+        g_ch_fed[ch]++;
+    } else {
+        g_ch_short[ch]++;
+    }
+    if (g_put_cs_ok) LeaveCriticalSection(&g_put_cs);
+    return ok;
+}
+
+void net_put(uint8_t op, const void* p, size_t n);
+
+// a replay's lobby running free (its lockstep dropped): it ticks as often as the recording's did before that one was
+// parked again -- where its channel has the park mark next, it waits to be asked to suspend (or end)
+bool lobby_at_fence() {
+    if (g_put_cs_ok) EnterCriticalSection(&g_put_cs);
+    const std::vector<uint32_t>& c = g_ch[CH_LOBBY];
+    const bool fence = g_ch_at[CH_LOBBY] < c.size() && payload(g_recs[c[g_ch_at[CH_LOBBY]]])[1] == NOP_PARK;
+    if (g_put_cs_ok) LeaveCriticalSection(&g_put_cs);
+    return fence;
+}
+void lobby_fence() {
+    if (g_session_mode != SESSION_PLAY || g_lb_on) return;
+    volatile TaskInfo* t = task_info(g_lb_task);
+    const DWORD t0 = GetTickCount();
+    for (;;) {
+        const bool fence = lobby_at_fence();
+        if (!fence || g_lb_on || !t || t->suspend_req || t->kill || g_session_mode != SESSION_PLAY || GetTickCount() - t0 > 60000)
+            return;
+        Sleep(2);
+    }
+}
+
+// the lobby's thread, running free, about to suspend (Grab parks it, and its lockstep is taken back): a recording marks
+// the place on its channel; a replay's channel moves on to just past that mark, so both go on from the same read
+void lobby_park_mark() {
+    if (g_session_mode == SESSION_RECORD) {
+        net_put(NOP_PARK, 0, 0);
+        return;
+    }
+    if (g_put_cs_ok) EnterCriticalSection(&g_put_cs);
+    std::vector<uint32_t>& c = g_ch[CH_LOBBY];
+    size_t& at = g_ch_at[CH_LOBBY];
+    size_t j = at;
+    while (j < c.size() && payload(g_recs[c[j]])[1] != NOP_PARK) j++;
+    if (j < c.size()) {
+        g_ch_skipped[CH_LOBBY] += (unsigned long)(j - at);
+        at = j + 1;
+        g_ch_fed[CH_LOBBY]++;
+        g_ch_parted[CH_LOBBY] = false;
+    }
+    if (g_put_cs_ok) LeaveCriticalSection(&g_put_cs);
+}
+
+void net_put(uint8_t op, const void* p, size_t n) {
+    if (g_session_mode != SESSION_RECORD) return;
+    const int ch = channel();
+    std::vector<uint8_t> b(2 + n);
+    b[0] = (uint8_t)ch, b[1] = op;
+    if (n) memcpy(&b[2], p, n);
+    put(K_NET, b.data(), b.size());
+    g_ch_recorded[ch]++;
+    g_net_seen = true;
+}
+
+#pragma pack(push, 1)
+struct SendRec { uint8_t role; uint8_t to[16]; int32_t tolen, len, ret; uint64_t hash; };
+#pragma pack(pop)
+
+void describe_send(const SendRec& s, char* out, size_t n) {
+    const uint8_t* a = s.to;                                          // a sockaddr_in: family, port (big-endian), address
+    if (s.tolen >= 8 && a[0] == 2 && a[1] == 0)
+        _snprintf(out, n, "socket %u to %u.%u.%u.%u:%u, %d bytes", s.role, a[4], a[5], a[6], a[7], a[2] << 8 | a[3], s.len);
+    else
+        _snprintf(out, n, "socket %u, %d bytes", s.role, s.len);
+    out[n - 1] = 0;
+}
+
 // ---- the race recorder's races, and the lockstep's hooks -----------------------------------------------------------------------
 typedef void(__cdecl* Void_t)(void);
 Void_t o_PhysicsStart, o_PhysicsStop;
@@ -693,13 +1117,15 @@ void __cdecl h_PhysicsStart() {
         RaceMark m = {g_races, g_frame};
         g_race_tolerant = false;
 #ifndef SESSION_TEST
-        const bool network = ((uint8_t(__cdecl*)())0x004a23c0)() != 0;   // MultiEnabled: a network race can't wait
+        const bool network = ((uint8_t(__cdecl*)())0x004a23c0)() != 0;   // MultiEnabled: a network race (in lockstep too)
 #else
-        const bool network = false;
+        const bool network = g_test_network_race;
 #endif
+        // a network race: the physics task's clock is the session's (session_phys_clock), set before it starts
+        InterlockedExchange(&g_net_race, network && (g_session_mode == SESSION_RECORD || g_session_mode == SESSION_PLAY));
         if (g_session_mode == SESSION_RECORD) {
             put(K_RACE_BEGIN, &m, sizeof m);
-            if (!network) lockstep_on();
+            lockstep_on();
         } else if (g_session_mode == SESSION_PLAY) {
             settle();
             if (!g_tolerant && !at_end() && g_recs[g_ri].kind != K_RACE_BEGIN) part_input(K_RACE_BEGIN, g_recs[g_ri].kind);
@@ -711,7 +1137,7 @@ void __cdecl h_PhysicsStart() {
                 g_ri = j + 1;
             }
             g_tolerant_before_race = g_tolerant;
-            if (!g_tolerant && !network) lockstep_on();               // (a replay that has parted can't keep step)
+            if (!g_tolerant) lockstep_on();                            // (a replay that has parted can't keep step)
             else g_race_tolerant = g_tolerant = true;                   // (fed by Win32Idle call)
             align_clocks();                                           // the physics thread's clock near the fed one
         }
@@ -719,10 +1145,10 @@ void __cdecl h_PhysicsStart() {
         frame_race_flag();
         if (g_lockstep_race) g_races_lockstep++;
         if (g_session_mode != SESSION_ENDED)
-            logf("session: race %u starts at frame %u -- %s; the race recorder %s its inputs", g_races, g_frame,
+            logf("session: race %u starts at frame %u%s -- %s; the race recorder %s its inputs", g_races, g_frame,
+                 network ? " (a network race)" : "",
                  g_lockstep_race ? "in lockstep (the physics updates at the main thread's sync points), frames compared"
-                 : network ? "NOT in lockstep (a network race): frames aren't compared until it ends"
-                           : "NOT in lockstep (the replay had parted): frames aren't compared until it ends",
+                                 : "NOT in lockstep (the replay had parted): frames aren't compared until it ends",
                  g_session_mode == SESSION_RECORD ? "records" : "replays");
     }
     o_PhysicsStart();
@@ -730,6 +1156,7 @@ void __cdecl h_PhysicsStart() {
 
 void __cdecl h_PhysicsStop() {
     o_PhysicsStop();                                  // (sets the end state: a physics waiting at the gate goes on to it)
+    if (on_main()) InterlockedExchange(&g_net_race, 0);
     if (!on_main() || g_session_mode == SESSION_OFF || !g_in_race) return;
     const bool stepped = g_lockstep_race;
     frame_race_flag();                                // (this frame: in lockstep if the race was)
@@ -850,9 +1277,11 @@ void acc_reset() {
     for (int i = 0; i < SP_N; i++) g_acc.f.part[i] = 1469598103934665603ull;
     for (int i = 0; i < 16; i++) g_acc.f.tile[i] = 1469598103934665603ull;
     if (g_in_race) g_acc.f.flags |= g_lockstep_race ? F_LOCKSTEP : F_RACE;
+    if (g_lb_free) g_acc.f.flags |= F_RACE, g_lb_free_frames++;      // the lobby task runs free: not compared
 }
 
 void frame_race_flag() { g_acc.f.flags |= g_lockstep_race ? F_LOCKSTEP : F_RACE; }
+void frame_lobby_free() { g_acc.f.flags |= F_RACE; }
 
 bool gfx_here() { return g_session_frames && g_session_mode != SESSION_OFF && on_main(); }   // (not a rewrite pass: never drawn)
 
@@ -1028,6 +1457,7 @@ void session_frame() {
     if (g_session_mode == SESSION_OFF || !on_main()) return;
     if (!g_first_present_done) first_present();
     const int mode = g_session_mode;
+    if (g_lb_lost || g_lb_free) g_acc.f.flags |= F_RACE;            // (the lobby task ran free during this frame)
     if (mode == SESSION_RECORD) {
         put(K_FRAME, &g_frame, 4);
     } else if (mode == SESSION_PLAY) {
@@ -1077,7 +1507,7 @@ bool session_update_gate(bool* granted) {
     bool run = true;
     for (;;) {
         const LONG g = g_grants;
-        if (g > 0 && InterlockedCompareExchange(&g_grants, g - 1, g) == g) { *granted = true; break; }
+        if (g > 0 && InterlockedCompareExchange(&g_grants, g - 1, g) == g) { *granted = t_stepping = true; break; }
         if (!g_gate_on) break;                                            // dropped: it runs free
         if (!gated_state(PHYS_STATE)) { run = false; break; }             // the main thread moved the task on
         if (GetTickCount() - g_arrived > limit) {
@@ -1091,6 +1521,7 @@ bool session_update_gate(bool* granted) {
     return run;
 }
 void session_update_done() {
+    t_stepping = false;
     InterlockedIncrement(&g_done);
     SetEvent(g_ev_done);
 }
@@ -1109,6 +1540,7 @@ void session_idle_begin() {
     if (g_session_mode != SESSION_RECORD || !on_main() || g_idle_open) return;   // (nested: the outer call's group)
     g_idle.clear();
     g_idle.push_back(sync_record(true));                              // (lockstep: the updates let run here)
+    lobby_sync_record();                                              // (the lobby task's step: a 'Y' before the 'I')
     g_idle_open = true;
 }
 
@@ -1143,14 +1575,22 @@ bool session_play_idle() {
     play_lost_here();
     if (!g_tolerant) {
         settle();
-        if (at_end()) { end_of_recording("the recording ended"); return false; }
+        uint8_t lobby = 0;                                            // the lobby task's steps let run here ('Y')
+        if (!at_end() && g_recs[g_ri].kind == K_LOBBY && g_recs[g_ri].len >= 1) {
+            lobby = payload(g_recs[g_ri])[0];
+            g_used[g_ri++] = 1;
+            settle();
+        }
+        if (at_end()) { lobby_play(lobby); end_of_recording("the recording ended"); return false; }
         const Rec& r = g_recs[g_ri];
         if (r.kind == K_IDLE) {
             g_used[g_ri++] = 1;
             if (r.len >= IDLE_HEAD) sync_play(payload(r)[0]);         // the physics updates let run here
+            if (lobby) lobby_play(lobby);                             // (after them, as recorded)
             apply_idle(r);
             return true;
         }
+        if (lobby) lobby_play(lobby);
         part_input(K_IDLE, r.kind);
         if (g_lockstep_race) lose("the replay's input parted from the recording's");
     }
@@ -1169,7 +1609,7 @@ uint32_t session_seed(uint32_t chosen) {
 bool session_random_feed(int range, int* v) {
     if (g_session_mode != SESSION_PLAY) return false;
     if (!on_main()) {
-        if (!g_in_race) g_other_thread_draws++;                       // (none expected: the physics' are the race's)
+        if (!g_in_race && GetCurrentThreadId() != g_lb_tid) g_other_thread_draws++;   // (the lobby's: net_wsock.cpp)
         return false;
     }
     int rec[2];
@@ -1193,7 +1633,7 @@ bool session_random_feed(int range, int* v) {
 void session_random_saw(int range, int v) {
     if (g_session_mode != SESSION_RECORD) return;
     if (!on_main()) {
-        if (!g_in_race) g_other_thread_draws++;
+        if (!g_in_race && GetCurrentThreadId() != g_lb_tid) g_other_thread_draws++;
         return;
     }
     int rec[2] = {range, v};
@@ -1267,13 +1707,18 @@ bool hook_all() {
 
 }  // namespace
 
-void session_install(const char* ini) {
+namespace {
+void session_install_mode(const char* ini) {
     const bool record = GetPrivateProfileIntA("session", "record", 0, ini) != 0;
     char play[128], label[64];
     GetPrivateProfileStringA("session", "play", "", play, sizeof play, ini);
     GetPrivateProfileStringA("session", "label", "", label, sizeof label, ini);
     if (!record && !play[0]) return;
     g_main = GetCurrentThreadId();
+    InitializeCriticalSection(&g_put_cs);
+    g_put_cs_ok = true;
+    g_ev_lb_grant = CreateEventA(0, FALSE, FALSE, 0);
+    g_ev_lb_park = CreateEventA(0, FALSE, FALSE, 0);
 #ifndef SESSION_TEST
     if (!build_is_v10()) { logf("session: NOT %s -- sessions need v1.0 race.exe", play[0] ? "replaying" : "recording"); return; }
     if (!GetPrivateProfileIntA("platform", "sdl", 0, ini)) {
@@ -1285,16 +1730,32 @@ void session_install(const char* ini) {
 #else
     g_session_frames = true;
 #endif
-    char base[MAX_PATH];
-    strcpy(base, ini);
-    char* slash = strrchr(base, '\\');
-    strcpy(slash ? slash + 1 : base, "sessions");
+    // sessions\ beside the DLL; the second of two copies ([test] two_copies) records to sessions-2\ (vp_copy_suffix)
+    char home[MAX_PATH], base[MAX_PATH];
+    strcpy(home, ini);
+    char* slash = strrchr(home, '\\');
+    *(slash ? slash : home) = 0;
+    _snprintf(base, sizeof base, "%s\\sessions%s", home, vp_copy_suffix());
+    base[sizeof base - 1] = 0;
     CreateDirectoryA(base, 0);
     char path[MAX_PATH];
     if (play[0]) {
         if (record) logf("session: both record and play are set -- replaying %s, not recording", play);
         _snprintf(g_name, sizeof g_name, "%s", play);
-        path_in(g_dir, sizeof g_dir, base, g_name);
+        // play=<name> is this copy's own recording (sessions\, or sessions-2\ for copy 2); play=sessions-2\<name>
+        // names the second copy's from the DLL's folder. Either is replayed by one copy running alone.
+        if (strchr(play, '\\') || strchr(play, '/')) {
+            path_in(g_dir, sizeof g_dir, home, g_name);
+        } else {
+            path_in(g_dir, sizeof g_dir, base, g_name);
+            char other[MAX_PATH];
+            _snprintf(other, sizeof other, "%s\\sessions%s\\%s", home, vp_copy() == 2 ? "" : "-2", g_name);
+            other[sizeof other - 1] = 0;
+            if (!is_dir(g_dir) && is_dir(other)) {
+                logf("session: %s isn't among this copy's recordings, but %s is -- replaying that one", g_name, other);
+                strcpy(g_dir, other);
+            }
+        }
         path_in(path, sizeof path, g_dir, "session.vps");
         if (!load_file(path, g_in) || !index_stream()) { logf("session: NOT replaying -- can't read %s", path); return; }
         if (((const StreamHeader*)g_in.data())->version != 2) {
@@ -1367,12 +1828,19 @@ void session_install(const char* ini) {
              g_dir, g_session_frames ? "and a hash of every frame" : "but no frame hashes: they're taken on the OpenGL renderer"
              " ([platform] renderer=gl)");
     }
+    InterlockedExchange(&g_lb_on, 1);                                 // (the lobby task's lockstep: see THE NETWORK)
     if (g_trace) {
         setvbuf(g_trace, 0, _IOFBF, 1 << 16);
         TraceHeader th = {{'V', 'P', 'S', 'F'}, 1, {0, 0}};
         fwrite(&th, sizeof th, 1, g_trace);
     }
     acc_reset();
+}
+}  // namespace
+
+void session_install(const char* ini) {
+    session_install_mode(ini);
+    net_install(ini);                                                 // the wsock32 layer: for a session, or [test] two_copies
 }
 
 void session_report() {
@@ -1409,6 +1877,211 @@ void session_report() {
              g_races, g_races_lockstep, g_races_lost, g_grants_given, g_sync_points);
     if (g_other_thread_draws)
         logf("exit: session: %lu random numbers were drawn outside the main thread and a race (not recorded)", g_other_thread_draws);
+    net_session_report();
     if (g_trace) fclose(g_trace), g_trace = 0;
     g_session_mode = SESSION_OFF;
 }
+
+// ---- the network: what net_wsock.cpp calls -----------------------------------------------------------------------------------
+bool session_net_live() { return g_session_mode == SESSION_OFF || g_session_mode == SESSION_RECORD; }
+bool session_net_recording() { return g_session_mode == SESSION_RECORD; }
+bool session_net_main() { return GetCurrentThreadId() == g_main; }
+bool session_net_lobby() { return GetCurrentThreadId() == g_lb_tid; }
+bool session_net_take(uint8_t op, const uint8_t** p, uint32_t* n) { return net_take(op, p, n); }
+void session_net_put(uint8_t op, const void* p, size_t n) { net_put(op, p, n); }
+
+int session_net_sent(uint8_t role, const void* to, int tolen, const void* buf, int len, int live_ret) {
+    const int mode = g_session_mode;
+    if (mode == SESSION_OFF) return live_ret;
+    SendRec s;
+    memset(&s, 0, sizeof s);
+    s.role = role;
+    if (to && tolen > 0) memcpy(s.to, to, tolen < 16 ? tolen : 16);
+    // an IPv4 destination is its family, port and address: UDPSocket::Send (0x4add40) builds the sockaddr_in on the
+    // stack and never writes sin_zero (bytes 8-15), so those are stack garbage
+#ifdef SESSION_TEST
+    const bool old_dll = mode == SESSION_RECORD && getenv("WNS_OLD_SINZERO");   // (the harness: a recording made before)
+#else
+    const bool old_dll = false;
+#endif
+    if (s.to[0] == 2 && s.to[1] == 0 && !old_dll) memset(s.to + 8, 0, 8);
+    s.tolen = tolen, s.len = len, s.ret = live_ret;
+    s.hash = session_hash(buf, len > 0 ? (size_t)len : 0, session_hash(s.to, 16, mix(1469598103934665603ull, role)));
+    int ret = live_ret;
+    uint64_t frame_hash = s.hash;
+    const int ch = channel();
+    // the record: the send's summary, then its bytes as compared (net_wsock.cpp has left out what the game never
+    // writes), so a replay can say which bytes differ. (A summary alone: a recording made before the bytes were kept.)
+    if (mode == SESSION_RECORD) {
+        const size_t keep = len > 0 ? (size_t)(len < 2048 ? len : 2048) : 0;
+        std::vector<uint8_t> b(sizeof s + keep);
+        memcpy(b.data(), &s, sizeof s);
+        if (keep) memcpy(b.data() + sizeof s, buf, keep);
+        net_put(NOP_SENDTO, b.data(), b.size());
+    } else {
+        const uint8_t* p;
+        uint32_t n;
+        g_sends++;
+        if (net_take(NOP_SENDTO, &p, &n) && n >= sizeof(SendRec)) {
+            SendRec r;
+            memcpy(&r, p, sizeof r);
+            ret = r.ret;
+            // compared: the socket, the destination (an IPv4 one without sin_zero, which a recording made before the
+            // fix holds as garbage), the length, and the bytes -- the recorded ones when the record has them (its
+            // hash then may include that garbage), else the hash
+            const int have_b = (int)(n - sizeof r);
+            // the recorded bytes, masked as today's sends are (net_send_mask is idempotent: a recording made with the
+            // same masks is unchanged; one made before a mask existed loses its garbage the same way)
+            std::vector<uint8_t> rec_b(p + sizeof r, p + sizeof r + (have_b > 0 ? have_b : 0));
+            if (!rec_b.empty()) {
+                std::vector<uint8_t> mk(rec_b.size(), 0xff);
+                net_send_mask(rec_b.data(), (int)rec_b.size(), mk.data());
+                for (size_t i = 0; i < rec_b.size(); i++) rec_b[i] &= mk[i];
+            }
+            const bool ipv4 = r.to[0] == 2 && r.to[1] == 0;
+            const bool same_to = !memcmp(r.to, s.to, ipv4 ? 8 : 16);
+            const bool same_bytes = have_b == len && len > 0 ? !memcmp(rec_b.data(), buf, (size_t)len) : r.hash == s.hash;
+            const bool same = r.role == s.role && r.tolen == s.tolen && same_to && r.len == s.len && same_bytes;
+            if (same) frame_hash = r.hash;                           // (the frame hash as recorded)
+            if (!same) {
+                if (g_sends_differ++ < 6) {
+                    char a[96], b[96], at[160] = "";
+                    describe_send(s, a, sizeof a);
+                    describe_send(r, b, sizeof b);
+                    const uint8_t* rb = rec_b.data();
+                    const int have = (int)(n - sizeof r), m = have < len ? have : len;
+                    if (r.role == s.role && r.len == s.len && same_to && have > 0) {
+                        size_t w = 0;
+                        int shown = 0;
+                        const uint8_t* q = (const uint8_t*)buf;
+                        for (int i = 0; i < m && shown < 8 && w + 24 < sizeof at; i++)
+                            if (q[i] != rb[i]) {
+                                w += _snprintf(at + w, sizeof at - w, "%s%d (%02x, recorded %02x)", shown ? ", " : " at byte ",
+                                               i, q[i], rb[i]);
+                                shown++;
+                            }
+                        if (len >= 4)
+                            _snprintf(at + w, sizeof at - w, "; the packet's first bytes %02x %02x %02x %02x", q[0], q[1],
+                                      q[2], q[3]);
+                        at[sizeof at - 1] = 0;
+                    }
+                    logf("session: frame %u: send %lu on %s differs from the recording's: %s, where the recording sent %s%s%s",
+                         g_frame, g_ch_fed[ch], CH_NAME[ch], a, b,
+                         r.role == s.role && r.len == s.len && same_to ? " (other bytes)" : "", at);
+                }
+            }
+        } else {
+            ret = len;                                                // (nothing goes out: it "went")
+        }
+    }
+    // into the frame: the main thread's own, or a lobby step / physics update the main thread waits for
+    if (g_session_frames && (on_main() || t_stepping)) {
+        add_event(SG_NET_SEND, frame_hash);
+        g_sends_hashed++;
+    }
+    return ret;
+}
+
+void session_net_async_event() {
+    if (g_session_mode != SESSION_RECORD || !on_main()) return;
+    if (g_idle_open) session_op(SOP_NET);
+    else put(K_NET_ASYNC, 0, 0);
+}
+
+void session_lobby_sleep(int ms, void(__cdecl* real)(int)) {
+    if (!lobby_gating()) { real(ms); return; }
+    lobby_note_self();
+    if (GetCurrentThreadId() != g_lb_tid) { real(ms); return; }
+    if (g_lb_on && lobby_wait(LB_SLEEP) != LV_FREE) return;
+    real(ms);                                                         // (dropped: it sleeps out its time, as the original)
+    lobby_fence();
+}
+
+void session_lobby_suspend_me(void(__cdecl* real)(void)) {
+    if (!lobby_gating()) { real(); return; }
+    lobby_note_self();
+    if (GetCurrentThreadId() != g_lb_tid) { real(); return; }
+    for (;;) {
+        t_stepping = false;
+        if (!g_lb_on) lobby_park_mark();                              // (running free: its channel's place)
+        InterlockedExchange(&g_lb_state, LB_SUSPENDING);
+        SetEvent(g_ev_lb_park);
+        real();                                                       // until TaskResume
+        if (!g_lb_on || !lobby_gating()) { InterlockedExchange(&g_lb_state, LB_RUNNING); return; }
+        if (lobby_wait(LB_RESUME) != LV_SUSPEND) return;               // asked again before it ran: suspends again
+    }
+}
+
+void session_lobby_grab(void* lmi, bool after) {
+    if (!lobby_gating() || GetCurrentThreadId() == g_lb_tid) return;
+    const int id = lmi_task(lmi);
+    if (!after) {
+        if (g_lb_on) { lobby_suspend_now(id); return; }
+        // dropped: still suspend it here, without the original's Win32Idle polling, so the main thread's reads
+        // stay where they were
+        volatile TaskInfo* t = task_info(id);
+        if (!t || task_gone(t) || task_suspended(t)) return;
+        if (g_session_mode == SESSION_PLAY) {                         // a replay: once it has ticked as the recording's did
+            const DWORD t1 = GetTickCount();
+            while (!lobby_at_fence() && !task_gone(t) && GetTickCount() - t1 < 60000) Sleep(2);
+        }
+        TASK_SUSPEND(id);
+        const DWORD t0 = GetTickCount();
+        while (!task_suspended(t) && !task_gone(t) && GetTickCount() - t0 < 3000) Sleep(1);
+        return;
+    }
+    // after the original: a dropped lobby, parked (suspended) again, goes back into lockstep
+    if (!g_lb_on && g_lb_task == id && task_suspended(task_info(id)) && g_session_mode != SESSION_ENDED) {
+        InterlockedExchange(&g_lb_state, LB_SUSPENDING);
+        InterlockedExchange(&g_lb_grants, 0);
+        InterlockedExchange(&g_lb_on, 1);
+        if (InterlockedExchange(&g_lb_free, 0))
+            logf("session: the lobby task is parked again (Grab) -- back in lockstep, frames compared again");
+    }
+}
+
+void session_lobby_release(void* lmi, bool after) {
+    if (!lobby_gating() || !g_lb_on || GetCurrentThreadId() == g_lb_tid) return;
+    const int id = lmi_task(lmi);
+    if (!after) {
+        // the original resumes a suspended task; a lobby waiting at a gate is suspended first (as it would have been)
+        const LONG s = lobby_park(id, 3000);
+        if (s == LB_SLEEP || s == LB_RESUME) lobby_suspend_now(id);
+        return;
+    }
+    // after TaskResume: its first step (the tick right after waking) runs now, as the original's would
+    if (lobby_park(id, 3000) == LB_RESUME) lobby_step(id, true, 3000);
+}
+
+// the exit log's network lines
+void net_session_report() {
+    const int mode = g_session_mode;
+    unsigned long any = g_lb_steps + g_lb_implied + g_lb_drops;
+    for (int c = 0; c < CH_N; c++) any += g_ch_recorded[c] + g_ch_fed[c] + g_ch_short[c] + (unsigned long)g_ch[c].size();
+    if (!any) return;
+    for (int c = 0; c < CH_N; c++) {
+        if (mode == SESSION_RECORD) {
+            if (g_ch_recorded[c]) logf("exit: session: network: %lu records on %s", g_ch_recorded[c], CH_NAME[c]);
+        } else if (g_ch[c].size() || g_ch_short[c]) {
+            logf("exit: session: network: %s: fed %lu of the recording's %u records%s; %lu reads found none, %lu passed over%s",
+                 CH_NAME[c], g_ch_fed[c], (unsigned)g_ch[c].size(), g_ch_parted[c] ? " (it parted)" : "", g_ch_short[c],
+                 g_ch_skipped[c], g_ch_at[c] < g_ch[c].size() ? "; some were never read" : "");
+        }
+    }
+    if (mode != SESSION_RECORD)
+        logf("exit: session: network: %lu sends compared, %lu differ from the recording's; %lu hashed into frames", g_sends,
+             g_sends_differ, g_sends_hashed);
+    if (g_phys_clock_reads)
+        logf("exit: session: network: the physics task read the clock %lu times in network races%s", g_phys_clock_reads,
+             g_phys_clock_short ? " (some had no record and read the live clock)" : "");
+    logf("exit: session: network: the lobby task took %lu steps at Win32Idle calls and %lu for Grab / Release; its lockstep"
+         " was dropped %lu times (%lu frames not compared for it)", g_lb_steps, g_lb_implied, g_lb_drops, g_lb_free_frames);
+}
+
+bool session_phys_clock(bool on) {
+    const bool was = t_phys_clock;
+    t_phys_clock = on && g_net_race && (g_session_mode == SESSION_RECORD || g_session_mode == SESSION_PLAY);
+    return was;
+}
+void session_phys_clock_restore(bool was) { t_phys_clock = was; }
+bool session_phys_clock_on() { return t_phys_clock; }

@@ -1113,11 +1113,18 @@ PORT_FN(0x004123a0, "check_for_canary_launch", check_for_canary_launch_rw, fp_pu
 
 // start_unique_instance (0x4123b0): a named semaphore; if it already exists another copy runs: its window (by
 // class and title) restored, 0. A failed CreateSemaphore panics.
+// TEST (viperport.ini [test] two_copies=1, README "Testing multiplayer on one PC"): a process holding one of the two
+// copies' slots (viperport.cpp takes it at load) starts beside the running copy; the semaphore stays open, as for the
+// first, and end_unique_instance closes it.
 static uint8_t __cdecl start_unique_instance_rw() {
     HANDLE s = kCreateSemaphoreA(0, 0, 1, k_sem_name);
     g_semaphore = s;
     if (!s) LogPanic(S(0x004e5fb4));                               // "CreateSemaphore failed"
     if (kGetLastError() != ERROR_ALREADY_EXISTS) return 1;
+    if (vp_g_two_copies) {
+        logf("two_copies: copy %d starts beside the copy already running", vp_g_copy);
+        return 1;
+    }
     const char* title = k_app_name;
     const char* cls = k_class_name;
     HWND w = kFindWindowA(cls, title);
@@ -1140,6 +1147,8 @@ PORT_FN(0x00412420, "end_unique_instance", end_unique_instance_rw, fp_win_os)
 // GetModuleFileNameA(NULL). The first time (no such folder yet), the old user directory's whole tree is copied into
 // it: the literal as this exe has it -- an absolute one's VirtualStore copies first (where a game without elevation
 // really wrote), then the folder itself; a relative one from the current directory, unless that is the new folder.
+// The second copy under viperport.ini [test] two_copies=1 has its own, <race.exe's folder>\Config-2\, seeded the same
+// way but from <race.exe's folder>\Config\ first (the first copy's, already migrated), so the two never share a file.
 // The old files are only read. Every user of the directory (options.cfg, the *.sco records, ghostcar\, setups\,
 // paint*.tex, the career files, replays) appends a file name to Win32GetUserDirectory() in a MAX_PATH-sized buffer
 // (FileCreateDirectoryRecursively's prefixes and the file table's names are 0x100 bytes), and WinMain logs "Long
@@ -1208,15 +1217,17 @@ static bool fix_user_directory() {
         logf("fix: user directory: race.exe's folder not found; keeping %s", lit);
         return false;
     }
-    if (n + 7 > FIX_USER_DIR_MAX) {
-        logf("fix: user directory: %sConfig\\ would be %u characters (the game takes %d); keeping %s", dir, n + 7,
-             FIX_USER_DIR_MAX, lit);
+    const uint32_t ns = (uint32_t)strlen(vp_g_copy_suffix);        // "" ("-2": the second of two copies)
+    if (n + 7 + ns > FIX_USER_DIR_MAX) {
+        logf("fix: user directory: %sConfig%s\\ would be %u characters (the game takes %d); keeping %s", dir,
+             vp_g_copy_suffix, n + 7 + ns, FIX_USER_DIR_MAX, lit);
         return false;
     }
-    memcpy(dir + n, "Config", 7);
+    memcpy(dir + n, "Config", 6);
+    memcpy(dir + n + 6, vp_g_copy_suffix, ns + 1);
     const BOOL made = kCreateDirectoryA(dir, 0);                   // (made now: a new user directory)
     const DWORD err = made ? 0 : kGetLastError();
-    memcpy(dir + n + 6, "\\", 2);
+    memcpy(dir + n + 6 + ns, "\\", 2);
     char note[3 * MAX_PATH];
     if (!made) {
         if (err == ERROR_ALREADY_EXISTS) snprintf(note, sizeof note, "already there");
@@ -1224,8 +1235,13 @@ static bool fix_user_directory() {
     } else {
         // the old user directory: an absolute literal's VirtualStore copies (Program Files, then Program Files (x86)),
         // then the literal itself -- a relative one taken from the current directory
-        char cand[3][MAX_PATH];
+        char cand[4][MAX_PATH];
         int nc = 0;
+        if (ns) {                                                  // the second copy: the first copy's Config\ first
+            memcpy(cand[nc], dir, n);
+            memcpy(cand[nc] + n, "Config\\", 8);
+            nc++;
+        }
         if (lit[0] && lit[1] == ':' && lit[2] == '\\') {
             char la[MAX_PATH];
             const DWORD k = GetEnvironmentVariableA("LOCALAPPDATA", la, sizeof la);   // (not a game import: the DLL's)

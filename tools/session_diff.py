@@ -21,12 +21,13 @@ F_RACE, F_PLAYER, F_TOLERANT, F_CUT, F_LOCKSTEP = 1, 2, 4, 8, 16   # F_RACE: out
 PARTS = ["the 2D page", "the surfaces (textures, offscreen images)",
          "the 3D state (render states, matrices, viewports, materials)", "the 3D work (draws, clears, transforms)"]
 EVENTS = ["?", "2D page (Unlock)", "surface made", "surface written (Unlock)", "blit", "texture load", "colour key",
-          "display mode", "clear", "TransformVertices", "draw"]
+          "display mode", "clear", "TransformVertices", "draw", "network send (sendto)"]
 KINDS = {"Q": "clock (QueryPerformanceCounter)", "q": "clock rate (QueryPerformanceFrequency)",
          "W": "millisecond clock (timeGetTime)", "L": "date (GetLocalTime)", "R": "random number", "Z": "random seed",
          "J": "joystick (JoyGetPos)", "N": "joystick name", "H": "joystick force feedback", "I": "Win32Idle call",
          "A": "switch away / back", "F": "frame end (Flip)", "B": "race start", "E": "race end", "X": "end",
-         "G": "window size", "P": "physics sync point (PhysicsGetStatePacket)", "K": "race lockstep dropped"}
+         "G": "window size", "P": "physics sync point (PhysicsGetStatePacket)", "K": "race lockstep dropped",
+         "C": "network read", "Y": "lobby task steps", "V": "async network reply"}
 OPS = {1: "KeyDown", 2: "KeyUp", 3: "KeyQueueChar", 4: "KeyQueueMetaChar", 5: "MouseQueueEvent", 6: "switch",
        7: "KeyClearBits", 8: "gxRestore", 9: "keys held", 10: "quit"}
 

@@ -53,7 +53,16 @@ for bit, and that is the bar. Three checks in game enforce it (`hook/port.h`, `p
   `tools/session_diff.py` compares any two traces. A race inside a session runs in lockstep (each physics
   update waits for the main thread's sync points, and a replay lets the same updates run at the same
   points), so its frames are compared too, and it is handed to the race recorder. This is the check for
-  code the menus run, which the race recorder doesn't reach.
+  code the menus run, which the race recorder doesn't reach. Network games are recorded too
+  (`hook/net_wsock.cpp`): every value the game reads from winsock, on the thread that reads it (the menus,
+  the multiplayer lobby task, the physics thread), and every packet it sends, which a replay compares and
+  hashes into the frames. A replay makes no real network call. The lobby task ticks at the main thread's
+  Win32Idle calls and a network race runs in lockstep, so their frames are compared like any other. With
+  `[test] two_copies=1` (see "Testing multiplayer on one PC") copy 2 records to `sessions-2\` and binds port
+  2002; copy 1 keeps 2001 and also sends its broadcasts to 2002, so copy 1 hosts and copy 2 joins (by the
+  LAN list or copy 1's address). Replay each copy's recording on its own, with one copy running and
+  `two_copies=1` still set (the window must be the recording's size): `play=<name>` also looks in
+  `sessions-2\`, or name it outright as `play=sessions-2\<name>`.
 
 A fourth check runs outside the game: `test/fuzz.exe` (`test/build_fuzz.bat`) loads the v1.0 `race.exe`'s
 code at its own address, puts the FPU in the physics thread's single precision, and runs every rewrite
@@ -201,6 +210,38 @@ drivetrains, AI cars, racing lines, replays and network cars in memory, and comp
 address (for trampolines), the physics classes and their named fields, and the statics of the physics
 and AI object files, attributed by which file's code uses each address, with the input code and the
 main thread's buffers left out.
+
+## Testing multiplayer on one PC
+
+A test switch for the multiplayer stages, off by default (without it the game is exactly as it was). In
+`viperport.ini`:
+
+```ini
+[test]
+two_copies=1
+```
+
+Then start the game twice from the same folder. The second start runs beside the first instead of being
+refused by the game's single-instance check, and becomes **copy 2**:
+
+- Copy 2 has its own user folder, `Config-2\`, so the two copies never write the same file. It is made the
+  first time, as a copy of `Config\` (or, if there's no `Config\` yet, of the old user folder the way `Config\`
+  is made). Its logs (`log.log`, `except.log`, `timer.log` and the DLL's `viperport.log`) go to `log-2\`.
+  Copy 1 keeps `Config\`, `log\` and `viperport.log` next to the DLL, as always.
+- Both copies open in a window instead of full screen: copy 1 on the left half of the main screen and copy 2
+  on the right. Each window is the largest 4:3 or 16:9 picture that fits its half. Copy 2's title is
+  "Viper Racing (copy 2)". For the windows you need `[platform] sdl=1` and `renderer=gl`, because DirectDraw
+  takes the whole screen.
+- A copy keeps running while the other one is in front: the game's switched-away wait is skipped, so a
+  network game goes on in both windows. The mouse isn't held inside either window. A single-player race in the
+  copy behind still pauses, and the copy behind is silent, as DirectSound made it (only the copy in front is heard).
+- A third start while both run is refused, as usual.
+
+Which copy a start becomes is decided by two slots that are held for as long as each copy runs. The first
+free slot wins, so if copy 1 is closed, the next start is copy 1 again. The single-instance check and the
+folders come from the rewrites of `start_unique_instance`, `get_user_directory`, `log_file_begin`,
+`ExceptBegin` and `TimerWatchdog::dump`, so leave those on `new` (the default). Turn `two_copies` off
+again before playing normally.
 
 ## Layout
 

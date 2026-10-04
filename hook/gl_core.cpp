@@ -8,6 +8,7 @@
 #include "viperport.h"
 #include "port.h"
 #include "session.h"
+#include "fix_paths.h"
 #include "gl_dxgi.h"
 
 SDL_Window* platform_window();
@@ -757,12 +758,15 @@ bool write_bmp(const char* name, int w, int h, const uint32_t* rgba, bool top_do
     char path[MAX_PATH];                         // <race.exe's folder>\log\capture\<name> (any build: plain Win32)
     DWORD n = GetModuleFileNameA(0, path, MAX_PATH);
     while (n && path[n - 1] != '\\') n--;
-    if (!n || n + 20 + strlen(name) >= MAX_PATH) return false;
-    memcpy(path + n, "log", 4);
+    if (!n || n + 24 + strlen(name) >= MAX_PATH) return false;
+    _snprintf(path + n, MAX_PATH - n, "log%s", vp_g_copy_suffix);     // log-2\ for the second copy ([test] two_copies)
+    path[MAX_PATH - 1] = 0;
     CreateDirectoryA(path, 0);
-    memcpy(path + n + 3, "\\capture", 9);
+    const size_t m = strlen(path);
+    _snprintf(path + m, MAX_PATH - m, "\\capture");
     CreateDirectoryA(path, 0);
-    _snprintf(path + n + 11, MAX_PATH - n - 11, "\\%s", name);
+    const size_t k = strlen(path);
+    _snprintf(path + k, MAX_PATH - k, "\\%s", name);
     path[MAX_PATH - 1] = 0;
     FILE* f = fopen(path, "wb");
     if (!f) return false;

@@ -376,7 +376,9 @@ static void finish(const char* why) {
 
 static void __cdecl h_PhysTaskBegin(void* stream) {
     begin_race();
+    const bool clock = session_phys_clock(true);        // (a session's network race: the physics task's clock is fed)
     o_PhysTaskBegin(stream);
+    session_phys_clock_restore(clock);
     if (g_active) {
         int n = *NPHOBS;
         logf("replay: the race has %d physics objects", n);
@@ -385,13 +387,17 @@ static void __cdecl h_PhysTaskBegin(void* stream) {
 
 static void __cdecl h_PhysTaskEnd(void) {
     finish("the race ended");
+    const bool clock = session_phys_clock(true);
     o_PhysTaskEnd();
+    session_phys_clock_restore(clock);
 }
 
 static void __cdecl h_PhysTaskRestart(void) {
     bool was = g_active, playing = g_cur_play[0] != 0, session = g_session_race;
     finish("the race was restarted");
+    const bool clock = session_phys_clock(true);
     o_PhysTaskRestart();
+    session_phys_clock_restore(clock);
     // recording: the restarted race is a new recording; a session's replay goes on to its next race file too
     if (session || (was && !playing)) begin_race();
 }
@@ -408,7 +414,9 @@ static void __cdecl h_PhysTaskUpdate(void) {
         else if (take(K_UPDATE, &paused, 1)) *PHYSICS_PAUSED = paused;
         g_updates++;
     }
+    const bool clock = session_phys_clock(true);
     o_PhysTaskUpdate();
+    session_phys_clock_restore(clock);
     if (granted) session_update_done();
 }
 
