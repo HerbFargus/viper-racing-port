@@ -4,6 +4,7 @@
 //   build (x86 tools, from the repo root):
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_menu_sched.cpp
 //        /Fo<dir>\ /Fe<dir>\world_menu_sched.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
+//     (and with /DVP_MENU_FIXES: the fix build, below)
 //   run:   world_menu_sched.exe [rounds] [seed]      (VP_TRACE=1: one line per function; VP_ONLY=name: just those;
 //          VP_TAGS=1: which stubs the originals reached; VP_DEBUG=1: the window's widgets at setup, every sprintf, and
 //          where a fault happened)
@@ -40,9 +41,15 @@
 // must lie in the rewrite's footprint (unless it's replay_only); a pure one changes nothing. Built VP_FAITHFUL: every
 // rewrite must match its original bit for bit.
 //
-// Inputs are kept inside the original's bounds where it would overrun a buffer on its own stack (FIX CANDIDATEs in
-// hook/menu_sched.cpp): track names of at most 11 characters, car names of at most 20, NumberString's argument in 0..14,
-// the client's state in 0..13, set_arrows / set_garage's flag 0 or 1.
+// Inputs are kept inside the original's bounds where it would overrun a buffer on its own stack (the cases the FIXes in
+// hook/menu_sched.cpp are for): track names of at most 11 characters, car names of at most 20, NumberString's argument in
+// 0..14, the client's state in 0..13, set_arrows / set_garage's flag 0 or 1. So every round is a case the fixes leave alone.
+//
+// Built with /DVP_MENU_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Multiplayer
+// menus"): every function is still compared as above (the rounds never reach a fixed case), and then directed_fix_tests
+// runs each fix on its bad case -- the rewrite alone, clean, nothing written outside what it's given, the promised result
+// -- and its boundary case on both, bit for bit (see there). VP_FIXTEST=n runs fix group n alone; built with
+// /DVP_MENU_FIXES /DVP_FAITHFUL the same tests run on the faithful rewrites, and every group fails (or crashes).
 //
 // Stubbed (a jump to a logger; state in the arena so both passes see the same): world_ui.cpp's (MemAlloc / delete, the
 // logs, the input and the clock, the 2D calls, the fonts and stamps, the palettes, Xlator::xlate, sprintf, the files,
@@ -69,7 +76,12 @@
 #include <utility>
 #include <vector>
 
+#ifndef VP_MENU_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#define MENU_FIXES 0
+#else
+#define MENU_FIXES 1                // (built with /DVP_MENU_FIXES: the fixes on, and tested -- see directed_fix_tests)
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------------
@@ -498,7 +510,13 @@ static void __cdecl stub_gxRect(int32_t a, int32_t b, int32_t c, int32_t d, uint
 static void __cdecl stub_gxLine(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t col) { L('LINE'); L(a); L(b); L(c); L(d); L(col); L_canvas(); }
 static void __cdecl stub_gxPaste(const gxCanvas* src, int32_t x, int32_t y) { L('PAST'); L(P(src)); L((uint32_t)x); L((uint32_t)y); L_canvas(); }
 static void __cdecl stub_gxText(int32_t x, int32_t y, const char* s, uint32_t col) { L('TEXT'); L((uint32_t)x); L((uint32_t)y); LS(s); L(col); L_canvas(); }
-static int32_t __cdecl stub_gxTextHeight() { L('TXTH'); return 8; }
+// the fix tests' overrides (directed_fix_tests; none set in the rounds)
+static bool g_fx_th_set;
+static int32_t g_fx_th;
+static const char* const* g_fx_tn;                         // the track names (GetTrackName), 64 of them
+static const char *g_fx_tfn, *g_fx_car, *g_fx_carf, *g_fx_str;   // a friendly track name, a car's name and friendly name, the front end's strings
+static char g_fx_lap[0x400], g_fx_rsml[0x400];             // GetLapCountFromType's name, ResourceSetMustLoad's last
+static int32_t __cdecl stub_gxTextHeight() { L('TXTH'); return g_fx_th_set ? g_fx_th : 8; }
 static void __cdecl stub_gxAllocCanvas(gxCanvas* c, int32_t w, int32_t h) {
     L('ACNV'); L(P(c)); L((uint32_t)w); L((uint32_t)h);
     c->format = 4; c->flags = 0; c->pixels = (uint8_t*)(uintptr_t)(0x7c000000u + (uint32_t)(HS->alloc_canvas_next++) * 0x100000u);
@@ -519,7 +537,7 @@ static void __cdecl stub_mrEndFrame() { L('MREF'); }
 
 // ---- stubs: text, controls, files (world_ui.cpp's) ------------------------------------------------------------------------------
 // an Xlator's text: its key from after its last ':' ("Multi:AI_Cars" -> "AI_Cars"), as short as a real translation (the
-// whole keys overrun the ghost types' 64-byte multi string at 0x57a048: a FIX CANDIDATE in hook/menu_sched.cpp)
+// whole keys overrun the ghost types' 64-byte multi string at 0x57a048: a FIX in hook/menu_sched.cpp)
 static uint32_t xl_text(uint32_t key) {
     const char* k = (const char*)(uintptr_t)key;
     if (!readable(k, 1)) return key;
@@ -609,7 +627,7 @@ static void __cdecl stub_OptionsGetI(const char* sec, const char* key, int32_t* 
     L('OGI '); L_key(sec, key); L(P(v));
     const uint32_t h = opt_h(sec, key);
     if (!opt_present(h)) { L('MISS'); L((uint32_t)*v); return; }
-    *v = (int32_t)((h >> 3) % 6);                       // 0..5: NumberString's range (FIX CANDIDATE)
+    *v = (int32_t)((h >> 3) % 6);                       // 0..5: NumberString's range (outside it: a FIX)
 }
 static void __cdecl stub_OptionsGetB(const char* sec, const char* key, uint8_t* v) {
     L('OGB '); L_key(sec, key); L(P(v));
@@ -632,15 +650,19 @@ static const char* k_user_names[8] = {"Player", "Herb", "a12charname!", "x", "Pa
 static int32_t __cdecl stub_HackGetCarIndex() { L('HGCI'); return HS->hack_car; }
 static int32_t __cdecl stub_GetCarFileNumber(const char* s) { L('GCFR'); LS(s); return HS->car_number; }
 static int32_t __cdecl stub_GetTrackCount() { L('GTCN'); return HS->ntracks; }
-static const char* __cdecl stub_GetTrackName(int32_t i) { L('GTNM'); L((uint32_t)i); return k_tracks[(uint32_t)i & 7]; }
-static const char* __cdecl stub_GetTrackFriendlyName(int32_t i) { L('GTFN'); L((uint32_t)i); return k_track_names[(uint32_t)i & 7]; }
-static const char* __cdecl stub_GetRealismString(int32_t i) { L('GRLS'); L((uint32_t)i); return k_strs[0][(uint32_t)i & 3]; }
-static const char* __cdecl stub_GetRaceTypeString(int32_t i) { L('GRTS'); L((uint32_t)i); return k_strs[1][(uint32_t)i & 3]; }
-static const char* __cdecl stub_GetWeatherString(int32_t i) { L('GWES'); L((uint32_t)i); return k_strs[2][(uint32_t)i & 3]; }
-static const char* __cdecl stub_GetGameTimeString(int32_t i) { L('GGTS'); L((uint32_t)i); return k_strs[3][(uint32_t)i & 3]; }
-static const char* __cdecl stub_GetAIStrengthString(int32_t i) { L('GAIS'); L((uint32_t)i); return k_strs[4][(uint32_t)i & 3]; }
-static int32_t __cdecl stub_GetLapCountFromType(int32_t t, const char* name) { L('GLAP'); L((uint32_t)t); LS(name); return HS->laps + t; }
-static void __cdecl stub_ResourceSetMustLoad(const char* s) { L('RSML'); LS(s); }
+static const char* __cdecl stub_GetTrackName(int32_t i) { L('GTNM'); L((uint32_t)i); return g_fx_tn ? g_fx_tn[(uint32_t)i & 63] : k_tracks[(uint32_t)i & 7]; }
+static const char* __cdecl stub_GetTrackFriendlyName(int32_t i) { L('GTFN'); L((uint32_t)i); return g_fx_tfn ? g_fx_tfn : k_track_names[(uint32_t)i & 7]; }
+static const char* __cdecl stub_GetRealismString(int32_t i) { L('GRLS'); L((uint32_t)i); return g_fx_str ? g_fx_str : k_strs[0][(uint32_t)i & 3]; }
+static const char* __cdecl stub_GetRaceTypeString(int32_t i) { L('GRTS'); L((uint32_t)i); return g_fx_str ? g_fx_str : k_strs[1][(uint32_t)i & 3]; }
+static const char* __cdecl stub_GetWeatherString(int32_t i) { L('GWES'); L((uint32_t)i); return g_fx_str ? g_fx_str : k_strs[2][(uint32_t)i & 3]; }
+static const char* __cdecl stub_GetGameTimeString(int32_t i) { L('GGTS'); L((uint32_t)i); return g_fx_str ? g_fx_str : k_strs[3][(uint32_t)i & 3]; }
+static const char* __cdecl stub_GetAIStrengthString(int32_t i) { L('GAIS'); L((uint32_t)i); return g_fx_str ? g_fx_str : k_strs[4][(uint32_t)i & 3]; }
+static int32_t __cdecl stub_GetLapCountFromType(int32_t t, const char* name) {
+    L('GLAP'); L((uint32_t)t); LS(name);
+    if (readable(name, 1)) strncpy(g_fx_lap, name, sizeof g_fx_lap - 1);
+    return HS->laps + t;
+}
+static void __cdecl stub_ResourceSetMustLoad(const char* s) { L('RSML'); LS(s); if (readable(s, 1)) strncpy(g_fx_rsml, s, sizeof g_fx_rsml - 1); }
 static void __cdecl stub_ResourceSetUnload(const char* s) { L('RSUL'); LS(s); }
 static void __cdecl stub_MenuDoOptions() { L('MOPT'); HS->hack_car = (HS->hack_car + 3) & 7; }
 static uint8_t __cdecl stub_MenuEditCar(const char* car, const char* track, uint32_t a, uint32_t b) {
@@ -677,8 +699,8 @@ static void __fastcall stub_CV_Prev(uint8_t* self, int) { L('CVPV'); L(P(self));
 static void __fastcall stub_CV_SetCar(uint8_t* self, int, int32_t car) { L('CVSC'); L(P(self)); L((uint32_t)car); *(int32_t*)(self + CV_CAR) = car; }
 static int32_t __cdecl cv_car(const uint8_t* self) { return readable(self + CV_CAR, 4) ? *(const int32_t*)(self + CV_CAR) : 0; }
 static int32_t __fastcall stub_CV_GetPaintJob(uint8_t* self, int) { L('CVPJ'); L(P(self)); return HS->paintjob; }
-static const char* __fastcall stub_CV_GetFriendlyName(uint8_t* self, int) { L('CVFN'); L(P(self)); return k_car_names[(uint32_t)cv_car(self) & 7]; }
-static const char* __fastcall stub_CV_GetName(uint8_t* self, int) { L('CVGN'); L(P(self)); return k_cars[(uint32_t)cv_car(self) & 7]; }
+static const char* __fastcall stub_CV_GetFriendlyName(uint8_t* self, int) { L('CVFN'); L(P(self)); return g_fx_carf ? g_fx_carf : k_car_names[(uint32_t)cv_car(self) & 7]; }
+static const char* __fastcall stub_CV_GetName(uint8_t* self, int) { L('CVGN'); L(P(self)); return g_fx_car ? g_fx_car : k_cars[(uint32_t)cv_car(self) & 7]; }
 // the multi library
 static uint8_t __cdecl stub_MultiEnabled() { L('MENB'); return HS->multi_enabled; }
 static void __cdecl stub_MultiResumeChat() { L('MRCH'); }
@@ -699,7 +721,7 @@ static void* __cdecl stub_CreateRaceServer(void* sm, const char* nm, const char*
     L('CRSV'); L(P(sm)); LS(nm, 64); L(P(pw)); if (pw) LS(pw, 32);
     return HS->server_ok ? (void*)g_server : 0;
 }
-static const char* __cdecl stub_GetClientStatusString(int32_t s) { L('GCSS'); L((uint32_t)s); return k_strs[5][(uint32_t)s & 3]; }
+static const char* __cdecl stub_GetClientStatusString(int32_t s) { L('GCSS'); L((uint32_t)s); return g_fx_str ? g_fx_str : k_strs[5][(uint32_t)s & 3]; }
 static const char* __cdecl stub_ClientDisconnectString(int32_t r) { L('CDSS'); L((uint32_t)r); return HS->disc_named ? "Kicked" : 0; }
 // the race client's methods (thiscall; each pops its own arguments)
 static void __fastcall fc_void(FakeClient* c, int) { L('FCV '); L(P(c)); }
@@ -1058,8 +1080,8 @@ static void random_race(uint8_t* ri) {
     *(int32_t*)(ri + NRI_STRENGTH) = irange(0, 3);
     ri[NRI_DAMAGE] = (uint8_t)(chance(50) ? 0 : rnd());
     ri[NRI_REVERSED] = (uint8_t)(chance(50) ? 0 : rnd());
-    *(int32_t*)(ri + NRI_TRACK) = irange(0, 5);                          // a track the chooser has (set_track: FIX CANDIDATE)
-    *(int32_t*)(ri + NRI_COUNT) = irange(0, 14);                         // NumberString's range (FIX CANDIDATE)
+    *(int32_t*)(ri + NRI_TRACK) = irange(0, 5);                          // a track the chooser has (any other: set_track's FIX)
+    *(int32_t*)(ri + NRI_COUNT) = irange(0, 14);                         // NumberString's range (outside it: a FIX)
 }
 static void random_proposal(uint8_t* p) {
     fill_random(p, 0x3c);
@@ -1330,6 +1352,608 @@ static bool make_args(const Ent& f, uint32_t* w) {
     return true;
 }
 
+#if MENU_FIXES
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+// Built with /DVP_MENU_FIXES. Each fix's bad case runs on the rewrite alone (the original would overrun its frame or the
+// object there, or call through a stray pointer -- this program's stack among what it would take), from a world set up for
+// it (fx_reset, then the case): it must return cleanly (no fault, the bytes popped, ebx / esi / edi / ebp kept), write
+// nothing outside what it's given (every other byte of .data/.bss/.idata and the arena compared with before, where the
+// function doesn't run a dialog) and give what the fix promises (a text cut to its field, the track's own name, no call
+// made). Where it's harmless (an overrun of an object in the arena) the original is run on the case too, to show it is a
+// bad case. Each fix's boundary case (the longest input that fits, or the last one in range) runs on the original and the
+// rewrite from the same state and must give the same memory, call logs and result. VP_FIXTEST=n runs group n alone (to
+// watch one fix's test fail on a build without the fixes: /DVP_MENU_FIXES /DVP_FAITHFUL).
+static int g_fx_bad, g_fx_n, g_fx_same_n;
+static const Ent& fx_fn(const char* name) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, name)) return g_fns[i];
+    printf("  fix test: %s isn't listed\n", name);
+    fflush(stdout);
+    ExitProcess(4);
+}
+struct Span { const void* p; uint32_t n; };
+// the first byte changed since `before` outside the spans (the stubs' state block aside); 0 if none
+static uint32_t fx_outside(const Mem& before, const std::vector<Span>& ok) {
+    auto in = [&](const uint8_t* q) {
+        for (const Span& sp : ok)
+            if (q >= (const uint8_t*)sp.p && q < (const uint8_t*)sp.p + sp.n) return true;
+        return false;
+    };
+    for (uint32_t i = 0; i < DATA_BYTES; i++)
+        if (before.data[i] != DATA[i] && !in(DATA + i)) return 0x004e1000 + i;
+    for (uint32_t i = 0; i < IDATA_BYTES; i++)
+        if (before.idata[i] != IDATA[i] && !in(IDATA + i)) return 0x005d7000 + i;
+    for (uint32_t i = sizeof(HState); i < ARENA_BYTES; i++)
+        if (before.arena[i] != g_arena[i] && !in(g_arena + i)) return U32(g_arena + i);
+    return 0;
+}
+// the running window and its widgets (UIShowGroup / UIHideGroup / UICustomControl::Dirty write them)
+static std::vector<Span> fx_win(std::initializer_list<Span> more) {
+    std::vector<Span> v(more);
+    v.push_back({W.win, (uint32_t)sizeof(WidgetWindow)});
+    for (Widget* w : W.widgets) v.push_back({w, widget_size(w)});
+    return v;
+}
+static Result fx_run(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w) {
+    uint32_t words[72] = {};
+    int i = 0;
+    for (uint32_t x : w) words[i++] = x;
+    g_pc = _PC_53;
+    return run(f, rewrite, words);
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0, uint32_t where = 0) {
+    g_fx_n++;
+    if (ok) return;
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, popped %u, return %08x, ebx esi edi ebp %08x %08x %08x %08x)", r->fault, r->code, r->eip,
+                  r->pops, r->ret, r->regs[0], r->regs[1], r->regs[2], r->regs[3]);
+    if (where) printf(" (wrote %08x)", where);
+    printf("\n");
+}
+static int fx_count(uint32_t tag) {
+    int n = 0;
+    for (uint32_t i = 0; i < g_log.n && i < LOG_MAX; i++) n += g_log.w[i] == tag;
+    return n;
+}
+static CallLog g_fx_log;
+// the original and the rewrite from the same state: the rewrite clean; the same return, memory and call logs
+static void fx_same(const Ent& f, std::initializer_list<uint32_t> w, const char* what) {
+    g_fx_same_n++;
+    mem_save(g_snap);
+    const Result ro = fx_run(f, false, w);
+    mem_save(g_after);
+    memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+    mem_load(g_snap);
+    const Result rn = fx_run(f, true, w);
+    char m[256];
+    sprintf(m, "%s: a clean return", what);
+    fx_check(fx_clean(f, rn), m, &rn);
+    sprintf(m, "%s: the original's result, bit for bit", what);
+    const uint32_t where = mem_diff(g_after);
+    const bool same = !ro.fault && where == 0 && ro.ret == rn.ret && g_log.n == g_fx_log.n &&
+                      !memcmp(g_log.w, g_fx_log.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+    if (!same) printf("    (memory at %08x, return %08x / %08x, logs %u / %u words)\n", where, ro.ret, rn.ret, g_fx_log.n, g_log.n);
+    fx_check(same, m, &ro, where);
+}
+// an Xlator (a function-local one: its guard's bit set; a static one: guard 0) with the text given, fresh
+static void fx_xl(uint32_t guard, uint8_t bit, uint32_t xl, const char* text) {
+    if (guard) UI_G8(guard) = (uint8_t)(UI_G8(guard) | bit);
+    UI_GU32(xl + 4) = U32(text);
+    UI_GU32(xl + 8) = UI_GU32(S_XLATOR_COOKIE);
+}
+// NumberString's Xlators all constructed, their texts the one given (or their keys' last parts)
+static void fx_numbers(const char* text) {
+    UI_G8(S_NUM_ONCE) = 0xff;
+    UI_G8(S_NUM_ONCE2) = (uint8_t)(UI_G8(S_NUM_ONCE2) | 0x7f);
+    for (int k = 0; k < 15; k++) {
+        static const uint32_t keys[15] = {0x004f8794, 0x004f87a0, 0x004f87ac, 0x004f87b8, 0x004f87c8, 0x004f87d4, 0x004f87e0, 0x004f87ec,
+                                          0x004f87fc, 0x004f880c, 0x004f8818, 0x004f8824, 0x004f8834, 0x004f8844, 0x004f8854};
+        UI_GU32(k_number_xl[k]) = keys[k];
+        fx_xl(0, 0, k_number_xl[k], text ? text : (const char*)(uintptr_t)xl_text(keys[k]));
+    }
+}
+// a string of n c's and then tail (in one of eight buffers of this program's)
+static char g_fx_s[8][0x400];
+static const char* mk(int k, char c, int n, const char* tail = "") {
+    memset(g_fx_s[k], c, (size_t)n);
+    strcpy(g_fx_s[k] + n, tail);
+    return g_fx_s[k];
+}
+// what the game's sprintf would print, its first `keep` characters
+static std::string fx_expect(uint32_t keep, const char* fmt, ...) {
+    static char t[0x2000];
+    va_list ap;
+    va_start(ap, fmt);
+    vsprintf(t, fmt, ap);
+    va_end(ap);
+    if (strlen(t) > keep) t[keep] = 0;
+    return t;
+}
+// a callee caught for a test: a jump to the harness's own (or a rewrite), the original's bytes put back after
+struct FxPatch {
+    uint32_t at;
+    uint8_t b[5];
+    FxPatch(uint32_t a, void* to) : at(a) { memcpy(b, (const void*)(uintptr_t)a, 5); patch_jmp(a, to); }
+    ~FxPatch() { memcpy((void*)(uintptr_t)at, b, 5); }
+};
+static char g_fx_box[0x400];
+static void __cdecl fx_drat_box(const char*, const char* text, uint32_t) { L('FXDB'); strncpy(g_fx_box, text, 0x3ff); }
+// the tests' world: pristine, a deterministic state, the overrides off, the statics the code follows
+static const char* g_fx_names[64];
+static char g_fx_names_buf[64][32];
+static void fx_reset(uint32_t seed) {
+    g_rng = seed * 2654435761u | 1;
+    mem_load(g_pristine);
+    randomize_world();
+    randomize_statics();
+    g_fx_th_set = false; g_fx_tn = 0; g_fx_tfn = g_fx_car = g_fx_carf = g_fx_str = 0;
+    g_fx_lap[0] = g_fx_rsml[0] = g_fx_box[0] = 0;
+    UI_GP(WidgetWindow, S_ACTIVE) = W.win;
+    UI_G8(S_EXIT) = 0;
+    HS->frames = 0; HS->frame_limit = 40; HS->script_n = HS->script_pos = 0;
+    fx_numbers(0);
+}
+// the add-on tracks: n names of the form "addon_track_NN" (14 characters), or "trk_NN" (6)
+static void fx_tracks(bool long_names) {
+    for (int i = 0; i < 64; i++) {
+        sprintf(g_fx_names_buf[i], long_names ? "addon_track_%02d" : "trk_%02d", i);
+        g_fx_names[i] = g_fx_names_buf[i];
+    }
+    g_fx_tn = g_fx_names;
+}
+// the chooser as its fixed constructor leaves it for `count` tracks of the names above
+static void fx_chooser(int32_t count) {
+    MultiTrackChooser* t = W.track;
+    t->count = count;
+    for (int i = 0; i < 16; i++) {
+        strncpy(t->names[i], g_fx_tn[i], 12);
+        t->names[i][12] = 0;
+    }
+}
+
+static int directed_fix_tests() {
+    char m[256];
+    const char* only_fx = getenv("VP_FIXTEST");
+    auto fx_on = [&](int g) { return !only_fx || atoi(only_fx) == g; };
+    // ---- 1 MultiTrackChooser's constructor: 28 tracks (an add-on table), names of 14 characters -----------------------------
+    if (fx_on(1)) {
+        const Ent& f = fx_fn("MultiTrackChooser::MultiTrackChooser");
+        fx_reset(0xa100);
+        fx_tracks(true);
+        HS->ntracks = 30;
+        memset(W.scratch, 0xa5, 0x800);
+        mem_save(g_snap);
+        Result r = fx_run(f, true, {U32(W.scratch), 0, 1});
+        const MultiTrackChooser* t = (const MultiTrackChooser*)W.scratch;
+        bool names = true;
+        for (int i = 0; i < 16; i++) names &= !strncmp(t->names[i], g_fx_names[i], 12) && t->names[i][12] == 0;
+        const std::vector<Span> obj = {{W.scratch, (uint32_t)sizeof(MultiTrackChooser)}, {(const void*)(uintptr_t)S_TRACKCH_G, 4}};
+        const uint32_t out = fx_outside(g_snap, obj);
+        fx_check(fx_clean(f, r) && r.ret == U32(W.scratch) && t->count == 28 && t->host == 1 && t->stamp == 0 && names &&
+                 fx_count('GTNM') == 16 && out == 0,
+                 "MultiTrackChooser, 28 tracks of 14 characters: clean, the first 16 names cut to 12, the host flag kept, nothing past the object",
+                 &r, out);
+        mem_load(g_snap);
+        r = fx_run(f, false, {U32(W.scratch), 0, 1});
+        fx_check(r.fault || fx_outside(g_snap, obj) != 0,
+                 "MultiTrackChooser, 28 tracks: the original (for comparison) writes past the object");
+        fx_reset(0xa101);
+        fx_tracks(false);
+        HS->ntracks = 18;
+        memset(W.scratch, 0xa5, 0x800);
+        fx_same(f, {U32(W.scratch), 0, 1}, "MultiTrackChooser, 16 tracks of 6 characters");
+        fx_reset(0xa102);
+        HS->ntracks = 8;
+        memset(W.scratch, 0xa5, 0x800);
+        fx_same(f, {U32(W.scratch), 0, 0}, "MultiTrackChooser, the stock 6 tracks (an 11-character name among them)");
+    }
+    // ---- 2 MultiTrackChooser::set_track: a track past the first 16, a 12-character name, a track this machine doesn't have --
+    if (fx_on(2)) {
+        const Ent& f = fx_fn("MultiTrackChooser::set_track(int)");
+        static const int32_t ts[4] = {20, 5, 28, -1};
+        for (int32_t tr : ts) {
+            fx_reset(0xa200);
+            fx_tracks(true);
+            fx_chooser(28);
+            W.track->stamp = 0;
+            const Result r = fx_run(f, true, {U32(W.track), 0, (uint32_t)tr});
+            const bool have = tr >= 0 && tr < 28;
+            char want[64];
+            sprintf(want, "%s.stp", have ? g_fx_names[tr] : "");
+            sprintf(m, "set_track(%d) of 28 (names of 14 characters): clean, %s", tr, have ? "the track's whole name's picture" : "no picture, none loaded");
+            fx_check(fx_clean(f, r) && W.track->track == tr &&
+                     (have ? W.track->stamp == (void*)fake_for(want, 'STMP') && fx_count('GSTP') == 1 : W.track->stamp == 0 && fx_count('GSTP') == 0),
+                     m, &r);
+        }
+        fx_reset(0xa201);
+        fx_same(f, {U32(W.track), 0, 5}, "set_track(5) of the stock 6 (an 11-character name)");
+        fx_reset(0xa202);
+        fx_tracks(false);
+        fx_chooser(16);
+        fx_same(f, {U32(W.track), 0, 15}, "set_track(15) of 16");
+    }
+    // ---- 3 MultiRaceCfg::Callback (2, the race type): the laps of a track past the first 16, of one not here ---------------
+    if (fx_on(3)) {
+        const Ent& f = fx_fn("MultiRaceCfg::Callback");
+        for (int k = 0; k < 2; k++) {
+            fx_reset(0xa300 + k);
+            fx_tracks(true);
+            fx_chooser(28);
+            W.track->track = k ? 28 : 20;
+            W.cfg->laps = 777;
+            W.cfg->type_f = 2.0f;
+            const Result r = fx_run(f, true, {U32(W.cfg), 0, 2, U32(&W.ints[0])});
+            sprintf(m, "MultiRaceCfg::Callback(2), track %d of 28: clean, %s", k ? 28 : 20,
+                    k ? "the laps left as they were, GetLapCountFromType not called" : "the laps of the track's whole name");
+            fx_check(fx_clean(f, r) && (k ? W.cfg->laps == 777 && fx_count('GLAP') == 0 && g_fx_lap[0] == 0
+                                          : !strcmp(g_fx_lap, g_fx_names[20]) && W.cfg->laps == HS->laps + 2),
+                     m, &r);
+        }
+        fx_reset(0xa302);
+        W.track->track = 5;
+        fx_same(f, {U32(W.cfg), 0, 2, U32(&W.ints[0])}, "MultiRaceCfg::Callback(2), the stock track 5");
+    }
+    // ---- 4 NumberString outside 0..14 -------------------------------------------------------------------------------------------
+    if (fx_on(4)) {
+        const Ent& f = fx_fn("NumberString");
+        static const int32_t ns[4] = {15, -1, 0x7fffffff, (int32_t)0x80000000};
+        for (int32_t n : ns) {
+            fx_reset(0xa400);
+            mem_save(g_snap);
+            const Result r = fx_run(f, true, {(uint32_t)n});
+            const uint32_t out = fx_outside(g_snap, {});
+            sprintf(m, "NumberString(%d): clean, \"\"", n);
+            fx_check(fx_clean(f, r) && r.ret == S_EMPTY_STR && out == 0, m, &r, out);
+        }
+        for (int32_t n = 0; n <= 14; n += 14) {
+            fx_reset(0xa401);
+            sprintf(m, "NumberString(%d)", n);
+            fx_same(f, {(uint32_t)n}, m);
+        }
+    }
+    // ---- 5 MultiMaster::Update: the client's state past 13 (the race's) or negative ------------------------------------------------
+    if (fx_on(5)) {
+        const Ent& f = fx_fn("MultiMaster::Update");
+        static const int32_t st[5][2] = {{12, 14}, {14, 0x15}, {13, 0xe}, {9, -5}, {12, 100}};
+        for (auto& s2 : st) {
+            fx_reset(0xa500);
+            MultiMaster* mm = W.master;
+            mm->last_state = s2[0];
+            g_client->state = s2[1];
+            mm->done = 0;
+            mm->config_time = 0;
+            const Result r = fx_run(f, true, {U32(mm), 0});
+            const bool past = s2[1] > 13;
+            sprintf(m, "MultiMaster::Update, state %d after %d: clean, %s", s2[1], s2[0],
+                    past ? "the lobby done (as car get)" : "as state 0 (sf_hang's panic)");
+            fx_check(fx_clean(f, r) && mm->last_state == s2[1] && (past ? mm->done == 1 : fx_count('PANC') == 1), m, &r);
+        }
+        fx_reset(0xa501);
+        W.master->last_state = 12; g_client->state = 13; W.master->done = 0;
+        fx_same(f, {U32(W.master), 0}, "MultiMaster::Update, state 13 (car get) after 12");
+    }
+    // ---- 6 MultiDo: the client already past car get (14) when the lobby sees it ----------------------------------------------
+    if (fx_on(6)) {
+        const Ent& f = fx_fn("MultiDo");
+        FxPatch up(0x00488610, fx_fn("MultiMaster::Update").fn);       // (the master's Update is the rewrite, as in the DLL)
+        for (int32_t s2 = 14; s2 <= 0x15; s2 += 7) {
+            fx_reset(0xa600);
+            g_client->state = s2;
+            HS->frame_limit = 200;
+            const Result r = fx_run(f, true, {U32(W.lmi)});
+            sprintf(m, "MultiDo, the client at state %d: clean, 1 (the race follows)", s2);
+            fx_check(fx_clean(f, r) && r.ret == 1 && fx_count('WDOG') == 0, m, &r);
+        }
+        fx_reset(0xa601);
+        g_client->state = 13;
+        HS->frame_limit = 200;
+        fx_same(f, {U32(W.lmi)}, "MultiDo, the client at car get (13)");
+        fx_reset(0xa602);
+        g_client->state = 12;
+        HS->script[0][0] = OP_NOP; HS->script[1][0] = OP_KEY; HS->script[1][1] = 0x1b; HS->script_n = 2;   // Escape
+        fx_same(f, {U32(W.lmi)}, "MultiDo, the client at car waiting (12), Escape");
+    }
+    // ---- 7 ChatControl::Draw / MouseMove: a text height of -3 ------------------------------------------------------------------
+    if (fx_on(7)) {
+        const Ent& dr = fx_fn("ChatControl::Draw");
+        const Ent& mv = fx_fn("ChatControl::MouseMove");
+        fx_reset(0xa700);
+        g_fx_th_set = true; g_fx_th = -3;
+        Result r = fx_run(dr, true, {U32(W.chat), 0, U32(W.screen)});
+        fx_check(fx_clean(dr, r) && fx_count('FCNT') == 0, "ChatControl::Draw, a text height of -3: clean, no rows", &r);
+        fx_reset(0xa701);
+        g_fx_th_set = true; g_fx_th = -3;
+        W.chat->dragging = 1;
+        HS->nusers = 3;
+        r = fx_run(mv, true, {U32(W.chat), 0, 30, 0x150});
+        fx_check(fx_clean(mv, r) && W.chat->sel == 0, "ChatControl::MouseMove, a text height of -3: clean, the first row picked", &r);
+        fx_reset(0xa702);
+        fx_same(dr, {U32(W.chat), 0, U32(W.screen)}, "ChatControl::Draw, a text height of 8");
+        fx_reset(0xa703);
+        W.chat->dragging = 1;
+        fx_same(mv, {U32(W.chat), 0, 30, 0x150}, "ChatControl::MouseMove, a text height of 8");
+    }
+    // ---- 8 ChatWindow::Draw: a name padding past the line's room ----------------------------------------------------------------
+    if (fx_on(8)) {
+        const Ent& f = fx_fn("ChatWindow::Draw");
+        static const int32_t ws[4] = {0x200, -0x200, (int32_t)0x80000000, 0x7fffffff};
+        for (int32_t w : ws) {
+            fx_reset(0xa800);
+            HS->maxname = w;
+            HS->scroll_on = 1;
+            const Result r = fx_run(f, true, {U32(&W.chat->window), 0, U32(W.screen)});
+            sprintf(m, "ChatWindow::Draw, a name padding of %d: clean", w);
+            fx_check(fx_clean(f, r), m, &r);
+        }
+        fx_reset(0xa801);
+        HS->maxname = 0xc8;                                             // 0xc8 + ": " + 49 = 251 characters: the most that fit
+        HS->scroll_on = 1;
+        for (int i = 0; i < 8; i++) { memset(g_client->ring[i].text, 'w', 0x31); g_client->ring[i].text[0x31] = 0; }
+        fx_same(f, {U32(&W.chat->window), 0, U32(W.screen)}, "ChatWindow::Draw, lines of 251 characters");
+    }
+    // ---- 9 MultiMaster::race: a car name of 31 characters ("<car>.car") ------------------------------------------------------------
+    if (fx_on(9)) {
+        const Ent& f = fx_fn("MultiMaster::race");
+        fx_reset(0xa900);
+        g_client->state = 0xb;
+        g_fx_car = mk(0, 'c', 31);
+        const Result r = fx_run(f, true, {U32(W.master), 0});
+        fx_check(fx_clean(f, r) && fx_expect(0x400, "%s.car", g_fx_s[0]) == g_fx_rsml,
+                 "MultiMaster::race, a 31-character car: clean, \"<car>.car\" loaded by its whole name", &r);
+        fx_reset(0xa901);
+        g_client->state = 0xb;
+        g_fx_car = mk(0, 'c', 27);
+        fx_same(f, {U32(W.master), 0}, "MultiMaster::race, a 27-character car");
+    }
+    // ---- 10 MultiCarChooser::update_car: a friendly name over 33 characters -----------------------------------------------------
+    if (fx_on(10)) {
+        const Ent& f = fx_fn("MultiCarChooser::update_car");
+        fx_reset(0xaa00);
+        g_fx_carf = mk(0, 'f', 50);
+        mem_save(g_snap);
+        const Result r = fx_run(f, true, {U32(W.carch), 0});
+        const uint32_t out = fx_outside(g_snap, {{W.carch->name, (uint32_t)sizeof W.carch->name}});
+        fx_check(fx_clean(f, r) && fx_expect(33, "%s", g_fx_s[0]) == W.carch->name && out == 0,
+                 "MultiCarChooser::update_car, a 50-character name: clean, 33 kept, the CarViewer3D untouched", &r, out);
+        fx_reset(0xaa01);
+        g_fx_carf = mk(0, 'f', 33);
+        fx_same(f, {U32(W.carch), 0}, "MultiCarChooser::update_car, a 33-character name");
+    }
+    // ---- 11 MultiTrackChooser::set_text_from_race: a long name and the reversed text; a track not here --------------------------
+    if (fx_on(11)) {
+        const Ent& f = fx_fn("MultiTrackChooser::set_text_from_race");
+        uint8_t* ri = W.prop + NP_RACE;
+        fx_reset(0xab00);
+        *(int32_t*)(ri + NRI_TRACK) = 2; ri[NRI_REVERSED] = 1;
+        g_fx_tfn = mk(0, 'F', 70);
+        fx_xl(0, 0, 0x00579f40, "Reversed");
+        mem_save(g_snap);
+        Result r = fx_run(f, true, {U32(W.track), 0, U32(ri)});
+        uint32_t out = fx_outside(g_snap, {{W.track->text, (uint32_t)sizeof W.track->text}});
+        fx_check(fx_clean(f, r) && fx_expect(63, "%s - %s", g_fx_s[0], "Reversed") == W.track->text && out == 0,
+                 "set_text_from_race, a 70-character name, reversed: clean, 63 kept, the race number's text untouched", &r, out);
+        fx_reset(0xab01);
+        *(int32_t*)(ri + NRI_TRACK) = W.track->count;
+        mem_save(g_snap);
+        r = fx_run(f, true, {U32(W.track), 0, U32(ri)});
+        out = fx_outside(g_snap, {{W.track->text, (uint32_t)sizeof W.track->text}});
+        fx_check(fx_clean(f, r) && W.track->text[0] == 0 && fx_count('GTFN') == 0 && out == 0,
+                 "set_text_from_race, a track this machine doesn't have: clean, no name, GetTrackFriendlyName not called", &r, out);
+        fx_reset(0xab02);
+        *(int32_t*)(ri + NRI_TRACK) = 2; ri[NRI_REVERSED] = 1;
+        g_fx_tfn = mk(0, 'F', 63 - 3 - 8);
+        fx_xl(0, 0, 0x00579f40, "Reversed");
+        fx_same(f, {U32(W.track), 0, U32(ri)}, "set_text_from_race, a text of 63 characters");
+        fx_reset(0xab03);
+        *(int32_t*)(ri + NRI_TRACK) = W.track->count - 1; ri[NRI_REVERSED] = 0;
+        fx_same(f, {U32(W.track), 0, U32(ri)}, "set_text_from_race, the last track");
+    }
+    // ---- 12 MultiTrackChooser::set_race_number: long number translations -----------------------------------------------------
+    if (fx_on(12)) {
+        const Ent& f = fx_fn("MultiTrackChooser::set_race_number");
+        fx_reset(0xac00);
+        fx_numbers(mk(0, 'n', 30));
+        mem_save(g_snap);
+        const Result r = fx_run(f, true, {U32(W.track), 0, 3, 5});
+        const uint32_t out = fx_outside(g_snap, {{W.track->race_text, (uint32_t)sizeof W.track->race_text}});
+        fx_check(fx_clean(f, r) && fx_expect(35, "XXX Race %s of %s XXX", g_fx_s[0], g_fx_s[0]) == W.track->race_text && out == 0,
+                 "set_race_number, 30-character numbers: clean, 35 kept, the count and track untouched", &r, out);
+        fx_reset(0xac01);
+        fx_numbers(mk(0, 'n', 9));
+        fx_same(f, {U32(W.track), 0, 3, 5}, "set_race_number, a text of 35 characters");
+    }
+    // ---- 13 MultiRaceCfg: the AI cars' and the laps' texts with long translations ------------------------------------------------
+    if (fx_on(13)) {
+        const Ent& ct = fx_fn("MultiRaceCfg::MultiRaceCfg");
+        const Ent& cb = fx_fn("MultiRaceCfg::Callback");
+        fx_reset(0xad00);
+        fx_xl(0, 0, 0x0057a020, mk(0, 'A', 40));
+        memset(W.scratch, 0xa5, 0x800);
+        mem_save(g_snap);
+        Result r = fx_run(ct, true, {U32(W.scratch), 0});
+        const MultiRaceCfg* c = (const MultiRaceCfg*)W.scratch;
+        uint32_t out = fx_outside(g_snap, {{W.scratch, 0x68}, {(const void*)(uintptr_t)S_RACECFG_G, 4}});
+        fx_check(fx_clean(ct, r) && strlen(c->opp_text) == 15 && !strncmp(c->opp_text, g_fx_s[0], 15) && out == 0,
+                 "MultiRaceCfg's constructor, a 40-character translation: clean, the AI cars' text 15, the laps' untouched", &r, out);
+        fx_reset(0xad01);
+        fx_xl(S_RACECFG_ONCE, 1, 0x0057a1f8, mk(0, 'A', 40));
+        fx_xl(S_RACECFG_ONCE, 2, 0x0057a238, mk(1, 'L', 40));
+        W.cfg->opp_f = 3.0f;
+        mem_save(g_snap);
+        r = fx_run(cb, true, {U32(W.cfg), 0, 1, U32(&W.ints[0])});
+        out = fx_outside(g_snap, fx_win({{(const void*)&W.cfg->opponents, 4}, {W.cfg->opp_text, (uint32_t)sizeof W.cfg->opp_text}}));
+        fx_check(fx_clean(cb, r) && strlen(W.cfg->opp_text) == 15 && out == 0,
+                 "MultiRaceCfg::Callback(1), a 40-character translation: clean, 15 kept, the laps' text untouched", &r, out);
+        fx_reset(0xad02);
+        fx_xl(S_RACECFG_ONCE, 1, 0x0057a1f8, mk(0, 'A', 40));
+        fx_xl(S_RACECFG_ONCE, 2, 0x0057a238, mk(1, 'L', 40));
+        W.cfg->type_f = 2.0f;
+        mem_save(g_snap);
+        r = fx_run(cb, true, {U32(W.cfg), 0, 2, U32(&W.ints[0])});
+        out = fx_outside(g_snap, {{(const void*)&W.cfg->race_type, 4}, {(const void*)&W.cfg->laps, 4},
+                                  {W.cfg->laps_text, (uint32_t)sizeof W.cfg->laps_text}});
+        fx_check(fx_clean(cb, r) && strlen(W.cfg->laps_text) == 23 && out == 0,
+                 "MultiRaceCfg::Callback(2), a 40-character translation: clean, 23 kept, the groups untouched", &r, out);
+        // the boundaries: "<12>: Three" (15), "<17>: <2 digits>" (23)
+        fx_reset(0xad03);
+        fx_numbers("Three");
+        fx_xl(0, 0, 0x0057a020, mk(0, 'A', 15 - 2 - 5));
+        memset(W.scratch, 0xa5, 0x800);
+        fx_same(ct, {U32(W.scratch), 0}, "MultiRaceCfg's constructor, an AI cars' text that fits");
+        fx_reset(0xad04);
+        fx_xl(S_RACECFG_ONCE, 2, 0x0057a238, mk(1, 'L', 23 - 2 - 2));      // (laps 10 + 3: two digits)
+        W.cfg->type_f = 3.0f;
+        HS->laps = 10;
+        fx_same(cb, {U32(W.cfg), 0, 2, U32(&W.ints[0])}, "MultiRaceCfg::Callback(2), a laps' text of 23 characters");
+    }
+    // ---- 14 MultiRaceInfo: the proposal's texts, long ---------------------------------------------------------------------------
+    if (fx_on(14)) {
+        const Ent& ur = fx_fn("MultiRaceInfo::update_race");
+        const Ent& up = fx_fn("MultiRaceInfo::UpdateProposal");
+        auto setup = [&](uint32_t seed, int n) {
+            fx_reset(seed);
+            g_fx_str = mk(0, 'R', n);
+            fx_xl(S_RACE_ONCE, 1, 0x0057a0d0, mk(1, 'E', n));
+            fx_xl(S_RACE_ONCE, 2, 0x0057a180, mk(1, 'E', n));
+            fx_xl(S_RACE_ONCE, 4, 0x0057a108, mk(2, 'P', n));
+            fx_xl(S_RACE_ONCE, 8, 0x0057a038, mk(2, 'P', n));
+            fx_xl(0, 0, 0x0057a010, mk(3, 'I', n));
+            fx_numbers(mk(4, 'N', n));
+            uint8_t* ri = W.prop + NP_RACE;
+            *(int32_t*)(ri + NRI_COUNT) = 3; *(int32_t*)(ri + NRI_LAPS) = 5; ri[NRI_DAMAGE] = 1;
+            W.prop[NP_IROC] = 1;
+        };
+        const std::vector<Span> fields = fx_win({{W.info->title, 0xa0 - 0x18}});
+        FxPatch rw(F_MRI_update_race, ur.fn);                           // (UpdateProposal's update_race the rewrite, as in the DLL)
+        setup(0xae00, 40);
+        mem_save(g_snap);
+        Result r = fx_run(ur, true, {U32(W.info), 0, U32(W.prop + NP_RACE), 1});
+        uint32_t out = fx_outside(g_snap, fields);
+        bool ok = strlen(W.info->title) == 15 && strlen(W.info->realism) == 15 && strlen(W.info->damage) == 15 &&
+                  strlen(W.info->time) == 15 && strlen(W.info->weather) == 15 && strlen(W.info->type) == 23 &&
+                  strlen(W.info->count) == 15 && strlen(W.info->strength) == 15;
+        fx_check(fx_clean(ur, r) && ok && out == 0, "MultiRaceInfo::update_race, 40-character texts: clean, each held to its field", &r, out);
+        setup(0xae01, 40);
+        mem_save(g_snap);
+        r = fx_run(up, true, {U32(W.prop)});
+        out = fx_outside(g_snap, fields);
+        fx_check(fx_clean(up, r) && strlen(W.info->title) == 15 && out == 0,
+                 "MultiRaceInfo::UpdateProposal, 40-character texts: clean, each held to its field", &r, out);
+        setup(0xae02, 15);
+        fx_xl(S_RACE_ONCE, 4, 0x0057a108, mk(2, 'P', 23 - 15 - 2 - 1 - 1));
+        fx_same(ur, {U32(W.info), 0, U32(W.prop + NP_RACE), 1}, "MultiRaceInfo::update_race, texts that fill their fields");
+        setup(0xae03, 15);
+        fx_xl(S_RACE_ONCE, 4, 0x0057a108, mk(2, 'P', 23 - 15 - 2 - 1 - 1));
+        fx_same(up, {U32(W.prop)}, "MultiRaceInfo::UpdateProposal, texts that fill their fields");
+    }
+    // ---- 15 MultiRaceInfo::Added: the ghost types' string ---------------------------------------------------------------------
+    if (fx_on(15)) {
+        const Ent& f = fx_fn("MultiRaceInfo::Added");
+        fx_reset(0xaf00);
+        fx_xl(S_RACEINFO_ONCE, 1, 0x0057a098, mk(0, 'a', 40));
+        fx_xl(S_RACEINFO_ONCE, 2, 0x0057a0e0, mk(1, 'b', 40));
+        fx_xl(S_RACEINFO_ONCE, 4, 0x0057a148, mk(2, 'c', 40));
+        uint8_t next[0xc];
+        memcpy(next, (const void*)(uintptr_t)0x0057a088, 0xc);
+        const Result r = fx_run(f, true, {U32(W.info), 0});
+        const char* ms = (const char*)(uintptr_t)S_GHOST_MULTI;
+        const bool str = !strcmp(ms, mk(5, 'a', 20)) && !strcmp(ms + 21, mk(6, 'b', 20)) && !strcmp(ms + 42, mk(7, 'c', 20)) && ms[63] == 0;
+        fx_check(fx_clean(f, r) && str && !memcmp(next, (const void*)(uintptr_t)0x0057a088, 0xc),
+                 "MultiRaceInfo::Added, three 40-character ghost types: clean, each cut to 20 in the 64 bytes, the next Xlator untouched", &r);
+        fx_reset(0xaf01);
+        fx_xl(S_RACEINFO_ONCE, 1, 0x0057a098, mk(0, 'a', 20));
+        fx_xl(S_RACEINFO_ONCE, 2, 0x0057a0e0, mk(1, 'b', 20));
+        fx_xl(S_RACEINFO_ONCE, 4, 0x0057a148, mk(2, 'c', 20));
+        fx_same(f, {U32(W.info), 0}, "MultiRaceInfo::Added, ghost types of 20 characters (the 64 bytes full)");
+    }
+    // ---- 16 sf_noconn: a long lost-connection text ------------------------------------------------------------------------------
+    if (fx_on(16)) {
+        const Ent& f = fx_fn("MultiMaster::sf_noconn");
+        FxPatch db(F_UIDoDratBox, (void*)&fx_drat_box);
+        fx_reset(0xb000);
+        g_client->state = 2;
+        fx_xl(S_NOCONN_ONCE, 2, 0x0057a2c0, mk(0, 'L', 200));
+        const Result r = fx_run(f, true, {U32(W.master), 0});
+        fx_check(fx_clean(f, r) && fx_expect(127, "%s\n%s", g_fx_s[0], k_strs[5][2]) == g_fx_box,
+                 "sf_noconn, a 200-character translation: clean, the box's text its first 127", &r);
+        fx_reset(0xb001);
+        g_client->state = 2;
+        fx_xl(S_NOCONN_ONCE, 2, 0x0057a2c0, mk(0, 'L', 127 - 1 - (int)strlen(k_strs[5][2])));
+        fx_same(f, {U32(W.master), 0}, "sf_noconn, a text of 127 characters");
+    }
+    // ---- 17 MenuMultiScheduler: a game's name not ending in its 32 bytes ------------------------------------------------------
+    if (fx_on(17)) {
+        const Ent& f = fx_fn("MenuMultiScheduler");
+        auto setup = [&](uint32_t seed, int n) {
+            fx_reset(seed);
+            random_gi();
+            W.gi[MGI_HOST] = 0; W.gi[MGI_BY_NAME] = 0;
+            memset(W.gi + MGI_NAME, 'G', (size_t)n); W.gi[MGI_NAME + n] = 0;
+            W.lmi2[LMI_LIVE] = 0;
+            memset(W.lmi2 + LMI_NAME, 0x5c, 0x30);
+            HS->client_ok = 0;
+        };
+        setup(0xb100, 0x50);
+        const Result r = fx_run(f, true, {U32(W.lmi2), U32(W.gi)});
+        bool after = true;
+        for (int i = 0x30; i < 0x40; i++) after &= W.lmi2[i] == 0x5c;
+        fx_check(fx_clean(f, r) && fx_expect(31, "%s", (const char*)W.gi + MGI_NAME) == (const char*)(W.lmi2 + LMI_NAME) && after,
+                 "MenuMultiScheduler, an 80-character name: clean, 31 kept, the task id untouched", &r);
+        setup(0xb101, 31);
+        fx_same(f, {U32(W.lmi2), U32(W.gi)}, "MenuMultiScheduler, a 31-character name");
+    }
+    // ---- 18 set_arrows / set_garage: a flag other than 0 or 1 -------------------------------------------------------------------
+    if (fx_on(18)) {
+        for (int k = 0; k < 2; k++) {
+            const Ent& f = fx_fn(k ? "MultiCarChooser::set_garage" : "MultiCarChooser::set_arrows");
+            fx_reset(0xb200 + k);
+            mem_save(g_snap);
+            const Result r1 = fx_run(f, true, {U32(W.carch), 0, 1});
+            mem_save(g_after);
+            mem_load(g_snap);
+            const Result r2 = fx_run(f, true, {U32(W.carch), 0, 2});
+            uint8_t* flag = k ? (uint8_t*)&W.carch->garage : (uint8_t*)&W.carch->arrows;
+            const bool two = *flag == 2;
+            *flag = 1;
+            const uint32_t where = mem_diff(g_after);
+            sprintf(m, "%s(2): clean, shown as for 1 (the flag 2 kept)", f.name);
+            fx_check(fx_clean(f, r1) && fx_clean(f, r2) && two && where == 0, m, &r2, where);
+            for (uint32_t v = 0; v < 2; v++) {
+                fx_reset(0xb202 + k);
+                sprintf(m, "%s(%u)", f.name, v);
+                fx_same(f, {U32(W.carch), 0, v}, m);
+            }
+        }
+    }
+    // ---- 19 MultiTrackChooser::next / prev with no tracks -----------------------------------------------------------------------
+    if (fx_on(19)) {
+        for (int k = 0; k < 2; k++) {
+            const Ent& f = fx_fn(k ? "MultiTrackChooser::prev" : "MultiTrackChooser::next");
+            fx_reset(0xb300 + k);
+            W.track->count = 0;
+            mem_save(g_snap);
+            const Result r = fx_run(f, true, {U32(W.track), 0});
+            const uint32_t out = fx_outside(g_snap, {});
+            sprintf(m, "%s, no tracks: clean, nothing changed, nothing called", f.name);
+            fx_check(fx_clean(f, r) && out == 0 && g_log.n == 0, m, &r, out);
+            fx_reset(0xb302 + k);
+            sprintf(m, "%s, the stock 6 tracks", f.name);
+            fx_same(f, {U32(W.track), 0}, m);
+        }
+    }
+    mem_load(g_pristine);
+    g_fx_th_set = false; g_fx_tn = 0; g_fx_tfn = g_fx_car = g_fx_carf = g_fx_str = 0;
+    printf("fix tests: %s -- %d checks (%d of them original against rewrite), %d failed\n", g_fx_bad ? "FAILED" : "all passed", g_fx_n,
+           g_fx_same_n, g_fx_bad);
+    return g_fx_bad;
+}
+#endif
+
 // ---- main -----------------------------------------------------------------------------------------------------------------------
 static bool is_modal(const char* nm) {
     return strstr(nm, "MultiDo") || strstr(nm, "MenuMultiScheduler") || strstr(nm, "xit") || strstr(nm, "noconn") ||
@@ -1428,6 +2052,11 @@ int main(int argc, char** argv) {
                 dup++;
             }
 
+#if MENU_FIXES
+    const int fix_bad = only ? 0 : directed_fix_tests();
+#else
+    const int fix_bad = 0;
+#endif
     static Footprint fp;
     long long checks = 0, poisoned_checks = 0, log_words = 0;
     int differ = 0, fp_bad = 0, faults = 0, pure_n = 0, replay_n = 0, changed_fns = 0, still_fns = 0, bad_fns = 0, skipped = 0;
@@ -1527,5 +2156,5 @@ int main(int argc, char** argv) {
            "%d functions bad\n", g_nfns, pure_n, replay_n, g_nfns - pure_n - replay_n, dup, checks, poisoned_checks, log_words, differ,
            fp_bad, faults, both_fault, skipped, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
-    return differ || fp_bad || dup ? 1 : 0;
+    return differ || fp_bad || dup || fix_bad ? 1 : 0;
 }

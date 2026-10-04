@@ -21,6 +21,11 @@
 // frees the device (the packetizer's destructor) is replay_only: a session replay of a line game is their in-game check
 // (no line hardware here), and test/world_net_line.cpp checks them all offline against the originals on a fake line.
 //
+// Fixes (docs/FIXES.md, "Multiplayer"; each marked `// FIX:` in place, `VP_FIX &&`, so the faithful build is the original):
+// LinePacketizer::Recv goes back to looking for a header when the device reads fewer than the header's 3 bytes (the
+// original took the rest from its stack as the length and CRC); LineChecker::Tick's reply is terminated after its 0x40
+// bytes (strchr / strtoul ran on past the buffer when the read had no NUL).
+//
 // Also here: the bare `ret`s VERBOSE (linechek.obj) and tapidbg's dump_callstatedetail, dump_modemsettings and
 // dump_devstatus. Left to tools/gen_leftovers.py --lib multi (group B's net_leftover.cpp): these objects' $E initialisers.
 #include <stdint.h>
@@ -28,6 +33,11 @@
 #include "port.h"
 #include "net_types.h"
 #include "net_wsock.h"
+
+// a harness's marker for "a fix changed what happens here" (nothing in the DLL)
+#ifndef VP_FIX_HIT
+#define VP_FIX_HIT(what) ((void)0)
+#endif
 
 namespace {
 namespace net_linepkt {
@@ -100,7 +110,9 @@ PORT_FN(0x004af870, "LinePacketizer::GetHeaderSize", LinePacketizer_GetHeaderSiz
 //   0 sync: read the 3 - count bytes still wanted into a zeroed 3-byte buffer; trailing 0xf0s are dropped from the count
 //     read; while some other byte is left, read that many again. A read of nothing, or all 0xf0s: on to the header.
 //     count = 3 - what was still wanted when it stopped.
-//   1 header (3 bytes once there are 3): the length (under 0xe2, else logged and back to sync) and the CRC;
+//   1 header (3 bytes once there are 3): the length (under 0xe2, else logged and back to sync) and the CRC. FIX: a read
+//     of fewer than 3 (the device had less than DataAvail said, or ReadFile failed) goes back to sync and waits for the
+//     next call; the original used the bytes it didn't read (stack garbage) as the length and CRC;
 //   2 body: longer than the caller's buffer -> logged, back to sync; not all there -> wait; else read it (into the
 //     length field: the device's count), back to sync, and a packet if the CRC matches;
 //   3 (after the destructor) panics.
@@ -139,6 +151,12 @@ static uint8_t __fastcall LinePacketizer_Recv(LinePacketizer* self, Edx, void* b
             hn = 3;
             avail -= 3;
             vcall<uint8_t>(self->dev, LD_RECV, (void*)hdr, &hn);
+            if (VP_FIX && hn != 3) {
+                VP_FIX_HIT("LinePacketizer::Recv");
+                self->state = 0;
+                self->count = 0;
+                break;
+            }
             if (hdr[0] < 0xe2) {
                 self->state = 2;
                 progress = 1;
@@ -214,9 +232,11 @@ PORT_FN(0x004ae9f0, "LineChecker::LineOk", LineChecker_LineOk, fp_pure_this<Line
 // Tick: on a connected line, until DoneChecking, every 500 ms: send "(my_seq)" (with its NUL); every other time also read
 // up to 0x40 bytes and parse "(n)": the first reply sets the peer's number; a later one that is the last plus one counts
 // as in sequence, otherwise the start moves on 500 ms; a reply without "(...)" counts as bad (at most 40), and no reply
-// at all moves the start on 500 ms. The buffer isn't terminated by the read (strchr runs on to a NUL).
+// at all moves the start on 500 ms. The buffer isn't terminated by the read. FIX: a NUL after its 0x40 bytes (the original's
+// strchr and strtoul ran on past the buffer when a full read held none; with one in it nothing changes -- the ping's own
+// text, sprintf'd into the same buffer, stays where the read didn't reach, as in the original).
 static void __fastcall LineChecker_Tick(LineChecker* self, Edx) {
-    char buf[0x40];
+    char buf[0x41];
     int32_t n;
     if (vcall<int32_t>(self->dev, LD_GET_STATUS) != 2) return;
     if (tcall<uint8_t>(A_LineChecker_DoneChecking, self)) return;
@@ -235,6 +255,10 @@ static void __fastcall LineChecker_Tick(LineChecker* self, Edx) {
         NT_VERBOSE(NT_CP(0x004fe5c8), now, check_deadline(self));
         self->start += 500;
         return;
+    }
+    if (VP_FIX) {
+        if (!memchr(buf, 0, 0x40)) VP_FIX_HIT("LineChecker::Tick");
+        buf[0x40] = 0;
     }
     char* open = ccall<char*>(F_strchr, (const char*)buf, (int32_t)'(');
     char* close = ccall<char*>(F_strchr, (const char*)buf, (int32_t)')');

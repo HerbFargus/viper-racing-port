@@ -25,19 +25,23 @@
 // replay_only -- a session replay of a network game is its in-game check (test/world_net_server.cpp checks them all
 // offline, over a fake SessionMgr).
 //
-// FIX CANDIDATEs (left faithful, marked in place): the wire's indices are used unchecked -- race_packet's car index (a
-// signed byte: cars[-128..127]), NetCarInfoRequest's car index (likewise, and the session it derives from that car),
-// UserInfoReq's and Whisper's user index (& 0xff: users[0..255]); race_packet with a length under 2 loops ~178 million
-// times; Tick passes user_disconnected the SESSION number, not the user index (another user cleared when the service's
-// sessions don't start at 0; past users[7] when the session is 8 or more); Tick calls the state table unchecked (a state
-// of 0 or 9 calls address 0); a sync packet after the 40th sample writes samples[40] over nsamples; calc_send_interval
-// divides by (header + 24 x cars) and by its quotient (0 when the link's bps is under that); next_user never returns when
-// no user is in (add_ai_cars with AI cars and nobody in); add_ai_cars, dispatch_NetCarInfoPacket and
-// transRS_CHOOSE_CAR_RS_GET_CAR don't bound the car count (more than 8 cars: past cars[7] into ncars and the proposal;
-// GET_CAR's 0x31 packet past its frame); SendAll's frame holds 7 car records (8 overrun it: a user with no car of its own
-// and 8 cars sending); the constructor strcpy's the password unbounded into its LocalService; TrackCRC's path is 16 bytes
-// (a long track name runs into its read buffer, then the frame); NetCarInfoRequest uses get_iroc_car's result unchecked
-// (0 when the IROC user has no car); AddMe only checks the first of the client's CRCs.
+// The fixes (docs/PORTING.md, "Fixes"; `// FIX:` in place, VP_FIX): the original's bugs, each changed only where it would
+// crash, hang or overrun, so a normal game sends and stores exactly what the original does. The car count: add_ai_cars
+// adds at most 8 - (the cars already in) AI cars (the AI-cars slider goes to 6, so 3 or more players took the total past
+// 8: past cars[7] into ncars and the proposal, and GET_CAR's 0x31 packet past its frame), and the 0x30 handler and
+// transRS_CHOOSE_CAR_RS_GET_CAR stop at 8 too. The wire's indices: race_packet skips a record whose car index (a signed
+// byte) isn't 0..7 and reads no records from a packet under 2 bytes (the original looped ~178 million times);
+// NetCarInfoRequest drops a request for a car outside 0..7 (or one whose owner isn't a user index) and sends the car
+// itself when the IROC user has no car (get_iroc_car's 0); UserInfoReq and Whisper treat a user index past 7 as nobody
+// (and a whisper must name the target's own session). Tick passes user_disconnected the user's index (session - base;
+// the original passed the session: another user cleared when the sessions don't start at 0, past users[7] from 8 on) and
+// skips a state with no check (0, 9 or past the table: a call to address 0). A sync reply after the 40th sample isn't
+// stored (it wrote samples[40] over nsamples); calc_send_interval never divides by 0 (a link too slow for one car packet a
+// second sends once a second); next_user returns 0 when nobody is in (it never returned); the constructor cuts the
+// password to the LocalService's 16 bytes (15 characters, as the client's SetConnectPassword cuts it); TrackCRC gives -1
+// (no file) for a name too long for its frame. SendAll's frame holds 8 car records (the original's held 7). Left as is:
+// AddMe checks only the first of the client's CRCs (the 32 bytes must equal the server's own, which CreateTrackVersion
+// zeroes, so no other CRC can be bogus).
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -110,10 +114,13 @@ static int __cdecl smart_strncpy(char* dst, const char* src, int n) {
 static void fp_smart_strncpy(Footprint& f, char* dst, const char*, int n) { f.add(dst, n > 0 ? (uint32_t)n : 1u, "the copy"); }
 PORT_FN(0x004aa9e0, "smart_strncpy", smart_strncpy, fp_smart_strncpy)
 
-// the sum of a track's first 0x800 bytes, from -1. FIX CANDIDATE: the path buffer is 16 bytes (the name + ".trk")
+// the sum of a track's first 0x800 bytes, from -1. (Never called in v1.0.) The path buffer is 16 bytes (the name + ".trk");
+// a longer name runs on into the read buffer, harmlessly (the file is opened before the read).
 static int __cdecl TrackCRC(const char* name) {
     struct { char path[16]; uint8_t data[0x800]; } fr;       // the original's frame: the path runs into the data
     int fh;
+    // FIX: a name too long for the whole frame (".trk" too) ran on past it; it gives -1, as a file that can't be opened
+    if (VP_FIX && crt_strlen(name) + 5 > sizeof fr) return -1;
     crt_strcpy(fr.path, name);
     {
         char* e = fr.path + crt_strlen(fr.path);
@@ -162,7 +169,14 @@ static RaceServer* __fastcall RaceServer_ctor(RaceServer* self, Edx, void* sm, c
     WR32(ls + 0x24, I32(G_MULTI_VERSION));
     WR32(ls + 0x20, 0x1001);
     ls[0x2c] = password ? 1 : 0;
-    if (password) crt_strcpy((char*)ls + 0x34, password);    // FIX CANDIDATE: unbounded (16 bytes there)
+    if (password) {
+        // FIX: the password is cut to the 16 bytes there (15 characters and the NUL, as the client's SetConnectPassword
+        // cuts what it sends); a longer one ran on over the rest of the LocalService and the frame
+        uint32_t n = crt_strlen(password);
+        if (VP_FIX && n > 15) n = 15;
+        crt_copy(ls + 0x34, password, n);
+        ls[0x34 + n] = 0;
+    }
     self->service = tcall<uint32_t>(F_SM_OfferUnboundService, self->sm, (void*)ls, 8);
     self->state = 1;
     int16_t lo;
@@ -244,7 +258,7 @@ static void __fastcall RS_user_disconnected(RaceServer* self, Edx, int idx) {
 static void fp_user_disc(Footprint& f, RaceServer*, Edx, int) { f.replay_only = R_SEND; }
 PORT_FN(0x004aad20, "RaceServer::user_disconnected", RS_user_disconnected, fp_user_disc)
 
-// the id of the next user in after `id` (0: from the first), round the 8 slots. FIX CANDIDATE: never returns with nobody in.
+// the id of the next user in after `id` (0: from the first), round the 8 slots
 static int __fastcall next_user(RaceServer* self, Edx, int id) {
     int i;
     if (!id) i = 0;
@@ -252,7 +266,11 @@ static int __fastcall next_user(RaceServer* self, Edx, int id) {
         i = (id & 0xff) + 1;
         ASSERT_MSG(id & (int)0xffffff00, CP(0x004fd870));
     }
-    for (;;) {
+    // FIX: with nobody in (add_ai_cars' AI cars on an empty server) the original never returned; after a whole round it
+    // gives 0 (no user). An index past the slots (a bad id) starts from the first.
+    if (VP_FIX && i > 8) i = 0;
+    for (int tries = 0;; tries++) {
+        if (VP_FIX && tries > 8) return 0;
         if (i == 8) i = 0;
         if (self->users[i].id != 0) break;
         i++;
@@ -284,10 +302,13 @@ static void fp_cfsp(Footprint& f, RaceServer*, Edx) { f.replay_only = R_SEND; }
 PORT_FN(0x004aae50, "RaceServer::check_for_singleton_player", check_for_singleton_player, fp_cfsp)
 
 // the proposal's AI cars, in front of the players' (moved up): each handed to the next user in, named "viper" / "#!@^&*",
-// the default setup. FIX CANDIDATE: the car count isn't bounded (more than 8: past cars[7]).
+// the default setup
 static void __fastcall add_ai_cars(RaceServer* self, Edx) {
     for (int i = 0; i < self->ncars; i++) self->cars[i].info.human = 1;
     int n = I32((uintptr_t)self + 0x1164);                   // game +0x2c: the proposal's aicars
+    // FIX: at most 8 cars in all: the AI cars are cut to the room the players' cars leave (the AI-cars slider goes to 6, so
+    // with 3 or more players the original ran past cars[7] into ncars and the proposal). Up to 8, the same cars.
+    if (VP_FIX && n > 8 - self->ncars) n = 8 - self->ncars;
     if (n <= 0) return;
     ccall<void*>(F_memmove, (void*)((uint8_t*)self + 0x918 + n * 0xf5), (void*)((uint8_t*)self + 0x918), self->ncars * 0xf5);
     int prev = 0;
@@ -380,7 +401,7 @@ static void __fastcall sync_rpi_cb(RaceServer* self, Edx, int idx, uint32_t resu
 static void fp_srpi(Footprint& f, RaceServer* self, Edx, int idx, uint32_t) { f.add(&self->users[idx].sync_acked, 1, "sync_acked"); }
 PORT_FN(0x004ab1a0, "RaceServer::sync_rpi_cb", sync_rpi_cb, fp_srpi)
 
-// with a round trip over 125 ms: 1000 / (bps / (header + 24 x the cars it gets)); else 66 ms. FIX CANDIDATE: both divisions.
+// with a round trip over 125 ms: 1000 / (bps / (header + 24 x the cars it gets)); else 66 ms
 static void __fastcall calc_send_interval(RaceServer* self, Edx, ServerData* u) {
     if (u->rtt > 0x7d) {
         int n = 0;
@@ -389,7 +410,12 @@ static void __fastcall calc_send_interval(RaceServer* self, Edx, ServerData* u) 
             if (self->cars[k].info.user != u->id) n++;
         const int hdr = vcall<int>(SM(self)->sock, SOCK_GetHeaderSize);
         const int bps = vcall<int>(SM(self)->sock, SOCK_GetBPS);
-        const int q = bps / (hdr + n * 24);
+        // FIX: neither division by 0: a link too slow for one packet a second (the quotient 0) sends once a second, and a
+        // packet of no size (no header, no cars) counts as 1 byte. The original crashed on both.
+        int d = hdr + n * 24;
+        if (VP_FIX && d == 0) d = 1;
+        int q = bps / d;
+        if (VP_FIX && q == 0) q = 1;
         u->send_interval = 1000 / q;
     } else {
         u->send_interval = 0x42;
@@ -483,13 +509,19 @@ static uint8_t __cdecl no_bogus_crcs(int32_t* crcs) {
 static void fp_nbc(Footprint& f, int32_t*) { f.replay_only = R_LOG; }
 PORT_FN(0x004ab4c0, "no_bogus_crcs", no_bogus_crcs, fp_nbc)
 
-// 0x24: user (+4)'s info back (0x25). FIX CANDIDATE: the index (& 0xff) unchecked.
+// 0x24: user (+4)'s info back (0x25)
 static void __fastcall dispatch_UserInfoReqPacket(RaceServer* self, Edx, uint8_t* pkt, int sess) {
     int32_t w;
     memcpy(&w, pkt + 4, 4);
     const int idx = w & 0xff;
     ASSERT_MSG(w & (int)0xffffff00, CP(0x004fd870));
     ServerData* u = &self->users[idx];
+    // FIX: an index past the 8 users (the id's low byte, from the wire) is nobody, as an empty slot is; the original read
+    // (and sent) whatever lay past users[7]
+    if (VP_FIX && idx >= 8) {
+        LOG(CP(0x004fd964), idx);
+        return;
+    }
     if (u->id) {
         uint8_t p[0x19];
         p[3] = 0x25;
@@ -521,7 +553,6 @@ static void fp_speak(Footprint& f, RaceServer*, Edx, uint8_t*, int) { f.replay_o
 PORT_FN(0x004ab580, "RaceServer::dispatch_SpeakPacket", dispatch_SpeakPacket, fp_speak)
 
 // 0x29: said to one user (+4) -- sent it as 0x27 (id, 1, the text) on the session in the target id's second byte.
-// FIX CANDIDATE: the target index (& 0xff) unchecked.
 static void __fastcall dispatch_WhisperPacket(RaceServer* self, Edx, uint8_t* pkt, int sess) {
     ServerData* u = &self->users[sess - self->base];
     if (!u->id) {
@@ -532,6 +563,12 @@ static void __fastcall dispatch_WhisperPacket(RaceServer* self, Edx, uint8_t* pk
     memcpy(&w, pkt + 4, 4);
     const int t = w & 0xff;
     ASSERT_MSG(w & (int)0xffffff00, CP(0x004fd870));
+    // FIX: a target index past the 8 users, or a session byte that isn't that user's (both from the wire: a real id has the
+    // user's own session there), is no one to whisper to; the original read past users[7] and sent on any session
+    if (VP_FIX && (t >= 8 || pkt[5] != (uint8_t)(self->base + t))) {
+        LOG(CP(0x004fd9b4), (const char*)u->name, "");
+        return;
+    }
     ServerData* to = &self->users[t];
     if (!to->id) {
         LOG(CP(0x004fd9b4), (const char*)u->name, (const char*)to->name);
@@ -566,7 +603,7 @@ static void __fastcall dispatch_ApprovePacket(RaceServer* self, Edx, uint8_t* pk
 static void fp_approve(Footprint& f, RaceServer*, Edx, uint8_t*, int) { f.replay_only = R_SEND; }
 PORT_FN(0x004ab710, "RaceServer::dispatch_ApprovePacket", dispatch_ApprovePacket, fp_approve)
 
-// 0x30: the user's car (its id at +5), or (id 0) its choice withdrawn. FIX CANDIDATE: the car count unbounded.
+// 0x30: the user's car (its id at +5), or (id 0) its choice withdrawn
 static void __fastcall dispatch_NetCarInfoPacket(RaceServer* self, Edx, uint8_t* pkt, int sess) {
     const int idx = sess - self->base;
     ServerData* u = &self->users[idx];
@@ -577,7 +614,9 @@ static void __fastcall dispatch_NetCarInfoPacket(RaceServer* self, Edx, uint8_t*
             ASSERT_MSG(cid & (int)0xffffff00, CP(0x004fd870));
             if ((cid & 0xff) == idx) {
                 ServerNetCarInfo* c = &self->cars[self->ncars];
-                if (c->info.user == 0) {
+                // FIX: with 8 cars in (or more) there is no room: the duplicate's log and the disconnect, which is what
+                // the original does at exactly 8 (cars[8]'s user is ncars itself, not 0); past 8 it wrote past the cars
+                if (!(VP_FIX && (uint32_t)self->ncars >= 8) && c->info.user == 0) {
                     crt_copy(c, pkt + 5, 0xd9);
                     crt_strcpy(self->cars[self->ncars].info.driver, u->name);
                     self->ncars++;
@@ -613,25 +652,34 @@ static void fp_nci(Footprint& f, RaceServer*, Edx, uint8_t*, int) { f.replay_onl
 PORT_FN(0x004ab770, "RaceServer::dispatch_NetCarInfoPacket", dispatch_NetCarInfoPacket, fp_nci)
 
 // 0x32: car (+4, a signed byte) asked for: 0x33 with the car, the round trip to its owner's session, and for a player's
-// car in an IROC race the IROC car's name and setup. FIX CANDIDATE: the car index unchecked (and so the session from the
-// owner's id); get_iroc_car's 0 used.
+// car in an IROC race the IROC car's name and setup
 static void __fastcall dispatch_NetCarInfoRequestPacket(RaceServer* self, Edx, uint8_t* pkt, int sess) {
     uint8_t p[0xe0];                                         // 0xde sent; the original's frame has 0xe0 behind it (the strcpy)
     p[3] = 0x33;
     const int ci = (int8_t)pkt[4];
+    // FIX: a car index outside 0..7 (a signed byte from the wire) asks for no car: the request is dropped (the original
+    // read cars[-128..127] and the session of whatever lay there)
+    if (VP_FIX && (ci < 0 || ci >= 8)) return;
     p[4] = (uint8_t)ci;
     crt_copy(p + 5, (uint8_t*)self + 0x918 + ci * 0xf5, 0xd9);
     int32_t w;
     memcpy(&w, p + 5, 4);                                    // the car's owner: its session's round trip
     ASSERT_MSG(w & (int)0xffffff00, CP(0x004fd870));
+    // FIX: (with the above) an owner id whose user index isn't 0..7 has no session of this service: dropped too (every car
+    // the server stores has a user's id, or 0, there)
+    if (VP_FIX && (w & 0xff) >= 8) return;
     const int s = self->base + (w & 0xff);
     netc::SessionMgr* m = SM(self);
     const int lat = tcall<int>(F_RDP_GetEstRTLatency, (void*)&m->rdp, (const void*)((uint8_t*)m->sessions + s * 0x1c + 0xc));
     WR32(p + 0xd9, lat);
     if (U8((uintptr_t)self + 0x10c8) && ((uint8_t*)self)[0x9f0 + ci * 0xf5]) {
         const uint8_t* ir = (const uint8_t*)tcall<NetCarInfo*>(S_get_iroc_car, self);
-        crt_strcpy((char*)p + 0x1a, (const char*)ir + 0x15);
-        crt_copy(p + 0x3d, ir + 0x38, 0x8c);
+        // FIX: with no IROC car (the IROC user has no car of its own: get_iroc_car's 0) the car goes as it is; the original
+        // read through the 0
+        if (!(VP_FIX && !ir)) {
+            crt_strcpy((char*)p + 0x1a, (const char*)ir + 0x15);
+            crt_copy(p + 0x3d, ir + 0x38, 0x8c);
+        }
     }
     sm_send_reliable(self->sm, sess, p, 0xde, 0);
 }
@@ -649,7 +697,7 @@ PORT_FN(0x004abaa0, "RaceServer::dispatch_RaceReadyPacket", dispatch_RaceReadyPa
 
 // 0x38: a sync reply. A first send (class 2) of an acked exchange is a sample; under 40, the next exchange (the packet
 // itself back as 0x37, +4 = now); at 40, the middle 32 by round trip averaged: dt = their clock word - rtt / 2, status 5,
-// and 0x2e 0x11. FIX CANDIDATE: a sync packet after the 40th sample writes samples[40] over nsamples.
+// and 0x2e 0x11
 static void __fastcall dispatch_SyncPacket(RaceServer* self, Edx, uint8_t* pkt, int sess) {
     const int idx = sess - self->base;
     ServerData* u = &self->users[idx];
@@ -658,7 +706,9 @@ static void __fastcall dispatch_SyncPacket(RaceServer* self, Edx, uint8_t* pkt, 
         return;
     }
     const int now = net_PTimeNow();                          // site 0x4abb0d
-    if (u->sync_acked && (uint8_t)((pkt[0] >> 4) & U8(G_SEND_CLASS_MASK)) == 2) {
+    // FIX: a sample past the 40 (a reply after the last, or a count gone wrong) isn't stored: the original wrote
+    // samples[40] over nsamples and sync_acked. The rest goes on as the original's (40 or more: the averages again).
+    if (u->sync_acked && (uint8_t)((pkt[0] >> 4) & U8(G_SEND_CLASS_MASK)) == 2 && !(VP_FIX && (uint32_t)u->nsamples >= 0x28)) {
         u->samples[u->nsamples].rtt = (uint16_t)((uint16_t)now - (uint16_t)u->sync_sent);
         int32_t r;
         memcpy(&r, pkt + 4, 4);
@@ -740,20 +790,24 @@ static void fp_deity(Footprint& f, RaceServer*, Edx, uint8_t*, int, int) { f.rep
 PORT_FN(0x004abd60, "RaceServer::deitycast", deitycast, fp_deity)
 
 // the unreliable car packet: (len - 2) / 24 records [car index][CarNetPacket], each for a car the sender drives stored
-// with its time word moved to the server's clock. FIX CANDIDATE: the car index (a signed byte) unchecked; a length under 2.
+// with its time word moved to the server's clock
 static void __fastcall race_packet(RaceServer* self, Edx, uint8_t* pkt, int sess, int len) {
     const int now = net_PTimeNow();                          // site 0x4abdfb
     const int idx = sess - self->base;
     ServerData* u = &self->users[idx];
     const int32_t uid = u->id;
     int n = (int)((uint32_t)(len - 2) / 24u);
+    // FIX: a packet under 2 bytes has no records (the unsigned division made ~178 million of them, read past the packet)
+    if (VP_FIX && len < 2) n = 0;
     if (!uid) return;
     if (n > 0) {
         const uint8_t* r = pkt + 2;
         do {
             uint8_t* car = (uint8_t*)self + 0x918 + (int8_t)r[0] * 0xf5;
             int32_t cu;
-            memcpy(&cu, car, 4);
+            // FIX: a record whose car index (a signed byte) isn't 0..7 is skipped; the original read and wrote cars[-128..127]
+            if (VP_FIX && ((int8_t)r[0] < 0 || (int8_t)r[0] >= 8)) cu = 0;            // (uid isn't 0)
+            else memcpy(&cu, car, 4);
             if (cu == uid) {
                 crt_copy(car + 0xd9, r, 24);
                 uint16_t t;
@@ -889,15 +943,16 @@ static void __fastcall trans_CHOOSE_CAR_APPROVE(RaceServer* self, Edx) {
 static void fp_t_cc_a(Footprint& f, RaceServer*, Edx) { f.replay_only = R_SEND; }
 PORT_FN(0x004ac310, "RaceServer::transRS_CHOOSE_CAR_RS_APPROVE", trans_CHOOSE_CAR_APPROVE, fp_t_cc_a)
 
-// the cars are in: the AI cars added, the car list sent (0x31: the cars' user ids), no unchoosing any more.
-// FIX CANDIDATE: more than 8 cars overrun the packet's frame.
+// the cars are in: the AI cars added, the car list sent (0x31: the cars' user ids), no unchoosing any more
 static void __fastcall trans_CHOOSE_CAR_GET_CAR(RaceServer* self, Edx) {
     owner_check(self, 0x5d0, 0x004fddf0, 0x004fddfc);
     tcall<void>(S_add_ai_cars, self);
     uint8_t p[0x24];
     p[3] = 0x31;
     nt::crt_zero(p + 4, 8);
-    const int nc = self->ncars;
+    int nc = self->ncars;
+    // FIX: the packet holds 8 ids: no more are written (add_ai_cars keeps to 8 now; the original wrote past its frame)
+    if (VP_FIX && nc > 8) nc = 8;
     for (int k = 0; k < nc; k++) WR32(p + 4 + 4 * k, self->cars[k].info.user);
     broadcast(self, p, 0x24);
     self->cars_locked = 1;
@@ -1070,7 +1125,8 @@ static void fp_propose(Footprint& f, RaceServer*, Edx, const NetProposal*, int) 
 PORT_FN(0x004ac9e0, "RaceServer::Propose", Propose, fp_propose)
 
 // the physics thread: each user due one gets the cars it doesn't drive that moved since (unreliable), their time words on
-// its clock. FIX CANDIDATE: the original's frame holds 7 records; 8 overrun it.
+// its clock. FIX: the frame holds 8 records (the most there are: a user with no car of its own and 8 cars); the original's
+// held 7, so 8 ran past it. (The rewrite's frame is this size in every build.)
 static void __fastcall SendAll(RaceServer* self, Edx) {
     owner_check(self, 0x6ea, 0x004fdf98, 0x004fdfa4);
     const int now = net_PTimeNow();                          // site 0x4acb4b
@@ -1111,7 +1167,7 @@ static void fp_sic(Footprint& f, RaceServer*, Edx, int, const char*) { f.replay_
 PORT_FN(0x004acc30, "RaceServer::SetIrocCar", SetIrocCar, fp_sic)
 
 // the main loop's step: the lag warning, the sessions gone down, the state's check, every packet in, the dead users,
-// a lone player. FIX CANDIDATEs: user_disconnected gets the session number; the state table unchecked.
+// a lone player
 static void __fastcall Tick(RaceServer* self, Edx) {
     owner_check(self, 0x722, 0x004fe038, 0x004fe044);
     const int now = net_PTimeNow();                          // site 0x4acd14
@@ -1123,12 +1179,18 @@ static void __fastcall Tick(RaceServer* self, Edx) {
         if (sess == -1) break;
         if (st & 1) continue;
         LOG(CP(0x004fe078), sess, (uint32_t)st);
-        user_disconnected(self, sess);
+        // FIX: the user gone is the session's user, index session - base; the original passed the session itself (the
+        // same when the service's sessions start at 0, else another user cleared, or past users[7] from session 8 on).
+        // A session outside the service's 8 clears nobody.
+        if (!VP_FIX) user_disconnected(self, sess);
+        else if ((uint32_t)(sess - self->base) < 8) user_disconnected(self, sess - self->base);
     }
     const uint32_t tbl[10] = {0, S_checkRS_APPROVE, S_checkRS_CLOSE_ENTRY, S_checkRS_CHOOSE_CAR, S_checkRS_GET_CAR,
                               S_checkRS_SYNC, S_checkRS_PRESTAGE, S_checkRS_STAGE, S_checkRS_RACE, 0};
     ASSERT_MSG(1, CP(0x004fe0a0), CP(0x004fe094), 0x752);
-    tcall<void>(tbl[self->state], self);
+    // FIX: a state with no check (0, 9, or past the table) checks nothing; the original called address 0 (or read past
+    // the table). The states the server sets are 1..8.
+    if (!(VP_FIX && (uint32_t)(self->state - 1) >= 8)) tcall<void>(tbl[self->state], self);
     for (;;) {
         uint8_t pkt[0xe4];
         int len = 0xe2;

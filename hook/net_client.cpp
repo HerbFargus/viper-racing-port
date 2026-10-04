@@ -34,15 +34,18 @@
 // physics / AI (NetCar::NewPacket, AIResetDriverMap) is replay_only; the rest list the client (or the caller's buffer) and the
 // status strings' Xlators GetClientStatusString may translate.
 //
-// FIX CANDIDATEs (left faithful): the user id from the wire indexes users[] / user_ids[] by its low byte, unchecked against 8
-// -- get_userdata reads up to 0x14e3 bytes past the client (chat, whisper), dispatch_UserInfoPacket and
-// dispatch_RemoveUserPacket WRITE 21 bytes there (and a dword at user_ids[0..255]); dispatch_NetCarInfoPacket takes the car
-// index as a signed byte (-128..127) and, when the request slot there matches, copies 0xd9 bytes to cars[index];
-// dispatch_ChatPacket's "latency" reads atoi(strchr(text, ' ')) -- strchr's 0 when there is no space --, strstr / the chat
-// copy trust the text's NUL, and an empty scrollback with the pool exhausted reads the ring through 0; race_packet divides
-// (len - 2) unsigned (a packet under 2 bytes runs ~178 million cars); DeityCast copies len bytes into a 0xe0 buffer;
-// GetPacketTypeString indexes its table unchecked (types 0x20..0x3e; never called in v1.0); NextUser skips the users that are
-// there and stops at the first empty slot (returns 0: it reads like an inverted test, kept).
+// The fixes (docs/PORTING.md, "Fixes"; `// FIX:` in place, VP_FIX), each changing only what the original would crash on or
+// overrun with: a user id from the wire whose low byte (its index) is past 7 is no user -- get_userdata returns 0 (it read
+// up to 0x14e3 bytes past the client) and dispatch_UserInfoPacket / dispatch_RemoveUserPacket drop the packet (they wrote 21
+// bytes and a dword past users[] / user_ids[]); dispatch_NetCarInfoPacket drops a reply for a car index outside 0..7 (a
+// signed byte: it read car_req[-128..127] and could copy 0xd9 bytes to cars[index]); dispatch_ChatPacket leaves the packet
+// delay alone for a "latency" with no space after it (atoi(0)) or a text with no NUL in the packet, and drops a line it has
+// no room for when the scrollback is empty (it read the ring through 0); race_packet reads no records from a packet under 2
+// bytes (~178 million); DeityCast sends nothing over the packet's 0xe0 bytes (it overran its frame); GetPacketTypeString
+// gives PT_INVALID's name outside 0x20..0x3e (never called in v1.0). Left as is: NextUser skips the users that are there
+// and stops at the first empty slot, so FirstUser / NextUser always give 0 (an inverted test): its one caller,
+// ChatControl::keep_user_focused, then always drops the whisper target when the user list changes -- wrong, but harmless,
+// and a fix would change what a normal game's chat screen does.
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -187,7 +190,9 @@ static const char* __cdecl GetPacketTypeString_c(int t) {
                                    0x004fd70c, 0x004fd71c, 0x004fd730, 0x004fd740, 0x004fd758, 0x004fd76c, 0x004fd77c,
                                    0x004fd78c, 0x004fd7a0, 0x004fd7b4, 0x004fd7c0, 0x004fd7cc, 0x004fd7dc, 0x004fd7ec,
                                    0x004fd7f8, 0x004fd804, 0x004fd80c};
-    return S(k[t - 0x20]);                                              // unchecked (FIX CANDIDATE; never called)
+    // FIX: a type outside 0x20..0x3e is PT_INVALID's (the original read its table anywhere; never called in v1.0)
+    if (VP_FIX && (uint32_t)(t - 0x20) >= 31u) return S(0x004fd80c);
+    return S(k[t - 0x20]);
 }
 static void fp_packet_type_string(Footprint&, int) {}        // (not pure: an out-of-range type reads anywhere)
 PORT_FN(0x004aa4f0, "GetPacketTypeString", GetPacketTypeString_c, fp_packet_type_string)
@@ -431,6 +436,9 @@ PORT_FN(0x004a85b0, "RaceClient::keep_alive", RC_keep_alive, fp_io)
 
 static ClientData* __fastcall RC_get_userdata(RaceClient* self, Edx, int id) {
     ASSERT_MSG((int)((uint32_t)id & 0xffffff00u), S(S_INVALID_USER));
+    // FIX: an id whose index (its low byte, from the wire: chat, whisper) is past the 8 users is nobody's; the original read
+    // up to 0x14e3 bytes past the client
+    if (VP_FIX && ((uint32_t)id & 0xff) >= 8) return 0;
     ClientData* const p = user_at(self, (uint32_t)id & 0xff);
     return p->id == id ? p : 0;
 }
@@ -542,7 +550,7 @@ static int __fastcall RC_NextUser(RaceClient* self, Edx, int32_t* it) {
     if (first < 8) {
         const uint8_t* u = (const uint8_t*)user_at(self, (uint32_t)first);
         for (;;) {
-            if (ld32(u) == 0) break;                                    // (an empty slot ends it: FIX CANDIDATE)
+            if (ld32(u) == 0) break;                                    // (an empty slot ends it: inverted, kept)
             u += 0x15;
             const int32_t v = *p + 1;
             *p = v;
@@ -603,6 +611,9 @@ PORT_FN(0x004a8db0, "RaceClient::IAmHoldingThingsUp", RC_IAmHoldingThingsUp, fp_
 static void __fastcall RC_DeityCast(RaceClient* self, Edx, const void* dp, int len) {
     task_check(self, 0x3ea, 0x004fd004, 0x004fcff8);
     uint8_t pkt[0xe4];
+    // FIX: a cast too long for the packet (over 0xe0 bytes, or a negative length) isn't sent; the original copied it past
+    // its frame
+    if (VP_FIX && (uint32_t)len > 0xe0u) return;
     pkt[3] = 0x3b;                                                      // DeityCast
     crt_copy(pkt + 4, dp, (uint32_t)len);
     send_reliable(self, pkt, len + 4);
@@ -871,6 +882,9 @@ PORT_FN(0x004a98c0, "RaceClient::dispatch_UserStatusPacket", RC_d_UserStatus, fp
 
 static void __fastcall RC_d_NetCarInfo(RaceClient* self, Edx, const uint8_t* pkt) {
     const int32_t i = (int8_t)pkt[4];
+    // FIX: a reply for a car index outside 0..7 (a signed byte from the wire: no car this client asked for) is dropped; the
+    // original read car_req[-128..127] and, when that matched, copied the car over cars[index]
+    if (VP_FIX && (uint32_t)i >= 8u) return;
     const uint8_t* const src = pkt + 5;
     const int32_t req = ld32((const uint8_t*)self + 0x7b8 + i * 4);
     const int32_t u = ld32(src);
@@ -902,6 +916,9 @@ static void __fastcall RC_d_Chat(RaceClient* self, Edx, const uint8_t* pkt) {
         return;
     }
     ChatLine* const e = (ChatLine*)tcall<void*>(F_PoolBase_alloc, &self->pool);
+    // FIX: no line to put it in (the pool's allocation failed with the scrollback still empty) drops it; the original read
+    // the ring through 0
+    if (VP_FIX && !e && !self->chat) return;
     if (e) {
         if (self->chat) {
             e->next = self->chat->next;
@@ -925,8 +942,13 @@ static void __fastcall RC_d_Chat(RaceClient* self, Edx, const uint8_t* pkt) {
     self->chat->whisper = w;
     const int32_t from = ld32(pkt + 4);
     self->chat->user = from;
+    // FIX: (with the one below) a text with no NUL inside the packet (0xe4 bytes, the text from +9) isn't searched: the
+    // original's strstr / strchr ran on past it
+    if (VP_FIX && !memchr(text, 0, 0xe4 - 9)) return;
     if (!ccall<const char*>(F_strstr, text, S(0x004fd47c))) return;     // "latency"
     const char* const sp = ccall<const char*>(F_strchr, text, 0x20);
+    // FIX: "latency" with no space after it leaves the delay alone; the original's atoi read through strchr's 0
+    if (VP_FIX && !sp) return;
     const int n = ccall<int>(F_atoi, sp);
     if (n >= 1000 || n < 0) return;
     ccall<void>(A_MultiSetPacketDelay, n);
@@ -949,6 +971,9 @@ static void __fastcall RC_d_UserInfo(RaceClient* self, Edx, const uint8_t* pkt) 
     const int32_t id = ld32(pkt + 4);
     ASSERT_MSG((int)((uint32_t)id & 0xffffff00u), S(S_INVALID_USER));
     const uint32_t k = (uint32_t)id & 0xff;
+    // FIX: a user index past 7 (the id's low byte, from the wire) is dropped; the original wrote the user's 21 bytes past
+    // users[] (into the cars) and its id past user_ids[]
+    if (VP_FIX && k >= 8) return;
     ClientData* const d = user_at(self, k);
     crt_zero(d, 5);
     ((volatile uint8_t*)d)[0x14] = 0;
@@ -963,6 +988,8 @@ static void __fastcall RC_d_RemoveUser(RaceClient* self, Edx, const uint8_t* pkt
     const int32_t id = ld32(pkt + 4);
     ASSERT_MSG((int)((uint32_t)id & 0xffffff00u), S(S_INVALID_USER));
     const uint32_t k = (uint32_t)id & 0xff;
+    // FIX: a user index past 7 is dropped; the original zeroed 21 bytes past users[] and a dword past user_ids[]
+    if (VP_FIX && k >= 8) return;
     ((volatile int32_t*)((uint8_t*)self + 0xd0))[k] = 0;
     ClientData* const d = user_at(self, k);
     crt_zero(d, 5);
@@ -1024,7 +1051,9 @@ static void fp_d_new_state(Footprint& f, RaceClient*, Edx, const uint8_t*) { f.r
 PORT_FN(0x004a9d60, "RaceClient::dispatch_NewStatePacket", RC_d_NewState, fp_d_new_state)
 
 static void __fastcall RC_race_packet(RaceClient* self, Edx, const uint8_t* pkt, int len) {
-    const uint32_t n = (uint32_t)(len - 2) / 24u;
+    uint32_t n = (uint32_t)(len - 2) / 24u;
+    // FIX: a packet under 2 bytes has no records (the unsigned division made ~178 million, read past the packet)
+    if (VP_FIX && len < 2) n = 0;
     self->last_race_pkt = net_PTimeNow();                               // site 0x4a9dfb
     if (ccall<uint8_t>(F_PhysicsIsPaused)) return;
     if ((int32_t)n <= 0) return;

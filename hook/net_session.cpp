@@ -26,18 +26,22 @@
 // (the session replay of a network game is their in-game check; test/world_net_core.cpp checks them offline); the getters
 // read only; GetStatus / GetNextStatus write a channel's flags, SetConnectPassword the password.
 //
-// FIX CANDIDATEs (left faithful, marked in place): find_range loops forever when a channel it reaches has flags set but
-// no service (OfferUnboundService on a manager with a channel going down); async_msg / SessionDiscReasonString index
-// their tables unchecked (async_msg: only 1..5 are ever passed; SessionDiscReasonString checks 0..6); recv_chandata,
-// recv_connreject / connaccept / disconreq trust the channel number from the wire only against the count (fine) but
-// recv_chandata copies the packet's length into SessionData's 0xe4 bytes unchecked (Tick passes at most 0xe2); Recv
-// unlinks a channel's packet from the global list through 0 if the lists disagree (never: they're built together);
-// GetNextStatus divides by the channel count (0: no channels).
+// Fixes (docs/FIXES.md, "Multiplayer"; each marked `// FIX:` in place, `VP_FIX &&`, so the faithful build is the original):
+// find_range steps past a channel in use (it looped forever on one: OfferUnboundService with any channel busy before a
+// free range); async_msg answers a state outside 0..5 with its first text (SessionDiscReasonString already checked its
+// 0..6); recv_chandata drops a packet longer than SessionData's 0xe4 bytes (Tick passes at most 0xe2); Recv skips the
+// unlink when the channel's packet isn't on the global list (it went through 0); GetNextStatus with no channels finds
+// none (it divided by 0). recv_connreject / connaccept / disconreq check the wire's channel number against the count.
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
 #include "net_core.h"
 #include "net_wsock.h"
+
+// a harness's marker for "a fix changed what happens here" (nothing in the DLL)
+#ifndef VP_FIX_HIT
+#define VP_FIX_HIT(what) ((void)0)
+#endif
 
 namespace {
 namespace net_session {
@@ -355,11 +359,16 @@ static const XlatorDef k_async_x[6] = {
     {0x0057d368, 0x004fbd2c, 0x004a5550}, {0x0057d448, 0x004fbd44, 0x004a5540}, {0x0057d3c0, 0x004fbd5c, 0x004a5530},
     {0x0057d400, 0x004fbd70, 0x004a5520}, {0x0057d390, 0x004fbd88, 0x004a5510}, {0x0057d420, 0x004fbda0, 0x004a5500},
 };
-// FIX CANDIDATE: i unchecked (its callers pass the states 1..5)
+// FIX: a state outside 0..5 gives the first text (the original read past its table; its callers pass a lookup's state,
+// which the sockets keep to 0..5)
 static const char* __cdecl async_msg_c(int i) {
     build_xlators(G_ASYNC_GUARD, k_async_x, 6);
     uint32_t t[6];
     texts_of(k_async_x, 6, t);
+    if (VP_FIX && (uint32_t)i >= 6u) {
+        VP_FIX_HIT("async_msg");
+        i = 0;
+    }
     return (const char*)(uintptr_t)t[i];
 }
 static void fp_async_msg(Footprint& f, int) { f.replay_only = R_XL; }
@@ -732,7 +741,7 @@ static uint8_t __fastcall SM_Recv(SessionMgr* self, Edx, int s, void* buf, int* 
     SessionData* const e = sd->queue;
     if (!e) return 0;
     sd->queue = e->snext;
-    SessionData** pp = &self->data;                                    // FIX CANDIDATE: through 0 if the lists disagree
+    SessionData** pp = &self->data;
     if (*pp) {
         for (;;) {
             SessionData* const x = *pp;
@@ -741,7 +750,8 @@ static uint8_t __fastcall SM_Recv(SessionMgr* self, Edx, int s, void* buf, int* 
             if (!*pp) break;
         }
     }
-    *pp = (*pp)->next;
+    if (VP_FIX && !*pp) VP_FIX_HIT("SessionMgr::Recv");                // FIX: not on the global list: nothing to unlink
+    else *pp = (*pp)->next;                                             // (the original went through 0)
     memcpy(buf, e->data, (size_t)e->len);
     *len = e->len;
     pool_free(&self->data_pool, e);
@@ -792,12 +802,16 @@ static uint8_t __fastcall SM_GetStatus(SessionMgr* self, Edx, int s) {
 static void fp_sm_getstatus(Footprint& f, SessionMgr* self, Edx, int s) { f.add(&self->sessions[s].flags, 1, "the channel's flags"); }
 PORT_FN(0x004a66e0, "SessionMgr::GetStatus", SM_GetStatus, fp_sm_getstatus)
 
-// FIX CANDIDATE: divides by the channel count
+// FIX: no channels finds none (-1, nothing written); the original divided by the channel count
 static int __fastcall SM_GetNextStatus2(SessionMgr* self, Edx, uint8_t* out, uint32_t filter) {
     task_check(self, 0x452, 0x004fc454, 0x004fc460);
     const int n = self->nsessions;
     const int at = self->status_at;
     SessionInfo* const base = self->sessions;
+    if (VP_FIX && n == 0) {
+        VP_FIX_HIT("SessionMgr::GetNextStatus");
+        return -1;
+    }
     int i = (at + 1) % n;
     const int start = i;
     uint8_t found = 0;
@@ -834,8 +848,8 @@ static int __fastcall SM_GetNextStatus(SessionMgr* self, Edx, uint8_t* out) {
 static void fp_sm_nextstatus(Footprint& f, SessionMgr* self, Edx, uint8_t* out) { fp_sm_nextstatus2(f, self, 0, out, 0); }
 PORT_FN(0x004a6850, "SessionMgr::GetNextStatus(status)", SM_GetNextStatus, fp_sm_nextstatus)
 
-// n free channels in a row (no flags, no service). FIX CANDIDATE: a channel with flags set stops the scan where it is --
-// the original loops forever there (it neither advances nor fails); faithful.
+// n free channels in a row (no flags, no service). FIX: a channel with flags set (in use, connecting, going down) is
+// stepped past like one with a service; the original stopped there and looped forever (it neither advanced nor failed).
 static uint8_t __fastcall SM_find_range(SessionMgr* self, Edx, int n, LocalService* ls) {
     int run = 0, i = 0;
     if (!(self->nsessions > 0)) return 0;
@@ -844,6 +858,11 @@ static uint8_t __fastcall SM_find_range(SessionMgr* self, Edx, int n, LocalServi
     for (;;) {
         if (*fl != 0) {
             run = 0;
+            if (VP_FIX) {
+                VP_FIX_HIT("SessionMgr::find_range");
+                fl += 0x1c;
+                i++;
+            }
         } else {
             fl += 0x1c;
             const int k = i;
@@ -918,7 +937,8 @@ static __forceinline void name_buf(char* buf, uint32_t first) {
     memset(buf + 1, 0, 0x7f);
 }
 
-// FIX CANDIDATE: len is copied into SessionData's 0xe4 bytes unchecked (Tick passes at most 0xe2)
+// FIX: a packet longer than SessionData's 0xe4 bytes (or a negative length) for a connected channel is dropped; the
+// original copied it unchecked (Tick passes at most 0xe2)
 static void __fastcall SM_recv_chandata(SessionMgr* self, Edx, const uint8_t* pkt, int len, const void* addr) {
     const uint8_t cls = (uint8_t)((pkt[0] >> 4) & G8(G_CHAN_MASK));
     const uint8_t sb = cls < 7 ? pkt[2] : pkt[1];
@@ -938,6 +958,10 @@ static void __fastcall SM_recv_chandata(SessionMgr* self, Edx, const uint8_t* pk
             name_buf(buf, 0x004fc4e4);
             sock_make_str(self->sock, addr, buf);
             LOG_REPORT(S(0x004fc4e8), buf);
+            return;
+        }
+        if (VP_FIX && (uint32_t)len > 0xe4u) {
+            VP_FIX_HIT("SessionMgr::recv_chandata");
             return;
         }
         SessionData* const e = (SessionData*)fn<PoolAlloc_t>(F_PoolBase_alloc)(&self->data_pool, 0);

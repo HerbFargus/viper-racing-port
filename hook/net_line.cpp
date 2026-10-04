@@ -15,10 +15,19 @@
 // import slot the original keeps in a register across calls is read once, as there). KERNEL32, ADVAPI32 and TAPI32 are
 // called through race.exe's own import slots, read at the call; the TAPI callback handed to lineInitialize is tapi_cb's
 // v1.0 address (its rewrite, when hooked, is what TAPI calls). The function-local Xlators (LineDeviceInfo::GetError,
-// LineStatusText) are built the first time as the original builds them (guard bit, constructor, atexit). Faithful,
-// quirks included: enum_devices zeroes its count after the TAPI pass of a "modems only" listing (flags 2), so the COM
-// ports' pass overwrites it; LineStatusText's entries 8 and 10 are the same text; get_tapiline_port leaves its registry
-// key open; LineDevice::Send copies the packet into a 0xe4-byte block unchecked. (FIX candidates, not applied.)
+// LineStatusText) are built the first time as the original builds them (guard bit, constructor, atexit). Quirks kept:
+// enum_devices zeroes its count after the TAPI pass of a "modems only" listing (flags 2), so the COM ports' pass
+// overwrites it; LineStatusText's entries 8 and 10 are the same text.
+//
+// Fixes (docs/FIXES.md, "Multiplayer"; each marked `// FIX:` in place, `VP_FIX &&`, so the faithful build is the original):
+// LineDevice::Send drops a packet over its send block's 0xe4 bytes; set_from_bytestream / TAPILine::get_handle /
+// get_tapiline_port keep the offsets and sizes the TAPI driver hands back inside their buffers, and get_tapiline_port
+// closes its registry key; lds_str and LineStatusText give their entry 0 for a status outside 0..11; enum_devices walks
+// only its two lists; enumerate_tapi_devices clears COM4's "a modem's port" flag with the others; LineEnd no longer
+// closes a port handle a pending write still names (the device's own, already closed or about to be).
+// Left as they are: kill_thread's 12 s wait and panic (nothing in v1.0 ever sets the task it waits for: it returns at
+// once) and LineDevice::Recv's ReadFile without an OVERLAPPED on the overlapped port (kernel32 waits on the handle when
+// a read pends, and with cfg_com_timeouts' return-at-once timeouts a read never pends).
 //
 // Footprints: replay_only for everything that touches a COM port, TAPI, the registry, events or tasks, allocates or frees
 // -- no line hardware here, so test/world_net_line.cpp checks every one offline against the originals on a fake COM port,
@@ -59,6 +68,11 @@ static __forceinline uint32_t xlate(uint32_t xl) {
 }
 static __forceinline bool xl_built(uint32_t guard, uint8_t bits) { return (NT_G8(guard) & bits) == bits; }
 
+// a harness's marker for "a fix changed what happens here" (nothing in the DLL)
+#ifndef VP_FIX_HIT
+#define VP_FIX_HIT(what) ((void)0)
+#endif
+
 template <typename T> static void fp_pure(Footprint& f, T*, Edx) { f.pure = true; }
 template <typename T> static void fp_line_io(Footprint& f, T*, Edx) { f.replay_only = "talks to the COM port or TAPI"; }
 template <typename T> static void fp_status_out(Footprint& f, T* self, Edx) {
@@ -70,7 +84,8 @@ template <typename T> static void fp_status_out(Footprint& f, T* self, Edx) {
 // LineDevice
 // =========================================================================================================================
 // Send(p, n): connected only (else logged); the finished blocks freed, the packet copied into a free block (none: dropped)
-// and written overlapped (an error other than "pending" logged)
+// and written overlapped (an error other than "pending" logged). FIX: a length outside 0..0xe4 drops the packet before a
+// block is taken (the original copied it into the block's 0xe4 bytes unchecked, over the next blocks).
 static void __fastcall LineDevice_Send(LineDevice* self, Edx, const void* p, int32_t n) {
     ccall<void>(A_dump_blocks);
     const int32_t st = self->status;
@@ -79,6 +94,10 @@ static void __fastcall LineDevice_Send(LineDevice* self, Edx, const void* p, int
         return;
     }
     ccall<void>(A_free_completed_sendblocks);
+    if (VP_FIX && (uint32_t)n > 0xe4u) {
+        VP_FIX_HIT("LineDevice::Send");
+        return;
+    }
     SendBlock* b = ccall<SendBlock*>(A_alloc_sendblock, self->handle);
     if (!b) return;
     crt_copy(b->data, p, (uint32_t)n);
@@ -221,7 +240,9 @@ static void __fastcall TAPILine_dtor(TAPILine* self, Edx) {
 }
 PORT_FN(0x004a0420, "TAPILine::~TAPILine", TAPILine_dtor, fp_line_io<TAPILine>)
 
-// get_handle: the line's COM handle (lineGetID "comm/datamodem": a VARSTRING, binary {HANDLE, name}); 0 counts as none
+// get_handle: the line's COM handle (lineGetID "comm/datamodem": a VARSTRING, binary {HANDLE, name}); 0 counts as none.
+// FIX: a string offset from the driver past the 0x200-byte VARSTRING gives no handle (the original read wherever it
+// pointed).
 static uint8_t __fastcall TAPILine_get_handle(TAPILine* self, Edx) {
     uint8_t vs[0x200];
     crt_zero(vs, 0x80);
@@ -232,10 +253,12 @@ static uint8_t __fastcall TAPILine_get_handle(TAPILine* self, Edx) {
     if (r == 0) {
         uint32_t format, offset;
         memcpy(&format, vs + 0xc, 4);
+        memcpy(&offset, vs + 0x14, 4);
         if (format != 4) {
             NT_LogReport(NT_CP(0x004fac54), format);
+        } else if (VP_FIX && offset > 0x200u - 4u) {
+            VP_FIX_HIT("TAPILine::get_handle");
         } else {
-            memcpy(&offset, vs + 0x14, 4);
             uint32_t h;
             memcpy(&h, vs + offset, 4);
             self->handle = h;
@@ -252,7 +275,9 @@ static uint8_t __fastcall TAPILine_cfg_modem(TAPILine* self, Edx) { return ccall
 PORT_FN(0x004a0540, "TAPILine::cfg_modem", TAPILine_cfg_modem, fp_line_io<TAPILine>)
 
 // set_from_bytestream(device): the modem's settings, a fixed 0x6c-byte configuration (every byte written, as the original
-// writes it byte by byte on its stack), set, read back and compared (a difference only logged); 0 if the set failed
+// writes it byte by byte on its stack), set, read back and compared (a difference only logged); 0 if the set failed.
+// FIX: the configuration read back is compared only when the driver's offset and size lie inside the 0x400-byte VARSTRING
+// (the original compared wherever they pointed, for as long as they said).
 static uint8_t __cdecl set_from_bytestream_c(uint32_t devid) {
     static const uint8_t k_nonzero[][2] = {
         {0x00, 0x6c}, {0x04, 0x03}, {0x06, 0x01}, {0x0a, 0x08}, {0x0c, 0x60}, {0x10, 0x01}, {0x14, 0x1c}, {0x19, 0xe1},
@@ -282,6 +307,10 @@ static uint8_t __cdecl set_from_bytestream_c(uint32_t devid) {
     uint32_t size, offset;
     memcpy(&offset, l.vs + 0x14, 4);
     memcpy(&size, l.vs + 0x10, 4);
+    if (VP_FIX && (offset > 0x400u || size > 0x400u - offset)) {
+        VP_FIX_HIT("set_from_bytestream");
+        return 1;
+    }
     if (memcmp(l.vs + offset, l.cfg, size) != 0) NT_LogReport(NT_CP(0x004fac7c));
     return 1;
 }
@@ -762,7 +791,8 @@ static SendBlock* __cdecl alloc_sendblock_c(uint32_t handle) {
 static void fp_alloc_sendblock(Footprint& f, uint32_t) { f.add((void*)(uintptr_t)S_BLOCKS, S_BLOCKS_END - S_BLOCKS, "the send blocks"); }
 PORT_FN(0x004a1360, "alloc_sendblock", alloc_sendblock_c, fp_alloc_sendblock)
 
-// lds_str(status): the status's name (12 entries on the stack; unchecked)
+// lds_str(status): the status's name (12 entries on the stack). FIX: a status outside 0..11 gives entry 0 ("LDS_BOGUS");
+// the original read past its table.
 static const char* __cdecl lds_str_c(int32_t st) {
     volatile uint32_t t[12];
     t[0] = 0x004fb0c0;
@@ -777,6 +807,10 @@ static const char* __cdecl lds_str_c(int32_t st) {
     t[9] = 0x004fb144;
     t[10] = 0x004fb150;
     t[11] = 0x004fb160;
+    if (VP_FIX && (uint32_t)st >= 12u) {
+        VP_FIX_HIT("lds_str");
+        st = 0;
+    }
     return NT_CP(t[st]);
 }
 static void fp_lds_str(Footprint&, int32_t) {}
@@ -833,7 +867,8 @@ static void __stdcall tapi_cb_c(uint32_t hdev, uint32_t msg, uint32_t inst, uint
 static void fp_tapi_cb(Footprint& f, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) { f.replay_only = "a TAPI event"; }
 PORT_FN(0x004a1530, "tapi_cb", tapi_cb_c, fp_tapi_cb)
 
-// kill_thread: a task of another thread waited for (100 ms steps, the window kept alive; 12 s -> a panic) and destroyed
+// kill_thread: a task of another thread waited for (100 ms steps, the window kept alive; 12 s -> a panic) and destroyed.
+// (Not fixed: S_THREAD is read only here and in v1.0 nothing ever sets it, so this returns at once.)
 static void __cdecl kill_thread_c() {
     if (NT_G32(S_THREAD) == 0) return;
     if (ccall<int32_t>(F_TaskGetID) == NT_G32(S_THREAD)) return;
@@ -852,7 +887,10 @@ static void __cdecl kill_thread_c() {
 static void fp_kill_thread(Footprint& f) { f.replay_only = "waits for and destroys a task"; }
 PORT_FN(0x004a1580, "kill_thread", kill_thread_c, fp_kill_thread)
 
-// LineEnd: the finished writes freed, TAPI shut down; a block still writing is logged and its port closed; the events closed
+// LineEnd: the finished writes freed, TAPI shut down; a block still writing is logged and its port closed; the events
+// closed. FIX: the port isn't closed. The block only names the port handle of the device that wrote it, which the device
+// closes itself (DirectLine / TAPILine's destructor, which runs before LineEnd): the original closed that handle value a
+// second time -- by then possibly another handle of the game's.
 static void __cdecl LineEnd_c() {
     ccall<void>(A_free_completed_sendblocks);
     TAPI(Tapi1_f, I_lineShutdown)(NT_GU32(S_HLINEAPP));
@@ -863,7 +901,8 @@ static void __cdecl LineEnd_c() {
         SendBlock* b = (SendBlock*)(uintptr_t)a;
         if (*(volatile uint32_t*)&b->handle != 0xffffffffu) {
             NT_LogReport(NT_CP(0x004fb208));
-            close(b->handle);
+            if (VP_FIX) VP_FIX_HIT("LineEnd");
+            else close(b->handle);
             b->handle = 0xffffffffu;
         }
         const uint32_t ev = b->event;
@@ -883,7 +922,8 @@ static void fp_LineEnumerateDevices(Footprint& f, LineDeviceInfo*, int32_t, int3
 PORT_FN(0x004a1690, "LineEnumerateDevices", LineEnumerateDevices_c, fp_LineEnumerateDevices)
 
 // enum_devices(info, max, flags): bit 0 the TAPI modems, bit 1 the COM ports (a table of two on the stack, walked bit by
-// bit: no bound). Flags 2 alone also runs the TAPI pass first (to mark the modems' ports) and then zeroes the count.
+// bit). Flags 2 alone also runs the TAPI pass first (to mark the modems' ports) and then zeroes the count. FIX: only the
+// two lists are walked (the original called whatever the stack held past its table for a flag bit above 1).
 static int32_t __cdecl enum_devices_c(LineDeviceInfo* info, int32_t max, int32_t flags) {
     typedef void(__cdecl * Enum_t)(LineDeviceInfo*, int32_t, int32_t*);
     struct {
@@ -898,17 +938,27 @@ static int32_t __cdecl enum_devices_c(LineDeviceInfo* info, int32_t max, int32_t
         l.count = 0;
     }
     const volatile uint32_t* fn = l.fn;
-    for (int32_t f = flags; f != 0; f >>= 1, fn++)
+    for (int32_t f = flags; f != 0; f >>= 1, fn++) {
+        if (VP_FIX && fn == l.fn + 2) {
+            VP_FIX_HIT("enum_devices");
+            break;
+        }
         if (f & 1) ((Enum_t)(uintptr_t)*fn)(info, max, &l.count);
+    }
     return l.count;
 }
 PORT_FN(0x004a16b0, "enum_devices", enum_devices_c, fp_LineEnumerateDevices)
 
 // enumerate_tapi_devices(info, max, &count): every TAPI device that is a voice-bearer data modem, with the COM port it's
-// attached to marked as taken (S_PORT_TAPI, ports 1..4; byte 4 isn't cleared); the others logged
+// attached to marked as taken (S_PORT_TAPI, ports 1..4); the others logged. FIX: COM4's flag (byte 4) is cleared with the
+// others; the original cleared only bytes 0..3, so once a modem on COM4 had been listed COM4 was never offered again.
 static void __cdecl enumerate_tapi_devices_c(LineDeviceInfo* info, int32_t max, int32_t* count) {
     uint8_t caps[0x400];
     NT_GU32(S_PORT_TAPI) = 0;
+    if (VP_FIX) {
+        if (NT_G8(S_PORT_TAPI + 4)) VP_FIX_HIT("enumerate_tapi_devices");
+        NT_G8(S_PORT_TAPI + 4) = 0;
+    }
     if (NT_GU32(S_NDEVS) == 0) return;
     uint32_t i = 0;
     do {
@@ -949,7 +999,9 @@ static void fp_enumerate_devices(Footprint& f, LineDeviceInfo*, int32_t, int32_t
 PORT_FN(0x004a1730, "enumerate_tapi_devices", enumerate_tapi_devices_c, fp_enumerate_devices)
 
 // get_tapiline_port(caps): the COM port a modem is attached to (1..9), from its driver key's AttachedTo ("COMn"), via the
-// device-specific part of its LINEDEVCAPS; 0 if none (the key is left open)
+// device-specific part of its LINEDEVCAPS; 0 if none. FIX: the key is closed (the original left it open, one handle per
+// modem per listing), and the driver's offsets must keep the key's name, terminated, inside the 0x400-byte LINEDEVCAPS
+// (else 0: the original read wherever they pointed).
 static int32_t __cdecl get_tapiline_port_c(const uint8_t* caps) {
     struct {
         uint32_t type, cb, hkey;
@@ -959,11 +1011,19 @@ static int32_t __cdecl get_tapiline_port_c(const uint8_t* caps) {
     memcpy(&size, caps + 0xe4, 4);
     if (size == 0) return 0;
     memcpy(&at, caps + 0xe8, 4);
+    if (VP_FIX && at > 0x400u - 8u) {
+        VP_FIX_HIT("get_tapiline_port");
+        return 0;
+    }
     const uint8_t* spec = caps + at;
     uint32_t first, rel;
     memcpy(&first, spec, 4);
     if (first == 0) return 0;
     memcpy(&rel, spec + 4, 4);
+    if (VP_FIX && (rel >= 0x400u - at || !memchr(spec + rel, 0, 0x400u - at - rel))) {
+        VP_FIX_HIT("get_tapiline_port");
+        return 0;
+    }
     const char* key = (const char*)(spec + rel);
     if (NT_IAT(RegOpenKeyExA_f, I_RegOpenKeyExA)(0x80000002u, key, 0, 0x20019, &l.hkey) != 0) {
         NT_LogReport(NT_CP(0x004fb2ec), key, win32_error());
@@ -972,8 +1032,10 @@ static int32_t __cdecl get_tapiline_port_c(const uint8_t* caps) {
     l.cb = 0x40;
     if (NT_IAT(RegQueryValueExA_f, I_RegQueryValueExA)(l.hkey, NT_CP(0x004fb29c), 0, &l.type, l.data, &l.cb) != 0) {
         NT_LogReport(NT_CP(0x004fb2d0), win32_error());
+        if (VP_FIX) NT_IAT(RegCloseKey_f, I_RegCloseKey)(l.hkey);
         return 0;
     }
+    if (VP_FIX) NT_IAT(RegCloseKey_f, I_RegCloseKey)(l.hkey);
     if (l.type != 1) {
         NT_LogReport(NT_CP(0x004fb2a8), l.type);
         return 0;
@@ -1075,7 +1137,8 @@ static int32_t __cdecl DBGLineBlocksFree_c() { return NT_G32(S_BLOCKS_FREE); }
 static void fp_DBGLineBlocksFree(Footprint&) {}
 PORT_FN(0x004a1bb0, "DBGLineBlocksFree", DBGLineBlocksFree_c, fp_DBGLineBlocksFree)
 
-// LineStatusText(status): the status's translated text (twelve entries: 0 a constant, 8 and 10 the same Xlator)
+// LineStatusText(status): the status's translated text (twelve entries: 0 a constant, 8 and 10 the same Xlator). FIX: a
+// status outside 0..11 gives entry 0 ("*** invalid ***"); the original read past its table.
 static const struct { uint32_t guard; uint8_t bit; uint32_t xl, key, dtor; } k_status_xl[] = {
     {0x0057be98, 0x01, 0x0057beb8, 0x004fb344, 0x004a1f90}, {0x0057be98, 0x02, 0x0057c1b8, 0x004fb35c, 0x004a1f80},
     {0x0057be98, 0x04, 0x0057d1b8, 0x004fb374, 0x004a1f70}, {0x0057be98, 0x08, 0x0057c1a8, 0x004fb388, 0x004a1f60},
@@ -1092,6 +1155,10 @@ static const char* __cdecl LineStatusText_c(int32_t st) {
     for (const auto& x : k_status_xl) xl_once(x.guard, x.bit, x.xl, x.key, x.dtor);
     t[0] = 0x004fb438;                                              // "*** invalid ***"
     for (int32_t i = 0; i < 11; i++) t[i + 1] = xlate(k_status_entry[i]);
+    if (VP_FIX && (uint32_t)st >= 12u) {
+        VP_FIX_HIT("LineStatusText");
+        st = 0;
+    }
     return NT_CP(t[st]);
 }
 static void fp_LineStatusText(Footprint& f, int32_t) {

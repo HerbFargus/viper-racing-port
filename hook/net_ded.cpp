@@ -18,11 +18,14 @@
 // Footprints: everything here drives the console, the log, a task or the RaceServer: replay_only, except the string
 // helpers (contains, get_numeric) and the proposal's setup (init_game_info, update_laps), which write their outputs only.
 //
-// FIX CANDIDATEs (left faithful, marked in place): get_numeric's 12-byte digit buffer takes 12 digits and its NUL lands
-// one past it (in the original: the low byte of its return address -- the rewrite's buffer has the 13th byte, so it can't
-// crash the same way); idle hands handle_input a 0x400-byte line without a NUL when the read fills the buffer; the console
-// reads block (ReadConsoleA) with no way out but a line; handle_input's server:/restart/end race wait (Sleep(50)) for the
-// main loop to take the line, forever if it doesn't run; MultiDedicatedServer's main loop exits only on "quit".
+// The fixes (docs/PORTING.md, "Fixes"; `// FIX:` in place, VP_FIX): get_numeric's digit buffer holds the 12 digits it takes
+// and their NUL (the original's 12 bytes put the NUL on its return address); idle terminates a line that fills its 0x400
+// bytes (the last byte gives way, as prompt_user's does; the original handed handle_input no NUL); handle_input logs
+// "Unrecognized command" only for a line it doesn't know (the original logged it after every command). Left as is: the
+// console reads block (ReadConsoleA) until a line comes, and handle_input waits (Sleep(50)) for the main loop to take a
+// server:/restart/end race line -- the main loop clears Server::g_msg only once it has finished with the line, so giving
+// up the wait could free the line under it, and the main loop runs until "quit" (the input task is destroyed then);
+// MultiDedicatedServer's main loop exits only on "quit"; and any line said while racing restarts the race (see chat).
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -152,11 +155,14 @@ static int __cdecl contains_list(const char* text, const uint32_t* list) {
 static void fp_cl(Footprint& f, const char*, const uint32_t*) { f.add(&f, 0, "nothing"); }
 PORT_FN(0x004a3520, "contains(list)", contains_list, fp_cl)
 
-// "key<digits>": the number (up to 12 digits), out of [lo, hi] -> lo. FIX CANDIDATE: 12 digits put the NUL past the buffer.
+// "key<digits>": the number (up to 12 digits), out of [lo, hi] -> lo
 static uint8_t __cdecl get_numeric(const char* text, const char* key, int32_t* out, int lo, int hi) {
     const char* p = ccall<const char*>(F_strstr, text, key);
     if (!p) return 0;
-    char buf[13];                                            // the original's is 12: its 13th byte is its return address's
+    // FIX: the buffer holds 12 digits and their NUL. The original's is 12 bytes: 12 digits put the NUL on the low byte of
+    // its return address ("server: track 000000000003" crashed the dedicated server). (The rewrite's buffer is this size in
+    // every build.)
+    char buf[13];
     char* d = buf;
     p += crt_strlen(key);
     while (ccall<int>(F_isdigit, (int)*(const volatile signed char*)p) && *(const volatile char*)p) {
@@ -298,8 +304,7 @@ static void __cdecl ded_end() {
 static void fp_de(Footprint& f) { f.replay_only = R_CONSOLE; }
 PORT_FN(0x004a3a40, "ded_end", ded_end, fp_de)
 
-// the "dedicated input" task: console lines (trailing blanks cut) to handle_input until quit.
-// FIX CANDIDATE: a full 0x400-byte read isn't terminated.
+// the "dedicated input" task: console lines (trailing blanks cut) to handle_input until quit
 static void __cdecl idle() {
     if (U8(G_QUIT)) return;
     char buf[0x400];
@@ -309,6 +314,9 @@ static void __cdecl idle() {
         if (IAT(ReadConsoleA_f, I_ReadConsoleA)(U32(G_HIN), buf, 0x400, &n, 0)) {
             while (n > 0 && ccall<int>(F_isspace, (int)(signed char)buf[n - 1])) n--;
             if (n < 0x400) buf[n] = 0;
+            // FIX: a read that fills the buffer (and doesn't end in a blank) is terminated in its last byte, which gives
+            // way (as prompt_user's does); the original handed handle_input a line with no NUL
+            else if (VP_FIX) buf[0x3ff] = 0;
             ccall<void>(D_handle_input, (const char*)buf);
         }
     } while (!U8(G_QUIT));
@@ -316,8 +324,9 @@ static void __cdecl idle() {
 static void fp_idle(Footprint& f) { f.replay_only = R_CONSOLE; }
 PORT_FN(0x004a3a70, "idle(ded.obj)", idle, fp_idle)
 
-// a console line. Every one ends with "Unrecognized command" (the original's tail, kept).
+// a console line
 static void __cdecl handle_input(const char* line) {
+    bool known = true;
     if (!ccall<int>(F_strnicmp, line, CP(0x004fb9c0), 4)) {                // "quit"
         U8(G_QUIT) = 1;
         LOG(CP(0x004fb9c8));
@@ -334,8 +343,12 @@ static void __cdecl handle_input(const char* line) {
         LOG(CP(0x004fba88));
         LOG(CP(0x004fbac4));
         LOG(CP(0x004fbb00));
+    } else {
+        known = false;
     }
-    LOG(CP(0x004fbb20), line);
+    // FIX: "Unrecognized command" only for a line that is one; the original logged it after every command, the ones it
+    // had just carried out too (cosmetic: the console's log only)
+    if (!(VP_FIX && known)) LOG(CP(0x004fbb20), line);
 }
 static void fp_hi(Footprint& f, const char*) { f.replay_only = R_CONSOLE; }
 PORT_FN(0x004a3b10, "handle_input", handle_input, fp_hi)

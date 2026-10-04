@@ -18,9 +18,23 @@
 // patched call sites are in these functions: LineSocket's constructor draws its id through net_Random (k_random_sites
 // 0x4ad4df) and winsock_grab registers the hook net_async_hook_for_winsock_grab names (PUSH_ASYNC_HOOK 0x4adb11: N0's
 // h_async_hook in a session, async_msg_hook otherwise). The stack locals the original hands winsock half-written (a
-// sockaddr_in's sin_zero, which N0's recorder masks) are left unwritten here too. Faithful: init_local_addrs writes past
-// its three slots on a host with more than three IPv4 addresses, as the original does (a FIX candidate, not applied).
+// sockaddr_in's sin_zero, which N0's recorder masks) are left unwritten here too.
 //
+// Fixes (docs/FIXES.md, "Multiplayer"; each marked `// FIX:` in place, `VP_FIX &&`, so the faithful build is the original):
+// UDPSocket::init_local_addrs keeps the host's first three addresses (a fourth -- a VPN, Hyper-V or WSL adapter -- wrote
+// over the port and the count, and AddressIsLocal then crashed); IPXSocket's constructor sets its socket to "none" first
+// (a failed winsock_grab left it as MemAlloc left it, and the destructor closed that); async_msg_hook ignores a reply
+// whose request is gone or isn't the one in the slot (a reply after AsyncCancel read through 0, or filled in the next
+// request); a socket past the four async request slots doesn't touch the table and fails its lookups at once.
+// LineSocket::enqueue drops an empty packet or one over its 0xe4 bytes (an empty one made the local queue a cycle: the
+// next enqueue never ended), dequeue drops one longer than the caller's buffer. set_autodial is left as it is (without
+// administrator rights the HKEY_USERS key doesn't open and it quietly does nothing).
+//
+// a harness's marker for "a fix changed what happens here" (nothing in the DLL)
+#ifndef VP_FIX_HIT
+#define VP_FIX_HIT(what) ((void)0)
+#endif
+
 // Footprints: whatever calls winsock, the registry, allocates or frees, or logs on every call is replay_only (a session
 // replay of a LAN game is their in-game check: the recorder hands the rewrites what winsock gave the original); the
 // accessors and the address compares are pure or write only their output. test/world_net_line.cpp checks them all
@@ -166,10 +180,17 @@ static void __fastcall LineSocket_MakeStr(LineSocket* self, Edx, const SocketAdd
 static void fp_LineSocket_MakeStr(Footprint& f, LineSocket*, Edx, const SocketAddr*, char* out) { f.add(out, 12, "the string"); }
 PORT_FN(0x004ad650, "LineSocket::MakeStr", LineSocket_MakeStr, fp_LineSocket_MakeStr)
 
-// dequeue(buf, &n): the oldest local packet (its length unchecked against the caller's buffer), freed
+// dequeue(buf, &n): the oldest local packet, freed. FIX: one longer than the caller's buffer is dropped (freed, 0); the
+// original copied it unchecked.
 static uint8_t __fastcall LineSocket_dequeue(LineSocket* self, Edx, void* buf, int32_t* n) {
     LocalPkt* p = self->head;
     if (!p) return 0;
+    if (VP_FIX && p->len > *n) {
+        VP_FIX_HIT("LineSocket::dequeue");
+        self->head = p->next;
+        p->len = 0;
+        return 0;
+    }
     crt_copy(buf, p->data, (uint32_t)p->len);
     *n = self->head->len;
     LocalPkt* h = self->head;
@@ -184,8 +205,15 @@ static void fp_LineSocket_dequeue(Footprint& f, LineSocket* self, Edx, void* buf
 }
 PORT_FN(0x004ad6f0, "LineSocket::dequeue", LineSocket_dequeue, fp_LineSocket_dequeue)
 
-// enqueue(p, n): into a free slot (its length unchecked against the slot's 0xe4), at the end of the queue; none free panics
+// enqueue(p, n): into a free slot, at the end of the queue; none free panics. FIX: an empty packet or one over the slot's
+// 0xe4 bytes is dropped. The original overran the slot with a long one; an empty one stayed queued with length 0, which
+// alloc_pkt takes as free, so the next enqueue linked that slot to itself and the one after never ended (and Recv handed
+// the empty packet out forever).
 static void __fastcall LineSocket_enqueue(LineSocket* self, Edx, const void* p, int32_t n) {
+    if (VP_FIX && (n <= 0 || n > 0xe4)) {
+        VP_FIX_HIT("LineSocket::enqueue");
+        return;
+    }
     LocalPkt* k = tcall<LocalPkt*>(A_LineSocket_alloc_pkt, self);
     if (!k) {
         NT_LogPanic(NT_CP(0x004fe22c), (int32_t)8);
@@ -268,8 +296,16 @@ PORT_FN(0x004ae530, "LineSocket::local_pkt::local_pkt", local_pkt_ctor, fp_local
 // =========================================================================================================================
 // UDPSocket
 // =========================================================================================================================
+// the async request slots: 4, by UDPSocket::slot (winsock_grab's count when the socket was made). FIX: a socket made
+// while four or more were open has none: the original read and wrote past the table (over winsock_grab's count).
+static __forceinline bool slot_ok(const UDPSocket* s) {
+    if (!VP_FIX || (uint32_t)s->slot < 4u) return true;
+    VP_FIX_HIT("UDPSocket's async slot");
+    return false;
+}
+
 static void __fastcall UDPSocket_AsyncCancel(UDPSocket* self, Edx, AsyncReq* rq) {
-    NT_GU32(S_ASYNC_REQS + (uint32_t)self->slot * 4) = 0;
+    if (slot_ok(self)) NT_GU32(S_ASYNC_REQS + (uint32_t)self->slot * 4) = 0;
     WS(Int1_f, I_WSACancelAsyncRequest)(rq->handle);
     rq->handle = 0xffffffffu;
 }
@@ -287,6 +323,11 @@ static uint8_t __fastcall UDPSocket_AsyncGetHostAddr(UDPSocket* self, Edx, const
     if (ip != 0xffffffffu) {
         rq->addr.d[0] = ip;
         rq->status = 2;
+        return 1;
+    }
+    if (!slot_ok(self)) {                                       // FIX: no slot, no reply: failed at once
+        rq->status = 1;
+        NT_LogReport(NT_CP(0x004fe260), "no request slot");         // "AsyncGetHostName fails (%s)"
         return 1;
     }
     const uint32_t msg = (uint32_t)self->slot + 0xf400;
@@ -316,7 +357,10 @@ static const char* __cdecl err2str1_c(int32_t e) {
 static void fp_err2str1(Footprint& f, int32_t) { f.add((void*)(uintptr_t)S_ERRBUF, 0x20, "err2str's buffer"); }
 PORT_FN(0x004ad8c0, "err2str(int)", err2str1_c, fp_err2str1)
 
-// init_local_addrs: this host's addresses from gethostbyname(gethostname()) -- every one, into slots for three
+// init_local_addrs: this host's addresses from gethostbyname(gethostname()) into slots for three. FIX: the first three are
+// kept. The original took every one: a fourth wrote its port over the socket's port and its address over the count (then
+// the count + 1), so a fifth wrote far past the socket and AddressIsLocal walked off it -- a PC with a VPN, Hyper-V or WSL
+// adapter (gethostbyname lists them all) crashed hosting or joining a LAN game.
 static void __fastcall UDP_init_local_addrs(UDPSocket* self, Edx) {
     char name[0x80];
     const uintptr_t me = (uintptr_t)self;
@@ -334,6 +378,10 @@ static void __fastcall UDP_init_local_addrs(UDPSocket* self, Edx) {
     uint32_t* const* list = *(uint32_t* const* const*)(h + 0xc);
     if (*(uint32_t* const volatile*)list == 0) return;
     do {
+        if (VP_FIX && NT_G32(me + 0x2c) >= 3) {
+            VP_FIX_HIT("UDPSocket::init_local_addrs");
+            break;
+        }
         const uint16_t port = NT_G16(me + 0x30);
         int32_t n = NT_G32(me + 0x2c);
         NT_G8(me + 0x32) = 1;
@@ -357,7 +405,7 @@ static UDPSocket* __fastcall UDPSocket_ctor(UDPSocket* self, Edx, uint32_t port)
     self->ok = 0;
     const int32_t slot = NT_G32(S_GRABS);
     self->slot = slot;
-    NT_GU32(S_ASYNC_REQS + (uint32_t)slot * 4) = 0;
+    if (slot_ok(self)) NT_GU32(S_ASYNC_REQS + (uint32_t)slot * 4) = 0;
     if (!ccall<uint8_t>(A_winsock_grab)) return self;
     const uint32_t s = WS(Socket_f, I_socket)(2, 2, 0);
     self->sock = s;
@@ -433,13 +481,20 @@ static void fp_set_autodial(Footprint& f, uint32_t) { f.replay_only = "reads and
 PORT_FN(0x004adb30, "set_autodial", set_autodial_c, fp_set_autodial)
 
 // async_msg_hook(msg, wparam, lparam): the reply to AsyncGetHostAddr's request (message 0xf400 + slot): the first
-// address (status 2) or the error (status 1), logged; the slot freed. Other messages: 0.
+// address (status 2) or the error (status 1), logged; the slot freed. Other messages: 0. FIX: a reply with no request in
+// its slot (one already posted when AsyncCancel cleared it) or for another request than the slot's (wparam is the
+// request's handle: a cancelled request's late reply after a new one took the slot) is taken and ignored; the original
+// wrote through 0, or gave the new request the old one's answer and then crashed on its own reply.
 static uint8_t __cdecl async_msg_hook_c(uint32_t msg, int32_t wparam, int32_t lparam) {
     (void)wparam;
     const uint32_t i = msg - 0xf400;
     if (i >= 4) return 0;
     const uint32_t slot = S_ASYNC_REQS + i * 4;
     AsyncReq* rq = (AsyncReq*)(uintptr_t)NT_GU32(slot);
+    if (VP_FIX && (!rq || rq->handle != (uint32_t)wparam)) {
+        VP_FIX_HIT("async_msg_hook");
+        return 1;
+    }
     const uint16_t err = (uint16_t)((uint32_t)lparam >> 16);
     if (err == 0) {
         NT_LogReport(NT_CP(0x004fe340), (uint32_t)(uint16_t)lparam);
@@ -590,11 +645,15 @@ PORT_FN(0x004ae630, "UDPSocket::GetBPS", UDPSocket_GetBPS, fp_pure<UDPSocket>)
 // =========================================================================================================================
 // IPXSocket
 // =========================================================================================================================
+// FIX: the socket is "none" (-1) from the start; when winsock_grab failed the original returned with it as MemAlloc left
+// it, and the destructor closed that handle (any of the game's, or the fake one in the harness)
 static IPXSocket* __fastcall IPXSocket_ctor(IPXSocket* self, Edx, uint32_t port) {
+    if (VP_FIX) self->sock = 0xffffffffu;
     self->port = (int16_t)port;
     self->vtbl = (const void*)(uintptr_t)VT_IPXSocket;
     self->ok = 0;
     if (!ccall<uint8_t>(A_winsock_grab)) {
+        if (VP_FIX) VP_FIX_HIT("IPXSocket::IPXSocket");
         NT_LogReport(NT_CP(0x004fe450));
         return self;
     }

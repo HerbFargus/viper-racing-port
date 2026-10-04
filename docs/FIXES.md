@@ -485,6 +485,120 @@ the DLL makes (it is at most 200 characters, `<game folder>\Config\`).
   missing translation, and the "Can't XLAT" warning with the key still fits a log line. A name that fits is looked up as
   before.
 
+## Multiplayer
+
+The multiplayer library, its menus and the dedicated server (`hook/net_*.cpp`, `menu_multi.cpp`, `menu_sched.cpp`).
+A normal LAN game is unchanged: recorded on the fixed code, it replays identically on the original.
+
+### In play
+
+- More than 8 cars: the AI-cars slider goes to 6, so with 3 or more players the host's server added cars past its
+  8 slots. That overwrote its own car count and the race on offer and overran the car-list packet, usually
+  crashing the host or garbling the race. The server now adds only as many AI cars as there is room for, up to 8
+  in all (`add_ai_cars`). A race of 8 or fewer is unchanged; the lobby still shows the count the host asked for.
+- Hosting or joining on a PC with more than three IPv4 addresses crashed. VPN, Hyper-V, WSL and VirtualBox
+  adapters are listed alongside the real ones; the socket kept every address in room for three, so a fourth wrote
+  over the address count and the game then read far past the socket. The first three are kept now
+  (`UDPSocket::init_local_addrs`). If the LAN adapter isn't among them, the game may not recognise its own
+  broadcasts as its own; nothing worse.
+- A player dropping out (their reliable packets unanswered five times) also cut off every player listed after them
+  in the reliable layer: those players' chat and race control messages were never resent or acknowledged again.
+  The others now stay (`ReliableDataPort::Tick`). When the player who drops is the last one listed, nothing
+  changes.
+- A player whose connection dropped could be forgotten in the wrong slot when the server's sessions didn't start
+  at 0: another player was cleared instead, or memory past the 8 players. The disconnect now clears the player who
+  left (`RaceServer::Tick`). Where sessions start at 0, as in every game tested, nothing changes.
+- The reliable layer keeps an entry for every address it has exchanged reliable packets with (two per channel, at
+  least 8), freed only when that address stops answering. Once all were in use the next new address ended the game
+  with a panic ("overalloc") -- a dedicated server after enough different players, or a game browser on a busy
+  LAN. A new address now takes over an entry with nothing in flight (it starts its packet sequence afresh, as any
+  new peer does); with none idle its packets are dropped. The 9th host on a server also wrote one byte before the
+  slot table when it went away; it no longer does.
+- The lobby could crash as the race began: the client can pass car get within one tick (with no car to fetch it
+  goes straight to race waiting), and the lobby then read past its table of state functions and jumped through its
+  own return address. A state past car get now ends the lobby as car get does, and the race follows.
+- The lobby's track chooser had room for 16 names of 12 characters. A 17th track (an add-on row in tracks.tab) ran
+  over the chooser's picture and flags -- the host flag among them, so a client could get the host's arrows -- and
+  on into the car chooser; a 12-character name ran over the stack while "<name>.stp" was built. The chooser now
+  offers every installed track (names past the first 16, or longer ones, are read from the track table where
+  they're needed). A track the host has and this machine doesn't shows no picture or name; with no tracks the
+  arrows do nothing (they divided by zero).
+- A chat line of just "latency" (the packet-delay command with no number) crashed every player who received it.
+  It's now an ordinary chat line.
+- On a link too slow for one car packet a second, the server divided by 0 working out its send interval. It now
+  sends once a second (`calc_send_interval`).
+- The pre-race "Synchronizing" screen no longer hangs when the screen can never be grabbed; it gives up after 200
+  tries (switching away still just waits). `MultiSynchronize` no longer crashes if the client has no proposal.
+- The LAN list's selection wasn't checked against the games found: a game dropping out of the list between frames,
+  or no selection, made Connect join a stale entry or garbage. Connect now does nothing unless one of the listed
+  games is selected.
+- A host-name lookup whose answer arrived just as it was cancelled wrote through a null pointer, and a cancelled
+  lookup's late answer was taken as the next lookup's. Both are ignored now. Choosing IPX when winsock itself
+  failed to start closed an uninitialised handle; the socket now starts out as "none".
+
+### Texts
+
+- Texts are held to their buffers; every text that fits comes out exactly as before. A long translation, a mod's
+  name or a name off the network ran over the frame or the next field in: the game list's lines (a game's name
+  needn't end in its 32 bytes), the version text, the Find box's title, the Create box's name and password, the
+  modem and direct-line boxes' titles and status messages; the chat line, the AI cars' and laps' texts, the race
+  info's texts, the ghost types' list (it ran over the lost-connection box's title), the lost-connection message,
+  the race number, the track's name, a car's friendly name and the game's name. "<car>.car" for a car name over 27
+  characters now has room, so the car loads by its whole name.
+- The line check's verdicts are translations that were used as the printf format: a '%' conversion in one read
+  arguments from the stack (garbage, or a crash for %s or %n). Such a text, or one over 63 characters, is shown as
+  written (cut to 63).
+- The AI cars' count text read the stack for a number outside 0..14; it's now empty. The protocol table is used
+  only for 0 or 1, the show / hide table takes any flag but 0 as "show", and a text height of -3 no longer divides
+  by zero in the user list.
+
+### Bad or foreign packets
+
+- Every user and car index that comes off the wire is checked; a packet that names no real user or car is dropped
+  (or logged as nobody) instead of being read or written outside the tables. A normal game's packets are
+  unchanged.
+- Server: car packets with a car index outside 0..7, or under 2 bytes (the original looped about 178 million
+  times); car-info requests for a car outside 0..7, or whose owner isn't a user; user-info requests and whispers
+  to a user index past 7, or whispers naming another player's session; a 41st clock-sync reply (it overwrote the
+  sample count); an IROC car-info request when the IROC player has no car (it crashed).
+- Client: user info, user removal, chat and whisper with a user index past 7; car info for a car index outside
+  0..7; car packets under 2 bytes; chat text with no terminator in the packet; a chat line arriving with nowhere
+  to store it while the scrollback was empty; a deity cast longer than a packet.
+- Packets longer than the reliable layer's 0xe4 bytes overran their buffers in the packet-delay queue, the
+  reliable packet store (it now keeps the first 0xe4 bytes) and a channel's receive queue; they are dropped. A
+  reliable packet or ack from, or a send to, an address the reliable layer has no room for ran on a null host; it
+  is dropped.
+- In cases normal play doesn't reach: offering a service while a channel was in use looped forever (the busy
+  channel is stepped past); channel news with no channels and a round-trip count of 0 divided by zero; a channel's
+  packet missing from the global list was unlinked through 0; a lookup state outside 0-5 read past the status
+  texts; a fifth open socket wrote past the 4 lookup slots; `next_user` looped forever with nobody in; a server
+  state outside 1..8 jumped to address 0; a password over 15 characters ran past its field (now cut to 15, as the
+  joining side already cut it). Never called in v1.0, fixed anyway: `TrackCRC`, `GetPacketTypeString`,
+  `MultiAdjustPacketDelay`.
+
+### Serial and modem lines (tested offline only: no line hardware)
+
+- An empty packet sent to itself made the local queue a loop: the next send never returned and the receive loop
+  handed out the empty packet forever. Empty packets are dropped; so are packets over 0xe4 bytes (they overran the
+  local queue and the overlapped send blocks), and a queued packet longer than the reader's buffer.
+- A frame header read short used stack garbage as the packet's length and CRC; the reader now goes back to looking
+  for the sync bytes. The line check's reply buffer is terminated.
+- The modem driver's offsets and sizes (the device configuration read back, the port handle, the modem's registry
+  key) are kept inside their buffers, and the modem's registry key is closed after it's read (it was left open
+  each time the devices were listed). COM4's flag is cleared with the other ports' (COM4 was never offered again
+  once a modem on it had been listed).
+- At the end of a line game, a write still in progress made the game close the port's handle a second time
+  (possibly another of the game's handles by then); it no longer does. A device listing with a flag bit above 1
+  called stack data as code; line status texts outside 0-11 read past their tables.
+
+### Dedicated server
+
+- `server: track 000000000003`, or any number of 12 digits, crashed the dedicated server; it is read as a number
+  now. A console line that filled the 1 KB input buffer was passed on unterminated; its last character now gives
+  way.
+- "Unrecognized command" was logged after every command, including the ones just carried out; it is now logged
+  only for lines the server doesn't know.
+
 ## Limits lifted
 
 Like M1's limits, these move a table into the DLL for the original code and the rewrites alike, so
@@ -503,6 +617,16 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
 
 ## Not fixed
 
+- Multiplayer: anything said in chat during a race on the dedicated server restarts the race (it may be intended);
+  the dedicated server's console hand-off still waits without a limit. The lobby drops the whisper target whenever
+  the user list changes (`NextUser` always returns 0) -- wrong but harmless, and fixing it would change a normal
+  game's chat screen. The host's AI-cars slider still runs 0..6 whatever the number of players (the server caps
+  the cars). `kill_thread`'s 12-second wait and panic: nothing in v1.0 sets the task it waits for. The line device
+  reads its overlapped port without an OVERLAPPED: kernel32 waits on the handle itself, and the game's return-at-
+  once timeouts mean a read never pends. `set_autodial` still tries to turn Windows' autodial off in
+  HKEY_USERS\.Default (without administrator rights nothing happens). A hornball carries from one player's car to
+  another's (the cars share `ball.mod`), and an AI car hit by a hornball snaps back to its line in a network race:
+  behaviour, for a later look.
 - A track with no AI racing line still crashes in a career race or a multiplayer race; those are fixed
   with their own stages (the menus and career, multiplayer).
 - The AI's quirks that shape how it drives (its per-segment speed notes are computed and then

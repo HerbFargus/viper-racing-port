@@ -33,7 +33,12 @@
 // fillout fills; NumberString's Xlators once constructed; the stubs (a bare `ret`) are pure. Only ChatControl::Callback
 // (0x488060) branches within its first 5 bytes: new or original, never shadowed.
 //
-// FIX CANDIDATEs (left faithful): see each `// FIX CANDIDATE:`.
+// Fixes (// FIX:, docs/FIXES.md "Multiplayer menus"; VP_FIX, off in the faithful harness build): the track chooser holds
+// every track (its 16-name table kept for the first 16, the rest read from the track table) and checks the host's track
+// against this machine's; the lobby's state table checked (a state past car get ends the lobby as car get does); every
+// text held to its buffer (the chat's scrollback line, the race settings' and the race info's texts, the ghost types'
+// string, the lost-connection box, "<car>.car", the track's name, the game's name); NumberString outside 0..14 gives "";
+// the show / hide table, no tracks, a text height of -3. See each `// FIX:`.
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -93,9 +98,46 @@ static __forceinline void add_items(void* self, void* items) { tcall<void>(F_UIC
 #define IC(n, ...) item_ctor(fr.at(n), __VA_ARGS__)
 #define RAW(n, ...) raw(fr.at(n), __VA_ARGS__)
 // a group group shown or hidden through the table at 0x4f83d0 (UIHideGroup, UIShowGroup), read at the call
-// FIX CANDIDATE (every use): an index other than 0 or 1 calls what follows the two-entry table
+// FIX: an index other than 0 or 1 (only set_arrows / set_garage take one from their caller, a byte: the lobby passes 0 or
+// 1) called what follows the two-entry table; any other is taken as 1 (show), as a flag would be
 static __forceinline void showhide(uint32_t i, uint32_t grp) {
+    if (VP_FIX && i > 1u) i = 1u;
     ((void(__cdecl*)(uint32_t))(uintptr_t)UI_GU32(S_SHOWHIDE + 4u * i))(grp);
+}
+
+// ---- the fixes' helpers (docs/PORTING.md, "Fixes"; each use is marked // FIX:) --------------------------------------------
+// A text overrunning its buffer is caught by predicting what the game's sprintf prints: such a text is formatted in a buffer
+// of the rewrite's (each %s argument cut to 255 characters, so nothing passes it) and what fits is kept; every other text is
+// formatted where the original formats it, so it's the original's bytes and calls.
+// a string's length, counted up to 0x400 (anything that long overruns every buffer here)
+static __forceinline uint32_t fx_len(const char* s) { return ui_strnlen(s, 0x400); }
+// the characters the game's %d prints for v (a '-' and the digits)
+static __forceinline uint32_t fx_dec(int32_t v) {
+    uint32_t n = v < 0 ? 2u : 1u;
+    uint32_t u = v < 0 ? 0u - (uint32_t)v : (uint32_t)v;
+    while (u >= 10) { u /= 10; n++; }
+    return n;
+}
+// s, or (in buf, max + 1 bytes) its first max characters when it's longer
+static __forceinline const char* fx_cut(const char* s, char* buf, uint32_t max) {
+    if (ui_strnlen(s, max) <= max) return s;
+    ui_copy_bounded(buf, s, max + 1);
+    return buf;
+}
+// a string copied into a field of `size` bytes: held to it (the fix), or unbounded (the original)
+static __forceinline void fx_copy(char* dst, const char* src, uint32_t size) {
+    if (VP_FIX) ui_copy_bounded(dst, src, size);
+    else crt_strcpy(dst, src);
+}
+// "%s: %s" (fmt) into a field of `size` bytes: as the original formats it, or (the fix) held to the field
+static void fx_pair(char* field, uint32_t size, uint32_t fmt, const char* a, const char* b) {
+    if (VP_FIX && fx_len(a) + 2 + fx_len(b) > size - 1) {
+        char t[0x400], c1[0x100], c2[0x100];
+        UI_sprintf(t, (const char*)(uintptr_t)fmt, fx_cut(a, c1, 0xff), fx_cut(b, c2, 0xff));
+        ui_copy_bounded(field, t, size);
+    } else {
+        UI_sprintf(field, (const char*)(uintptr_t)fmt, a, b);
+    }
 }
 static __forceinline void hide(uint32_t grp) { ccall<void>(F_UIHideGroup, grp); }
 static __forceinline void show(uint32_t grp) { ccall<void>(F_UIShowGroup, grp); }
@@ -163,12 +205,12 @@ static void fp_ChatControl_dtor(Footprint& f, ChatControl*, Edx) { f.replay_only
 PORT_FN(0x00487dc0, "ChatControl::~ChatControl", ChatControl_dtor_n, fp_ChatControl_dtor)
 
 // the user list: as many rows as fit, each the Nth user's name and, with the stamp, its status at the right edge
-// FIX CANDIDATE: a text height of -3 divides by 0
+// FIX: a text height of -3 (a row 0 high) divided by 0; no rows are drawn
 static void __fastcall ChatControl_Draw_n(ChatControl* self, Edx, gxCanvas* c) {
     ccall<gxCanvas*>(F_gxSetCanvas, c);
     const int32_t lh = ccall<int32_t>(F_gxTextHeight) + 3;
     int32_t y = self->y;
-    const int32_t n = self->h / lh;
+    const int32_t n = VP_FIX && lh == 0 ? 0 : self->h / lh;
     for (int32_t i = 0; i < n; i++) {
         const int32_t id = vcall<int32_t>(self->client, C_NTH_USER, i);
         if (id) {
@@ -248,13 +290,13 @@ static uint8_t __fastcall ChatControl_whisper_n(ChatControl* self, Edx) {
 PORT_FN(0x00487f40, "ChatControl::whisper", ChatControl_whisper_n, fp_client0)
 
 // dragging over the user list picks a row (clamped to the users), and remembers its user's id
-// FIX CANDIDATE: a text height of -3 divides by 0
+// FIX: a text height of -3 (rows 0 high) divided by 0; the first row is picked
 static void __fastcall ChatControl_MouseMove_n(ChatControl* self, Edx, int32_t, int32_t y) {
     if (!self->dragging) return;
     tcall<void>(F_UICC_Dirty, self);
     const int32_t lh = ccall<int32_t>(F_gxTextHeight) + 3;
     const int32_t max = vcall<int32_t>(self->client, C_COUNT_USERS) - 1;
-    const int32_t q = (y - self->y) / lh;
+    const int32_t q = VP_FIX && lh == 0 ? 0 : (y - self->y) / lh;
     if (q < 0) self->sel = 0;
     else self->sel = max < q ? max : q;
     self->sel_id = vcall<int32_t>(self->client, C_NTH_USER, self->sel);
@@ -357,9 +399,10 @@ PORT_FN(0x004883a0, "ChatWindow::Update", ChatWindow_Update_n, fp_client0)
 
 // the scrollback from the newest line up: "<name padded to the longest>: <text>" for a speaker's first line, " " for the
 // lines that follow it (and 4 pixels more above a speaker's first), whispers in style 0x12's flag 2
-// FIX CANDIDATE: the line is sprintf'd unbounded into the frame (252 bytes from it to the frame's end -- the rewrite's buffer
-// is that size, so it overruns exactly where the original would): the name padding (MaxNameLength) and a line of 0x32 fit,
-// a bigger padding wouldn't
+// FIX: the line was sprintf'd unbounded into the frame (252 bytes from it to the frame's end -- the rewrite's buffer is that
+// size): the name padding (MaxNameLength, the longest user's name) and a line of 0x32 fit, a padding (or a name, or a line
+// that doesn't end in its field) past them ran over the return address. Such a line is made with the padding held to 256
+// and the name and text cut to 255, and keeps its first 251 characters (fx_len above); every other is as before.
 static void __fastcall ChatWindow_Draw_n(ChatWindow* self, Edx, gxCanvas* c) {
     char buf[0xfc];                                     // the original's frame from the line to its end: 252 bytes
     ccall<gxCanvas*>(F_gxSetCanvas, c);
@@ -378,7 +421,21 @@ static void __fastcall ChatWindow_Draw_n(ChatWindow* self, Edx, gxCanvas* c) {
         else head = *(const volatile int32_t*)line == *(const volatile int32_t*)prev ? 0 : 1;
         const char* name = head ? (const char*)(line + 0x36) : (const char*)0x004f8528;     // ""
         const int32_t ch = head ? ':' : ' ';
-        UI_sprintf(buf, (const char*)0x004f852c, maxlen, name, ch, (const char*)(line + 4));   // "%*s%c %s"
+        const char* text = (const char*)(line + 4);
+        if (VP_FIX) {
+            const int64_t w = maxlen < 0 ? -(int64_t)maxlen : (int64_t)maxlen;
+            const int64_t nl = (int64_t)fx_len(name);
+            if ((w > nl ? w : nl) + 2 + (int64_t)fx_len(text) > 0xfb) {
+                char t[0x400], c1[0x100], c2[0x100];
+                const int32_t wc = maxlen < -0x100 ? -0x100 : maxlen > 0x100 ? 0x100 : maxlen;
+                UI_sprintf(t, (const char*)0x004f852c, wc, fx_cut(name, c1, 0xff), ch, fx_cut(text, c2, 0xff));
+                ui_copy_bounded(buf, t, sizeof buf);
+            } else {
+                UI_sprintf(buf, (const char*)0x004f852c, maxlen, name, ch, text);
+            }
+        } else {
+            UI_sprintf(buf, (const char*)0x004f852c, maxlen, name, ch, text);   // "%*s%c %s"
+        }
         const uint32_t flags = *(const volatile uint8_t*)(line + 0x43) ? 2u : 0u;
         ccall<void>(F_UIStyleDraw, (int32_t)0x12, x, y, (const char*)buf, flags);
         line = *(const uint8_t* const volatile*)(line + 0x44);
@@ -465,8 +522,11 @@ static void __fastcall MultiMaster_tick_n(MultiMaster* self, Edx) {
 PORT_FN(0x004885e0, "MultiMaster::tick", MultiMaster_tick_n, fp_client0)
 
 // MultiMaster::Update's table, by the client's state: {entered, each frame, left} (the original builds it on its stack each
-// call). FIX CANDIDATE: a state past 13 (the race's) or negative reads past the table and calls what it finds there; the
-// lobby's dialog ends at 13 (car get)
+// call). FIX: a state past 13 (the race's: race waiting 0xe .. racing 0x15) or negative read past the table and called what
+// it found there (state 14's "entered" is the return address). The lobby's dialog ends at 13 (car get), but the client can
+// pass it within one tick: CommenceCarGet makes it 13 and, when it already has every car it's to fetch, 14 at once. A
+// state past 13 now takes 13's functions (car get: the lobby ends, and MultiDo goes on to the race), a negative one 0's
+// (invalid).
 static const uint32_t k_state_fns[14 * 3] = {
     0, F_sf_hang, 0,                  // 0 invalid
     F_sf_noconn, 0, 0,                // 1
@@ -489,14 +549,17 @@ static void __fastcall MultiMaster_Update_n(MultiMaster* self, Edx) {
     tcall<void>(F_MultiMaster_tick, self);
     const int32_t st = client_state(self->client);
     const int32_t old = self->last_state;
+    // FIX: (above) the table's row for a state
+    const int32_t rs = VP_FIX ? (st < 0 ? 0 : st > 13 ? 13 : st) : st;
     if (st != old) {
-        const uint32_t ex = k_state_fns[old * 3 + 2];
+        const int32_t ro = VP_FIX ? (old < 0 ? 0 : old > 13 ? 13 : old) : old;
+        const uint32_t ex = k_state_fns[ro * 3 + 2];
         if (ex) tcall<void>(ex, self);
-        const uint32_t en = k_state_fns[st * 3];
+        const uint32_t en = k_state_fns[rs * 3];
         if (en) tcall<void>(en, self);
     }
     {
-        const uint32_t fr = k_state_fns[st * 3 + 1];
+        const uint32_t fr = k_state_fns[rs * 3 + 1];
         if (fr) tcall<void>(fr, self);
     }
     self->last_state = st;
@@ -618,9 +681,10 @@ static uint8_t __fastcall MultiMaster_approve_n(MultiMaster* self, Edx) {
 PORT_FN(0x00488a30, "MultiMaster::approve", MultiMaster_approve_n, fp_client0)
 
 // Race: the car chosen (its .car kept loaded while the client takes it), the lobby's lock held for the race
-// FIX CANDIDATE: "<car name>.car" is built in 32 bytes: a car name over 27 characters overruns the frame
+// FIX: "<car name>.car" was built in 32 bytes: a car name over 27 characters (the car list holds up to 31) overran the
+// frame. The name now has room (and is held to it): the car's resource set is loaded by its whole name, as for any other.
 static uint8_t __fastcall MultiMaster_race_n(MultiMaster* self, Edx) {
-    char buf[0x20];
+    char buf[VP_FIX ? 0x110 : 0x20];
     const int32_t st = client_state(self->client);
     if (st != 0xb) {
         UI_LogReport((const char*)0x004f85bc, st);     // "MultiMaster::Race() called bogusly: status == (%d)"
@@ -628,7 +692,7 @@ static uint8_t __fastcall MultiMaster_race_n(MultiMaster* self, Edx) {
     }
     if (!tcall<uint8_t>(F_LMI_AmOwner, g_master()->lmi)) net_Grab(g_master()->lmi, 0);   // site 0x488ab1
     net_Release(g_master()->lmi, 0);                                                      // site 0x488abe
-    crt_strcpy(buf, tcall<const char*>(F_CarViewer3D_GetName, g_carch()->viewer));
+    fx_copy(buf, tcall<const char*>(F_CarViewer3D_GetName, g_carch()->viewer), sizeof buf - 5);   // FIX: (above)
     {
         char* e = buf + crt_strlen(buf);
         *(volatile uint32_t*)e = *(const volatile uint32_t*)(uintptr_t)0x004f85b4;         // ".car"
@@ -704,7 +768,8 @@ static void fp_sf_hang(Footprint& f, MultiMaster*, Edx) { f.replay_only = "LogPa
 PORT_FN(0x00489260, "MultiMaster::sf_hang", sf_hang_n, fp_sf_hang)
 
 // the connection lost (or never made): a box with the client's status (or why it went down), then the lobby ends
-// FIX CANDIDATE: the box's text is sprintf'd into 128 bytes ("Multi:LostConnection"'s translation, a newline, the status)
+// FIX: the box's text ("Multi:LostConnection"'s translation, a newline, the status or why it went down -- translations) was
+// sprintf'd into 128 bytes unbounded; a longer one keeps its first 127 characters (fx_len above)
 static void __fastcall sf_noconn_n(MultiMaster* self, Edx) {
     char buf[0x80];
     const int32_t st = client_state(self->client);
@@ -717,7 +782,16 @@ static void __fastcall sf_noconn_n(MultiMaster* self, Edx) {
     once_xl(S_NOCONN_ONCE, 1, 0x0057a088, 0x004f86d0, 0x004893a0);            // "Multi:LostConnectionDialogTitle"
     once_xl(S_NOCONN_ONCE, 2, 0x0057a2c0, 0x004f86f0, 0x00489390);            // "Multi:LostConnection"
     xl(0x0057a2c0);
-    UI_sprintf(buf, (const char*)0x004f8708, UI_GP(const char, 0x0057a2c4), s);      // "%s\n%s"
+    {
+        const char* lost = UI_GP(const char, 0x0057a2c4);
+        if (VP_FIX && fx_len(lost) + 1 + fx_len(s) > 0x7f) {
+            char t[0x400], c1[0x100], c2[0x100];
+            UI_sprintf(t, (const char*)0x004f8708, fx_cut(lost, c1, 0xff), fx_cut(s, c2, 0xff));
+            ui_copy_bounded(buf, t, sizeof buf);
+        } else {
+            UI_sprintf(buf, (const char*)0x004f8708, lost, s);                  // "%s\n%s"
+        }
+    }
     xl(0x0057a088);
     ccall<void>(F_UIDoDratBox, UI_GP(const char, 0x0057a08c), (const char*)buf, (uint32_t)F_MultiMaster_Tick);
     g_master()->done = 1;
@@ -890,9 +964,9 @@ static void __fastcall MCC_update_text_loc_n(MultiCarChooser* self, Edx) {
 static void fp_MCC_groups(Footprint& f, MultiCarChooser*, Edx) { fp_groups(f); }
 PORT_FN(0x00489820, "MultiCarChooser::update_text_loc", MCC_update_text_loc_n, fp_MCC_groups)
 
-// FIX CANDIDATE: the friendly name is copied unbounded into 34 bytes (the CarViewer3D follows)
+// FIX: the friendly name (the car's .tab) was copied unbounded into 34 bytes, over the CarViewer3D that follows; it keeps 33
 static void __fastcall MCC_update_car_n(MultiCarChooser* self, Edx) {
-    crt_strcpy(self->name, tcall<const char*>(F_CarViewer3D_GetFriendlyName, self->viewer));
+    fx_copy(self->name, tcall<const char*>(F_CarViewer3D_GetFriendlyName, self->viewer), sizeof self->name);
 }
 static void fp_MCC_update_car(Footprint& f, MultiCarChooser*, Edx) { f.replay_only = "asks the CarViewer3D (group C's: its car loaded)"; }
 PORT_FN(0x00489870, "MultiCarChooser::update_car", MCC_update_car_n, fp_MCC_update_car)
@@ -982,8 +1056,12 @@ PORT_FN(0x00489a30, "MultiCarChooser::Added", MultiCarChooser_Added_n, fp_items0
 // MultiTrackChooser
 // =====================================================================================================================
 // the tracks' names (all but the last two rows), the MULTI "track" option, the frame's stamp
-// FIX CANDIDATE: the names are copied unbounded, 13 bytes each, 16 of them: more than 16 tracks (or a name over 12
-// characters) runs into the stamps and the flags that follow
+// FIX: the names were copied unbounded, 13 bytes each, into room for 16: a 17th track (an add-on track's row in
+// tracks.tab) ran over the stamps, the host flag (set just before: a client could get the host's arrows) and the groups,
+// then MultiDo's next control; a name over 12 characters ran into the next name. The table now keeps the first 16 tracks,
+// each held to its 13 bytes, and every track past them -- or whose name is 12 characters or more -- is read from the track
+// table itself where it's used (fx_track_name), so the chooser offers every installed track. Up to 16 tracks with names
+// of up to 11 characters (the stock game's), every call is the original's.
 static MultiTrackChooser* __fastcall MultiTrackChooser_ctor_n(MultiTrackChooser* self, Edx, uint8_t host) {
     self->vtbl = (const void*)(uintptr_t)VT_UICustomControl;
     self->vtbl = (const void*)(uintptr_t)VT_MultiTrackChooser;
@@ -1003,9 +1081,9 @@ static MultiTrackChooser* __fastcall MultiTrackChooser_ctor_n(MultiTrackChooser*
             do {
                 const char* nm = ccall<const char*>(F_GetTrackName, i);
                 i++;
-                crt_strcpy(dst, nm);
+                fx_copy(dst, nm, 0xd);                                // FIX: (above) each held to its 13 bytes
                 dst += 0xd;
-            } while (self->count > i);
+            } while (self->count > i && !(VP_FIX && i >= 16));        // FIX: (above) the first 16
         }
     }
     self->stamp = 0;
@@ -1015,6 +1093,19 @@ static MultiTrackChooser* __fastcall MultiTrackChooser_ctor_n(MultiTrackChooser*
 }
 static void fp_MultiTrackChooser_ctor(Footprint& f, MultiTrackChooser*, Edx, uint8_t) { f.replay_only = "reads the options, loads a stamp"; }
 PORT_FN(0x00489d60, "MultiTrackChooser::MultiTrackChooser", MultiTrackChooser_ctor_n, fp_MultiTrackChooser_ctor)
+
+// FIX helper (the constructor's table, set_track, MultiRaceCfg::Callback): track t's name for the chooser -- its copy in
+// the table when that's whole (one of the first 16, under 12 characters: the original's read, no call), else the track
+// table's own (GetTrackName) -- or 0 for a track this machine's table doesn't have (outside 0 .. count - 1: the host's
+// track, from the network, past this machine's tracks)
+static const char* fx_track_name(const MultiTrackChooser* self, int32_t t) {
+    if (t < 0 || t >= self->count) return 0;
+    if (t < 16) {
+        const char* n = self->names[t];
+        if (ui_strnlen(n, 12) < 12) return n;
+    }
+    return ccall<const char*>(F_GetTrackName, t);
+}
 
 static void __fastcall MultiTrackChooser_dtor_n(MultiTrackChooser* self, Edx) {
     const int32_t saved = self->saved;
@@ -1081,18 +1172,26 @@ static void __fastcall MultiTrackChooser_Draw_n(MultiTrackChooser* self, Edx, gx
 static void fp_MultiTrackChooser_Draw(Footprint& f, MultiTrackChooser*, Edx, gxCanvas* c) { fp_draw(f, c); }
 PORT_FN(0x0048a150, "MultiTrackChooser::Draw", MultiTrackChooser_Draw_n, fp_MultiTrackChooser_Draw)
 
+// FIX: "XXX Race <a> of <b> XXX" (the numbers' translations) went into 36 bytes unbounded, over the count and track that
+// follow; a longer one keeps its first 35 characters (fx_len above)
 static void __fastcall MTC_set_race_number_n(MultiTrackChooser* self, Edx, int32_t a, int32_t b) {
     const char* sb = ccall<const char*>(F_NumberString, b);
     const char* sa = ccall<const char*>(F_NumberString, a);
-    UI_sprintf(self->race_text, (const char*)0x004f877c, sa, sb);            // "XXX Race %s of %s XXX"
+    if (VP_FIX && 17 + fx_len(sa) + fx_len(sb) > sizeof self->race_text - 1) {
+        char t[0x400], c1[0x100], c2[0x100];
+        UI_sprintf(t, (const char*)0x004f877c, fx_cut(sa, c1, 0xff), fx_cut(sb, c2, 0xff));
+        ui_copy_bounded(self->race_text, t, sizeof self->race_text);
+    } else {
+        UI_sprintf(self->race_text, (const char*)0x004f877c, sa, sb);        // "XXX Race %s of %s XXX"
+    }
 }
 static void fp_MTC_set_race_number(Footprint& f, MultiTrackChooser*, Edx, int32_t, int32_t) { f.replay_only = "NumberString (its Xlators)"; }
 PORT_FN(0x0048a1d0, "MultiTrackChooser::set_race_number", MTC_set_race_number_n, fp_MTC_set_race_number)
 
 // "Number:Zero" .. "Number:Fourteen", translated
-// FIX CANDIDATE: a number outside 0..14 reads the frame around the table (the return address, the argument, the callee's
-// garbage) as the string -- and its callers pass numbers from the network (the proposal's AI cars, update_race) and the
-// options (MULTI opponent_count, MultiRaceCfg)
+// FIX: a number outside 0..14 read the frame around the table (the return address, the argument, the callee's garbage)
+// as the string -- and its callers pass numbers from the network (the proposal's AI cars, update_race) and the options
+// (MULTI opponent_count, MultiRaceCfg). Such a number gives "" (its Xlators are made and refreshed as before).
 static const char* __cdecl NumberString_n(int32_t n) {
     static const uint32_t keys[15] = {0x004f8794, 0x004f87a0, 0x004f87ac, 0x004f87b8, 0x004f87c8, 0x004f87d4, 0x004f87e0,
                                       0x004f87ec, 0x004f87fc, 0x004f880c, 0x004f8818, 0x004f8824, 0x004f8834, 0x004f8844,
@@ -1107,6 +1206,7 @@ static const char* __cdecl NumberString_n(int32_t n) {
         xl(k_number_xl[k]);
         a[k] = UI_GP(const char, k_number_xl[k] + 4);
     }
+    if (VP_FIX && (uint32_t)n > 14u) return (const char*)(uintptr_t)S_EMPTY_STR;
     return a[n];
 }
 static void fp_NumberString(Footprint& f, int32_t) {
@@ -1116,9 +1216,35 @@ static void fp_NumberString(Footprint& f, int32_t) {
 PORT_FN(0x0048a210, "NumberString", NumberString_n, fp_NumberString)
 
 // the track's friendly name, and " - " the reversed text when the race is reversed
-// FIX CANDIDATE: copied unbounded into 64 bytes (the set_race_number text follows)
+// FIX: copied unbounded into 64 bytes (the set_race_number text follows); a longer text keeps its first 63 characters. And
+// the track (the host's, from the network) wasn't checked against this machine's table (GetTrackFriendlyName reads past
+// it); a track this machine doesn't have (as set_track) shows no name.
 static void __fastcall MTC_set_text_from_race_n(MultiTrackChooser* self, Edx, const uint8_t* ri) {
-    crt_strcpy(self->text, ccall<const char*>(F_GetTrackFriendlyName, *(const volatile int32_t*)(ri + NRI_TRACK)));
+    const int32_t track = *(const volatile int32_t*)(ri + NRI_TRACK);
+    if (VP_FIX && (track < 0 || track >= self->count)) {
+        *(volatile char*)self->text = 0;
+        return;
+    }
+    const char* fn = ccall<const char*>(F_GetTrackFriendlyName, track);
+    if (VP_FIX) {
+        const char* rv = 0;
+        if (*(const volatile uint8_t*)(ri + NRI_REVERSED)) {
+            xl(0x00579f40);
+            rv = UI_GP(const char, 0x00579f44);
+        }
+        if (fx_len(fn) + (rv ? 3 + fx_len(rv) : 0) > sizeof self->text - 1) {
+            char t[0x210];
+            ui_copy_bounded(t, fn, 0x100);
+            if (rv) {
+                char c1[0x100];
+                crt_strcat(t, (const char*)0x004f8864);                         // " - "
+                crt_strcat(t, fx_cut(rv, c1, 0xff));
+            }
+            ui_copy_bounded(self->text, t, sizeof self->text);
+            return;
+        }
+    }
+    crt_strcpy(self->text, fn);
     if (*(const volatile uint8_t*)(ri + NRI_REVERSED)) {
         char* e = self->text + crt_strlen(self->text);
         *(volatile uint32_t*)e = *(const volatile uint32_t*)(uintptr_t)0x004f8864;    // " - "
@@ -1142,21 +1268,23 @@ static void fp_MTC_set_track_p(Footprint& f, MultiTrackChooser*, Edx, const uint
 PORT_FN(0x0048a860, "MultiTrackChooser::set_track(NetProposal)", MTC_set_track_p_n, fp_MTC_set_track_p)
 
 // the track's picture: '<name>.stp'
-// FIX CANDIDATE: the name is built in 16 bytes: a name of 12 characters (the most the table holds) writes its terminator
-// past them; and the index (the host's, from the network: sf_carchoice, i_running) isn't checked against this machine's
-// table -- one past its tracks copies whatever follows (uninitialised in MultiDo's frame) over the frame
+// FIX: the name was built in 16 bytes: a name of 12 characters (the most the table held) wrote its terminator past them;
+// and the index (the host's, from the network: sf_carchoice, i_running) wasn't checked against this machine's table --
+// one past its tracks copied whatever followed (uninitialised in MultiDo's frame) over the frame. The name now has room
+// and comes from fx_track_name (every installed track); a track this machine doesn't have shows no picture.
 static void __fastcall MTC_set_track_n(MultiTrackChooser* self, Edx, int32_t t) {
-    char buf[0x10];
+    char buf[VP_FIX ? 0x110 : 0x10];
     self->track = t;
-    crt_strcpy(buf, (const char*)self + 0x88 + 13 * t);
-    {
+    const char* name = VP_FIX ? fx_track_name(self, t) : (const char*)self + 0x88 + 13 * t;
+    if (name) {
+        fx_copy(buf, name, sizeof buf - 5);
         char* e = buf + crt_strlen(buf);
         *(volatile uint32_t*)e = *(const volatile uint32_t*)(uintptr_t)0x004f8868;    // ".stp"
         *(volatile char*)(e + 4) = *(const volatile char*)(uintptr_t)0x004f886c;
     }
     void* st = self->stamp;
     if (st) ccall<void>(F_gxForgetStamp, st);
-    self->stamp = ccall<void*>(F_gxGetStamp, (const char*)buf);
+    self->stamp = name ? ccall<void*>(F_gxGetStamp, (const char*)buf) : 0;    // FIX: (above) no track: no picture
     ((void(__cdecl*)(uint32_t))(uintptr_t)UI_GU32(S_SHOWHIDE + 4))(self->grp_track);   // `call [0x4f83d4]`: UIShowGroup
     tcall<void>(F_UICC_Dirty, self);
 }
@@ -1164,8 +1292,9 @@ static void fp_MTC_set_track(Footprint& f, MultiTrackChooser*, Edx, int32_t) { f
 PORT_FN(0x0048a880, "MultiTrackChooser::set_track(int)", MTC_set_track_n, fp_MTC_set_track)
 
 // the host's arrows: the next / previous track, the change sent
-// FIX CANDIDATE: no tracks (count 0) divides by 0
+// FIX: no tracks (a track table of two rows or fewer: count 0) divided by 0; the arrows do nothing
 static void __fastcall MTC_next_n(MultiTrackChooser* self, Edx) {
+    if (VP_FIX && self->count == 0) return;
     const int32_t t = (self->track + 1) % self->count;
     self->track = t;
     self->saved = t;
@@ -1176,6 +1305,7 @@ static void fp_MTC_stamp_clock(Footprint& f, MultiTrackChooser*, Edx) { f.replay
 PORT_FN(0x0048a930, "MultiTrackChooser::next", MTC_next_n, fp_MTC_stamp_clock)
 
 static void __fastcall MTC_prev_n(MultiTrackChooser* self, Edx) {
+    if (VP_FIX && self->count == 0) return;                           // FIX: (next)
     const int32_t n = self->count;
     const int32_t t = (self->track + n - 1) % n;
     self->track = t;
@@ -1213,7 +1343,8 @@ PORT_FN(0x0048a9f0, "MultiCarChooser::NextCar", MCC_NextCar_n, fp_MCC_car)
 // MultiRaceCfg
 // =====================================================================================================================
 // the host's settings: the GAME section's, then the MULTI section's over them; the AI cars' text
-// FIX CANDIDATE: "<Multi:AI_Cars>: <number>" is sprintf'd into 16 bytes (the laps' text follows)
+// FIX: "<Multi:AI_Cars>: <number>" (translations) was sprintf'd into 16 bytes unbounded, over the laps' text; a longer one
+// keeps its first 15 characters (fx_pair)
 static MultiRaceCfg* __fastcall MultiRaceCfg_ctor_n(MultiRaceCfg* self, Edx) {
     self->vtbl = (const void*)(uintptr_t)VT_UICustomControl;
     self->vtbl = (const void*)(uintptr_t)VT_MultiRaceCfg;
@@ -1242,7 +1373,7 @@ static MultiRaceCfg* __fastcall MultiRaceCfg_ctor_n(MultiRaceCfg* self, Edx) {
     self->type_f = (float)self->race_type;
     xl(0x0057a020);
     const char* num = ccall<const char*>(F_NumberString, x87_ftol(D(self->opp_f)));
-    UI_sprintf(self->opp_text, (const char*)0x004f8910, UI_GP(const char, 0x0057a024), num);    // "%s: %s"
+    fx_pair(self->opp_text, sizeof self->opp_text, 0x004f8910, UI_GP(const char, 0x0057a024), num);    // "%s: %s" (FIX: fx_pair)
     return self;
 }
 static void fp_MultiRaceCfg_ctor(Footprint& f, MultiRaceCfg*, Edx) { f.replay_only = "reads the options"; }
@@ -1293,7 +1424,9 @@ PORT_FN(0x0048ad30, "MultiRaceCfg::Destroy", MultiRaceCfg_Destroy_n, fp_notes0)
 
 // 0: the change sent (config_changed); 1, 4: the AI cars from their slider (the strength's group shown with any), their
 // text; 2: the race type from its slider, its laps on this track, their text; else a panic
-// FIX CANDIDATE: "<GameOptions:Laps>: <laps>" is sprintf'd into 24 bytes (the groups follow)
+// FIX: "<GameOptions:Laps>: <laps>" was sprintf'd into 24 bytes unbounded (the groups follow), and the AI cars' text into
+// 16 (as the constructor's); each keeps what fits. The track's name for its laps comes from fx_track_name (a track past the
+// chooser's first 16 read past its table); a track this machine doesn't have leaves the laps as they were.
 static void __fastcall MultiRaceCfg_Callback_n(MultiRaceCfg* self, Edx, int32_t id, const void*) {
     once_xl(S_RACECFG_ONCE, 1, 0x0057a1f8, 0x004f8984, 0x0048aef0);           // "Multi:AI_Cars"
     once_xl(S_RACECFG_ONCE, 2, 0x0057a238, 0x004f8994, 0x0048aee0);           // "GameOptions:Laps"
@@ -1310,17 +1443,24 @@ static void __fastcall MultiRaceCfg_Callback_n(MultiRaceCfg* self, Edx, int32_t 
         else show(g);
         xl(0x0057a1f8);
         const char* num = ccall<const char*>(F_NumberString, x87_ftol(D(self->opp_f)));
-        UI_sprintf(self->opp_text, (const char*)0x004f89a8, UI_GP(const char, 0x0057a1fc), num);      // "%s: %s"
+        fx_pair(self->opp_text, sizeof self->opp_text, 0x004f89a8, UI_GP(const char, 0x0057a1fc), num);   // "%s: %s" (FIX)
         return;
     }
     case 2: {
         const int32_t t = x87_ftol(D(self->type_f));
         self->race_type = t;
         const int32_t idx = g_track()->track;
-        const char* name = (const char*)g_track() + 13 * idx + 0x88;
-        self->laps = ccall<int32_t>(F_GetLapCountFromType, t, name);
+        const char* name = VP_FIX ? fx_track_name(g_track(), idx) : (const char*)g_track() + 13 * idx + 0x88;   // FIX: (above)
+        if (name) self->laps = ccall<int32_t>(F_GetLapCountFromType, t, name);
         xl(0x0057a238);
-        UI_sprintf(self->laps_text, (const char*)0x004f89b0, UI_GP(const char, 0x0057a23c), self->laps);   // "%s: %d"
+        const char* lt = UI_GP(const char, 0x0057a23c);
+        if (VP_FIX && fx_len(lt) + 2 + fx_dec(self->laps) > sizeof self->laps_text - 1) {   // FIX: (above)
+            char tb[0x400], c1[0x100];
+            UI_sprintf(tb, (const char*)0x004f89b0, fx_cut(lt, c1, 0xff), self->laps);
+            ui_copy_bounded(self->laps_text, tb, sizeof self->laps_text);
+        } else {
+            UI_sprintf(self->laps_text, (const char*)0x004f89b0, lt, self->laps);   // "%s: %d"
+        }
         return;
     }
     default:
@@ -1442,7 +1582,8 @@ static void fp_MultiRaceInfo_Create(Footprint& f, MultiRaceInfo*, Edx) { fp_grou
 PORT_FN(0x0048b460, "MultiRaceInfo::Create", MultiRaceInfo_Create_n, fp_MultiRaceInfo_Create)
 
 // the proposal shown: "Multi:Enabled" over it when the cars are slaved
-// FIX CANDIDATE: the texts are copied unbounded into 16 bytes each (the next text follows)
+// FIX: the texts (translations, the front end's names) were copied unbounded into 16 bytes each (24 for the race type's
+// "%s: %d %s"), each running into the next and the last into the groups; each keeps what fits (15, 23 characters)
 static void __cdecl MRI_UpdateProposal_n(const uint8_t* p) {
     const char* s;
     if (*(const volatile uint8_t*)(p + NP_IROC)) {
@@ -1451,7 +1592,7 @@ static void __cdecl MRI_UpdateProposal_n(const uint8_t* p) {
     } else {
         s = (const char*)0x004f89e4;                                          // ""
     }
-    crt_strcpy(g_info()->title, s);
+    fx_copy(g_info()->title, s, sizeof g_info()->title);                      // FIX: (above)
     tcall<void>(F_MRI_update_race, g_info(), (const void*)(p + NP_RACE), (uint32_t)*(const volatile uint8_t*)(p + NP_IROC));
 }
 static void fp_MRI_UpdateProposal(Footprint& f, const uint8_t*) { f.replay_only = "the front end's strings, NumberString (its Xlators)"; }
@@ -1470,8 +1611,8 @@ static void __fastcall MRI_update_race_n(MultiRaceInfo* self, Edx, const uint8_t
     } else {
         s = (const char*)0x004f8a2c;                                          // ""
     }
-    crt_strcpy(self->title, s);
-    crt_strcpy(self->realism, ccall<const char*>(F_GetRealismString, *(const volatile int32_t*)(ri + NRI_REALISM)));
+    fx_copy(self->title, s, sizeof self->title);                             // FIX: (UpdateProposal) each held to its field
+    fx_copy(self->realism, ccall<const char*>(F_GetRealismString, *(const volatile int32_t*)(ri + NRI_REALISM)), sizeof self->realism);
     if (*(const volatile uint8_t*)(ri + NRI_DAMAGE)) {
         xl(0x0057a0d0);
         s = UI_GP(const char, 0x0057a0d4);
@@ -1479,9 +1620,9 @@ static void __fastcall MRI_update_race_n(MultiRaceInfo* self, Edx, const uint8_t
         xl(0x0057a180);
         s = UI_GP(const char, 0x0057a184);
     }
-    crt_strcpy(self->damage, s);
-    crt_strcpy(self->time, ccall<const char*>(F_GetGameTimeString, *(const volatile int32_t*)(ri + NRI_TIME)));
-    crt_strcpy(self->weather, ccall<const char*>(F_GetWeatherString, *(const volatile int32_t*)(ri + NRI_WEATHER)));
+    fx_copy(self->damage, s, sizeof self->damage);
+    fx_copy(self->time, ccall<const char*>(F_GetGameTimeString, *(const volatile int32_t*)(ri + NRI_TIME)), sizeof self->time);
+    fx_copy(self->weather, ccall<const char*>(F_GetWeatherString, *(const volatile int32_t*)(ri + NRI_WEATHER)), sizeof self->weather);
     uint32_t lap;
     if (*(const volatile int32_t*)(ri + NRI_LAPS) == 1) {
         xl(0x0057a038);
@@ -1494,13 +1635,21 @@ static void __fastcall MRI_update_race_n(MultiRaceInfo* self, Edx, const uint8_t
         const int32_t type = *(const volatile int32_t*)(ri + NRI_TYPE);
         const int32_t laps = *(const volatile int32_t*)(ri + NRI_LAPS);
         const char* ts = ccall<const char*>(F_GetRaceTypeString, type);
-        UI_sprintf(self->type, (const char*)0x004f8a30, ts, laps, (const char*)(uintptr_t)lap);    // "%s: %d %s"
+        const char* ls = (const char*)(uintptr_t)lap;
+        if (VP_FIX && fx_len(ts) + 2 + fx_dec(laps) + 1 + fx_len(ls) > sizeof self->type - 1) {   // FIX: (UpdateProposal)
+            char t[0x400], c1[0x100], c2[0x100];
+            UI_sprintf(t, (const char*)0x004f8a30, fx_cut(ts, c1, 0xff), laps, fx_cut(ls, c2, 0xff));
+            ui_copy_bounded(self->type, t, sizeof self->type);
+        } else {
+            UI_sprintf(self->type, (const char*)0x004f8a30, ts, laps, ls);    // "%s: %d %s"
+        }
     }
-    crt_strcpy(self->count, ccall<const char*>(F_NumberString, *(const volatile int32_t*)(ri + NRI_COUNT)));
+    fx_copy(self->count, ccall<const char*>(F_NumberString, *(const volatile int32_t*)(ri + NRI_COUNT)), sizeof self->count);
     const uint32_t g = self->grp_opp;
     if (*(const volatile int32_t*)(ri + NRI_COUNT) != 0) {
         show(g);
-        crt_strcpy(self->strength, ccall<const char*>(F_GetAIStrengthString, *(const volatile int32_t*)(ri + NRI_STRENGTH)));
+        fx_copy(self->strength, ccall<const char*>(F_GetAIStrengthString, *(const volatile int32_t*)(ri + NRI_STRENGTH)),
+                sizeof self->strength);
     } else {
         hide(g);
     }
@@ -1509,8 +1658,9 @@ static void fp_MRI_update_race(Footprint& f, MultiRaceInfo*, Edx, const uint8_t*
 PORT_FN(0x0048b500, "MultiRaceInfo::update_race", MRI_update_race_n, fp_MRI_update_race)
 
 // the proposal's texts in their groups; the ghost car's type (a Multi of three) and the Options button
-// FIX CANDIDATE: the ghost types' three translations are joined (CreateMultiString) into 64 bytes at 0x57a048: longer ones
-// run over the lost-connection box's title Xlator at 0x57a088 (its key, then its text, become string bytes)
+// FIX: the ghost types' three translations are joined (CreateMultiString: each with its terminator, and one more) into 64
+// bytes at 0x57a048: longer ones ran over the lost-connection box's title Xlator at 0x57a088 (its key, then its text,
+// became string bytes). When they'd pass the 64 bytes, each is cut to 20 characters (3 x 21 + 1 = 64).
 static void __fastcall MultiRaceInfo_Added_n(MultiRaceInfo* self, Edx) {
     Frame<0x4ac> fr;
     once_xl(S_RACEINFO_ONCE, 1, 0x0057a098, 0x004f8a3c, 0x0048be50);          // "GameOptions:GhostType:Brief:Off"
@@ -1522,7 +1672,13 @@ static void __fastcall MultiRaceInfo_Added_n(MultiRaceInfo* self, Edx) {
     xl(0x0057a0e0);
     xl(0x0057a098);
     {
-        const uint32_t c = G(0x0057a14c), b = G(0x0057a0e4), a = G(0x0057a09c);
+        uint32_t c = G(0x0057a14c), b = G(0x0057a0e4), a = G(0x0057a09c);
+        char ca[0x15], cb[0x15], cc[0x15];
+        if (VP_FIX && fx_len((const char*)(uintptr_t)a) + fx_len((const char*)(uintptr_t)b) + fx_len((const char*)(uintptr_t)c) + 4 > 0x40) {
+            a = U(fx_cut((const char*)(uintptr_t)a, ca, 0x14));
+            b = U(fx_cut((const char*)(uintptr_t)b, cb, 0x14));
+            c = U(fx_cut((const char*)(uintptr_t)c, cc, 0x14));
+        }
         ccall<void>(F_CreateMultiString, (char*)(uintptr_t)S_GHOST_MULTI, a, b, c, (uint32_t)0);
     }
     xl(0x0057a0f8);
@@ -1578,7 +1734,8 @@ PORT_FN(0x0048be60, "PostRace::Tick", PostRace_Tick_n, fp_PostRace_Tick)
 
 // the live game made (the first time): the session on the Multiplayer screen's socket, the host's race server and the
 // client on it, or a client connecting to the host found; then the lobby (MultiDo)
-// FIX CANDIDATE: the game's name is copied unbounded into LiveMultiInfo's 32 bytes at +0x10 (its task id follows)
+// FIX: the game's name was copied unbounded into LiveMultiInfo's 32 bytes at +0x10, over its task id (a service's name off
+// the wire needn't end inside its 32 bytes); it keeps 31 characters
 static uint8_t __cdecl MenuMultiScheduler_n(uint8_t* lmi, const uint8_t* gi) {
     if (*(volatile uint8_t*)(lmi + LMI_LIVE) == 0) {
         void* volatile* const smp = (void* volatile*)(lmi + LMI_SM);
@@ -1601,7 +1758,7 @@ static uint8_t __cdecl MenuMultiScheduler_n(uint8_t* lmi, const uint8_t* gi) {
                 *(void* volatile*)(lmi + LMI_CLIENT) = ccall<void*>(F_create_client, gi, sm);
             }
         }
-        crt_strcpy((char*)(lmi + LMI_NAME), (const char*)(gi + MGI_NAME));
+        fx_copy((char*)(lmi + LMI_NAME), (const char*)(gi + MGI_NAME), 0x20);    // FIX: (above)
         *(volatile uint8_t*)(lmi + LMI_LIVE) = *(void* const volatile*)(lmi + LMI_CLIENT) ? 1 : 0;
     } else {
         ccall<void>(F_MultiPostRaceDo, lmi);
@@ -1616,6 +1773,9 @@ PORT_FN(0x0048be90, "MenuMultiScheduler", MenuMultiScheduler_n, fp_MenuMultiSche
 // UIDialog, 0x4e8 the MultiMaster, 0x450 the MultiRaceInfo, 0x3a0 the ChatControl, 0x2cc the MultiTrackChooser, 0x160 the
 // MultiCarChooser); the dialog runs till the master's done (Idle) or Back; the result: the client is getting its car
 // (the race follows)
+// FIX: (MultiMaster::Update) when the lobby saw car get and the client is already past it (a state of the race, 0xe ..
+// 0x15) -- the case Update's fix now ends the lobby for, where the original crashed -- the race follows as from car get.
+// (The original's lobby can't otherwise end with its master done and the state past 13.)
 static uint8_t __cdecl MultiDo_n(uint8_t* lmi) {
     Frame<0x710> fr;
     fr.d(0x6e8) = 0;                                                         // the LiveMultiKiller: its widget
@@ -1652,7 +1812,9 @@ static uint8_t __cdecl MultiDo_n(uint8_t* lmi) {
     ccall<void>(F_ResourceSetMustLoad, (const char*)0x004f8b00);            // "postrace.res"
     ccall<int32_t>(F_UIDoDialog, fr.at(0x710), UI_G32(S_SCREEN_W), UI_G32(S_SCREEN_H), (int32_t)-999, (int32_t)-999, (int32_t)1);
     ccall<void>(F_ResourceSetUnload, (const char*)0x004f8b10);
-    const uint8_t r = client_state(lmi_ptr(lmi, LMI_CLIENT)) == 0xd ? 1 : 0;
+    const int32_t st = client_state(lmi_ptr(lmi, LMI_CLIENT));
+    uint8_t r = st == 0xd ? 1 : 0;
+    if (VP_FIX && st > 0xd && st <= 0x15 && ((MultiMaster*)fr.at(0x4e8))->done) r = 1;   // FIX: (above)
     tcall<void>(F_MultiMaster_dtor, fr.at(0x4e8));
     tcall<void>(F_MultiCarChooser_dtor, fr.at(0x160));
     tcall<void>(F_MultiRaceInfo_dtor, fr.at(0x450));

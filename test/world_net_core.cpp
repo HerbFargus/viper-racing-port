@@ -9,6 +9,7 @@
 //        /STACK:0x800000,0x800000
 //   run:   world_net_core.exe [rounds] [seed]     (VP_TRACE=1: one line per function; VP_ONLY=text: those only;
 //          VP_DEBUG_WORLD=1: every fault's registers)
+//     (and with /DVP_NET_FIXES: the fix build, below)
 //
 // Loads out\race_v10.exe at 0x400000 the way test/world_leftover.cpp does (a child process with the range reserved) and
 // includes the three files with PORT_FN redefined to list each function (its v1.0 address, the rewrite, __cdecl or
@@ -43,7 +44,15 @@
 // lookups). The game's own code everywhere else: PoolBase, Xlator's constructor, memmove / strncpy, CIacos, the PTime
 // conversions, MultiGetPacketDelay, operator== / != (socket_addr), and every function of this group (each rewrite is
 // checked against its original with the original callees). find_range and OfferUnboundService get worlds whose free-
-// looking channels have no flags (the original loops forever on one with flags and no service: a FIX CANDIDATE).
+// looking channels have no flags (the original loops forever on one with flags and no service: fixed, see below).
+//
+// Built with /DVP_NET_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Multiplayer").
+// Every function is still compared as above; a round where a fix changed what the rewrite did (the fixes mark it:
+// VP_FIX_HIT) may differ from the original, and is counted (per fix, listed) instead -- the rewrite must still return
+// cleanly there. Then directed_fix_tests: for each fix, the bad case on the original (its fault, overrun, hang -- run on
+// a thread with a time limit -- or panic shown) and on the rewrite (no fault, nothing written outside what it may write,
+// the result the fix promises), and the boundary case that still fits on both, compared bit for bit. Without it
+// (VP_FAITHFUL) every rewrite must match its original bit for bit.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -56,7 +65,12 @@
 #include <type_traits>
 #include <utility>
 
-#define VP_FAITHFUL
+#ifndef VP_NET_FIXES
+#define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#define NET_FIXES 0
+#else
+#define NET_FIXES 1
+#endif
 #include "../hook/port.h"
 
 // ---- the registry -----------------------------------------------------------------------------------------------------------
@@ -104,6 +118,11 @@ void Footprint::stack_ptr(void* p, const char* what) { add(p, 4, what); }
 // what net_wsock.h gives the rewrites: here, N0's sites unpatched (the plain calls)
 int __cdecl net_PTimeNow() { return ((int(__cdecl*)())(uintptr_t)0x00413b40)(); }
 int __cdecl net_Random(int r) { return ((int(__cdecl*)(int))(uintptr_t)0x0041b6e0)(r); }
+
+// the fixes mark where they changed what happens (net_core.cpp / net_session.cpp: nothing in the DLL)
+static int g_fix_hits;
+static const char* g_fix_what;
+#define VP_FIX_HIT(what) (g_fix_hits++, (void)(g_fix_what = (what)))
 
 #include "../hook/net_core.cpp"
 #include "../hook/net_session.cpp"
@@ -1114,6 +1133,463 @@ static void poison() {
 }
 static void random_arena_part(uint32_t from, uint32_t n) { for (uint32_t i = 0; i < n; i++) g_arena[from + i] = (uint8_t)rnd(); }
 
+// ---- the fix build: rounds a fix changed, and the directed tests ------------------------------------------------------------------
+struct FixCount { const char* what; int rounds, differed; };
+static FixCount g_fixc[32];
+static int g_nfixc;
+static void fix_round(const char* what, bool same) {
+    int i = 0;
+    while (i < g_nfixc && strcmp(g_fixc[i].what, what)) i++;
+    if (i == g_nfixc) {
+        if (g_nfixc == 32) return;
+        g_fixc[g_nfixc++] = {what, 0, 0};
+    }
+    g_fixc[i].rounds++;
+    g_fixc[i].differed += !same;
+}
+#if NET_FIXES
+// directed_fix_tests: each fix's bad case on the original (shown failing: a fault, an overrun, a panic, a hang) and on the
+// rewrite (clean: no fault, the callee-saved registers and the stack kept, the result the fix promises), and a boundary case
+// that still fits on both, compared bit for bit as the random rounds are.
+static int g_dt_bad, g_dt_n;
+static void dt_check(bool ok, const char* name, const char* what) {
+    g_dt_n++;
+    printf("  fix test %-34s %s  %s\n", name, ok ? "ok    " : "FAILED", what);
+    if (!ok) g_dt_bad++;
+}
+static const Ent* ent_at(uint32_t v10) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!g_fns[i].leftover && g_fns[i].v10 == v10) return &g_fns[i];
+    printf("  (no rewrite listed at %08x)\n", v10);
+    ExitProcess(5);
+}
+static void dt_world(bool calm) {
+    mem_load(g_pristine);
+    memset(g_arena, 0, ARENA_BYTES);
+    g_logging = false;
+    build_world(calm);
+    HS()->fail_mask = 0;
+    g_logging = true;
+    g_pc = _PC_53;
+}
+static Mem g_dt_o;                                   // the original's memory after its run
+// the original then the rewrite from one snapshot (g_snap); the original's memory and call log kept (g_dt_o, g_log_orig)
+static void dt_both(const Ent& f, const uint32_t* w, Result& ro, Result& rn) {
+    if (!g_dt_o.data) g_dt_o = mem_alloc();
+    mem_save(g_snap);
+    ro = run(f, false, w);
+    mem_save(g_dt_o);
+    g_log_orig = g_log;
+    mem_load(g_snap);
+    g_fix_hits = 0;
+    rn = run(f, true, w);
+}
+// the two runs alike, as the random rounds compare them
+static bool dt_same(const Result& ro, const Result& rn) {
+    bool same = ro.fault == rn.fault && ro.code == rn.code && ro.ret == rn.ret && ro.pops == rn.pops &&
+                !memcmp(ro.regs, rn.regs, sizeof ro.regs) && ro.top == rn.top;
+    mask_garbage(g_dt_o.arena, g_snap.arena);
+    mask_garbage(g_arena, g_snap.arena);
+    same &= mem_diff(g_dt_o) == 0;
+    same &= g_log.n == g_log_orig.n && !memcmp(g_log.w, g_log_orig.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+    return same;
+}
+// a clean return: no fault, ebx / esi / edi / ebp as raw_call set them, the x87 stack empty, the stack arguments popped
+static bool clean(const Ent& f, const Result& r) {
+    return !r.fault && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 && r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e &&
+           r.top == 0 && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u);
+}
+static bool log_has(const CallLog& l, uint32_t tag, uint32_t next) {
+    for (uint32_t i = 0; i + 1 < l.n && i + 1 < LOG_MAX; i++)
+        if (l.w[i] == tag && (next == 0 || l.w[i + 1] == next)) return true;
+    return false;
+}
+// the original on a thread with a time limit: true if it was still running (an endless loop; it only reads, so it is
+// simply stopped)
+struct HangCall { const Ent* f; const uint32_t* w; Result r; };
+static DWORD WINAPI hang_thread(void* p) {
+    HangCall* h = (HangCall*)p;
+    h->r = run(*h->f, false, h->w);
+    return 0;
+}
+static bool runs_forever(const Ent& f, const uint32_t* w, int ms) {
+    HangCall h = {&f, w, {}};
+    HANDLE t = CreateThread(0, 0x800000, hang_thread, &h, STACK_SIZE_PARAM_IS_A_RESERVATION, 0);
+    const bool hung = WaitForSingleObject(t, (DWORD)ms) == WAIT_TIMEOUT;
+    if (hung) TerminateThread(t, 0);
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+    return hung;
+}
+static int list_len(HostEntry* h) {
+    int n = 0;
+    for (; h && n < 1000; h = h->next) n++;
+    return n;
+}
+static uint8_t* new_addr() {
+    uint8_t* a = sv(12);
+    a[0] = 2; a[1] = 0;
+    return a;
+}
+static HostEntry* orig_get_entry(const uint8_t* a) { return (HostEntry*)(uintptr_t)call_orig(F_RDP_get_entry, 1, {U(W.rdp), 0, U(a), 1}); }
+// the reliable port's host pool used up by new hosts (each idle: no packets); `busy`: then each host given a sent packet
+static void fill_hosts(bool busy) {
+    g_logging = false;
+    for (int k = 0; k < 64 && W.rdp->node_pool.free_list; k++) orig_get_entry(new_addr());
+    if (busy)
+        for (HostEntry* h = W.rdp->hosts; h; h = h->next)
+            if (!h->sent && !h->waiting && !h->held) {
+                RPP* d = (RPP*)sv(sizeof(RPP));                        // (only its being there counts)
+                d->next = 0;
+                h->sent = d;
+            }
+    g_logging = true;
+}
+
+static int directed_fix_tests() {
+    printf("directed fix tests (the bad case on the original, then on the rewrite; the boundary case on both, compared):\n");
+    uint32_t w[18];
+    Result ro, rn;
+    char msg[256];
+
+    // ---- DataModerator::Send: a packet longer than the record ----------------------------------------------------------
+    {
+        const Ent& f = *ent_at(0x004afcc0);
+        dt_world(false);
+        uint8_t* pk = sv(0x100);
+        memset(pk, 0xcc, 0x100);
+        memset(w, 0, sizeof w);
+        w[0] = U(W.dm); w[2] = U(pk); w[3] = 0x100; w[4] = U(addr_k(1));        // (0x100: up to the return address)
+        dt_both(f, w, ro, rn);
+        dt_check(ro.fault && clean(f, rn) && mem_diff(g_snap) == 0 && g_fix_hits, "DataModerator::Send",
+                 "0x100 bytes: the original overran its frame (a fault); the rewrite drops it, nothing queued");
+        dt_world(false);
+        uint8_t* pk2 = sv(0xe4);
+        w[0] = U(W.dm); w[2] = U(pk2); w[3] = 0xe4; w[4] = U(addr_k(1));
+        dt_both(f, w, ro, rn);
+        dt_check(dt_same(ro, rn) && !g_fix_hits, "DataModerator::Send", "0xe4 bytes: both alike");
+    }
+    // ---- HostEntry::init_rpp: a length past the packet -----------------------------------------------------------------
+    {
+        const Ent& f = *ent_at(0x004b01a0);
+        dt_world(false);
+        HostEntry* h = any_host();
+        uint8_t* r = sv(0x300);
+        memset(r, 0, 0x300);
+        uint8_t* pk = sv(0x200);
+        memset(pk, 0xa7, 0x200);
+        memset(w, 0, sizeof w);
+        w[0] = U(h); w[2] = U(r); w[3] = U(pk); w[4] = 0x200; w[5] = 0;
+        dt_both(f, w, ro, rn);
+        const uint32_t ro_off = U(r) - U(g_arena);
+        bool over = true, kept = true;
+        for (uint32_t i = 0x104; i < 0x200; i++) {
+            over &= g_dt_o.arena[ro_off + i] == 0xa7;
+            kept &= r[i] == 0;
+        }
+        dt_check(over && clean(f, rn) && kept && ((RPP*)r)->len == 0xe4 && !memcmp(r, pk, 0xe4), "HostEntry::init_rpp",
+                 "0x200 bytes: the original wrote 0xfc past the 0x104-byte packet; the rewrite keeps 0xe4 of them");
+        dt_world(false);
+        h = any_host();
+        r = sv(0x300);
+        w[0] = U(h); w[2] = U(r); w[3] = U(sv(0xe4)); w[4] = 0xe4; w[5] = 0;
+        dt_both(f, w, ro, rn);
+        dt_check(dt_same(ro, rn) && !g_fix_hits, "HostEntry::init_rpp", "0xe4 bytes: both alike");
+    }
+    // ---- ReliableDataPort::get_entry: the host pool used up ------------------------------------------------------------
+    {
+        const Ent& f = *ent_at(0x004af3e0);
+        dt_world(false);
+        fill_hosts(false);
+        HostEntry* idle = 0;
+        for (HostEntry* h = W.rdp->hosts; h && !idle; h = h->next)
+            if (!h->sent && !h->waiting && !h->held) idle = h;
+        const int n0 = list_len(W.rdp->hosts);
+        uint8_t* a = new_addr();
+        memset(w, 0, sizeof w);
+        w[0] = U(W.rdp); w[2] = U(a); w[3] = 1;
+        dt_both(f, w, ro, rn);
+        HostEntry* got = (HostEntry*)(uintptr_t)rn.ret;
+        int on = 0;
+        for (HostEntry* h = W.rdp->hosts; h; h = h->next) on += h == got;
+        sprintf(msg, "a host past the pool's %d (one idle): the original panicked (\"overalloc\"); the rewrite reuses the idle one",
+                W.rdp->node_pool.count);
+        dt_check(log_has(g_log_orig, 'LPAN', 0) && ro.ret == 0 && clean(f, rn) && !log_has(g_log, 'LPAN', 0) && got == idle &&
+                     !memcmp(&got->addr, a, 12) && on == 1 && list_len(W.rdp->hosts) == n0 && got->rtt_n == 1 && got->send_first &&
+                     got->recv_first && !got->next,
+                 "ReliableDataPort::get_entry", msg);
+        dt_world(false);
+        fill_hosts(true);
+        a = new_addr();
+        w[0] = U(W.rdp); w[2] = U(a); w[3] = 1;
+        dt_both(f, w, ro, rn);
+        dt_check(log_has(g_log_orig, 'LPAN', 0) && clean(f, rn) && rn.ret == 0 && !log_has(g_log, 'LPAN', 0),
+                 "ReliableDataPort::get_entry", "a host past the pool, none idle: the original panicked; the rewrite finds none (0)");
+        dt_world(false);
+        g_logging = false;
+        while (W.rdp->node_pool.free_list && ((PoolBase*)&W.rdp->node_pool)->used + 1 < W.rdp->node_pool.count) orig_get_entry(new_addr());
+        g_logging = true;
+        a = new_addr();
+        w[0] = U(W.rdp); w[2] = U(a); w[3] = 1;
+        dt_both(f, w, ro, rn);
+        dt_check(dt_same(ro, rn) && !g_fix_hits && rn.ret != 0, "ReliableDataPort::get_entry", "the pool's last host: both alike");
+    }
+    // ---- ReliableDataPort::handle_packet / SendReliable with no host -----------------------------------------------------
+    {
+        const Ent& fh = *ent_at(0x004af260);
+        const Ent& fs = *ent_at(0x004af230);
+        for (int cls = 0; cls < 2; cls++) {
+            dt_world(false);
+            fill_hosts(true);
+            uint8_t* p = sv(0x40);
+            p[0] = (uint8_t)(cls ? 0x20 : 0x00);
+            p[1] = 7;
+            memset(w, 0, sizeof w);
+            w[0] = U(W.rdp); w[2] = U(p); w[3] = cls ? 0x20 : 2; w[4] = U(new_addr());
+            dt_both(fh, w, ro, rn);
+            dt_check(ro.fault && clean(fh, rn) && rn.ret == 1, "ReliableDataPort::handle_packet",
+                     cls ? "reliable data from a host past the pool: the original faulted (HoldIncomingPacket on 0); the rewrite drops it"
+                         : "an ack from a host past the pool: the original faulted (RecvAck on 0); the rewrite drops it");
+        }
+        dt_world(false);
+        fill_hosts(true);
+        RPI* rpi = (RPI*)sv(12);
+        rpi->fn = 0;
+        memset(w, 0, sizeof w);
+        w[0] = U(W.rdp); w[2] = U(sv(0x40)); w[3] = 0x20; w[4] = U(new_addr()); w[5] = U(rpi);
+        dt_both(fs, w, ro, rn);
+        dt_check(ro.fault && clean(fs, rn) && log_has(g_log, 'LREP', 0x004fe7f8), "ReliableDataPort::SendReliable",
+                 "to a host past the pool: the original faulted (HostEntry::SendReliable on 0); the rewrite logs and drops it");
+        dt_world(false);
+        HostEntry* h = any_host();
+        uint8_t* p = sv(0x40);
+        p[0] = 0x00; p[1] = h && h->sent ? h->sent->pkt[1] : 3;
+        w[0] = U(W.rdp); w[2] = U(p); w[3] = 2; w[4] = U(addr_k(0));
+        dt_both(fh, w, ro, rn);
+        dt_check(dt_same(ro, rn) && !g_fix_hits, "ReliableDataPort::handle_packet", "an ack from a known host: both alike");
+    }
+    // ---- return_slot(-1) ------------------------------------------------------------------------------------------------
+    {
+        const Ent& f = *ent_at(0x004b00b0);
+        dt_world(false);
+        *(volatile uint8_t*)(uintptr_t)(G_HOST_SLOTS - 1) = 0x5a;
+        memset(w, 0, sizeof w);
+        w[0] = 0xffffffffu;
+        dt_both(f, w, ro, rn);
+        dt_check(g_dt_o.data[G_HOST_SLOTS - 1 - 0x004e1000] == 0 && clean(f, rn) && mem_diff(g_snap) == 0, "return_slot",
+                 "-1 (get_slot's none): the original cleared the byte before the slots; the rewrite writes nothing");
+        dt_world(false);
+        w[0] = 7;
+        dt_both(f, w, ro, rn);
+        dt_check(dt_same(ro, rn) && !g_fix_hits, "return_slot", "7: both alike");
+    }
+    // ---- rtt_n 0: HostEntry::Tick, GetEstRTLatency ------------------------------------------------------------------------
+    {
+        const Ent& ft = *ent_at(0x004b06e0);
+        const Ent& fl = *ent_at(0x004af4e0);
+        for (int k = 0; k < 2; k++) {
+            dt_world(false);
+            HostEntry* h = any_host();
+            h->sent = h->waiting = h->held = 0;
+            h->rtt_n = k ? 1 : 0;
+            h->rtt_sum = 600;
+            memset(w, 0, sizeof w);
+            w[0] = U(h);
+            dt_both(ft, w, ro, rn);
+            if (!k) dt_check(ro.fault && ro.code == EXCEPTION_INT_DIVIDE_BY_ZERO && clean(ft, rn), "HostEntry::Tick",
+                             "rtt_n 0: the original divided by zero; the rewrite takes the sum as the mean");
+            else dt_check(dt_same(ro, rn) && !g_fix_hits, "HostEntry::Tick", "rtt_n 1: both alike");
+            dt_world(false);
+            h = any_host();
+            h->rtt_n = k ? 1 : 0;
+            h->rtt_sum = 600;
+            w[0] = U(W.rdp); w[2] = U(&h->addr);
+            dt_both(fl, w, ro, rn);
+            if (!k) dt_check(ro.fault && ro.code == EXCEPTION_INT_DIVIDE_BY_ZERO && clean(fl, rn) && rn.ret == 600,
+                             "ReliableDataPort::GetEstRTLatency", "rtt_n 0: the original divided by zero; the rewrite gives the sum");
+            else dt_check(dt_same(ro, rn) && !g_fix_hits, "ReliableDataPort::GetEstRTLatency", "rtt_n 1: both alike");
+        }
+    }
+    // ---- ReliableDataPort::Tick: a host going down with another after it ----------------------------------------------------
+    {
+        const Ent& f = *ent_at(0x004af300);
+        for (int k = 0; k < 2; k++) {
+            RPP* r;
+            do {
+                dt_world(false);
+                g_logging = false;
+                r = make_rpp(0);
+                g_logging = true;
+            } while (!r);
+            W.rdp->hosts = 0;
+            W.rdp->dead = 0;
+            W.rdp->timeout_cb = 0;
+            W.rdp->dp.mod = 0;
+            g_logging = false;
+            HostEntry* hs[3];
+            for (int i = 0; i < 3; i++) hs[i] = orig_get_entry(new_addr());
+            g_logging = true;
+            HostEntry* down = hs[k ? 2 : 1];                           // the middle one (or, the boundary, the last)
+            r->pkt[1] = down->send_id;
+            r->sends = 6;
+            r->sent = HS()->now - 100000;
+            r->rpi.fn = 0;
+            down->sent = r;
+            memset(w, 0, sizeof w);
+            w[0] = U(W.rdp);
+            dt_both(f, w, ro, rn);
+            if (!k) {
+                const SessionMgr* m = (const SessionMgr*)(g_dt_o.arena + (U(W.sm) - U(g_arena)));
+                const uint32_t ho = U(m->rdp.hosts);
+                const HostEntry* a = ho ? (const HostEntry*)(g_dt_o.arena + (ho - U(g_arena))) : 0;
+                const bool lost = a && a->next == 0;                       // the original's list: the first host alone
+                dt_check(lost && clean(f, rn) && W.rdp->hosts == hs[0] && hs[0]->next == hs[2] && !hs[2]->next && !W.rdp->dead,
+                         "ReliableDataPort::Tick", "the middle of three hosts goes down: the original lost the third from the "
+                         "list; the rewrite keeps it");
+            } else {
+                dt_check(dt_same(ro, rn) && !g_fix_hits && W.rdp->hosts == hs[0] && hs[0]->next == hs[1] && !hs[1]->next,
+                         "ReliableDataPort::Tick", "the last of three goes down: both alike");
+            }
+        }
+    }
+    // ---- SessionMgr::find_range: a channel in use before the free ones -----------------------------------------------------
+    {
+        const Ent& f = *ent_at(0x004a6860);
+        const Ent& fo = *ent_at(0x004a5870);
+        for (int k = 0; k < 2; k++) {
+            do dt_world(true); while (W.sm->nsessions < 3 || W.sm->nlocal_max < 1);
+            SessionMgr* m = W.sm;
+            for (int i = 0; i < m->nsessions; i++) { m->sessions[i].flags = 0; m->sessions[i].service = 0; }
+            if (!k) m->sessions[0].flags = 0x81;
+            LocalService* ls = (LocalService*)sv(0x48);
+            memset(w, 0, sizeof w);
+            w[0] = U(m); w[2] = 2; w[3] = U(ls);
+            if (!k) {
+                mem_save(g_snap);
+                const bool hung = runs_forever(f, w, 300);
+                mem_load(g_snap);
+                g_fix_hits = 0;
+                rn = run(f, true, w);
+                dt_check(hung && clean(f, rn) && rn.ret == 1 && ls->lo == 1 && ls->hi == 3, "SessionMgr::find_range",
+                         "2 channels with channel 0 in use: the original never returned; the rewrite finds 1..2");
+                // and OfferUnboundService over it (find_range the rewrite too: hooked for this call)
+                mem_load(g_snap);
+                m->nlocal = 0;
+                LocalService* l2 = (LocalService*)sv(0x48);
+                memset(l2, 0, 0x48);
+                w[2] = U(l2); w[3] = 2;
+                patch_jmp(0x004a6860, f.fn, true);
+                rn = run(fo, true, w);
+                unpatch_remembered();
+                dt_check(clean(fo, rn) && rn.ret != 0 && m->nlocal == 1 && m->sessions[1].service == rn.ret &&
+                             m->sessions[2].service == rn.ret && m->sessions[0].service == 0,
+                         "SessionMgr::OfferUnboundService", "the same: the service gets channels 1..2");
+            } else {
+                dt_both(f, w, ro, rn);
+                dt_check(dt_same(ro, rn) && !g_fix_hits && rn.ret == 1 && ls->lo == 0 && ls->hi == 2, "SessionMgr::find_range",
+                         "every channel free: both alike");
+            }
+        }
+    }
+    // ---- SessionMgr::Recv: the channel's packet not on the global list ---------------------------------------------------
+    {
+        const Ent& f = *ent_at(0x004a64c0);
+        for (int k = 0; k < 2; k++) {
+            do dt_world(false); while (W.sm->nsessions < 1);
+            SessionMgr* m = W.sm;
+            m->task = HS()->task_cur;
+            m->data = 0;
+            for (int i = 0; i < m->nsessions; i++) m->sessions[i].queue = 0;
+            SessionData* e = (SessionData*)(uintptr_t)call_orig(F_PoolBase_alloc, 1, {U(&m->data_pool), 0});
+            e->next = 0; e->snext = 0; e->sess = 0; e->len = 0x20;
+            for (int i = 0; i < 0xe4; i++) e->data[i] = (uint8_t)i;
+            m->sessions[0].flags = 1;
+            m->sessions[0].queue = e;
+            if (k) m->data = e;                                            // (the boundary: on both lists)
+            int32_t* len = (int32_t*)sv(4);
+            *len = 0xe4;
+            uint8_t* buf = sv(0xe4);
+            memset(w, 0, sizeof w);
+            w[0] = U(m); w[2] = 0; w[3] = U(buf); w[4] = U(len);
+            dt_both(f, w, ro, rn);
+            if (!k) dt_check(ro.fault && clean(f, rn) && rn.ret == 1 && *len == 0x20 && !memcmp(buf, e->data, 0x20) &&
+                                 m->sessions[0].queue == 0 && m->data == 0,
+                             "SessionMgr::Recv", "a packet on its channel's list only: the original went through 0; the "
+                             "rewrite hands it out");
+            else dt_check(dt_same(ro, rn) && !g_fix_hits && rn.ret == 1, "SessionMgr::Recv", "on both lists: both alike");
+        }
+    }
+    // ---- SessionMgr::GetNextStatus: no channels ------------------------------------------------------------------------
+    {
+        const Ent& f = *ent_at(0x004a6760);
+        for (int k = 0; k < 2; k++) {
+            do dt_world(false); while (W.sm->nsessions < 1);
+            SessionMgr* m = W.sm;
+            if (!k) m->nsessions = 0;
+            uint8_t* out = sv(4);
+            memset(w, 0, sizeof w);
+            w[0] = U(m); w[2] = U(out); w[3] = 0;
+            dt_both(f, w, ro, rn);
+            if (!k) dt_check(ro.fault && ro.code == EXCEPTION_INT_DIVIDE_BY_ZERO && clean(f, rn) && rn.ret == 0xffffffffu,
+                             "SessionMgr::GetNextStatus", "no channels: the original divided by zero; the rewrite finds none (-1)");
+            else dt_check(dt_same(ro, rn) && !g_fix_hits, "SessionMgr::GetNextStatus", "channels: both alike");
+        }
+    }
+    // ---- SessionMgr::recv_chandata: a packet longer than SessionData's 0xe4 bytes ---------------------------------------
+    {
+        const Ent& f = *ent_at(0x004a6a90);
+        for (int k = 0; k < 2; k++) {
+            do dt_world(false); while (W.sm->nsessions < 1);
+            SessionMgr* m = W.sm;
+            m->sessions[0].flags = 1;
+            const int len = k ? 0xe4 : 0x200;
+            uint8_t* p = sv(0x200);
+            memset(p, 0xa7, 0x200);
+            p[0] = 0x71;                                                   // channel data of class 7: the channel in byte 1
+            p[1] = 0;
+            SessionData* next_free = (SessionData*)m->data_pool.free_list;
+            SessionData* const data0 = m->data;
+            SessionData* const q0 = m->sessions[0].queue;
+            const int used0 = m->data_pool.used;
+            memset(w, 0, sizeof w);
+            w[0] = U(m); w[2] = U(p); w[3] = (uint32_t)len; w[4] = U(&m->sessions[0].addr);
+            dt_both(f, w, ro, rn);
+            if (!k) {
+                bool over = next_free != 0;
+                if (over) {
+                    const uint32_t off = U(next_free) - U(g_arena);
+                    for (uint32_t i = 0xf4; i < 0x10 + 0x200; i++) over &= g_dt_o.arena[off + i] == 0xa7;
+                }
+                dt_check(over && clean(f, rn) && m->data_pool.used == used0 && m->data == data0 && m->sessions[0].queue == q0,
+                         "SessionMgr::recv_chandata", "0x200 bytes: the original wrote past its pool entry (0x12c bytes "
+                         "over); the rewrite drops the packet");
+            } else {
+                dt_check(dt_same(ro, rn) && !g_fix_hits, "SessionMgr::recv_chandata", "0xe4 bytes: both alike");
+            }
+        }
+    }
+    // ---- async_msg: a state outside 0..5 ---------------------------------------------------------------------------------
+    {
+        const Ent& f = *ent_at(0x004a5320);
+        dt_world(false);
+        memset(w, 0, sizeof w);
+        w[0] = 9;
+        dt_both(f, w, ro, rn);
+        uint32_t texts[6];
+        bool in = false;
+        for (int i = 0; i < 6; i++) { texts[i] = *(uint32_t*)(uintptr_t)(net_session::k_async_x[i].obj + 4); in |= ro.ret == texts[i]; }
+        dt_check(!in && clean(f, rn) && rn.ret == texts[0], "async_msg",
+                 "state 9: the original read past its six texts; the rewrite gives the first");
+        dt_world(false);
+        w[0] = 5;
+        dt_both(f, w, ro, rn);
+        dt_check(dt_same(ro, rn) && !g_fix_hits, "async_msg", "state 5: both alike");
+    }
+    printf("directed fix tests: %d checks, %d failed\n", g_dt_n, g_dt_bad);
+    return g_dt_bad;
+}
+#endif
+
 // ---- main ---------------------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -1250,7 +1726,9 @@ int main(int argc, char** argv) {
                     if (!seen && nshapes < 64) shapes[nshapes++] = h;
                 }
                 mem_load(g_snap);
+                g_fix_hits = 0;
                 const Result rn = run(f, true, words);
+                const int hits = g_fix_hits;
                 checks++; fn_checks++;
                 log_words += g_log_orig.n;
                 if (ro.fault) { faulted++; fn_faults++; }
@@ -1263,6 +1741,16 @@ int main(int argc, char** argv) {
                 const uint32_t where = mem_diff(g_after);
                 same &= where == 0;
                 same &= g_log.n == g_log_orig.n && !memcmp(g_log.w, g_log_orig.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+                if (NET_FIXES && hits) {                            // a fix changed this round: counted, the rewrite clean
+                    fix_round(g_fix_what, same);
+                    if (rn.fault) {
+                        printf("  %08x %s: round %d, a fixed case (%s): the rewrite faulted (%08x at %08x)\n", f.v10, f.name, rd,
+                               g_fix_what, rn.code, rn.eip);
+                        differ++;
+                        fn_bad = true;
+                    }
+                    continue;
+                }
                 if (!same) {
                     printf("  MISMATCH %08x %s (round %d, pc %s)\n", f.v10, f.name, rd, g_pc == _PC_24 ? "24" : "53");
                     printf("    fault %d/%d (%08x at %08x / %08x at %08x), return %08x / %08x, popped %u / %u, x87 top %u / %u, "
@@ -1311,5 +1799,12 @@ done:
            "logged words compared, %lld checks where the original faulted (both alike unless counted below): %d differ, "
            "%d footprint violations; %d functions bad\n", hand_n + left_n, hand_n, left_n, dup, checks, skipped, log_words,
            faulted, differ, fp_bad, bad_fns);
-    return differ || fp_bad || dup ? 1 : 0;
+    int fix_bad = 0;
+#if NET_FIXES
+    printf("fix build: rounds a fix changed (the rewrite clean in each; how many of them differed from the original):");
+    for (int i = 0; i < g_nfixc; i++) printf("%s %s %d (%d)", i ? ";" : "", g_fixc[i].what, g_fixc[i].rounds, g_fixc[i].differed);
+    printf("%s\n", g_nfixc ? "" : " none");
+    if (!only[0]) fix_bad = directed_fix_tests();
+#endif
+    return differ || fp_bad || dup || fix_bad ? 1 : 0;
 }

@@ -6,6 +6,7 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_net_line.cpp
 //        /Fo%TEMP%\wnl\ /Fe%TEMP%\wnl\world_net_line.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_net_line.exe [scenarios per kind] [seed]
+//     (and with /DVP_NET_FIXES: the fix build, below)
 //
 // Loads out\race_v10.exe at 0x400000 the way test/fuzz.cpp does (a child process with the range reserved before its heap
 // exists). Its KERNEL32 imports are the real functions; every import these functions use is a fake here, stdcall with the
@@ -42,6 +43,15 @@
 // every rewrite hooked into the image ("chain"). The passes must agree on every call's result, the log (every fake API
 // and stub call in order, with its arguments), the game's .data and the arena. In the originals' pass, each call whose
 // footprint isn't replay_only is checked to write only inside it.
+//
+// Built with /DVP_NET_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Multiplayer").
+// A fix that changes what happens logs "FIX <what>" where it does (VP_FIX_HIT); a rewrite pass with such a line must agree
+// with the originals' up to it, and after it only end cleanly (no fault); such scenarios are counted per fix. The one fix
+// that changes every call it's in -- get_tapiline_port closing its registry key -- logs that RegCloseKey apart, and those
+// lines are left out of the comparison. Then directed_fix_tests: for each fix, the bad case on the originals (the fault,
+// overrun, hang -- on a thread with a time limit -- or wrong result shown) and on the rewrite (clean, the result the fix
+// promises), and the boundary case that still fits on both, compared. Knobs the directed tests set make the fakes give
+// exact answers (g_dt_*); the random scenarios leave them off. Without it (VP_FAITHFUL) every pass must be identical.
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -56,7 +66,12 @@
 #include <tuple>
 #include <utility>
 #include <type_traits>
+#ifndef VP_NET_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
+#define NET_FIXES 0
+#else
+#define NET_FIXES 1
+#endif
 #include "../hook/port.h"
 
 // ---- the registered rewrites --------------------------------------------------------------------------------------------
@@ -108,6 +123,10 @@ void Footprint::stack_ptr(void* p, const char* what) { add(p, 4, what); }
 int __cdecl net_PTimeNow() { return ((int(__cdecl*)())(uintptr_t)0x00413b40)(); }
 int __cdecl net_Random(int range) { return ((int(__cdecl*)(int))(uintptr_t)0x0041b6e0)(range); }
 uint32_t net_async_hook_for_winsock_grab() { return 0x004adc00; }
+
+// a fix marking where it changed what happens: a "FIX <what>" line in the log (the fix build)
+static void fix_hit(const char* what);
+#define VP_FIX_HIT(what) fix_hit(what)
 
 #include "../hook/net_socket.cpp"
 #include "../hook/net_line.cpp"
@@ -239,6 +258,11 @@ static void L(const char* fmt, ...) {
     b[sizeof b - 1] = 0;
     g_log.push_back(b);
 }
+static int g_fix_hits;
+static void fix_hit(const char* what) {
+    g_fix_hits++;
+    L("FIX %s", what);
+}
 static NT_TIB* tib() { return (NT_TIB*)NtCurrentTeb(); }
 // a pointer, by where it points (stack frames differ between the passes)
 static std::string P(const void* p) {
@@ -286,8 +310,17 @@ struct World {
     uint8_t hostent[0x200];
 };
 static World g_w;
+// the directed tests' knobs (0: off, the random scenarios)
+static int g_dt_naddr;                  // gethostname succeeds, gethostbyname gives these addresses (k_dt_addrs)
+static const uint32_t k_dt_addrs[] = {0x0100000a, 0x0200000a, 0x0300000a, 0x07ffffff, 0x0500000a};
+static bool g_dt_wsa_fail;              // WSAStartup fails
+static bool g_dt_ok;                    // TAPI and the registry succeed
+static uint32_t g_dt_vs_off, g_dt_vs_size;   // lineGetDevConfig / lineGetID: this string offset (and size) back
+static uint32_t g_dt_wait;              // WaitForSingleObject's answer (+1)
+static std::vector<uint32_t> g_modem_keys;   // HKLM keys opened (a modem's driver key)
 static void world_reset(uint32_t seed) {
     g_w = World();
+    g_modem_keys.clear();
     g_world.s = seed * 2654435761u + 0x1234567u;
     if (!g_world.s) g_world.s = 1;
     g_w.clock = 100000;
@@ -400,7 +433,7 @@ static std::string sa_str(const void* sa, int len) {
     return b;
 }
 static int __stdcall f_WSAStartup(uint16_t ver, void* d) {
-    const int r = g_world.chance(10) ? 10091 : 0;
+    const int r = g_dt_wsa_fail ? 10091 : g_world.chance(10) ? 10091 : 0;
     L("WSAStartup %x %s -> %d", ver, P(d).c_str(), r);
     if (d) memset(d, 0x5a, 0x190);
     return r;
@@ -476,7 +509,7 @@ static int __stdcall f_recvfrom(uint32_t s, void* buf, int len, int flags, void*
     return r;
 }
 static int __stdcall f_gethostname(char* name, int n) {
-    const int r = g_world.chance(5) ? -1 : 0;
+    const int r = g_dt_naddr ? 0 : g_world.chance(5) ? -1 : 0;
     L("gethostname %d -> %d", n, r);
     if (!r) strcpy(name, "vipers-pc");
     return r;
@@ -500,6 +533,23 @@ static void* make_hostent(uint8_t* base, int naddr) {
     return base;
 }
 static void* __stdcall f_gethostbyname(const char* name) {
+    if (g_dt_naddr) {                                    // {name, aliases, type, list}: the list at +0x10, addresses at +0x40
+        uint32_t* h = (uint32_t*)g_w.hostent;
+        memset(g_w.hostent, 0, sizeof g_w.hostent);
+        uint32_t* list = h + 4;
+        uint32_t* addrs = h + 0x10;
+        for (int i = 0; i < g_dt_naddr; i++) {
+            addrs[i] = k_dt_addrs[i];
+            list[i] = (uint32_t)(uintptr_t)&addrs[i];
+        }
+        strcpy((char*)g_w.hostent + 0x80, "vipers-pc");
+        h[0] = (uint32_t)(uintptr_t)(g_w.hostent + 0x80);
+        h[1] = (uint32_t)(uintptr_t)(g_w.hostent + 0x90);
+        h[2] = 0x00040002;
+        h[3] = (uint32_t)(uintptr_t)list;
+        L("gethostbyname %s -> %d addresses (the test's)", S(name).c_str(), g_dt_naddr);
+        return h;
+    }
     if (g_world.chance(10)) {
         L("gethostbyname %s -> 0", S(name).c_str());
         return 0;
@@ -641,7 +691,7 @@ static int __stdcall f_SetCommState(uint32_t h, const uint8_t* dcb) {
 }
 static uint32_t __stdcall f_WaitForSingleObject(uint32_t ev, uint32_t ms) {
     static const uint32_t k[] = {0, 0, 0, 0x102, 0x102, 0x80, 0xffffffffu, 5};
-    const uint32_t r = k[g_world.next() % 8];
+    const uint32_t r = g_dt_wait ? g_dt_wait - 1 : k[g_world.next() % 8];
     if (r == 0xffffffffu) g_w.last_error = 6;
     L("WaitForSingleObject %x %u -> %x", ev, ms, r);
     return r;
@@ -654,17 +704,18 @@ static uint32_t __stdcall f_CreateEventA(void* sec, int manual, int initial, con
 
 // ---- fakes: ADVAPI32 ------------------------------------------------------------------------------------------------------
 static int32_t __stdcall f_RegOpenKeyExA(uint32_t root, const char* key, uint32_t opt, uint32_t sam, uint32_t* hk) {
-    const int32_t r = g_world.chance(10) ? 2 : 0;
+    const int32_t r = g_dt_ok ? 0 : g_world.chance(10) ? 2 : 0;
     if (!r) *hk = 0x8800u + (g_world.next() & 0xff);
+    if (!r && root == 0x80000002u) g_modem_keys.push_back(*hk);
     L("RegOpenKeyExA %x %s %u %x -> %d", root, S(key).c_str(), opt, sam, r);
     return r;
 }
 static int32_t __stdcall f_RegQueryValueExA(uint32_t hk, const char* name, uint32_t* res, uint32_t* type, uint8_t* data, uint32_t* cb) {
     const uint32_t cap = cb ? *cb : 0;
-    const int32_t r = g_world.chance(8) ? 234 : 0;
+    const int32_t r = g_dt_ok ? 0 : g_world.chance(8) ? 234 : 0;
     if (!r) {
         const bool attached = name && !strcmp(name, "AttachedTo");
-        *type = g_world.chance(10) ? 4 : attached ? 1 : 3;
+        *type = g_dt_ok ? (attached ? 1 : 3) : g_world.chance(10) ? 4 : attached ? 1 : 3;
         if (attached) {
             char s[8] = "COM?";
             s[3] = (char)(g_world.chance(10) ? 'x' : '1' + g_world.range(0, 8));
@@ -686,10 +737,19 @@ static int32_t __stdcall f_RegSetValueExA(uint32_t hk, const char* name, uint32_
     L("RegSetValueExA %x %s %u %u %s -> %d", hk, S(name).c_str(), res, type, H(data, cb).c_str(), r);
     return r;
 }
-static int32_t __stdcall f_RegCloseKey(uint32_t hk) { L("RegCloseKey %x", hk); return 0; }
+// (a modem's driver key, which only get_tapiline_port's fix closes: logged apart, left out of the fix build's comparison)
+static int32_t __stdcall f_RegCloseKey(uint32_t hk) {
+    bool modem = false;
+    for (uint32_t k : g_modem_keys) modem |= k == hk;
+    L(modem ? "RegCloseKey(modem key) %x" : "RegCloseKey %x", hk);
+    return 0;
+}
 
 // ---- fakes: TAPI32 -------------------------------------------------------------------------------------------------------
-static int32_t tapi_result() { return g_world.chance(8) ? (int32_t)(0x80000000u | (uint32_t)g_world.range(1, 0x4b)) : 0; }
+static int32_t tapi_result() {
+    if (g_dt_ok) return 0;
+    return g_world.chance(8) ? (int32_t)(0x80000000u | (uint32_t)g_world.range(1, 0x4b)) : 0;
+}
 static int32_t __stdcall f_lineInitialize(uint32_t* app, uint32_t inst, uint32_t cb, const char* name, uint32_t* ndevs) {
     const int32_t r = tapi_result();
     if (!r) {
@@ -747,9 +807,9 @@ static int32_t __stdcall f_lineGetID(uint32_t hline, uint32_t addr, uint32_t hca
     L("lineGetID %x %u %x %u %u %s -> %d", hline, addr, hcall, select, total, S(cls).c_str(), r);
     if (r) return r;
     auto put = [&](uint32_t at, uint32_t v) { memcpy(vs + at, &v, 4); };
-    put(0xc, g_world.chance(8) ? 1 : 4);
+    put(0xc, g_dt_ok ? 4 : g_world.chance(8) ? 1 : 4);
     put(0x10, 4 + 8);
-    put(0x14, 0x18);
+    put(0x14, g_dt_vs_off ? g_dt_vs_off : 0x18);
     // the modem's own COM port (port 4 or 5), or 0
     uint32_t h = 0;
     if (!g_world.chance(8) && g_w.nhandles < 0x40) {
@@ -774,8 +834,8 @@ static int32_t __stdcall f_lineGetDevConfig(uint32_t dev, uint8_t* vs, const cha
     if (r) return r;
     auto put = [&](uint32_t at, uint32_t v) { memcpy(vs + at, &v, 4); };
     const uint32_t n = g_world.chance(10) ? 0x40 : 0x6c;
-    put(0x10, n);
-    put(0x14, 0x18);
+    put(0x10, g_dt_vs_off ? g_dt_vs_size : n);
+    put(0x14, g_dt_vs_off ? g_dt_vs_off : 0x18);
     memcpy(vs + 0x18, g_w.devcfg, 0x6c);
     if (g_world.chance(20)) vs[0x18 + g_world.range(0, (int)n - 1)] ^= 0x10;   // the driver changed something
     return 0;
@@ -1515,34 +1575,637 @@ static void run_pass(Mode mode, int kind, uint32_t seed, PassResult& out) {
     out.data.assign((uint8_t*)(uintptr_t)DATA_AT, (uint8_t*)(uintptr_t)DATA_AT + DATA_SIZE);
     out.arena.assign((uint8_t*)(uintptr_t)ARENA, (uint8_t*)(uintptr_t)ARENA + ARENA_SIZE);
 }
-static int compare(const char* what, const PassResult& a, const PassResult& b, int kind, uint32_t seed) {
+static int compare(const char* what, const PassResult& a, const PassResult& b, int kind, uint32_t seed, bool quiet = false) {
     const size_t n = a.log.size() < b.log.size() ? a.log.size() : b.log.size();
     for (size_t i = 0; i < n; i++)
         if (a.log[i] != b.log[i]) {
+            if (quiet) return 1;
             printf("  %s: kind %d seed %u: log line %u differs:\n    original: %s\n    rewrite:  %s\n", what, kind, seed, (unsigned)i,
                    a.log[i].c_str(), b.log[i].c_str());
             for (size_t j = i >= 3 ? i - 3 : 0; j < i; j++) printf("    (before: %s)\n", a.log[j].c_str());
             return 1;
         }
     if (a.log.size() != b.log.size()) {
+        if (quiet) return 1;
         printf("  %s: kind %d seed %u: log lengths %u / %u (next: %s)\n", what, kind, seed, (unsigned)a.log.size(),
                (unsigned)b.log.size(), a.log.size() > n ? a.log[n].c_str() : b.log[n].c_str());
         return 1;
     }
     for (size_t i = 0; i < a.data.size(); i++)
         if (a.data[i] != b.data[i]) {
+            if (quiet) return 1;
             printf("  %s: kind %d seed %u: .data differs at %08x (%02x / %02x)\n", what, kind, seed, (unsigned)(DATA_AT + i),
                    a.data[i], b.data[i]);
             return 1;
         }
     for (size_t i = 0; i < a.arena.size(); i++)
         if (a.arena[i] != b.arena[i]) {
+            if (quiet) return 1;
             printf("  %s: kind %d seed %u: the arena differs at %08x (%02x / %02x)\n", what, kind, seed, (unsigned)(ARENA + i),
                    a.arena[i], b.arena[i]);
             return 1;
         }
     return 0;
 }
+
+// the fix build: a rewrite pass against the originals'. Without its fixes' marks (and the modem key's close) the same is
+// the same; else the logs agree up to the first "FIX" line and the rewrite pass ends cleanly after it.
+struct FixCount { std::string what; int n; };
+static std::vector<FixCount> g_fixc;
+static int compare_fixed(const char* what, const PassResult& a, const PassResult& b, int kind, uint32_t seed) {
+    PassResult c;
+    c.data = b.data;
+    c.arena = b.arena;
+    size_t first_fix = (size_t)-1;
+    for (const std::string& l : b.log) {
+        if (l.rfind("RegCloseKey(modem key)", 0) == 0) continue;
+        if (l.rfind("FIX ", 0) == 0) {
+            if (first_fix == (size_t)-1) first_fix = c.log.size();
+            continue;
+        }
+        c.log.push_back(l);
+    }
+    if (first_fix == (size_t)-1) return compare(what, a, c, kind, seed);
+    if (!compare(what, a, c, kind, seed, true)) return 0;
+    for (size_t i = 0; i < first_fix; i++)
+        if (i >= a.log.size() || a.log[i] != c.log[i]) {
+            printf("  %s: kind %d seed %u: log line %u differs before the first fix:\n    original: %s\n    rewrite:  %s\n", what,
+                   kind, seed, (unsigned)i, i < a.log.size() ? a.log[i].c_str() : "(none)", c.log[i].c_str());
+            return 1;
+        }
+    std::string fix;
+    for (const std::string& l : b.log)
+        if (l.rfind("FIX ", 0) == 0) { fix = l.substr(4); break; }
+    for (const std::string& l : b.log)
+        if (l.rfind("FAULT", 0) == 0) {
+            printf("  %s: kind %d seed %u: after the fix (%s) the rewrite pass ended with a %s\n", what, kind, seed, fix.c_str(), l.c_str());
+            return 1;
+        }
+    bool found = false;
+    for (FixCount& f : g_fixc)
+        if (f.what == fix) f.n++, found = true;
+    if (!found) g_fixc.push_back({fix, 1});
+    return 0;
+}
+#if NET_FIXES
+// ---- directed_fix_tests --------------------------------------------------------------------------------------------------
+// Each fix's bad case run as a small pass on the originals (ORIG) and on the rewrites (ISOLATED: the top-level calls the
+// rewrites, their callees the originals'), from the same start; the originals' failure shown, the rewrite's result checked;
+// then the boundary case on both, compared like a scenario.
+static int g_dt_bad, g_dt_n;
+static void dt_check(bool ok, const char* name, const char* what) {
+    g_dt_n++;
+    printf("  fix test %-30s %s  %s\n", name, ok ? "ok    " : "FAILED", what);
+    if (!ok) g_dt_bad++;
+}
+static void dt_knobs_off() {
+    g_dt_naddr = 0;
+    g_dt_wsa_fail = false;
+    g_dt_ok = false;
+    g_dt_vs_off = g_dt_vs_size = 0;
+    g_dt_wait = 0;
+}
+static void dt_begin(Mode mode) {
+    memcpy((void*)(uintptr_t)DATA_AT, g_pristine.data(), DATA_SIZE);
+    memset((void*)(uintptr_t)ARENA, 0, ARENA_SIZE);
+    world_reset(99);
+    g_drv.s = 12345;
+    g_heap = HEAP_AT;
+    g_fixed = ARENA + 0x100;
+    g_log.clear();
+    g_fault = false;
+    g_mode = mode;
+    g_check_fp = false;
+    g_fix_hits = 0;
+}
+static PassResult dt_end() {
+    PassResult r;
+    r.log = g_log;
+    r.data.assign((uint8_t*)(uintptr_t)DATA_AT, (uint8_t*)(uintptr_t)DATA_AT + DATA_SIZE);
+    r.arena.assign((uint8_t*)(uintptr_t)ARENA, (uint8_t*)(uintptr_t)ARENA + ARENA_SIZE);
+    return r;
+}
+static bool has_line(const char* prefix) {
+    for (const std::string& l : g_log)
+        if (l.rfind(prefix, 0) == 0) return true;
+    return false;
+}
+static bool faulted() { return has_line("FAULT"); }
+// the boundary: the same calls on the originals and the rewrites, alike (compare's rules, the fix's marks not expected)
+static bool dt_alike(void (*body)()) {
+    dt_begin(ORIG);
+    body();
+    const PassResult o = dt_end();
+    dt_begin(ISOLATED);
+    body();
+    const PassResult n = dt_end();
+    return !compare("boundary", o, n, -1, 0) && !g_fix_hits;
+}
+// an original that never returns: run on a thread, stopped after `ms` (it only reads)
+struct RawCall { uint32_t fn; uint32_t a[6]; int n; bool thiscall; };
+static DWORD WINAPI raw_thread(void* p) {
+    RawCall* r = (RawCall*)p;
+    uint32_t x;
+    seh_call(r->fn, r->thiscall, r->a, r->n, &x);
+    return 0;
+}
+static bool raw_hangs(uint32_t fn, bool thiscall, std::initializer_list<uint32_t> args, int ms) {
+    RawCall r = {fn, {}, 0, thiscall};
+    for (uint32_t v : args) r.a[r.n++] = v;
+    HANDLE t = CreateThread(0, 0x100000, raw_thread, &r, 0, 0);
+    const bool hung = WaitForSingleObject(t, (DWORD)ms) == WAIT_TIMEOUT;
+    if (hung) TerminateThread(t, 0);
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+    return hung;
+}
+// a line device of the test's own: its DataAvail and Recv give exactly what the test says
+static int g_fd_avail, g_fd_give;
+static uint8_t g_fd_bytes[0x100];
+static bool g_fd_full_no_nul;                    // the last Recv filled the whole buffer without a NUL
+static int32_t __fastcall fd_status(void*, int) { return 2; }
+static int32_t __fastcall fd_avail(void*, int) { L("fdev DataAvail -> %d", g_fd_avail); return g_fd_avail; }
+static uint8_t __fastcall fd_recv(void*, int, uint8_t* buf, int32_t* n) {
+    const int k = *n < g_fd_give ? *n : g_fd_give;
+    memcpy(buf, g_fd_bytes, (size_t)(k > 0 ? k : 0));
+    g_fd_full_no_nul = k == *n && k > 0 && !memchr(buf, 0, (size_t)k);
+    L("fdev Recv %d -> %d %s", *n, k, H(buf, (size_t)(k > 0 ? k : 0)).c_str());
+    *n = k;
+    return k > 0;
+}
+static void __fastcall fd_send(void*, int, const void* p, int32_t n) { L("fdev Send %s", H(p, (size_t)n).c_str()); }
+static void __fastcall fd_trap(void*, int) { L("fdev: an unexpected call"); RaiseException(0xe0000002, 0, 0, 0); }
+static void* g_fd_vt[16];
+static uint32_t fake_device() {
+    for (int i = 0; i < 16; i++) g_fd_vt[i] = (void*)fd_trap;
+    g_fd_vt[LD_GET_STATUS / 4] = (void*)fd_status;
+    g_fd_vt[LD_DATA_AVAIL / 4] = (void*)fd_avail;
+    g_fd_vt[LD_RECV / 4] = (void*)fd_recv;
+    g_fd_vt[LD_SEND / 4] = (void*)fd_send;
+    const uint32_t d = fixed_bytes(0x10, 0);
+    U(d) = (uint32_t)(uintptr_t)g_fd_vt;
+    return d;
+}
+// a UDPSocket made by hand (as the constructor leaves it, its addresses not yet read)
+static uint32_t udp_by_hand(int32_t slot) {
+    const uint32_t m = fixed_bytes(0x40, 0);
+    U(m) = VT_UDPSocket;
+    U(m + 4) = (uint32_t)slot;
+    *(uint16_t*)(uintptr_t)(m + 0x30) = 0x7d1;
+    *(uint8_t*)(uintptr_t)(m + 0x32) = 1;
+    U(m + 0x34) = 0x300;
+    return m;
+}
+static uint32_t line_socket_by_hand() {
+    const uint32_t s = fixed_bytes(0x774, 0);
+    U(s) = VT_LineSocket;
+    U(s + 0x76c) = 1234;
+    return s;
+}
+static uint32_t pkt_bytes(int n, uint8_t v) {
+    const uint32_t p = fixed_bytes(n, 0);
+    memset((void*)(uintptr_t)p, v, (size_t)n);
+    return p;
+}
+
+static int directed_fix_tests() {
+    printf("directed fix tests (the bad case on the originals, then on the rewrites; the boundary case on both, compared):\n");
+    dt_knobs_off();
+    char msg[256];
+
+    // ---- UDPSocket::init_local_addrs: 4 and 5 addresses -------------------------------------------------------------------
+    for (int naddr = 4; naddr <= 5; naddr++) {
+        uint32_t m = 0, nl[2], port[2];
+        bool fault[2], local3 = false, local4 = true;
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            g_dt_naddr = naddr;
+            m = udp_by_hand(0);
+            call(A_UDP_init_local_addrs, {m}, 0);
+            nl[pass] = U(m + 0x2c);
+            port[pass] = *(uint16_t*)(uintptr_t)(m + 0x30);
+            const uint32_t a = fixed_bytes(12, 0);
+            U(a) = k_dt_addrs[2];
+            const bool l3 = call(0x004add10, {m, a}, 8) != 0;                       // UDPSocket::AddressIsLocal
+            U(a) = k_dt_addrs[3];
+            const bool l4 = call(0x004add10, {m, a}, 8) != 0;
+            fault[pass] = faulted();
+            if (pass) local3 = l3, local4 = l4;
+            dt_knobs_off();
+        }
+        sprintf(msg, "%d addresses: the original %s; the rewrite keeps the first 3 (port intact, AddressIsLocal works)", naddr,
+                naddr == 4 ? "took the 4th address + 1 as its count (0x08000000 local addresses: AddressIsLocal walks off the socket)"
+                           : "wrote the 5th far past the socket (a fault)");
+        dt_check((naddr == 5 ? fault[0] : nl[0] == 0x08000000u) && !fault[1] && nl[1] == 3 && port[1] == 0x7d1 && local3 && !local4,
+                 "UDPSocket::init_local_addrs", msg);
+    }
+    dt_check(dt_alike([] {
+                 g_dt_naddr = 3;
+                 const uint32_t m = udp_by_hand(0);
+                 call(A_UDP_init_local_addrs, {m}, 0);
+                 const uint32_t a = fixed_bytes(12, 0);
+                 U(a) = k_dt_addrs[2];
+                 call(0x004add10, {m, a}, 8);
+                 dt_knobs_off();
+             }),
+             "UDPSocket::init_local_addrs", "3 addresses: both alike");
+
+    // ---- IPXSocket: winsock_grab fails ---------------------------------------------------------------------------------
+    {
+        bool closed[2], fault[2];
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            g_dt_wsa_fail = true;
+            const uint32_t m = pkt_bytes(0x40, 0xcd);                                  // as MemAlloc leaves it
+            call(A_IPXSocket_ctor, {m, 0x7d1});
+            call(A_IPXSocket_dtor, {m}, 0);
+            closed[pass] = has_line("closesocket cdcdcdcd");
+            fault[pass] = faulted();
+            dt_knobs_off();
+        }
+        dt_check(closed[0] && !closed[1] && !fault[1], "IPXSocket::IPXSocket",
+                 "winsock_grab fails: the original's destructor closed the socket field MemAlloc left (cdcdcdcd); the rewrite's is none");
+    }
+
+    // ---- async_msg_hook: no request in the slot; a late reply for another request -----------------------------------------
+    {
+        bool fault[2];
+        uint32_t ret1 = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            U(S_ASYNC_REQS) = 0;
+            const uint32_t r = call(A_async_msg_hook, {0xf400, 0x7001, 0x100}, 8);
+            fault[pass] = faulted();
+            if (pass) ret1 = r;
+        }
+        dt_check(fault[0] && !fault[1] && ret1 == 1, "async_msg_hook",
+                 "a reply with its slot empty (after AsyncCancel): the original wrote through 0; the rewrite takes and ignores it");
+        uint32_t st_after_old[2], st_after_new[2];
+        bool fault2[2];
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            const uint32_t rq = fixed_bytes(0x414, 0);
+            U(rq) = 0x7002;                                                          // the request now in the slot
+            U(rq + 4) = 0;
+            make_hostent((uint8_t*)(uintptr_t)(rq + 0x14), 1);
+            U(S_ASYNC_REQS) = rq;
+            call(A_async_msg_hook, {0xf400, 0x7001, 0x100}, 8);                     // the cancelled one's reply, late
+            st_after_old[pass] = U(rq + 4);
+            call(A_async_msg_hook, {0xf400, 0x7002, 0x100}, 8);                     // its own
+            st_after_new[pass] = U(rq + 4);
+            fault2[pass] = faulted();
+        }
+        dt_check(st_after_old[0] == 2 && fault2[0] && st_after_old[1] == 0 && st_after_new[1] == 2 && !fault2[1], "async_msg_hook",
+                 "a cancelled request's late reply: the original gave its answer to the new request, then crashed on the new one's "
+                 "reply; the rewrite waits for the new one's");
+        dt_check(dt_alike([] {
+                     const uint32_t rq = fixed_bytes(0x414, 0);
+                     U(rq) = 0x7002;
+                     make_hostent((uint8_t*)(uintptr_t)(rq + 0x14), 2);
+                     U(S_ASYNC_REQS + 4) = rq;
+                     call(A_async_msg_hook, {0xf401, 0x7002, 0x100}, 8);
+                     U(S_ASYNC_REQS + 8) = rq;
+                     call(A_async_msg_hook, {0xf402, 0x7002, 10060u << 16}, 8);
+                 }),
+                 "async_msg_hook", "its own reply (success, failure): both alike");
+    }
+
+    // ---- the async request slots past 4 -------------------------------------------------------------------------------
+    {
+        uint32_t slot5[2], st[2], grabs[2], r4[2];
+        bool asked[2];
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            U(S_ASYNC_REQS + 0x14) = 0;
+            const uint32_t m = udp_by_hand(5);
+            const uint32_t rq = fixed_bytes(0x414, 0);
+            call(0x004ad800, {m, fixed_str("viper-host"), rq}, 8);                  // UDPSocket::AsyncGetHostAddr
+            slot5[pass] = U(S_ASYNC_REQS + 0x14);
+            st[pass] = U(rq + 4);
+            asked[pass] = has_line("WSAAsyncGetHostByName");
+            U(S_GRABS) = 2;
+            const uint32_t m9 = udp_by_hand(9);
+            call(0x004ad7d0, {m9, rq}, 0);                                          // UDPSocket::AsyncCancel (slot 9: S_GRABS)
+            grabs[pass] = U(S_GRABS);
+            U(S_ASYNC_REQS + 0x10) = 0x5a5a5a5a;
+            U(S_GRABS) = 4;
+            g_dt_wsa_fail = true;                                                   // (the constructor's slot write is first)
+            call(A_UDPSocket_ctor, {fixed_bytes(0x40, 0), 0x7d1});
+            r4[pass] = U(S_ASYNC_REQS + 0x10);
+            dt_knobs_off();
+        }
+        dt_check(slot5[0] != 0 && asked[0] && grabs[0] == 0 && r4[0] == 0 && slot5[1] == 0 && st[1] == 1 && !asked[1] &&
+                     grabs[1] == 2 && r4[1] == 0x5a5a5a5a,
+                 "UDPSocket async slots", "slots 4, 5, 9: the original wrote past the table (slot 9 zeroed winsock_grab's count) and "
+                 "asked for a reply nothing takes; the rewrite fails the lookup at once and writes nothing");
+        dt_check(dt_alike([] {
+                     const uint32_t m = udp_by_hand(3);
+                     const uint32_t rq = fixed_bytes(0x414, 0);
+                     call(0x004ad800, {m, fixed_str("viper-host"), rq}, 8);
+                     call(0x004ad7d0, {m, rq}, 0);
+                 }),
+                 "UDPSocket async slots", "slot 3: both alike");
+    }
+
+    // ---- LineSocket::enqueue: an empty packet; a long one ------------------------------------------------------------
+    {
+        bool hung = false;
+        {
+            dt_begin(ORIG);
+            const uint32_t s = line_socket_by_hand(), p = pkt_bytes(0x10, 0x11);
+            call(A_LineSocket_enqueue, {s, p, 0}, 0);
+            call(A_LineSocket_enqueue, {s, p, 5}, 0);
+            hung = raw_hangs(A_LineSocket_enqueue, true, {s, p, 5}, 300);
+        }
+        dt_begin(ISOLATED);
+        const uint32_t s = line_socket_by_hand(), p = pkt_bytes(0x10, 0x11);
+        call(A_LineSocket_enqueue, {s, p, 0}, 0);
+        call(A_LineSocket_enqueue, {s, p, 5}, 0);
+        call(A_LineSocket_enqueue, {s, p, 5}, 0);
+        const uint32_t h = U(s + 0x770), h2 = h ? U(h + 0xe8) : 0;
+        dt_check(hung && !faulted() && h && h2 && h2 != h && !U(h2 + 0xe8) && U(h + 0xe4) == 5 && U(h2 + 0xe4) == 5, "LineSocket::enqueue",
+                 "an empty packet to itself, then two more: the original linked a slot to itself and the third enqueue never "
+                 "ended; the rewrite drops the empty one");
+        uint8_t over[2];
+        uint32_t head[2];
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            const uint32_t s2 = line_socket_by_hand(), p2 = pkt_bytes(0x100, 0xa7);
+            call(A_LineSocket_enqueue, {s2, p2, 0x100}, 0);
+            over[pass] = *(uint8_t*)(uintptr_t)(s2 + 0xc + 0xec);                     // the second slot's first byte
+            head[pass] = U(s2 + 0x770);
+        }
+        dt_check(over[0] == 0xa7 && over[1] == 0 && head[1] == 0, "LineSocket::enqueue",
+                 "0x100 bytes: the original wrote into the next slot; the rewrite drops it");
+        dt_check(dt_alike([] {
+                     const uint32_t s3 = line_socket_by_hand();
+                     call(A_LineSocket_enqueue, {s3, pkt_bytes(0xe4, 0x22), 0xe4}, 0);
+                     call(A_LineSocket_enqueue, {s3, pkt_bytes(1, 0x23), 1}, 0);
+                     const uint32_t buf = fixed_bytes(0x100, 0), n = fixed_alloc(4);
+                     U(n) = 0xe4;
+                     call(A_LineSocket_dequeue, {s3, buf, n}, 8);
+                     U(n) = 1;
+                     call(A_LineSocket_dequeue, {s3, buf, n}, 8);
+                 }),
+                 "LineSocket::enqueue/dequeue", "0xe4 and 1 bytes, buffers that fit: both alike");
+        // dequeue: a packet longer than the caller's buffer
+        bool beyond[2];
+        uint32_t ret[2], head2[2], len0[2];
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            const uint32_t s4 = line_socket_by_hand();
+            call(A_LineSocket_enqueue, {s4, pkt_bytes(0x80, 0x5c), 0x80}, 0);
+            const uint32_t buf = fixed_bytes(0x100, 0), n = fixed_alloc(4);
+            U(n) = 0x10;
+            ret[pass] = call(A_LineSocket_dequeue, {s4, buf, n}, 8);
+            beyond[pass] = *(uint8_t*)(uintptr_t)(buf + 0x7f) == 0x5c;
+            head2[pass] = U(s4 + 0x770);
+            len0[pass] = U(s4 + 0xc + 0xe4);
+        }
+        dt_check(beyond[0] && !beyond[1] && ret[1] == 0 && head2[1] == 0 && len0[1] == 0, "LineSocket::dequeue",
+                 "0x80 bytes into a 0x10-byte buffer: the original wrote 0x70 past it; the rewrite drops the packet");
+    }
+
+    // ---- LineDevice::Send: a packet past the send block ---------------------------------------------------------------
+    {
+        uint32_t next_handle[2];
+        bool wrote[2];
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            for (int i = 0; i < 16; i++) U(S_BLOCKS + 0xfcu * (uint32_t)i) = 0xffffffffu;
+            g_w.port[0].exists = true;
+            g_w.handle_port[0] = 1;
+            g_w.nhandles = 1;
+            const uint32_t d = fixed_bytes(0x10, 0);
+            U(d) = VT_DirectLine;
+            U(d + 4) = 2;
+            U(d + 8) = 0x5000;
+            call(A_LineDevice_Send, {d, pkt_bytes(0x200, 0xa7), 0x200}, 0);
+            next_handle[pass] = U(S_BLOCKS + 0xfc);
+            wrote[pass] = has_line("WriteFile");
+        }
+        dt_check(next_handle[0] == 0xa7a7a7a7u && wrote[0] && next_handle[1] == 0xffffffffu && !wrote[1], "LineDevice::Send",
+                 "0x200 bytes: the original copied them over the next send block; the rewrite drops the packet");
+        dt_check(dt_alike([] {
+                     for (int i = 0; i < 16; i++) U(S_BLOCKS + 0xfcu * (uint32_t)i) = 0xffffffffu;
+                     g_w.port[0].exists = true;
+                     g_w.handle_port[0] = 1;
+                     g_w.nhandles = 1;
+                     const uint32_t d = fixed_bytes(0x10, 0);
+                     U(d) = VT_DirectLine;
+                     U(d + 4) = 2;
+                     U(d + 8) = 0x5000;
+                     call(A_LineDevice_Send, {d, pkt_bytes(0xe4, 0xa7), 0xe4}, 0);
+                 }),
+                 "LineDevice::Send", "0xe4 bytes: both alike");
+    }
+
+    // ---- LinePacketizer::Recv: a header read short ---------------------------------------------------------------------
+    {
+        int st[2], len[2];
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            const uint32_t pk = fixed_bytes(0x14, 0);
+            U(pk) = fake_device();
+            *(int8_t*)(uintptr_t)(pk + 4) = 1;                                       // a header next
+            g_fd_avail = 3;
+            g_fd_give = 1;
+            g_fd_bytes[0] = 5; g_fd_bytes[1] = 0x12; g_fd_bytes[2] = 0x34;
+            const uint32_t buf = fixed_bytes(0x100, 0), n = fixed_alloc(4);
+            U(n) = 0x100;
+            call(A_LinePacketizer_Recv, {pk, buf, n}, 8);
+            st[pass] = *(int8_t*)(uintptr_t)(pk + 4);
+            len[pass] = (int)U(pk + 0xc);
+        }
+        dt_check(st[0] == 2 && len[0] == 5 && st[1] == 0, "LinePacketizer::Recv",
+                 "a 3-byte header read as 1: the original went on to a 5-byte body with its CRC from the stack; the rewrite "
+                 "goes back to sync");
+        dt_check(dt_alike([] {
+                     const uint32_t pk = fixed_bytes(0x14, 0);
+                     U(pk) = fake_device();
+                     *(int8_t*)(uintptr_t)(pk + 4) = 1;
+                     g_fd_avail = 3;
+                     g_fd_give = 3;
+                     g_fd_bytes[0] = 5; g_fd_bytes[1] = 0x12; g_fd_bytes[2] = 0x34;
+                     const uint32_t buf = fixed_bytes(0x100, 0), n = fixed_alloc(4);
+                     U(n) = 0x100;
+                     call(A_LinePacketizer_Recv, {pk, buf, n}, 8);
+                 }),
+                 "LinePacketizer::Recv", "the whole header: both alike");
+    }
+
+    // ---- LineChecker::Tick: a full read without a NUL -----------------------------------------------------------------
+    {
+        bool no_nul = false;
+        int extra = -1, got = -1;
+        uint32_t peer = 1;
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            const uint32_t lc = fixed_bytes(0x28, 0);
+            U(lc) = fake_device();
+            U(lc + 8) = (uint32_t)g_w.clock;                                          // start: the check has 7 s
+            U(lc + 0x1c) = 5;
+            g_fd_give = 0x40;
+            g_fd_bytes[0] = '(';
+            memset(g_fd_bytes + 1, '9', 0x3f);                                       // "(999...": no ')', no NUL
+            call(0x004aea10, {lc}, 0);
+            if (!pass) no_nul = g_fd_full_no_nul;
+            else extra = (int)U(lc + 0xc), got = (int)U(lc + 0x10), peer = U(lc + 0x20);
+        }
+        dt_check(no_nul && extra == 1 && got == 0 && peer == 0 && g_fix_hits, "LineChecker::Tick",
+                 "a 0x40-byte reply with no NUL: the original's strchr / strtoul ran on past the buffer; the rewrite stops at "
+                 "its end (no ')': a bad reply)");
+        dt_check(dt_alike([] {
+                     const uint32_t lc = fixed_bytes(0x28, 0);
+                     U(lc) = fake_device();
+                     U(lc + 8) = (uint32_t)g_w.clock;
+                     U(lc + 0x1c) = 5;
+                     g_fd_give = 0x40;
+                     memset(g_fd_bytes, 0, 0x40);
+                     strcpy((char*)g_fd_bytes, "(77)");
+                     call(0x004aea10, {lc}, 0);
+                 }),
+                 "LineChecker::Tick", "a reply with its NUL: both alike");
+    }
+
+    // ---- the TAPI driver's offsets and sizes -------------------------------------------------------------------------
+    {
+        bool fault[2];
+        uint32_t ret[2];
+        for (int pass = 0; pass < 2; pass++) {                                    // set_from_bytestream
+            dt_begin(pass ? ISOLATED : ORIG);
+            g_dt_ok = true;
+            g_dt_vs_off = 0x7ff00000;
+            g_dt_vs_size = 0x10;
+            ret[pass] = call(A_set_from_bytestream, {1}, 8);
+            fault[pass] = faulted();
+            dt_knobs_off();
+        }
+        dt_check(fault[0] && !fault[1] && ret[1] == 1, "set_from_bytestream",
+                 "the configuration read back at offset 0x7ff00000: the original compared there (a fault); the rewrite skips it");
+        uint32_t handle1 = 0;
+        for (int pass = 0; pass < 2; pass++) {                                    // TAPILine::get_handle
+            dt_begin(pass ? ISOLATED : ORIG);
+            g_dt_ok = true;
+            g_dt_vs_off = 0x7ff00000;
+            const uint32_t t = fixed_bytes(0x40, 0);
+            U(t) = VT_TAPILine;
+            U(t + 8) = 0xffffffffu;
+            U(t + 0xc) = 0x9100;
+            ret[pass] = call(A_TAPILine_get_handle, {t}, 8);
+            fault[pass] = faulted();
+            if (pass) handle1 = U(t + 8);
+            dt_knobs_off();
+        }
+        dt_check(fault[0] && !fault[1] && ret[1] == 0 && handle1 == 0xffffffffu, "TAPILine::get_handle",
+                 "the handle at offset 0x7ff00000: the original read it there (a fault); the rewrite has no handle");
+        bool closed[2];
+        for (int pass = 0; pass < 2; pass++) {                                    // get_tapiline_port
+            dt_begin(pass ? ISOLATED : ORIG);
+            g_dt_ok = true;
+            const uint32_t caps = fixed_bytes(0x400, 0);
+            U(caps + 0xe4) = 0x40;
+            U(caps + 0xe8) = 0x7ff00000;
+            ret[pass] = call(A_get_tapiline_port, {caps});
+            fault[pass] = faulted();
+            g_fault = false;
+            U(caps + 0xe8) = 0x280;                                                // and a good one: its key closed
+            U(caps + 0x280) = 1;
+            U(caps + 0x284) = 8;
+            strcpy((char*)(uintptr_t)(caps + 0x288), "System\\Modem\\0000");
+            call(A_get_tapiline_port, {caps});
+            closed[pass] = has_line("RegCloseKey(modem key)");
+            dt_knobs_off();
+        }
+        dt_check(fault[0] && !fault[1] && ret[1] == 0 && !closed[0] && closed[1], "get_tapiline_port",
+                 "the device-specific part at 0x7ff00000: the original read it there (a fault); the rewrite gives 0. A good "
+                 "one: the original left its key open, the rewrite closes it");
+    }
+
+    // ---- lds_str / LineStatusText outside 0..11 ------------------------------------------------------------------------
+    {
+        uint32_t r[2][2];
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            r[pass][0] = call(A_lds_str, {12});
+            r[pass][1] = call(0x004a1bc0, {0xffffffffu});
+        }
+        dt_check(r[0][0] != 0x004fb0c0 && r[1][0] == 0x004fb0c0 && r[0][1] != 0x004fb438 && r[1][1] == 0x004fb438,
+                 "lds_str / LineStatusText", "12 and -1: the originals read past their tables; the rewrites give entry 0");
+        dt_check(dt_alike([] {
+                     call(A_lds_str, {11});
+                     call(0x004a1bc0, {11});
+                     call(0x004a1bc0, {0});
+                 }),
+                 "lds_str / LineStatusText", "11 and 0: both alike");
+    }
+
+    // ---- enum_devices: a flag past its two lists ----------------------------------------------------------------------
+    {
+        bool fault[2];
+        uint32_t ret1 = 1;
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            const uint32_t r = call(A_enum_devices, {fixed_bytes(0x50 * 8, 0), 8, 8});
+            fault[pass] = faulted();
+            if (pass) ret1 = r;
+        }
+        dt_check(fault[0] && !fault[1] && ret1 == 0, "enum_devices",
+                 "flags 8: the original called its own argument as a function (a fault); the rewrite lists nothing");
+        dt_check(dt_alike([] {
+                     for (int i = 0; i < 4; i++) g_w.port[i].exists = true;
+                     call(A_enum_devices, {fixed_bytes(0x50 * 8, 0), 8, 3});
+                 }),
+                 "enum_devices", "flags 3: both alike");
+    }
+
+    // ---- COM4's "a modem's port" flag ---------------------------------------------------------------------------------
+    {
+        uint32_t count[2];
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            for (int i = 0; i < 4; i++) g_w.port[i].exists = true;
+            *(uint8_t*)(uintptr_t)(S_PORT_TAPI + 4) = 1;                            // a modem on COM4, listed before
+            const uint32_t info = fixed_bytes(0x50 * 8, 0), n = fixed_alloc(4);
+            U(n) = 0;
+            call(A_enumerate_tapi_devices, {info, 8, n}, 0);                        // (no TAPI devices: only the flags cleared)
+            call(A_enumerate_comport_devices, {info, 8, n}, 0);
+            count[pass] = U(n);
+        }
+        dt_check(count[0] == 3 && count[1] == 4, "enumerate_tapi_devices",
+                 "COM4's flag left from an earlier listing: the original never offered COM4 again; the rewrite clears it");
+    }
+
+    // ---- LineEnd: a write still pending -------------------------------------------------------------------------------
+    {
+        bool closed[2];
+        for (int pass = 0; pass < 2; pass++) {
+            dt_begin(pass ? ISOLATED : ORIG);
+            for (int i = 0; i < 16; i++) {
+                U(S_BLOCKS + 0xfcu * (uint32_t)i) = 0xffffffffu;
+                U(S_BLOCKS + 0xfcu * (uint32_t)i + 0xf8) = 0x6000u + (uint32_t)i;
+            }
+            U(S_BLOCKS) = 0x5000;                                                    // block 0 still writing to the port
+            g_dt_wait = 0x102 + 1;
+            call(0x004a1600, {}, 0);                                                 // LineEnd
+            closed[pass] = has_line("CloseHandle 5000");
+            dt_knobs_off();
+        }
+        dt_check(closed[0] && !closed[1], "LineEnd",
+                 "a block still writing: the original closed the port handle it names (the device's); the rewrite doesn't");
+        dt_check(dt_alike([] {
+                     for (int i = 0; i < 16; i++) {
+                         U(S_BLOCKS + 0xfcu * (uint32_t)i) = 0xffffffffu;
+                         U(S_BLOCKS + 0xfcu * (uint32_t)i + 0xf8) = 0x6000u + (uint32_t)i;
+                     }
+                     call(0x004a1600, {}, 0);
+                 }),
+                 "LineEnd", "no block writing: both alike");
+    }
+    printf("directed fix tests: %d checks, %d failed\n", g_dt_n, g_dt_bad);
+    return g_dt_bad;
+}
+#endif
 
 int main(int argc, char** argv) {
     setvbuf(stdout, 0, _IONBF, 0);
@@ -1590,15 +2253,17 @@ int main(int argc, char** argv) {
             if (of) {
                 faults++;
                 for (const std::string& l : o.log)
-                    if (l.rfind("FAULT", 0) == 0) printf("  (kind %d seed %u: %s, in every pass)\n", kind, seed, l.c_str());
+                    if (l.rfind("FAULT", 0) == 0)
+                        printf("  (kind %d seed %u: %s, %s)\n", kind, seed, l.c_str(),
+                               NET_FIXES ? "in the originals' pass" : "in every pass");
             }
             for (const std::string& l : o.log)
                 for (int e = 0; e < N_EVENTS; e++)
                     if (l.find(k_events[e].text) != std::string::npos) g_event_count[e]++;
             if (getenv("WNL_DUMP") && atoi(getenv("WNL_DUMP")) == (int)seed)
                 for (const std::string& l : o.log) printf("    | %s\n", l.c_str());
-            int f = compare("isolated", o, iso, kind, seed);
-            f |= compare("chain", o, ch, kind, seed);
+            int f = NET_FIXES ? compare_fixed("isolated", o, iso, kind, seed) : compare("isolated", o, iso, kind, seed);
+            f |= NET_FIXES ? compare_fixed("chain", o, ch, kind, seed) : compare("chain", o, ch, kind, seed);
             if (f) {
                 kf++;
                 if (kf > 3) break;
@@ -1623,7 +2288,15 @@ int main(int argc, char** argv) {
     printf("\n");
     printf("footprints: %d checked calls, %d writes outside a footprint\n", g_fp_checked, g_fp_violations);
     for (const std::string& m : g_fp_msgs) printf("  %s\n", m.c_str());
-    printf("%lld calls, %lld scenarios ended by a fault (in every pass alike); %s\n", calls, faults,
-           fails || g_fp_violations ? "FAILED" : "ALL IDENTICAL");
-    return fails || g_fp_violations ? 1 : 0;
+    int fix_bad = 0;
+#if NET_FIXES
+    printf("fix build: rewrite passes a fix changed (alike up to it, clean after):");
+    for (size_t i = 0; i < g_fixc.size(); i++) printf("%s %s %d", i ? ";" : "", g_fixc[i].what.c_str(), g_fixc[i].n);
+    printf("%s\n", g_fixc.empty() ? " none" : "");
+    fix_bad = directed_fix_tests();
+#endif
+    printf("%lld calls, %lld scenarios ended by a fault (%s); %s\n", calls, faults,
+           NET_FIXES ? "the originals' pass" : "in every pass alike",
+           fails || g_fp_violations || fix_bad ? "FAILED" : NET_FIXES ? "ALL IDENTICAL OR FIXED" : "ALL IDENTICAL");
+    return fails || g_fp_violations || fix_bad ? 1 : 0;
 }

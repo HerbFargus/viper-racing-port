@@ -34,7 +34,10 @@
 // callbacks write the tab; LineControl::Callback shows and hides the running window's groups; NetBrowser::Draw writes the
 // canvas it's given; GetDevice, ~LineControl and MultiGenesisInfo's constructor their object.
 //
-// FIX CANDIDATEs (left faithful): see each `// FIX CANDIDATE:`.
+// Fixes (// FIX:, docs/FIXES.md "Multiplayer menus"; VP_FIX, off in the faithful harness build): texts held to their
+// buffers (MyDoInputBoxN's copies, find_host's title, NetBrowser::Update's lines, the line tabs' titles and messages, the
+// version text), the line check's verdicts no longer used as a printf format when they'd read an argument, CreateSocket's
+// protocol and the LAN list's selection checked. The FIX CANDIDATE left: line_check's stale checker pointer (nothing reads it).
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -76,6 +79,49 @@ static __forceinline void dialog(void* p, uint32_t title, uint32_t back, uint32_
     d[0] = title; d[1] = back; d[2] = def; d[3] = items; d[4] = idle;
 }
 
+// ---- the fixes' helpers (docs/PORTING.md, "Fixes"; each use is marked // FIX:) --------------------------------------------
+// A text overrunning its buffer is caught by predicting what the game's sprintf prints: such a text is formatted in a buffer
+// of the rewrite's (each %s argument cut to 255 characters, so nothing passes it) and what fits is kept; every other text is
+// formatted where the original formats it, so it's the original's bytes and calls.
+// a string's length, counted up to 0x400 (anything that long overruns every buffer here)
+static __forceinline uint32_t fx_len(const char* s) { return ui_strnlen(s, 0x400); }
+// the characters the game's %d prints for v (a '-' and the digits)
+static __forceinline uint32_t fx_dec(int32_t v) {
+    uint32_t n = v < 0 ? 2u : 1u;
+    uint32_t u = v < 0 ? 0u - (uint32_t)v : (uint32_t)v;
+    while (u >= 10) { u /= 10; n++; }
+    return n;
+}
+// s, or (in buf, max + 1 bytes) its first max characters when it's longer
+static __forceinline const char* fx_cut(const char* s, char* buf, uint32_t max) {
+    if (ui_strnlen(s, max) <= max) return s;
+    ui_copy_bounded(buf, s, max + 1);
+    return buf;
+}
+// whether the game's printf (output.obj, 0x4d22b0), given s as its format, would read an argument: its state machine run
+// over s from its own class table (.rdata 0x4e0200), as hook/menu_board.cpp's fix_format_reads_args does -- a '*' taken as
+// a width or precision (states 3, 5), or reaching a conversion (state 7); 'I' in the size state skips a following "64"
+static bool fx_format_reads_args(const char* s) {
+    enum : uint32_t { T = 0x004e0200 };
+    uint32_t state = 0;
+    for (const volatile char* p = s; *p; p++) {
+        const int32_t c = (int8_t)*p;
+        const uint32_t cls = c < 0x20 || c > 0x78 ? 0u : (uint32_t)(UI_G8(T + (uint32_t)(c - 0x20)) & 0xf);
+        state = (uint32_t)(UI_G8(T + cls * 8 + state) >> 4) & 7u;
+        if ((state == 3 || state == 5) && c == '*') return true;
+        if (state == 7) return true;
+        if (state == 6 && c == 'I') {
+            if (p[1] == '6' && p[2] == '4') p += 2;
+            else state = 0;
+        }
+    }
+    return false;
+}
+// the games the protocol's manager lists (SessionMgr +0x24: the count Update lists): is `sel` one of them?
+static __forceinline bool fx_sel_listed(const void* mgr, int32_t sel) {
+    return sel >= 0 && sel < *(const volatile int32_t*)((const uint8_t*)mgr + 0x24);
+}
+
 template <typename T> static void fp_dialog0(Footprint& f, T*, Edx) { f.replay_only = "runs a dialog (modal)"; }
 template <typename T> static void fp_items0(Footprint& f, T*, Edx) { f.replay_only = "builds widgets (_UIAddItems allocates)"; }
 template <typename T> static void fp_notes0(Footprint& f, T*, Edx) { f.replay_only = "adds or removes notifications (allocates or frees their copies)"; }
@@ -89,15 +135,27 @@ static void fp_static_line(Footprint& f) { f.replay_only = "polls the line devic
 // the boxes: MyDoInputBoxN, MyDoCancelBox, cb_idle_func
 // =====================================================================================================================
 // two labelled text fields (their sizes capped at 32 characters' width), Ok (-2) and Cancel; on Ok both copied back
-// FIX CANDIDATE: bufs[0] / bufs[1] are copied into 0x100-byte locals unbounded (the callers' are 0x20 and 0x10)
+// FIX: bufs[0] / bufs[1] were copied into 0x100-byte locals unbounded, and back unbounded (the callers' are 0x20 and 0x10).
+// A caller's text that doesn't end inside 255 characters overran the frame; it's cut to 255. On Ok each is copied back held
+// to its size (sizes[i] bytes, when that's 1..0x100). The fields take at most sizes[i] - 1 characters, so a text that
+// fitted to begin with comes back exactly as before.
+static __forceinline void fx_copy_back(char* dst, const char* src, int32_t size) {
+    if (VP_FIX) ui_copy_bounded(dst, src, size >= 1 && size <= 0x100 ? (uint32_t)size : 0x100u);
+    else crt_strcpy(dst, src);
+}
 static uint8_t __cdecl MyDoInputBoxN_n(const char* title, const char* const* labels, char** bufs, int32_t* sizes, int32_t) {
     Fr<0x39c> fr;
     once_xl(0x0057a43c, 1, 0x0057a3d8, 0x004f8bc8, 0x0048cde0);
     once_xl(0x0057a43c, 2, 0x0057a510, 0x004f8bd0, 0x0048cdd0);
     char* const b0 = (char*)fr.t(0x19c);
     char* const b1 = (char*)fr.t(0x29c);
-    crt_strcpy(b0, ((char* const volatile*)bufs)[0]);
-    crt_strcpy(b1, ((char* const volatile*)bufs)[1]);
+    if (VP_FIX) {                                                     // FIX: (above) cut to the locals' 0x100 bytes
+        ui_copy_bounded(b0, ((char* const volatile*)bufs)[0], 0x100);
+        ui_copy_bounded(b1, ((char* const volatile*)bufs)[1], 0x100);
+    } else {
+        crt_strcpy(b0, ((char* const volatile*)bufs)[0]);
+        crt_strcpy(b1, ((char* const volatile*)bufs)[1]);
+    }
     {
         const uint32_t l0 = U(((const char* const volatile*)labels)[0]);
         RAW(0x14, 5, 0, 0xa0, 0x28, 0, 0, l0, 0, 0, 0xe, 0, 0, 0, 0);
@@ -116,8 +174,8 @@ static uint8_t __cdecl MyDoInputBoxN_n(const char* title, const char* const* lab
     item_end(fr.t(0x164));
     dialog(fr.t(0), U(title), 0x004f8bdc, 0, U(fr.t(0x14)), 0);
     if (ccall<int32_t>(F_UIDoDialog, fr.t(0), (int32_t)0x140, (int32_t)0xc8, (int32_t)-999, (int32_t)-999, (int32_t)1) != -2) return 0;
-    crt_strcpy(((char* const volatile*)bufs)[0], b0);
-    crt_strcpy(((char* const volatile*)bufs)[1], b1);
+    fx_copy_back(((char* const volatile*)bufs)[0], b0, ((const volatile int32_t*)sizes)[0]);   // FIX: (above) held to the sizes
+    fx_copy_back(((char* const volatile*)bufs)[1], b1, ((const volatile int32_t*)sizes)[1]);
     return 1;
 }
 static void fp_MyDoInputBoxN(Footprint& f, const char*, const char* const*, char**, int32_t*, int32_t) { f.replay_only = "runs a dialog (modal)"; }
@@ -214,7 +272,9 @@ static uint8_t __fastcall async_find_host_n(NetBrowser* self, Edx) {
 PORT_FN(0x0048cf50, "NetBrowser::async_find_host", async_find_host_n, fp_net0)
 
 // the lookup, in a cancel box titled "Finding host (port)"
-// FIX CANDIDATE: the title is sprintf'd into 0x40 bytes: the translation, the host (up to 31) and the port, unbounded
+// FIX: the title ("%s %s (%d)" / "%s %s": the translation, the host -- up to 31 -- and the port) was sprintf'd into 0x40
+// bytes unbounded, so a translation of about 20 characters or more ran over the frame; such a title keeps its first 63
+// characters (fx_len above)
 static uint8_t __fastcall find_host_n(NetBrowser* self, Edx, const char* host, int16_t port) {
     Fr<0x40> fr;
     char* const buf = (char*)fr.t(0);
@@ -223,10 +283,25 @@ static uint8_t __fastcall find_host_n(NetBrowser* self, Edx, const char* host, i
     once_xl(0x0057a488, 1, 0x0057a490, 0x004f8c40, 0x0048d2b0);
     if (port != 0x7d1) {
         xl(0x0057a490);
-        UI_sprintf(buf, (const char*)0x004f8c58, UI_GP(const char, 0x0057a494), host, (uint32_t)(uint16_t)port);
+        const char* s = UI_GP(const char, 0x0057a494);
+        const uint32_t p = (uint32_t)(uint16_t)port;
+        if (VP_FIX && fx_len(s) + 1 + fx_len(host) + 2 + fx_dec((int32_t)p) + 1 > 0x3f) {
+            char t[0x400], c1[0x100], c2[0x100];
+            UI_sprintf(t, (const char*)0x004f8c58, fx_cut(s, c1, 0xff), fx_cut(host, c2, 0xff), p);
+            ui_copy_bounded(buf, t, 0x40);
+        } else {
+            UI_sprintf(buf, (const char*)0x004f8c58, s, host, p);
+        }
     } else {
         xl(0x0057a490);
-        UI_sprintf(buf, (const char*)0x004f8c64, UI_GP(const char, 0x0057a494), host);
+        const char* s = UI_GP(const char, 0x0057a494);
+        if (VP_FIX && fx_len(s) + 1 + fx_len(host) > 0x3f) {            // FIX: (above)
+            char t[0x400], c1[0x100], c2[0x100];
+            UI_sprintf(t, (const char*)0x004f8c64, fx_cut(s, c1, 0xff), fx_cut(host, c2, 0xff));
+            ui_copy_bounded(buf, t, 0x40);
+        } else {
+            UI_sprintf(buf, (const char*)0x004f8c64, s, host);
+        }
     }
     if (*(const volatile char*)host) {
         tcall<void>(F_SessionMgr_AsyncServiceRequestByHostname, self->mgr[0], host, port, (uint32_t)0x1001, (void*)self->block);
@@ -267,8 +342,10 @@ static void fp_NetBrowser_ctor(Footprint& f, NetBrowser*, Edx) { f.replay_only =
 PORT_FN(0x0048d2c0, "NetBrowser::NetBrowser", NetBrowser_ctor_n, fp_NetBrowser_ctor)
 
 // the protocol's socket: SocketCreateUDP / SocketCreateIPX (the table at 0x4f8b20) on port 2001
-// FIX CANDIDATE: a protocol outside 0..1 indexes past the two-entry table (NetBrowser's constructor clamps the option)
+// FIX: a protocol outside 0..1 indexed past the two-entry table and called what follows it; it makes no socket (0, as for
+// a protocol that isn't there). NetBrowser's constructor clamps the option and the radio buttons set only 0 or 1.
 static void* __cdecl CreateSocket_n(int32_t proto) {
+    if (VP_FIX && (uint32_t)proto > 1u) return 0;
     return ((void*(__cdecl*)(int32_t))(uintptr_t)UI_GU32(S_CREATE_SOCKET + 4u * (uint32_t)proto))(0x7d1);
 }
 static void fp_CreateSocket(Footprint& f, int32_t) { f.replay_only = "makes a socket"; }
@@ -321,8 +398,10 @@ PORT_FN(0x0048d440, "NetBrowser::Tick", NetBrowser_Tick_n, fp_net0)
 
 // each frame: the managers ticked; every 4.5 s a broadcast for games (both protocols); then the active protocol's games
 // listed ("name  latency", or "name  NewerVersion / OlderVersion"), Connect shown while there are any
-// FIX CANDIDATE: each line is sprintf'd into 0x40 bytes: "%-*s" pads the name to 32 but doesn't cut it, and a service's
-// name (32 bytes off the wire) needn't end inside its 32 bytes; the translation after it is unbounded too
+// FIX: each line is sprintf'd into 0x40 bytes: "%-*s" pads the name to 32 but doesn't cut it, and a service's name (32
+// bytes off the wire) needn't end inside its 32 bytes; the translation after it was unbounded too. A line that would pass
+// 63 characters is made with the name cut to its 32 bytes, and keeps its first 63 characters (fx_len above). Every other
+// line is as before (a name running a few bytes past its field into the record shows them, as it always did).
 static void __fastcall NetBrowser_Update_n(NetBrowser* self, Edx) {
     Fr<0x40> fr;
     char* const buf = (char*)fr.t(0);
@@ -350,13 +429,28 @@ static void __fastcall NetBrowser_Update_n(NetBrowser* self, Edx) {
     int32_t k = n;
     do {
         const int32_t v = *(const volatile int32_t*)(rs + 0x24);
+        // FIX: (above) the name's printed width: at least 32
+        const uint32_t nw = VP_FIX ? (fx_len((const char*)rs) > 0x20 ? fx_len((const char*)rs) : 0x20u) : 0;
         if (mine == v) {
-            UI_sprintf(buf, (const char*)0x004f8cf8, (int32_t)0x20, (const char*)rs, *(const volatile int32_t*)(rs + 0x40));
+            const int32_t lat = *(const volatile int32_t*)(rs + 0x40);
+            if (VP_FIX && nw + 1 + fx_dec(lat) > 0x3f) {
+                char t[0x400], c1[0x21];
+                UI_sprintf(t, (const char*)0x004f8cf8, (int32_t)0x20, fx_cut((const char*)rs, c1, 0x20), lat);
+                ui_copy_bounded(buf, t, 0x40);
+            } else {
+                UI_sprintf(buf, (const char*)0x004f8cf8, (int32_t)0x20, (const char*)rs, lat);
+            }
         } else {
             const char* s;
             if (mine > v) { xl(0x0057a4f0); s = UI_GP(const char, 0x0057a4f4); }
             else { xl(0x0057a478); s = UI_GP(const char, 0x0057a47c); }
-            UI_sprintf(buf, (const char*)0x004f8cf0, (int32_t)0x20, (const char*)rs, s);
+            if (VP_FIX && nw + 1 + fx_len(s) > 0x3f) {
+                char t[0x400], c1[0x21], c2[0x100];
+                UI_sprintf(t, (const char*)0x004f8cf0, (int32_t)0x20, fx_cut((const char*)rs, c1, 0x20), fx_cut(s, c2, 0xff));
+                ui_copy_bounded(buf, t, 0x40);
+            } else {
+                UI_sprintf(buf, (const char*)0x004f8cf0, (int32_t)0x20, (const char*)rs, s);
+            }
         }
         rs += 0x54;
         tcall<void>(F_UIStringList_AddEntry, (void*)&self->list, (const char*)buf);
@@ -401,10 +495,15 @@ static void __fastcall NetBrowser_Destroy_n(NetBrowser* self, Edx) {
 PORT_FN(0x0048d700, "NetBrowser::Destroy", NetBrowser_Destroy_n, fp_notes0)
 
 // Connect: the password asked for when the chosen game has one; 1 (go) otherwise
-// FIX CANDIDATE: the list's selection isn't checked against the games found (here and where MenuMultiChooseTransport
-// copies the chosen service): a game that drops out of the list between frames leaves `sel` past the last one (or the
-// list's -1), and a stale or out-of-table entry is read
+// FIX: the list's selection wasn't checked against the games found (here and where MenuMultiChooseTransport copies the
+// chosen service): a game that drops out of the list between frames leaves `sel` past the last one (or the list's -1), and
+// a stale or out-of-table entry was read -- and joined. A selection that isn't one of the games listed now does nothing
+// (Connect stays on the screen). (The manager is there whenever Connect is: reset_active_proto hides it otherwise.)
 static uint8_t __fastcall connect_n(NetBrowser* self, Edx) {
+    if (VP_FIX) {
+        const void* m = self->mgr[self->proto];
+        if (m && !fx_sel_listed(m, self->sel)) return 0;
+    }
     const uint8_t* rs = tcall<const uint8_t*>(F_SessionMgr_GetServiceTable, self->mgr[self->proto]);
     if (!*(const volatile uint8_t*)(rs + (uint32_t)self->sel * 0x54u + 0x2c)) return 1;
     once_xl(0x0057a3f4, 1, 0x0057a5b8, 0x004f8d28, 0x0048d7f0);
@@ -549,8 +648,9 @@ static void fp_LC_GetDevice(Footprint& f, LineControl* self, Edx) { f.add((void*
 PORT_FN(0x0048ddd0, "LineControl::GetDevice", LC_GetDevice_n, fp_LC_GetDevice)
 
 // a cancel box while the two ends ping each other (checking); 1 if the line is up and good (and who is the server known)
-// FIX CANDIDATE: `checker` is left aimed at this frame's LineChecker (only checking / update_check_msg read it, and only
-// from inside the box)
+// FIX CANDIDATE: `checker` is left aimed at this frame's LineChecker. Not fixed: only checking / update_check_msg read it,
+// and only from inside this box (LineControl::Checking is no other box's idle function), so nothing reads it afterwards;
+// clearing it would change only a dead field
 static uint8_t __fastcall LC_line_check_n(LineControl* self, Edx) {
     Fr<0x68> fr;
     uint8_t ok = 0;
@@ -590,13 +690,21 @@ static void __fastcall LC_destroy_device_n(LineControl* self, Edx) {
 }
 PORT_FN(0x0048dee0, "LineControl::destroy_device", LC_destroy_device_n, fp_line0)
 
+// FIX helper: a cancel box's message (place_call's, answer's, line_check's: each 0x40 bytes of its frame) set to a text
+// (the device's status, a translation: LineStatusText), held to its 0x40 bytes -- it was copied unbounded. A text that fits
+// is copied as before.
+static __forceinline void fx_status(char* msg, const char* s) {
+    if (VP_FIX) ui_copy_bounded(msg, s, 0x40);
+    else crt_strcpy(msg, s);
+}
+
 // the idle functions of answer's and place_call's boxes: the device's status shown; once it's connected (or, answering, a
 // call offered and answered) the box closes 2.5 s later
 static uint8_t __fastcall LC_answering_n(LineControl* self, Edx) {
     const int32_t t = self->timer;
     if (t == 0) {
         const int32_t st = vcall<int32_t>(self->device, 0x10);
-        crt_strcpy((char*)self->msg, ccall<const char*>(F_LineStatusText, st));
+        fx_status(self->msg, ccall<const char*>(F_LineStatusText, st));  // FIX: (fx_status)
         if (st == 2) {
             self->timer = wadd(now(), 0x9c4);
             return 0;
@@ -616,7 +724,7 @@ static uint8_t __fastcall LC_connecting_n(LineControl* self, Edx) {
     const int32_t t = self->timer;
     if (t == 0) {
         const int32_t st = vcall<int32_t>(self->device, 0x10);
-        crt_strcpy((char*)self->msg, ccall<const char*>(F_LineStatusText, st));
+        fx_status(self->msg, ccall<const char*>(F_LineStatusText, st));  // FIX: (fx_status)
         if (st >= 1 && (st <= 2 || st == 9)) self->timer = wadd(now(), 0x9c4);
         return 0;
     }
@@ -637,14 +745,24 @@ static void __fastcall LC_update_check_msg_n(LineControl* self, Edx) {
     const char* s;
     if (bad >= 4) { xl(0x0057a3e8); s = UI_GP(const char, 0x0057a3ec); }
     else { xl(0x0057a418); s = UI_GP(const char, 0x0057a41c); }
-    UI_sprintf((char*)self->msg, (const char*)0x004f8e44, s);
+    // FIX: the verdict ("%s", a translation) went into line_check's 0x40-byte message unbounded; a longer one keeps its
+    // first 63 characters
+    if (VP_FIX && fx_len(s) > 0x3f) ui_copy_bounded((char*)self->msg, s, 0x40);
+    else UI_sprintf((char*)self->msg, (const char*)0x004f8e44, s);
 }
 static void fp_LC_update_check_msg(Footprint& f, LineControl*, Edx) { f.replay_only = "writes the cancel box's message (line_check's frame), constructs its Xlators"; }
 PORT_FN(0x0048e070, "LineControl::update_check_msg", LC_update_check_msg_n, fp_LC_update_check_msg)
 
 // line_check's idle function: while connected the checker runs, and when it's done the verdict is shown and the box closes
 // 2.5 s later; a lost connection is shown likewise
-// FIX CANDIDATE: the verdicts are translations sprintf'd as the format itself (a '%' in one reads stray arguments)
+// FIX: the verdicts are translations sprintf'd as the format itself, with nothing else passed, into line_check's 0x40-byte
+// message: a '%' conversion or '*' in one read arguments from the stack (garbage, or a crash for "%s" / "%n"), and a long
+// one ran over the frame. Such a text (one the game's printf would read an argument for, fx_format_reads_args, or one over
+// 63 characters) is shown as written, cut to 63 characters. Every other text is the format as before ("%%" prints '%').
+static __forceinline void fx_verdict(char* msg, const char* s) {
+    if (VP_FIX && (fx_len(s) > 0x3f || fx_format_reads_args(s))) ui_copy_bounded(msg, s, 0x40);
+    else UI_sprintf(msg, s);
+}
 static uint8_t __fastcall LC_checking_n(LineControl* self, Edx) {
     const int32_t t = now();
     const int32_t timer = self->timer;
@@ -658,14 +776,14 @@ static uint8_t __fastcall LC_checking_n(LineControl* self, Edx) {
         const char* s;
         if (tcall<uint8_t>(F_LineChecker_LineOk, self->checker)) { xl(0x0057a4e0); s = UI_GP(const char, 0x0057a4e4); }
         else { xl(0x0057a3a8); s = UI_GP(const char, 0x0057a3ac); }
-        UI_sprintf((char*)self->msg, s);
+        fx_verdict((char*)self->msg, s);                              // FIX: (fx_verdict)
         self->timer = wadd(t, 0x9c4);
         return 0;
     }
     once_xl(0x0057a584, 4, 0x0057a320, 0x004f8ea4, 0x0048e2e0);
     xl(0x0057a320);
     const char* s = UI_GP(const char, 0x0057a324);
-    UI_sprintf((char*)self->msg, s);
+    fx_verdict((char*)self->msg, s);                                  // FIX: (fx_verdict)
     self->timer = wadd(t, 0x9c4);
     return 0;
 }
@@ -673,7 +791,22 @@ PORT_FN(0x0048e150, "LineControl::checking", LC_checking_n, fp_line0)
 
 // Call / Connect: the chosen device made and told to call (the phone number); a cancel box ("Connecting to <number>..." /
 // "Connecting...") with its status until it's connected; the device shut if not. No device: "can't open" and its error
-// FIX CANDIDATE: the title is sprintf'd into 0x40 bytes: a translation and the 32-byte number, unbounded
+// FIX: the title ("%s %s...": a translation and the number, up to 31; "%s...", "%s": a translation) was sprintf'd into 0x40
+// bytes unbounded, and the device's status copied into the message's 0x40 unbounded (fx_status); a longer one keeps its
+// first 63 characters (fx_len above). Every title that fits is formatted as before.
+static void fx_title(char* title, uint32_t fmt, const char* s, const char* phone) {
+    const uint32_t n = fmt == 0x004f8eecu ? fx_len(s) + 1 + fx_len(phone) + 3 : fmt == 0x004f8ef8u ? fx_len(s) + 3 : fx_len(s);
+    if (VP_FIX && n > 0x3f) {
+        char t[0x400], c1[0x100], c2[0x100];
+        if (fmt == 0x004f8eecu) UI_sprintf(t, (const char*)(uintptr_t)fmt, fx_cut(s, c1, 0xff), fx_cut(phone, c2, 0xff));
+        else UI_sprintf(t, (const char*)(uintptr_t)fmt, fx_cut(s, c1, 0xff));
+        ui_copy_bounded(title, t, 0x40);
+    } else if (fmt == 0x004f8eecu) {
+        UI_sprintf(title, (const char*)(uintptr_t)fmt, s, phone);
+    } else {
+        UI_sprintf(title, (const char*)(uintptr_t)fmt, s);
+    }
+}
 static uint8_t __fastcall LC_place_call_n(LineControl* self, Edx) {
     Fr<0x80> fr;
     char* const title = (char*)fr.t(0);
@@ -687,14 +820,14 @@ static uint8_t __fastcall LC_place_call_n(LineControl* self, Edx) {
         once_xl(0x0057a32c, 2, 0x0057a598, 0x004f8ed4, 0x0048e540);
         if (info->flag0) {
             xl(0x0057a520);
-            UI_sprintf(title, (const char*)0x004f8eec, UI_GP(const char, 0x0057a524), (const char*)&self->phone[0]);
+            fx_title(title, 0x004f8eec, UI_GP(const char, 0x0057a524), (const char*)&self->phone[0]);   // FIX: (fx_title)
         } else {
             xl(0x0057a598);
-            UI_sprintf(title, (const char*)0x004f8ef8, UI_GP(const char, 0x0057a59c));
+            fx_title(title, 0x004f8ef8, UI_GP(const char, 0x0057a59c), 0);                             // FIX: (fx_title)
         }
         vcall<void>(self->device, 0x24, (const char*)&self->phone[0]);  // Call
         self->msg = msg;
-        crt_strcpy(msg, ccall<const char*>(F_LineStatusText, vcall<int32_t>(self->device, 0x10)));
+        fx_status(msg, ccall<const char*>(F_LineStatusText, vcall<int32_t>(self->device, 0x10)));   // FIX: (fx_status)
         self->timer = 0;
         if (ccall<int32_t>(F_MyDoCancelBox, (const char*)title, (const char*)msg, F_LC_Connecting) != 1 &&
             vcall<int32_t>(self->device, 0x10) == 2)
@@ -704,7 +837,7 @@ static uint8_t __fastcall LC_place_call_n(LineControl* self, Edx) {
     } else {
         once_xl(0x0057a32c, 4, 0x0057a378, 0x004f8f00, 0x0048e530);
         xl(0x0057a378);
-        UI_sprintf(title, (const char*)0x004f8f20, UI_GP(const char, 0x0057a37c));
+        fx_title(title, 0x004f8f20, UI_GP(const char, 0x0057a37c), 0);                                 // FIX: (fx_title)
         const char* e = tcall<const char*>(F_LineDeviceInfo_GetError, info);
         ccall<void>(F_UIDoOkBox, (const char*)title, e);
     }
@@ -713,6 +846,7 @@ static uint8_t __fastcall LC_place_call_n(LineControl* self, Edx) {
 PORT_FN(0x0048e310, "LineControl::place_call", LC_place_call_n, fp_dialog0)
 
 // Answer: the chosen device made; a cancel box ("Waiting for a call") with its status until it's connected
+// FIX: as place_call's: the title (a translation) and the status went into 0x40 bytes each unbounded; each keeps 63
 static uint8_t __fastcall LC_answer_n(LineControl* self, Edx) {
     Fr<0x80> fr;
     char* const title = (char*)fr.t(0);
@@ -724,11 +858,11 @@ static uint8_t __fastcall LC_answer_n(LineControl* self, Edx) {
     self->device = d;
     if (d) {
         self->msg = msg;
-        crt_strcpy(msg, ccall<const char*>(F_LineStatusText, vcall<int32_t>(d, 0x10)));
+        fx_status(msg, ccall<const char*>(F_LineStatusText, vcall<int32_t>(d, 0x10)));             // FIX: (fx_status)
         self->timer = 0;
         once_xl(0x0057a318, 1, 0x0057a460, 0x004f8f24, 0x0048e720);
         xl(0x0057a460);
-        crt_strcpy(title, UI_GP(const char, 0x0057a464));
+        fx_status(title, UI_GP(const char, 0x0057a464));               // FIX: (fx_status: the title's 0x40 bytes too)
         if (ccall<int32_t>(F_MyDoCancelBox, (const char*)title, (const char*)msg, F_LC_Answering) != 1 &&
             vcall<int32_t>(self->device, 0x10) == 2)
             ok = 1;
@@ -737,7 +871,7 @@ static uint8_t __fastcall LC_answer_n(LineControl* self, Edx) {
     } else {
         once_xl(0x0057a318, 2, 0x0057a5a8, 0x004f8f44, 0x0048e710);
         xl(0x0057a5a8);
-        UI_sprintf(title, (const char*)0x004f8f64, UI_GP(const char, 0x0057a5ac));
+        fx_title(title, 0x004f8f64, UI_GP(const char, 0x0057a5ac), 0);                                 // FIX: (fx_title)
         const char* e = tcall<const char*>(F_LineDeviceInfo_GetError, info);
         ccall<void>(F_UIDoOkBox, (const char*)title, e);
     }
@@ -949,7 +1083,18 @@ static uint8_t __cdecl MenuMultiChooseTransport_n(MultiGenesisInfo* info) {
     once_xl(0x0057a5c4, 0x10, 0x0057a4b0, 0x004f9060, 0x0048f9a0);
     once_xl(0x0057a5c4, 0x20, 0x0057a2e8, 0x004f906c, 0x0048f990);
     xl(0x0057a428);
-    UI_sprintf(version, (const char*)0x004f9074, UI_GP(const char, 0x0057a42c), multi_version());
+    {
+        // FIX: "<Multi:Version> 37" went into 0x40 bytes unbounded, before the line controls in the frame: a translation
+        // over 60 characters keeps the text's first 63 (fx_len above)
+        const char* s = UI_GP(const char, 0x0057a42c);
+        if (VP_FIX && fx_len(s) + 1 + fx_dec((int32_t)multi_version()) > 0x3f) {
+            char t[0x400], c1[0x100];
+            UI_sprintf(t, (const char*)0x004f9074, fx_cut(s, c1, 0xff), multi_version());
+            ui_copy_bounded(version, t, 0x40);
+        } else {
+            UI_sprintf(version, (const char*)0x004f9074, s, multi_version());
+        }
+    }
     IC(0x94, 4, 0x1e, 0x126, 0, 0, 0, 0, 0, F_prev_tab_cb, 0, 0, 0, 0, 0);
     IC(0xcc, 4, 0x1f, 0x128, 0, 0, 0, 0, 0, F_next_tab_cb, 0, 0, 0, 0, 0);
     IC(0x104, 1, 0, 0, 0, 0, 0, 0, 0, S_GRP_LAN, 0, 0, 0, 0, 0);
@@ -989,6 +1134,8 @@ static uint8_t __cdecl MenuMultiChooseTransport_n(MultiGenesisInfo* info) {
                 UI_LogReport((const char*)0x004f9094);
                 r = -1;
             }
+        } else if (VP_FIX && nb->mgr[nb->proto] && !fx_sel_listed(nb->mgr[nb->proto], nb->sel)) {
+            r = -1;                     // FIX: (connect) no game listed is chosen: as if the screen were left (Back)
         } else {
             const uint8_t* rs = tcall<const uint8_t*>(F_SessionMgr_GetServiceTable, nb->mgr[nb->proto]);
             crt_copy(&info->service[0], rs + (uint32_t)nb->sel * 0x54u, 0x54);

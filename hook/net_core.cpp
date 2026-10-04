@@ -29,12 +29,15 @@
 // allocates or frees (the pools), or logs is replay_only -- a session replay of a network game is their in-game check
 // (docs/PORTING.md; test/world_net_core.cpp checks them all offline).
 //
-// FIX CANDIDATEs (left faithful, marked in place): DataModerator::Send copies the packet into a 0xe4-byte record unchecked;
-// HostEntry::init_rpp copies a received packet's length into its 0xe4 bytes unchecked (ReliableDataPort's callers pass at
-// most 0xe2); ReliableDataPort::handle_packet uses get_entry's result unchecked (0 when the host pool is exhausted:
-// RecvAck / HoldIncomingPacket through 0); return_slot(-1) (get_slot found none of the 8) writes the byte before the
-// slots; HostEntry::Tick divides by rtt_n (never 0) and ReliableDataPort::Tick's dead list unlinks a host through the
-// link host_is_down overwrote (a host that times out while another is listed after it: the rest of the list is lost).
+// Fixes (docs/FIXES.md, "Multiplayer"; each marked `// FIX:` in place, `VP_FIX &&`, so the faithful build is the original):
+// DataModerator::Send drops a packet longer than its 0xe4-byte record; HostEntry::init_rpp copies at most 0xe4 bytes;
+// ReliableDataPort::get_entry, with the host pool used up, reuses an idle host's entry for the new one, or finds none (the
+// pool panicked); handle_packet / SendReliable then drop the packet (RecvAck / HoldIncomingPacket / HostEntry::
+// SendReliable ran on 0); return_slot ignores a slot outside 0..7
+// (get_slot's -1: it wrote the byte before the slots); HostEntry::Tick and GetEstRTLatency don't divide by a zero rtt_n;
+// ReliableDataPort::Tick takes a host that went down out of the list by its real successor (host_is_down overwrites its
+// link with the dead list's, so the hosts after it were skipped that tick and then lost for good: a peer dropping out
+// stranded the others' reliable packets).
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
@@ -42,6 +45,11 @@
 #include "x87.h"
 #include "net_core.h"
 #include "net_wsock.h"
+
+// a harness's marker for "a fix changed what happens here" (nothing in the DLL)
+#ifndef VP_FIX_HIT
+#define VP_FIX_HIT(what) ((void)0)
+#endif
 
 namespace {
 namespace net_core {
@@ -169,9 +177,14 @@ static uint8_t __fastcall DataModerator_Ok(DataModerator* self, Edx) { return se
 static void fp_dm_ok(Footprint&, DataModerator*, Edx) {}
 PORT_FN(0x004afca0, "DataModerator::Ok", DataModerator_Ok, fp_dm_ok)
 
-// the record queued: the packet (0xe4 bytes), its length, its address. FIX CANDIDATE: len over 0xe4 overruns the frame.
+// the record queued: the packet (0xe4 bytes), its length, its address. FIX: a length outside 0..0xe4 (the original copied
+// it into the record regardless, overrunning the frame past 0xf4) drops the packet.
 static void __fastcall DataModerator_Send(DataModerator* self, Edx, const void* pkt, int len, const SockAddr* addr) {
     uint8_t rec[0xf4];                                       // bytes len..0xe3 left as the frame had them
+    if (VP_FIX && (uint32_t)len > 0xe4u) {
+        VP_FIX_HIT("DataModerator::Send");
+        return;
+    }
     memcpy(rec, pkt, (size_t)len);
     memcpy(rec + 0xe4, &len, 4);
     memcpy(rec + 0xe8, addr, 12);
@@ -334,27 +347,48 @@ static void fp_rdp_settimeout(Footprint& f, ReliableDataPort* self, Edx, void*, 
 }
 PORT_FN(0x004af210, "ReliableDataPort::SetTimeoutCB", RDP_SetTimeoutCB, fp_rdp_settimeout)
 
+// FIX: no room for another host (get_entry's 0: the node pool exhausted) drops the packet, logged as HostEntry::SendReliable
+// logs a full packet pool (the original sent it through 0)
 static void __fastcall RDP_SendReliable(ReliableDataPort* self, Edx, const void* pkt, int len, const SockAddr* addr,
                                         const RPI* rpi) {
     HostEntry* const h = fn<GetEntry_t>(F_RDP_get_entry)(self, 0, addr, 1);
+    if (VP_FIX && !h) {
+        VP_FIX_HIT("ReliableDataPort::SendReliable");
+        LOG_REPORT((const char*)(uintptr_t)0x004fe7f8);      // "SendReliable: Can't alloc packet"
+        return;
+    }
     fn<HESendRel_t>(F_HE_SendReliable)(h, 0, pkt, len, rpi);
 }
 static void fp_rdp_sendrel(Footprint& f, ReliableDataPort*, Edx, const void*, int, const SockAddr*, const RPI*) { f.replay_only = R_IO; }
 PORT_FN(0x004af230, "ReliableDataPort::SendReliable", RDP_SendReliable, fp_rdp_sendrel)
 
-// FIX CANDIDATE: get_entry gives 0 when the host pool is exhausted; RecvAck / HoldIncomingPacket then run on 0.
+// FIX: get_entry gives 0 when the host pool is exhausted (every address that sends one of these packets takes a host:
+// a busy LAN, or foreign packets to the port, can use them all up); the original ran RecvAck / HoldIncomingPacket on 0.
+// Such a packet is dropped (taken, not handed out).
 static uint8_t __fastcall RDP_handle_packet(ReliableDataPort* self, Edx, uint8_t* pkt, int len, SockAddr* addr) {
     const uint32_t cls = (uint32_t)(uint8_t)((pkt[0] >> 4) & G8(G_CLASS_MASK_HE));
     switch (cls) {
     case 0:
-    case 1:
-        fn<HERecvAck_t>(F_HE_RecvAck)(fn<GetEntry_t>(F_RDP_get_entry)(self, 0, addr, 1), 0, pkt);
+    case 1: {
+        HostEntry* const h = fn<GetEntry_t>(F_RDP_get_entry)(self, 0, addr, 1);
+        if (VP_FIX && !h) {
+            VP_FIX_HIT("ReliableDataPort::handle_packet");
+            return 1;
+        }
+        fn<HERecvAck_t>(F_HE_RecvAck)(h, 0, pkt);
         return 1;
+    }
     case 2:
     case 3:
     case 4:
-    case 5:
-        return fn<HEHold_t>(F_HE_HoldIncomingPacket)(fn<GetEntry_t>(F_RDP_get_entry)(self, 0, addr, 1), 0, pkt, len);
+    case 5: {
+        HostEntry* const h = fn<GetEntry_t>(F_RDP_get_entry)(self, 0, addr, 1);
+        if (VP_FIX && !h) {
+            VP_FIX_HIT("ReliableDataPort::handle_packet");
+            return 1;
+        }
+        return fn<HEHold_t>(F_HE_HoldIncomingPacket)(h, 0, pkt, len);
+    }
     case 6:
         return 0;
     default:
@@ -364,9 +398,35 @@ static uint8_t __fastcall RDP_handle_packet(ReliableDataPort* self, Edx, uint8_t
 static void fp_rdp_handle(Footprint& f, ReliableDataPort*, Edx, uint8_t*, int, SockAddr*) { f.replay_only = R_IO; }
 PORT_FN(0x004af260, "ReliableDataPort::handle_packet", RDP_handle_packet, fp_rdp_handle)
 
+static bool on_list(HostEntry* list, HostEntry* h) {
+    for (; list; list = list->next)
+        if (list == h) return true;
+    return false;
+}
+// FIX: a host that goes down in its Tick (host_is_down) has its link overwritten with the dead list's. The original then
+// walked on along the dead list (the hosts after it went unticked) and, below, unlinked it through that link: every host
+// listed after it was lost (never ticked again, its packets never resent or acked, its slot and pool entry kept). The
+// fixed loop keeps each host's successor before its Tick and takes a host that went down out of the list at once; the
+// dead loop then finds it gone and only destroys and frees it. With the host that went down last in the list (or the only
+// one) both end the same.
 static void __fastcall RDP_Tick(ReliableDataPort* self, Edx) {
     fn<This_t>(F_DataPort_Tick)(self, 0);
-    for (HostEntry* h = self->hosts; h; h = h->next) fn<This_t>(F_HE_Tick)(h, 0);
+    if (VP_FIX) {
+        HostEntry** pp = &self->hosts;
+        for (HostEntry* h = *pp; h;) {
+            HostEntry* const nx = h->next;
+            fn<This_t>(F_HE_Tick)(h, 0);
+            if (on_list(self->dead, h)) {
+                if (h->next != nx) VP_FIX_HIT("ReliableDataPort::Tick");
+                *pp = nx;
+            } else {
+                pp = &h->next;
+            }
+            h = nx;
+        }
+    } else {
+        for (HostEntry* h = self->hosts; h; h = h->next) fn<This_t>(F_HE_Tick)(h, 0);
+    }
     HostEntry* d = self->dead;
     while (d) {
         HostEntry* const nx = d->next;
@@ -406,6 +466,26 @@ static void fp_rdp_pending(Footprint&, ReliableDataPort*, Edx) {}
 PORT_FN(0x004af3c0, "ReliableDataPort::PacketsPending", RDP_PacketsPending, fp_rdp_pending)
 
 typedef uint8_t(__cdecl* AddrCmp_t)(const void*, const void*);
+// FIX: a new host when the node pool is used up (2 x the channels, at least 8: every address that ever sent this port a
+// reliable packet or an ack, or was sent one, keeps its host until it times out -- a dedicated server reaches it after
+// that many players and browsers, a browser on a LAN with that many games) takes the place of the first idle host (nothing
+// sent unacked, waiting or held), or is none (0: the packet is dropped). The original's pool panicked ("overalloc"),
+// ending the game. A host made again starts fresh as any new one does (send_first / recv_first: the next packets each way
+// start a stream), so the protocol carries on; only its round-trip estimate starts over.
+static HostEntry* recycle_idle_host(ReliableDataPort* self, const SockAddr* addr, HostEntry**& pp) {
+    for (HostEntry** q = &self->hosts; *q; q = &(*q)->next) {
+        HostEntry* const h = *q;
+        if (h->sent || h->waiting || h->held || on_list(self->dead, h)) continue;
+        *q = h->next;                                        // out of the list
+        if (pp == &h->next) pp = q;                          // (it was the last: the new one goes where it was)
+        fn<This_t>(F_HE_destroy)(h, 0);                      // its slot back
+        *pp = h;
+        fn<HEInit_t>(F_HE_init)(h, 0, addr, self, &self->ready);
+        (*pp)->next = 0;
+        return h;
+    }
+    return 0;
+}
 static HostEntry* __fastcall RDP_get_entry(ReliableDataPort* self, Edx, const SockAddr* addr, uint8_t create) {
     HostEntry** pp = &self->hosts;
     if (*pp) {
@@ -413,6 +493,10 @@ static HostEntry* __fastcall RDP_get_entry(ReliableDataPort* self, Edx, const So
             if (!fn<AddrCmp_t>(F_addr_ne)(addr, &(*pp)->addr)) break;
             pp = &(*pp)->next;
         } while (*pp);
+    }
+    if (VP_FIX && create && !*pp && !self->node_pool.free_list) {
+        VP_FIX_HIT("ReliableDataPort::get_entry");
+        return recycle_idle_host(self, addr, pp);
     }
     if (create && !*pp) {
         HostEntry* const h = (HostEntry*)pool_alloc(&self->node_pool);
@@ -441,10 +525,19 @@ static uint8_t __fastcall RDP__recv(ReliableDataPort* self, Edx, void* pkt, int*
 static void fp_rdp__recv(Footprint& f, ReliableDataPort*, Edx, void*, int*, SockAddr*) { f.replay_only = R_IO; }
 PORT_FN(0x004af450, "ReliableDataPort::_recv", RDP__recv, fp_rdp__recv)
 
+// the mean round trip: rtt_sum / rtt_n. FIX: a zero count (a HostEntry constructed but never init'ed; init sets 1 and
+// RecvAck only counts up) gives the sum instead of a division by zero, as does -1 with the sum at INT_MIN (an overflow)
+static __forceinline int rtt_mean(int sum, int n) {
+    if (VP_FIX && (n == 0 || (n == -1 && sum == INT32_MIN))) {
+        VP_FIX_HIT("rtt_sum / rtt_n");
+        return sum;
+    }
+    return sum / n;
+}
 static int __fastcall RDP_GetEstRTLatency(ReliableDataPort* self, Edx, const SockAddr* addr) {
     HostEntry* const h = fn<GetEntry_t>(F_RDP_get_entry)(self, 0, addr, 0);
     if (!h) return 1000;
-    return h->rtt_sum / h->rtt_n;
+    return rtt_mean(h->rtt_sum, h->rtt_n);
 }
 static void fp_rdp_latency(Footprint&, ReliableDataPort*, Edx, const SockAddr*) {}
 PORT_FN(0x004af4e0, "ReliableDataPort::GetEstRTLatency", RDP_GetEstRTLatency, fp_rdp_latency)
@@ -514,8 +607,15 @@ static void __fastcall HE_destroy(HostEntry* self, Edx) {
 static void fp_he_destroy(Footprint& f, HostEntry*, Edx) { f.replay_only = "returns its packets to the pool"; }
 PORT_FN(0x004b0090, "HostEntry::destroy", HE_destroy, fp_he_destroy)
 
-// FIX CANDIDATE: no bounds check (-1, get_slot's "none", writes the byte before the slots)
-static void __cdecl return_slot_c(int s) { *(volatile uint8_t*)(uintptr_t)(G_HOST_SLOTS + (uint32_t)s) = 0; }
+// FIX: a slot outside 0..7 is ignored (get_slot's -1, "none of the 8 free", a ninth host's: the original cleared the byte
+// before the slots)
+static void __cdecl return_slot_c(int s) {
+    if (VP_FIX && (uint32_t)s >= 8u) {
+        VP_FIX_HIT("return_slot");
+        return;
+    }
+    *(volatile uint8_t*)(uintptr_t)(G_HOST_SLOTS + (uint32_t)s) = 0;
+}
 static void fp_return_slot(Footprint& f, int s) { f.add((void*)(uintptr_t)(G_HOST_SLOTS + (uint32_t)s), 1, "a HostEntry slot"); }
 PORT_FN(0x004b00b0, "return_slot", return_slot_c, fp_return_slot)
 
@@ -551,9 +651,14 @@ static void __fastcall HE_enlist_by_id(HostEntry* self, Edx, RPP** list, RPP* p)
 static void fp_he_enlist_id(Footprint& f, HostEntry*, Edx, RPP**, RPP*) { f.replay_only = "relinks the pending packets"; }
 PORT_FN(0x004b0100, "HostEntry::enlist_by_id", HE_enlist_by_id, fp_he_enlist_id)
 
-// FIX CANDIDATE: len is copied into the 0xe4-byte packet unchecked
+// FIX: the length is kept to the packet's 0xe4 bytes (a negative one to 0); the original copied it unchecked, past the
+// pool entry (SendReliable takes the game's length as it is)
 static void __fastcall HE_init_rpp(HostEntry*, Edx, RPP* r, const void* pkt, int len, const RPI* rpi) {
     r->next = 0;
+    if (VP_FIX && (uint32_t)len > 0xe4u) {
+        VP_FIX_HIT("HostEntry::init_rpp");
+        len = len < 0 ? 0 : 0xe4;
+    }
     memcpy(r->pkt, pkt, (size_t)len);
     r->len = len;
     if (rpi) memcpy(&r->rpi, rpi, 12);
@@ -753,7 +858,7 @@ static void __fastcall HE_Tick(HostEntry* self, Edx) {
         if (!nx) break;
     }
     const int now = net_PTimeNow();                          // site 0x4b073c
-    const int rtt = self->rtt_sum / self->rtt_n;
+    const int rtt = rtt_mean(self->rtt_sum, self->rtt_n);
     int timeout = (int)((uint32_t)rtt * 3u) / 2;
     if (!(timeout > 250)) timeout = 250;
     for (RPP* p = self->sent; p;) {

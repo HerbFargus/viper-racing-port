@@ -4,6 +4,7 @@
 //   build (x86 tools, from the repo root):
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_menu_multi.cpp
 //        /Fo<dir>\ /Fe<dir>\world_menu_multi.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
+//     (and with /DVP_MENU_FIXES: the fix build, below)
 //   run:   world_menu_multi.exe [rounds] [seed]      (VP_TRACE=1: one line per function; VP_ONLY=name: just those;
 //                                                     VP_TAGS=1: which stubs the originals reached, how they returned)
 //
@@ -43,6 +44,13 @@
 // Each is compared as in the rounds, and the original's pass must have taken the path (its return, a stub it reached,
 // what it left in the MultiGenesisInfo).
 //
+// Built with /DVP_MENU_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Multiplayer
+// menus"): the rounds keep to the cases the fixes leave alone (the LAN list's selection one of the games listed, the input
+// box's sizes holding their texts -- the stubs' texts are short) and every function is compared as above; then
+// directed_fix_tests runs each fix on its bad case (the rewrite alone: clean, the promised result) and its boundary case on
+// both, bit for bit. VP_FIXTEST=n runs fix group n alone; built with /DVP_MENU_FIXES /DVP_FAITHFUL the same tests run on
+// the faithful rewrites, and every group fails (or crashes).
+//
 // Stubbed (a jump to a logger; state in the arena so both passes see the same): world_menu_options.cpp's toolkit stubs
 // (MemAlloc / delete, the logs, the input and the clock, the 2D calls, the fonts and stamps, Xlator::xlate, sprintf, the
 // files, atexit, the CRT's fatal paths), the options, and this step's callees outside the menus: the multi library
@@ -66,7 +74,12 @@
 #include <utility>
 #include <vector>
 
+#ifndef VP_MENU_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#define MENU_FIXES 0
+#else
+#define MENU_FIXES 1                // (built with /DVP_MENU_FIXES: the fixes on, and tested -- see directed_fix_tests)
+#endif
 #include "../hook/port.h"
 
 // ---- the registry: PORT_FN lists each function -------------------------------------------------------------------------
@@ -715,8 +728,10 @@ static int32_t __cdecl stub_LineEnumerateDevices(uint8_t* infos, int32_t n, uint
     }
     return HS->ndev;
 }
+static const char* g_fx_status;                            // (the fix tests': a status text of their own, when set)
 static const char* __cdecl stub_LineStatusText(int32_t st) {
     L('LSTX'); L((uint32_t)st);
+    if (g_fx_status) return g_fx_status;
     static const char* t[16] = {"Idle", "Dialing", "Connected", "Busy", "No answer", "No dialtone", "Ringing", "Hung up", "Error",
                                 "Proceeding", "Offering", "Unknown", "?12", "?13", "?14", "?15"};
     return t[(uint32_t)st & 15];
@@ -1042,6 +1057,18 @@ static void randomize_world() {
             rs[0x2c] = (uint8_t)(chance(40) ? 1 : 0);
         }
     }
+#if MENU_FIXES
+    // the fix build: the list's selection one of the games listed (connect's fix makes any other do nothing: the fixed
+    // case, run by directed_fix_tests)
+    {
+        int32_t n = 8;
+        for (int k = 0; k < 2; k++) {
+            if (*(int32_t*)(g_mgrs[k] + 0x24) == 0) *(int32_t*)(g_mgrs[k] + 0x24) = 1;
+            if (*(int32_t*)(g_mgrs[k] + 0x24) < n) n = *(int32_t*)(g_mgrs[k] + 0x24);
+        }
+        nb->sel = irange(0, n - 1);
+    }
+#endif
     *(int32_t*)(W.block + 4) = irange(0, 6);
     strcpy((char*)W.block + 0x418, "Finding...");
     // the line tabs
@@ -1251,6 +1278,11 @@ static bool make_args(const Ent& f, uint32_t* w) {
         short_str(b0, 0x20); short_str(b1, 0x10);
         W.arr[2] = U32(b0); W.arr[3] = U32(b1);                 // buffers
         W.arr[4] = (uint32_t)(chance(80) ? 0x20 : irange(0, 0x40)); W.arr[5] = (uint32_t)(chance(80) ? 0x10 : irange(0, 0x40));
+#if MENU_FIXES
+        // the fix build: each size holds its text (MyDoInputBoxN's fix holds the copy back to it: the fixed case is a text
+        // longer than its size, run by directed_fix_tests)
+        W.arr[4] = (uint32_t)(chance(80) ? 0x20 : irange(0x20, 0x40)); W.arr[5] = (uint32_t)(chance(80) ? 0x10 : irange(0x10, 0x40));
+#endif
         a[1] = U32(&W.arr[0]); a[2] = U32(&W.arr[2]); a[3] = U32(&W.arr[4]); a[4] = 2;
     } else if (IS("MyDoCancelBox")) {
         a[0] = str_arg(4); a[1] = str_arg(5);
@@ -1470,6 +1502,391 @@ static int directed_tests() {
     return g_dt_bad;
 }
 
+#if MENU_FIXES
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+// Built with /DVP_MENU_FIXES. Each fix's bad case runs on the rewrite alone (the original would overrun its frame there, or
+// read through a stray pointer -- this program's stack among what it would take), from a directed world (dt_world): it must
+// return cleanly (no fault, the bytes popped, ebx / esi / edi / ebp kept) and give what the fix promises (a text cut to its
+// buffer, the bytes after it untouched, no call made). Each fix's boundary case (the longest input that fits, or the last
+// one in range) runs on the original and the rewrite from the same state and must give the same memory, call logs and
+// result. Callees whose output is the evidence are caught for the test's length (MyDoCancelBox, UIDoOkBox, UIDoDialog:
+// their arguments recorded, a set answer returned) in both passes alike.
+static int g_fx_bad, g_fx_n, g_fx_same_n;
+static const Ent& fx_fn(const char* name) {
+    for (int i = 0; i < g_nfns; i++)
+        if (!strcmp(g_fns[i].name, name)) return g_fns[i];
+    printf("  fix test: %s isn't listed\n", name);
+    fflush(stdout);
+    ExitProcess(4);
+}
+static Result fx_run(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w) {
+    uint32_t words[72] = {};
+    int i = 0;
+    for (uint32_t x : w) words[i++] = x;
+    g_pc = _PC_53;
+    return run(f, rewrite, words);
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0) {
+    g_fx_n++;
+    if (ok) return;
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, popped %u, return %08x, ebx esi edi ebp %08x %08x %08x %08x)", r->fault, r->code, r->eip,
+                  r->pops, r->ret, r->regs[0], r->regs[1], r->regs[2], r->regs[3]);
+    printf("\n");
+}
+static CallLog g_fx_log;
+// the original and the rewrite from the same state: the rewrite clean; the same return, memory and call logs
+static void fx_same(const Ent& f, std::initializer_list<uint32_t> w, const char* what) {
+    g_fx_same_n++;
+    mem_save(g_snap);
+    const Result ro = fx_run(f, false, w);
+    mem_save(g_after);
+    memcpy(&g_fx_log, &g_log, sizeof(uint32_t) * (1 + (g_log.n < LOG_MAX ? g_log.n : LOG_MAX)));
+    mem_load(g_snap);
+    const Result rn = fx_run(f, true, w);
+    char m[256];
+    sprintf(m, "%s: a clean return", what);
+    fx_check(fx_clean(f, rn), m, &rn);
+    sprintf(m, "%s: the original's result, bit for bit", what);
+    const uint32_t where = mem_diff(g_after);
+    const bool same = !ro.fault && where == 0 && ro.ret == rn.ret && g_log.n == g_fx_log.n &&
+                      !memcmp(g_log.w, g_fx_log.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+    if (!same) printf("    (memory at %08x, return %08x / %08x, logs %u / %u words)\n", where, ro.ret, rn.ret, g_fx_log.n, g_log.n);
+    fx_check(same, m, &ro);
+}
+// a function-local Xlator constructed (its guard's bit set) with the text given, fresh
+static void fx_xl(uint32_t guard, uint8_t bit, uint32_t xl, const char* text) {
+    UI_G8(guard) = (uint8_t)(UI_G8(guard) | bit);
+    UI_GU32(xl + 4) = U32(text);
+    UI_GU32(xl + 8) = UI_GU32(S_XLATOR_COOKIE);
+}
+// a string of n c's and then tail (in one of eight buffers of this program's)
+static char g_fx_s[8][0x400];
+static const char* mk(int k, char c, int n, const char* tail = "") {
+    memset(g_fx_s[k], c, (size_t)n);
+    strcpy(g_fx_s[k] + n, tail);
+    return g_fx_s[k];
+}
+// what the game's sprintf would print, its first `keep` characters (this program's sprintf: the same for %s, %d, %-*s)
+static std::string fx_expect(uint32_t keep, const char* fmt, ...) {
+    static char t[0x2000];
+    va_list ap;
+    va_start(ap, fmt);
+    vsprintf(t, fmt, ap);
+    va_end(ap);
+    if (strlen(t) > keep) t[keep] = 0;
+    return t;
+}
+// a callee caught for a test: a jump to the harness's own, the original's bytes put back after
+struct FxPatch {
+    uint32_t at;
+    uint8_t b[5];
+    FxPatch(uint32_t a, void* to) : at(a) { memcpy(b, (const void*)(uintptr_t)a, 5); patch_jmp(a, to); }
+    ~FxPatch() { memcpy((void*)(uintptr_t)at, b, 5); }
+};
+static char g_fx_title[0x400], g_fx_msg[0x400], g_fx_version[0x400];
+static int32_t g_fx_ret;
+static int32_t __cdecl fx_cancel_box(const char* title, const char* msg, void*) {
+    L('FXCB');
+    strncpy(g_fx_title, title, 0x3ff);
+    strncpy(g_fx_msg, msg, 0x3ff);
+    return g_fx_ret;
+}
+static void __cdecl fx_ok_box(const char* title, const char* msg) {
+    L('FXOK');
+    strncpy(g_fx_title, title, 0x3ff);
+    strncpy(g_fx_msg, msg, 0x3ff);
+}
+// UIDoDialog for MenuMultiChooseTransport: the version text (item 0x3dc - 0x94 of the list, its text) recorded, an answer
+static int32_t __cdecl fx_dialog(const uint32_t* d, int32_t, int32_t, int32_t, int32_t, int32_t) {
+    L('FXDL');
+    strncpy(g_fx_version, *(const char* const*)((const uint8_t*)(uintptr_t)d[3] + 0x348 + 0x18), 0x3ff);
+    return g_fx_ret;
+}
+static char g_fx_b0[0x400], g_fx_b1[0x100];
+
+static int directed_fix_tests() {
+    char m[256];
+    // VP_FIXTEST=n: group n alone (to watch one fix's test on a build without the fixes: /DVP_MENU_FIXES /DVP_FAITHFUL)
+    const char* only_fx = getenv("VP_FIXTEST");
+    auto fx_on = [&](int g) { return !only_fx || atoi(only_fx) == g; };
+    // ---- MyDoInputBoxN: a caller's text that doesn't end inside 255 characters; Ok (Enter) copies back to the size --------
+    if (fx_on(1)) {
+        const Ent& f = fx_fn("MyDoInputBoxN");
+        for (int k = 0; k < 2; k++) {
+            dt_world(0x9100 + k);
+            memset(g_fx_b0, 'a', 0x300); g_fx_b0[0x300] = 0;
+            strcpy(g_fx_b1, "pw");
+            if (k) { strcpy(g_fx_b1, g_fx_b0); strcpy(g_fx_b0, "name"); }
+            W.arr[0] = str_arg(2); W.arr[1] = str_arg(3); W.arr[2] = U32(g_fx_b0); W.arr[3] = U32(g_fx_b1);
+            W.arr[4] = 0x20; W.arr[5] = 0x10;
+            g_sn = 0; HS->script_n = HS->script_pos = 0;
+            sc_key(0xd);
+            const Result r = fx_run(f, true, {str_arg(1), U32(&W.arr[0]), U32(&W.arr[2]), U32(&W.arr[4]), 2});
+            sprintf(m, "MyDoInputBoxN, a %d-character text in field %d: a clean return, Ok", 0x300, k);
+            fx_check(fx_clean(f, r) && r.ret == 1, m, &r);
+            char* const lb = k ? g_fx_b1 : g_fx_b0;
+            const uint32_t size = k ? 0x10 : 0x20;
+            bool tail = true;
+            for (uint32_t i = size; i < 0x300; i++) tail &= lb[i] == 'a';
+            sprintf(m, "MyDoInputBoxN, field %d: copied back held to its %u bytes, the rest of the caller's buffer untouched", k, size);
+            fx_check(strlen(lb) == size - 1 && tail && !strcmp(k ? g_fx_b0 : g_fx_b1, k ? "name" : "pw"), m);
+        }
+        dt_world(0x9102);
+        memset(g_fx_b0, 'b', 0x1f); g_fx_b0[0x1f] = 0;
+        memset(g_fx_b1, 'c', 0xf); g_fx_b1[0xf] = 0;
+        W.arr[0] = str_arg(2); W.arr[1] = str_arg(3); W.arr[2] = U32(g_fx_b0); W.arr[3] = U32(g_fx_b1);
+        W.arr[4] = 0x20; W.arr[5] = 0x10;
+        g_sn = 0; HS->script_n = HS->script_pos = 0;
+        sc_key(0xd);
+        fx_same(f, {str_arg(1), U32(&W.arr[0]), U32(&W.arr[2]), U32(&W.arr[4]), 2}, "MyDoInputBoxN, texts of 31 and 15 (the sizes' most)");
+    }
+    // ---- find_host: a long translation in the title ("%s %s (%d)", "%s %s") ------------------------------------------------
+    if (fx_on(2)) {
+        const Ent& f = fx_fn("NetBrowser::find_host");
+        FxPatch cb(F_MyDoCancelBox, (void*)&fx_cancel_box);
+        const char* host = "host.example.com";
+        for (int k = 0; k < 2; k++) {
+            dt_world(0x9200 + k);
+            g_fx_ret = 0;
+            fx_xl(0x0057a488, 1, 0x0057a490, mk(0, 'T', 200));
+            strcpy(W.strs, host);
+            const uint32_t port = k ? 0x7d1 : 5;
+            g_fx_title[0] = 0;
+            const Result r = fx_run(f, true, {U32(W.nb), 0, U32(W.strs), port});
+            const std::string want = k ? fx_expect(63, "%s %s", g_fx_s[0], host) : fx_expect(63, "%s %s (%d)", g_fx_s[0], host, 5);
+            sprintf(m, "find_host, a 200-character translation (port %u): clean, the title its first 63 characters", port);
+            fx_check(fx_clean(f, r) && want == g_fx_title, m, &r);
+        }
+        dt_world(0x9202);
+        g_fx_ret = 0;
+        fx_xl(0x0057a488, 1, 0x0057a490, mk(0, 'T', 63 - 1 - 16 - 2 - 1 - 1));
+        strcpy(W.strs, host);
+        fx_same(f, {U32(W.nb), 0, U32(W.strs), 5}, "find_host, a title of 63 characters");
+    }
+    // ---- NetBrowser::Update: a game of another version, its name not ending in its 32 bytes, a long translation ----------
+    if (fx_on(3)) {
+        const Ent& f = fx_fn("NetBrowser::Update");
+        auto setup = [&](uint32_t seed, int nl, int tl) {
+            dt_world(seed);
+            W.nb->proto = 0;
+            W.nb->mgr[0] = g_mgrs[0];
+            *(int32_t*)(g_mgrs[0] + 0x24) = 1;
+            uint8_t* rs = g_tables[0];
+            memset(rs, 0, 0x54);
+            memset(rs, 'N', (size_t)(nl < 0x24 ? nl : 0x24));
+            *(int32_t*)(rs + 0x24) = 0x20;                              // older: "OlderVersion"
+            fx_xl(0x0057a390, 2, 0x0057a4f0, mk(1, 'O', tl));
+            W.nb->list.count = 0;
+        };
+        setup(0x9300, 0x23, 50);                                         // 35 characters: through the record's type field
+        const Result r = fx_run(f, true, {U32(W.nb), 0});
+        const std::string want = fx_expect(63, "%-*s %s", 0x20, mk(2, 'N', 0x20), g_fx_s[1]);
+        fx_check(fx_clean(f, r) && W.nb->list.count == 1 && want == W.nb->list.entries[0],
+                 "NetBrowser::Update, a 35-character name and a 50-character translation: clean, the line its name cut to 32, 63 kept", &r);
+        setup(0x9301, 3, 30);
+        fx_same(f, {U32(W.nb), 0}, "NetBrowser::Update, a line of 63 characters");
+    }
+    // ---- place_call / answer: long translations in the titles, a long status ------------------------------------------------
+    if (fx_on(4)) {
+        FxPatch cb(F_MyDoCancelBox, (void*)&fx_cancel_box);
+        FxPatch ok(F_UIDoOkBox, (void*)&fx_ok_box);
+        const Ent& pc = fx_fn("LineControl::place_call");
+        const Ent& an = fx_fn("LineControl::answer");
+        auto setup = [&](uint32_t seed, bool fail) {
+            dt_world(seed);
+            g_fx_ret = 0;
+            LineControl* lc = W.modem;
+            lc->sel = 0; lc->count = 2;
+            lc->dev[0].create = &stub_create_device; lc->dev[0].flag0 = 1;
+            strcpy(lc->phone, mk(3, '5', 31));
+            HS->create_fail = fail ? ~0u : 0u; HS->create_calls = 0;
+            for (int i = 0; i < 8; i++) HS->status[i] = 2;
+            g_fx_title[0] = g_fx_msg[0] = 0;
+        };
+        setup(0x9400, false);
+        fx_xl(0x0057a32c, 1, 0x0057a520, mk(0, 'C', 50));
+        g_fx_status = mk(4, 'S', 100);
+        Result r = fx_run(pc, true, {U32(W.modem), 0});
+        fx_check(fx_clean(pc, r) && r.ret == 1 && fx_expect(63, "%s %s...", g_fx_s[0], g_fx_s[3]) == g_fx_title &&
+                 fx_expect(63, "%s", g_fx_s[4]) == g_fx_msg,
+                 "place_call, a 50-character translation and a 100-character status: clean, title and message 63 characters", &r);
+        setup(0x9401, false);
+        W.modem->dev[0].flag0 = 0;
+        fx_xl(0x0057a32c, 2, 0x0057a598, mk(0, 'D', 100));
+        r = fx_run(pc, true, {U32(W.modem), 0});
+        fx_check(fx_clean(pc, r) && fx_expect(63, "%s...", g_fx_s[0]) == g_fx_title, "place_call (a COM port), a long translation: the title 63", &r);
+        setup(0x9402, true);
+        fx_xl(0x0057a32c, 4, 0x0057a378, mk(0, 'X', 100));
+        r = fx_run(pc, true, {U32(W.modem), 0});
+        fx_check(fx_clean(pc, r) && r.ret == 0 && fx_expect(63, "%s", g_fx_s[0]) == g_fx_title,
+                 "place_call, the device can't open, a long translation: the box's title 63", &r);
+        setup(0x9403, false);
+        fx_xl(0x0057a318, 1, 0x0057a460, mk(0, 'W', 100));
+        r = fx_run(an, true, {U32(W.modem), 0});
+        fx_check(fx_clean(an, r) && r.ret == 1 && fx_expect(63, "%s", g_fx_s[0]) == g_fx_title && fx_expect(63, "%s", g_fx_s[4]) == g_fx_msg,
+                 "answer, a long translation and status: clean, title and message 63 characters", &r);
+        setup(0x9404, true);
+        fx_xl(0x0057a318, 2, 0x0057a5a8, mk(0, 'Y', 100));
+        r = fx_run(an, true, {U32(W.modem), 0});
+        fx_check(fx_clean(an, r) && r.ret == 0 && fx_expect(63, "%s", g_fx_s[0]) == g_fx_title,
+                 "answer, the device can't open, a long translation: the box's title 63", &r);
+        // the boundaries: a title and a status of 63
+        setup(0x9405, false);
+        fx_xl(0x0057a32c, 1, 0x0057a520, mk(0, 'C', 63 - 1 - 31 - 3));
+        g_fx_status = mk(4, 'S', 63);
+        fx_same(pc, {U32(W.modem), 0}, "place_call, a title and a status of 63 characters");
+        setup(0x9406, false);
+        fx_xl(0x0057a318, 1, 0x0057a460, mk(0, 'W', 63));
+        fx_same(an, {U32(W.modem), 0}, "answer, a title and a status of 63 characters");
+        g_fx_status = 0;
+    }
+    // ---- connecting / answering: a long status into the box's message ---------------------------------------------------------
+    if (fx_on(5)) {
+        for (int k = 0; k < 2; k++) {
+            const Ent& f = fx_fn(k ? "LineControl::answering" : "LineControl::connecting");
+            dt_world(0x9500 + k);
+            LineControl* lc = W.direct;
+            lc->timer = 0; lc->device = &g_devs[0]; lc->msg = W.msgbuf;
+            memset(W.msgbuf, 'z', 0x100);
+            g_fx_status = mk(4, 'S', 200);
+            const Result r = fx_run(f, true, {U32(lc), 0});
+            bool tail = true;
+            for (int i = 0x40; i < 0x100; i++) tail &= W.msgbuf[i] == 'z';
+            sprintf(m, "%s, a 200-character status: clean, the message 63 characters, nothing past its 0x40 bytes", f.name);
+            fx_check(fx_clean(f, r) && strlen(W.msgbuf) == 63 && tail, m, &r);
+            dt_world(0x9502 + k);
+            lc = W.direct;
+            lc->timer = 0; lc->device = &g_devs[0]; lc->msg = W.msgbuf;
+            g_fx_status = mk(4, 'S', 63);
+            sprintf(m, "%s, a status of 63 characters", f.name);
+            fx_same(f, {U32(lc), 0}, m);
+        }
+        g_fx_status = 0;
+    }
+    // ---- update_check_msg / checking: long verdicts, verdicts with conversions ------------------------------------------------
+    if (fx_on(6)) {
+        const Ent& um = fx_fn("LineControl::update_check_msg");
+        const Ent& ck = fx_fn("LineControl::checking");
+        auto setup = [&](uint32_t seed, int32_t status) {
+            dt_world(seed);
+            LineControl* lc = W.direct;
+            lc->timer = 0; lc->device = &g_devs[0]; lc->msg = W.msgbuf; lc->checker = W.checker;
+            memset(W.checker, 0, 0x28);
+            memset(W.msgbuf, 'z', 0x100);
+            for (int i = 0; i < 8; i++) HS->status[i] = status;
+            HS->chk_bits = ~0u; HS->chk_calls = 0;                          // done, the line ok
+        };
+        auto tail_ok = [&]() { bool t = true; for (int i = 0x40; i < 0x100; i++) t &= W.msgbuf[i] == 'z'; return t; };
+        setup(0x9600, 2);
+        fx_xl(0x0057a568, 1, 0x0057a418, mk(0, 'U', 200));
+        Result r = fx_run(um, true, {U32(W.direct), 0});
+        fx_check(fx_clean(um, r) && strlen(W.msgbuf) == 63 && tail_ok(), "update_check_msg, a 200-character verdict: clean, 63 kept", &r);
+        static const char* const texts[4] = {"Line %s is %n ok %d", "%*d", "100%% fine but %s", 0};
+        for (int k = 0; k < 4; k++) {
+            setup(0x9610 + k, 2);
+            const char* t = texts[k] ? texts[k] : mk(1, 'K', 100);
+            fx_xl(0x0057a584, 1, 0x0057a4e0, t);
+            r = fx_run(ck, true, {U32(W.direct), 0});
+            sprintf(m, "checking, the verdict \"%.20s\"%s: clean, shown as written (63 at most)", t, texts[k] ? "" : "...");
+            fx_check(fx_clean(ck, r) && fx_expect(63, "%s", t) == W.msgbuf && tail_ok(), m, &r);
+        }
+        setup(0x9620, 0);
+        fx_xl(0x0057a584, 4, 0x0057a320, "%s lost");
+        r = fx_run(ck, true, {U32(W.direct), 0});
+        fx_check(fx_clean(ck, r) && !strcmp(W.msgbuf, "%s lost"), "checking, the connection lost, \"%s lost\": shown as written", &r);
+        // the boundaries: a verdict of 63, one with "%%" (the format as before: '%')
+        setup(0x9630, 2);
+        fx_xl(0x0057a568, 1, 0x0057a418, mk(0, 'U', 63));
+        fx_same(um, {U32(W.direct), 0}, "update_check_msg, a verdict of 63 characters");
+        setup(0x9631, 2);
+        fx_xl(0x0057a584, 1, 0x0057a4e0, "Line 100%% ok");
+        fx_same(ck, {U32(W.direct), 0}, "checking, the verdict \"Line 100%% ok\"");
+        setup(0x9632, 2);
+        fx_xl(0x0057a584, 1, 0x0057a4e0, mk(1, 'K', 63));
+        fx_same(ck, {U32(W.direct), 0}, "checking, a verdict of 63 characters");
+    }
+    // ---- CreateSocket: a protocol outside 0..1 ------------------------------------------------------------------------------
+    if (fx_on(7)) {
+        const Ent& f = fx_fn("CreateSocket");
+        static const int32_t bad[3] = {2, -1, 0x7fffffff};
+        for (int32_t p : bad) {
+            dt_world(0x9700);
+            const Result r = fx_run(f, true, {(uint32_t)p});
+            sprintf(m, "CreateSocket(%d): clean, no socket, nothing called", p);
+            fx_check(fx_clean(f, r) && r.ret == 0 && g_log.n == 0, m, &r);
+        }
+        for (int32_t p = 0; p < 2; p++) {
+            dt_world(0x9701 + p);
+            sprintf(m, "CreateSocket(%d)", p);
+            fx_same(f, {(uint32_t)p}, m);
+        }
+    }
+    // ---- connect: a selection that isn't one of the games listed ---------------------------------------------------------------
+    if (fx_on(8)) {
+        const Ent& f = fx_fn("NetBrowser::connect");
+        static const int32_t bad[3] = {3, -1, 9};
+        for (int32_t sel : bad) {
+            dt_world(0x9800);
+            W.nb->proto = 0; W.nb->mgr[0] = g_mgrs[0];
+            *(int32_t*)(g_mgrs[0] + 0x24) = 3;
+            W.nb->sel = sel;
+            const Result r = fx_run(f, true, {U32(W.nb), 0});
+            sprintf(m, "connect, selection %d of 3 games: clean, 0 (nothing joined), nothing called", sel);
+            fx_check(fx_clean(f, r) && r.ret == 0 && g_log.n == 0, m, &r);
+        }
+        for (int k = 0; k < 2; k++) {
+            dt_world(0x9801 + k);
+            W.nb->proto = 0; W.nb->mgr[0] = g_mgrs[0];
+            *(int32_t*)(g_mgrs[0] + 0x24) = 3;
+            W.nb->sel = 2;
+            g_tables[0][0x54 * 2 + 0x2c] = (uint8_t)k;
+            g_sn = 0; HS->script_n = HS->script_pos = 0;
+            sc_key('p'); sc_key(0xd);
+            fx_same(f, {U32(W.nb), 0}, k ? "connect, the last game listed (a password)" : "connect, the last game listed");
+        }
+    }
+    // ---- MenuMultiChooseTransport: a long version translation; the LAN path with no game listed --------------------------------
+    if (fx_on(9)) {
+        const Ent& f = fx_fn("MenuMultiChooseTransport");
+        FxPatch dl(F_UIDoDialog, (void*)&fx_dialog);
+        auto setup = [&](uint32_t seed, int32_t ret, int32_t games) {
+            dt_world(seed);
+            g_fx_ret = ret;
+            UI_GU32(S_GRP_LAN) = 1; UI_GU32(S_GRP_DIRECT) = 2; UI_GU32(S_GRP_MODEM) = 4;
+            for (int k = 0; k < 2; k++) *(int32_t*)(g_mgrs[k] + 0x24) = games;
+            memset(W.info, 0x5c, sizeof(MultiGenesisInfo));
+            g_fx_version[0] = 0;
+        };
+        setup(0x9900, -1, 3);
+        fx_xl(0x0057a5c4, 2, 0x0057a428, mk(0, 'V', 200));
+        Result r = fx_run(f, true, {U32(W.info)});
+        fx_check(fx_clean(f, r) && r.ret == 0 && fx_expect(63, "%s %d", g_fx_s[0], 0x25) == g_fx_version,
+                 "MenuMultiChooseTransport, a 200-character version translation: clean, the text its first 63", &r);
+        setup(0x9901, 0, 0);
+        r = fx_run(f, true, {U32(W.info)});
+        bool untouched = true;
+        for (uint32_t i = 0; i < sizeof(MultiGenesisInfo); i++) untouched &= ((const uint8_t*)W.info)[i] == 0x5c;
+        fx_check(fx_clean(f, r) && r.ret == 0 && untouched,
+                 "MenuMultiChooseTransport, LAN chosen with no game listed: clean, 0 (as Back), the info untouched", &r);
+        setup(0x9902, -1, 3);
+        fx_xl(0x0057a5c4, 2, 0x0057a428, mk(0, 'V', 63 - 3));
+        fx_same(f, {U32(W.info)}, "MenuMultiChooseTransport, a version text of 63 characters");
+        setup(0x9903, 0, 1);
+        fx_same(f, {U32(W.info)}, "MenuMultiChooseTransport, LAN, the one game listed");
+    }
+    mem_load(g_pristine);
+    printf("fix tests: %s -- %d checks (%d of them original against rewrite), %d failed\n", g_fx_bad ? "FAILED" : "all passed", g_fx_n,
+           g_fx_same_n, g_fx_bad);
+    return g_fx_bad;
+}
+#endif
+
 // ---- main -----------------------------------------------------------------------------------------------------------------------
 static bool is_modal(const char* nm) {
     static const char* const m[] = {"MenuMultiChooseTransport", "MyDoInputBoxN", "MyDoCancelBox", "NetBrowser::new_server",
@@ -1667,12 +2084,17 @@ int main(int argc, char** argv) {
 
     mem_load(g_pristine);
     const int dt_bad = !only || strstr("MenuMultiChooseTransport", only) ? directed_tests() : 0;
+#if MENU_FIXES
+    const int fix_bad = only ? 0 : directed_fix_tests();
+#else
+    const int fix_bad = 0;
+#endif
     if (tags) tag_print();
     printf("%d functions (%d static initialisers; %d pure, %d replay_only, %d others), %d listed twice; %lld checks (%lld on poisoned .data), "
            "%lld logged words compared: %d differ, %d footprint violations, %d checks faulted (%lld in both, the same way), %d skipped; "
            "%d functions bad\n", g_nfns, n_e, pure_n, replay_n, g_nfns - pure_n - replay_n, dup, checks, poisoned_checks, log_words,
            differ, fp_bad, faults, both_fault, skipped, bad_fns);
     printf("%d functions changed memory in some round, %d never did\n", changed_fns, still_fns);
-    return differ || fp_bad || dup || dt_bad ? 1 : 0;
+    return differ || fp_bad || dup || dt_bad || fix_bad ? 1 : 0;
 }
 

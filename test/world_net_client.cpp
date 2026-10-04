@@ -40,6 +40,20 @@
 // the deity's slots, the fake client's and server's. The game's own code everywhere else: PoolBase, Xlator's constructor,
 // MakeNetPacket / MakePhysicsPacket, smart_strncpy, strstr / strchr / atoi, and every function of these two objects (each
 // rewrite checked with the original callees).
+//
+// Built with /DVP_NET_FIXES, the rewrites have their fixes on (docs/PORTING.md, "Fixes"; docs/FIXES.md, "Multiplayer").
+// Every function is still compared as above, with the rounds that reach a fixed case kept out of the comparison and
+// counted -- get_userdata, dispatch_UserInfoPacket and dispatch_RemoveUserPacket with a user index past 7,
+// dispatch_NetCarInfoPacket with a car index outside 0..7, dispatch_ChatPacket with a text that has no NUL in the packet,
+// MultiAdjustPacketDelay with a sum past 32 bits, and every round where the original faulted and the rewrite didn't in
+// dispatch_ChatPacket ("latency" with no space; the empty scrollback with the pool's allocation failing) -- the rewrite
+// still run on each and required to return cleanly (or to fault just where the original does, in an original callee).
+// Then directed_fix_tests: each fix's bad case run on the original (it must crash, hang -- a thread given 2 s --, overrun,
+// or act on the malformed input) and on the rewrite (a clean return, nothing written outside what it may write, and what
+// the fix promises), and the boundary case on both, compared bit for bit. Without it (VP_FAITHFUL) every rewrite must
+// match its original bit for bit.
+//
+//   fix build: as above with /DVP_NET_FIXES (the same run line; VP_ONLY=fix: the directed tests alone)
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -51,8 +65,14 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <initializer_list>
 
-#define VP_FAITHFUL
+#ifndef VP_NET_FIXES
+#define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#define NET_FIXES 0
+#else
+#define NET_FIXES 1
+#endif
 #include "../hook/port.h"
 
 // ---- the registry -----------------------------------------------------------------------------------------------------------
@@ -229,6 +249,7 @@ struct HState {
     uint32_t es_after, es_calls;         // the fake server's EveryoneSynchronized: 1 from call es_after on
     uint8_t cl_human, _c1[3];
     int32_t carinfo_storage;
+    uint8_t grab_never, no_proposal, _c2[2];  // (the fix tests: no screen to grab; the fake client has no proposal)
 };
 static HState* HS() { return (HState*)(g_arena + A_STATE); }
 struct RecvPkt { int32_t len; uint8_t data[0xe4]; };
@@ -315,7 +336,13 @@ static void __fastcall stub_xlate(uint32_t* x, int) {
     x[2] = *(uint32_t*)(uintptr_t)G_XLATOR_COOKIE;
 }
 static int __cdecl stub_atexit(void* f) { L('ATEX'); L((uint32_t)(uintptr_t)f); return 0; }
-static uint8_t __cdecl stub_gxGrabScreen(void*) { HState* s = HS(); L('GGRB'); const uint32_t k = s->grab_calls++; return (uint8_t)!(k < 32 && (s->grab_fail_mask >> k & 1)); }
+static uint8_t __cdecl stub_gxGrabScreen(void*) {
+    HState* s = HS();
+    L('GGRB');
+    const uint32_t k = s->grab_calls++;
+    if (s->grab_never) return 0;
+    return (uint8_t)!(k < 32 && (s->grab_fail_mask >> k & 1));
+}
 static void* __cdecl stub_gxSetCanvas(void* c) { L('GCAN'); L_ptr(U(c)); return 0; }
 static void __cdecl stub_gxClear(uint32_t c) { L('GCLR'); L(c); }
 static void __cdecl stub_gxReleaseScreen() { L('GREL'); }
@@ -463,7 +490,7 @@ static void __fastcall fcl_Synchronize(void*, int) { L('CSYN'); }
 static void __fastcall fcl_WorldLoaded(void*, int) { L('CWLD'); }
 static void __fastcall fcl_GetGreenflagTime(void*, int, int32_t* t) { L('CGFT'); *t = HS()->gf_time; }
 static const void* __fastcall fcl_GetRaceInfo(void*, int) { L('CGRI'); return g_arena + A_PROP + 0x40; }
-static const void* __fastcall fcl_GetProposal(void*, int) { L('CGPR'); return g_arena + A_PROP; }
+static const void* __fastcall fcl_GetProposal(void*, int) { L('CGPR'); return HS()->no_proposal ? 0 : g_arena + A_PROP; }
 static void __fastcall fcl_GetCarList(void*, int, void* l) { L('CGCL'); L_ptr(U(l)); }
 static void __fastcall fcl_Register(void*, int, void* car, int i) { L('CREG'); L_ptr(U(car)); L((uint32_t)i); }
 static void __fastcall fcl_UnRegister(void*, int, void* car) { L('CURG'); L_ptr(U(car)); }
@@ -994,6 +1021,394 @@ static bool args_for(const Ent& f, uint32_t* w) {
     }
 }
 
+// ---- the fix build: rounds kept out of the comparison ------------------------------------------------------------------------
+// (the world and the arguments made, before the original runs) the rounds whose input reaches a fixed case
+static bool fx_pre_case(const Ent& f, const uint32_t* w) {
+    const uint32_t* a = f.fast ? w + 2 : w;
+    switch (f.v10) {
+    case 0x004a8670: return (a[0] & 0xff) >= 8;                                          // get_userdata: a user index past 7
+    case 0x004a9b50: case 0x004a9bd0: {                                                  // UserInfo / RemoveUser: likewise
+        uint32_t id;
+        memcpy(&id, (const uint8_t*)(uintptr_t)a[0] + 4, 4);
+        return (id & 0xff) >= 8;
+    }
+    case 0x004a9930: return (uint32_t)(int32_t)(int8_t)((const uint8_t*)(uintptr_t)a[0])[4] >= 8u;   // NetCarInfo: the car index
+    case 0x004a99e0: return !memchr((const uint8_t*)(uintptr_t)a[0] + 9, 0, 0xe4 - 9);   // Chat: no NUL in the packet
+    case 0x004a2ab0: {                                                                   // MultiAdjustPacketDelay: past 32 bits
+        const int64_t sum = (int64_t)(int32_t)hg32(G_PACKET_DELAY) + (int32_t)a[0];
+        return sum > INT32_MAX || sum < INT32_MIN;
+    }
+    default: return false;
+    }
+}
+// (after both ran) a round where only the original faulted, in a function whose fix is for that fault
+static bool fx_post_case(const Ent& f, const Result& ro, const Result& rn) {
+    return f.v10 == 0x004a99e0 && ro.fault && !rn.fault;                                 // Chat: atoi(0), the empty ring
+}
+
+#if NET_FIXES
+// ---- the fixes, each on its bad case (directed_fix_tests) -----------------------------------------------------------------
+static int g_fx_bad, g_fx_n, g_fx_same_n;
+static const Ent& fx_fn(uint32_t v10) {
+    for (int i = 0; i < g_nfns; i++)
+        if (g_fns[i].v10 == v10 && !g_fns[i].leftover) return g_fns[i];
+    printf("  fix test: %08x isn't listed\n", v10);
+    ExitProcess(4);
+}
+static void fx_check(bool ok, const char* what, const Result* r = 0, uint32_t where = 0) {
+    g_fx_n++;
+    if (ok) {
+        if (getenv("VP_TRACE")) printf("  fix test: %s\n", what);
+        return;
+    }
+    g_fx_bad++;
+    printf("  FIX TEST FAILED: %s", what);
+    if (r) printf(" (fault %d %08x at %08x, popped %u, ebx esi edi ebp %08x %08x %08x %08x, returned %08x)", r->fault, r->code, r->eip,
+                  r->pops, r->regs[0], r->regs[1], r->regs[2], r->regs[3], r->ret);
+    if (where) printf(" (wrote %08x)", where);
+    printf("\n");
+}
+static Result fx_run(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w) {
+    uint32_t words[18] = {};
+    int i = 0;
+    for (uint32_t x : w) words[i++] = x;
+    g_pc = _PC_53;
+    return run(f, rewrite, words);
+}
+static bool fx_clean(const Ent& f, const Result& r) {
+    return !r.fault && r.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && r.regs[0] == 0x0b0b0b0b && r.regs[1] == 0x05050505 &&
+           r.regs[2] == 0x0d0d0d0d && r.regs[3] == 0x0e0e0e0e;
+}
+static bool fx_broke(const Ent& f, const Result& r) { return !fx_clean(f, r); }
+struct Span { const void* p; uint32_t n; };
+static uint32_t fx_outside(const Mem& before, std::initializer_list<Span> ok) {
+    auto in = [&](const uint8_t* q) {
+        for (const Span& sp : ok)
+            if (q >= (const uint8_t*)sp.p && q < (const uint8_t*)sp.p + sp.n) return true;
+        return false;
+    };
+    for (uint32_t i = 0; i < DATA_BYTES; i++)
+        if (before.data[i] != DATA[i] && !in(DATA + i)) return 0x004e1000 + i;
+    for (uint32_t i = 0; i < IDATA_BYTES; i++)
+        if (before.idata[i] != IDATA[i] && !in(IDATA + i)) return 0x005d7000 + i;
+    for (uint32_t i = sizeof(HState); i < ARENA_BYTES; i++)
+        if (before.arena[i] != g_arena[i] && !in(g_arena + i)) return U(g_arena + i);
+    return 0;
+}
+static int fx_count(uint32_t tag) {
+    int n = 0;
+    for (uint32_t i = 0; i < g_log.n && i < LOG_MAX; i++) n += g_log.w[i] == tag;
+    return n;
+}
+static CallLog g_fx_log;
+static void fx_same(const Ent& f, std::initializer_list<uint32_t> w, const char* what) {
+    g_fx_same_n++;
+    mem_save(g_snap);
+    const Result ro = fx_run(f, false, w);
+    mem_save(g_after);
+    g_fx_log = g_log;
+    mem_load(g_snap);
+    const Result rn = fx_run(f, true, w);
+    char m[256];
+    sprintf(m, "%s: a clean return", what);
+    fx_check(fx_clean(f, rn), m, &rn);
+    sprintf(m, "%s: the original's result, bit for bit", what);
+    const uint32_t where = mem_diff(g_after);
+    const bool same = !ro.fault && where == 0 && ro.ret == rn.ret && g_log.n == g_fx_log.n &&
+                      !memcmp(g_log.w, g_fx_log.w, 4 * (g_log.n < LOG_MAX ? g_log.n : LOG_MAX));
+    fx_check(same, m, &ro, where);
+}
+static struct { const Ent* f; bool rw; uint32_t w[18]; Result r; } g_fx_t;
+static DWORD WINAPI fx_thread(void*) { g_pc = _PC_53; g_fx_t.r = run(*g_fx_t.f, g_fx_t.rw, g_fx_t.w); return 0; }
+static bool fx_run_timed(const Ent& f, bool rewrite, std::initializer_list<uint32_t> w, Result* out) {
+    g_fx_t.f = &f;
+    g_fx_t.rw = rewrite;
+    memset(g_fx_t.w, 0, sizeof g_fx_t.w);
+    int i = 0;
+    for (uint32_t x : w) g_fx_t.w[i++] = x;
+    HANDLE h = CreateThread(0, 0x400000, fx_thread, 0, 0, 0);
+    if (WaitForSingleObject(h, 2000) == WAIT_TIMEOUT) {
+        TerminateThread(h, 0);
+        CloseHandle(h);
+        return false;
+    }
+    CloseHandle(h);
+    *out = g_fx_t.r;
+    return true;
+}
+// the tests' world: a random one (from a fixed seed), the client's own task, no packets queued
+static RaceClient* fx_world(bool multi) {
+    mem_load(g_pristine);
+    memset(g_arena, 0, ARENA_BYTES);
+    g_logging = false;
+    build_world(multi);
+    g_logging = true;
+    HState* s = HS();
+    s->recv_n = 0;
+    s->fail_mask = 0;
+    RaceClient* c = g_rc;
+    c->task = s->task_cur;
+    return c;
+}
+static int32_t fx_uid(int slot) { return (int32_t)(((uint32_t)(slot + 0x11) << 8) | (uint32_t)slot); }
+static uint8_t* fx_pkt(int t) {
+    uint8_t* p = sv(0x100);
+    memset(p, 0, 0x100);
+    p[0] = 0x11;
+    p[3] = (uint8_t)t;
+    return p;
+}
+
+static void directed_fix_tests() {
+    g_rng = 0x5eed4321u;
+    char m[256];
+    // ---- get_userdata: a user index past 7 --------------------------------------------------------------------------------
+    {
+        const Ent& f = fx_fn(0x004a8670);
+        RaceClient* c = fx_world(false);
+        for (uint32_t k : {0x2au, 0xc0u}) {
+            const int32_t id = (int32_t)(0x3300u | k);
+            uint8_t* at = (uint8_t*)c + 0x28 + k * 0x15;             // where the original looks: made to match
+            memcpy(at, &id, 4);
+            mem_save(g_snap);
+            Result ro = fx_run(f, false, {U(c), 0, (uint32_t)id});
+            sprintf(m, "get_userdata of index 0x%x: the original hands back memory past users[] as a user", k);
+            fx_check(ro.fault || ro.ret == U(at), m, &ro);
+            mem_load(g_snap);
+            Result rn = fx_run(f, true, {U(c), 0, (uint32_t)id});
+            sprintf(m, "get_userdata of index 0x%x: the rewrite finds nobody", k);
+            fx_check(fx_clean(f, rn) && rn.ret == 0, m, &rn);
+        }
+        for (int i = 0; i < 8; i++) {
+            c->users[i].id = fx_uid(i);
+            sprintf(m, "get_userdata of user %d", i);
+            fx_same(f, {U(c), 0, (uint32_t)fx_uid(i)}, m);
+        }
+    }
+    // ---- dispatch_UserInfoPacket / dispatch_RemoveUserPacket: a user index past 7 ---------------------------------------------------
+    for (uint32_t fn : {0x004a9b50u, 0x004a9bd0u}) {
+        const Ent& f = fx_fn(fn);
+        const char* nm = fn == 0x004a9b50u ? "a user info" : "a remove-user";
+        RaceClient* c = fx_world(false);
+        for (int i = 0; i < 8; i++) c->user_ids[i] = c->users[i].id = fx_uid(i);   // nothing to ask for after
+        uint8_t* p = fx_pkt(fn == 0x004a9b50u ? 0x25 : 0x26);
+        const int32_t id = 0x5500c0;                                 // index 0xc0: past the client
+        memcpy(p + 4, &id, 4);
+        strcpy((char*)p + 8, "intruder");
+        const Span ok[] = {{&c->user_changes, 1}};
+        mem_save(g_snap);
+        Result ro = fx_run(f, false, {U(c), 0, U(p)});
+        uint32_t ow = fx_outside(g_snap, {ok[0]});
+        sprintf(m, "%s packet for index 0xc0: the original writes past users[] / user_ids[]", nm);
+        fx_check(ro.fault || ow, m, &ro);
+        mem_load(g_snap);
+        Result rn = fx_run(f, true, {U(c), 0, U(p)});
+        uint32_t nw = fx_outside(g_snap, {ok[0]});
+        sprintf(m, "%s packet for index 0xc0: the rewrite drops it", nm);
+        fx_check(fx_clean(f, rn) && !nw && fx_count('SREL') == 0, m, &rn, nw);
+        mem_load(g_snap);
+        const int32_t good = fx_uid(3);
+        memcpy(p + 4, &good, 4);
+        sprintf(m, "%s packet for user 3", nm);
+        fx_same(f, {U(c), 0, U(p)}, m);
+    }
+    // ---- dispatch_NetCarInfoPacket: the car index -----------------------------------------------------------------------------------
+    {
+        const Ent& f = fx_fn(0x004a9930);
+        RaceClient* c = fx_world(false);
+        c->state = 0xd;
+        const int32_t u = fx_uid(2);
+        uint8_t* p = fx_pkt(0x33);
+        memcpy(p + 5, &u, 4);
+        p[4] = (uint8_t)(int8_t)-2;
+        memcpy((uint8_t*)c + 0x7b8 - 8, &u, 4);                       // car_req[-2]: made to match
+        memset((uint8_t*)c + 0xf0 - 2 * 0xd9, 0, 4);                  // cars[-2] (before the client): empty
+        mem_save(g_snap);
+        Result ro = fx_run(f, false, {U(c), 0, U(p)});
+        uint32_t ow = fx_outside(g_snap, {{c, sizeof *c}});
+        fx_check(ro.fault || ow, "a car info for car -2: the original copies it before the client", &ro);
+        mem_load(g_snap);
+        Result rn = fx_run(f, true, {U(c), 0, U(p)});
+        uint32_t nw = fx_outside(g_snap, {});
+        fx_check(fx_clean(f, rn) && !nw && g_log.n == 0, "a car info for car -2: the rewrite drops it", &rn, nw);
+        mem_load(g_snap);
+        for (int i = 0; i < 8; i++) c->car_req[i] = 0;
+        c->car_req[3] = u;
+        c->cars[3].user = 0;
+        p[4] = 3;
+        fx_same(f, {U(c), 0, U(p)}, "a car info for car 3");
+    }
+    // ---- dispatch_ChatPacket: "latency", the empty scrollback, a text with no NUL ----------------------------------------------------
+    {
+        const Ent& f = fx_fn(0x004a99e0);
+        RaceClient* c = fx_world(true);
+        c->users[1].id = fx_uid(1);
+        strcpy(c->users[1].name, "talker");
+        hs32(G_PACKET_DELAY, 5);
+        uint8_t* p = fx_pkt(0x27);
+        const int32_t id = fx_uid(1);
+        memcpy(p + 4, &id, 4);
+        strcpy((char*)p + 9, "latency");
+        mem_save(g_snap);
+        Result ro = fx_run(f, false, {U(c), 0, U(p)});
+        fx_check(ro.fault, "a chat line \"latency\": the original's atoi reads through strchr's 0", &ro);
+        mem_load(g_snap);
+        Result rn = fx_run(f, true, {U(c), 0, U(p)});
+        fx_check(fx_clean(f, rn) && hg32(G_PACKET_DELAY) == 5 && c->chat && !strcmp(c->chat->text, "latency"),
+                 "a chat line \"latency\": the rewrite keeps the line, the delay as it was", &rn);
+        // a text running to the end of the packet: "lat" its last 3 bytes, "ency 77" after it
+        mem_load(g_snap);
+        memset(p + 9, 'x', 0xe4 - 9);
+        memcpy(p + 0xe1, "latency 77", 11);
+        mem_save(g_snap);
+        ro = fx_run(f, false, {U(c), 0, U(p)});
+        fx_check(ro.fault || hg32(G_PACKET_DELAY) == 77, "a chat text with no NUL in the packet: the original reads on past it (a delay of 77)", &ro);
+        mem_load(g_snap);
+        rn = fx_run(f, true, {U(c), 0, U(p)});
+        fx_check(fx_clean(f, rn) && hg32(G_PACKET_DELAY) == 5, "a chat text with no NUL in the packet: the rewrite reads no further", &rn);
+        mem_load(g_snap);
+        strcpy((char*)p + 9, "latency 120");
+        fx_same(f, {U(c), 0, U(p)}, "a chat line \"latency 120\"");
+        // the scrollback empty and its pool's allocation failing
+        mem_load(g_snap);
+        c->chat = 0;
+        c->pool.block = 0;
+        c->pool.free_list = 0;
+        c->pool.used = 0;
+        HS()->fail_mask = 0xffffffffu;
+        HS()->alloc_calls = 0;
+        strcpy((char*)p + 9, "hello");
+        mem_save(g_snap);
+        ro = fx_run(f, false, {U(c), 0, U(p)});
+        fx_check(ro.fault, "a chat line with no room and the scrollback empty: the original reads the ring through 0", &ro);
+        mem_load(g_snap);
+        rn = fx_run(f, true, {U(c), 0, U(p)});
+        fx_check(fx_clean(f, rn) && c->chat == 0, "a chat line with no room and the scrollback empty: the rewrite drops it", &rn);
+    }
+    // ---- race_packet: under 2 bytes --------------------------------------------------------------------------------------------------
+    {
+        const Ent& f = fx_fn(0x004a9de0);
+        RaceClient* c = fx_world(false);
+        HS()->paused = 0;
+        for (int i = 0; i < 8; i++) c->cars[i].netcar = car_obj(8 + i);
+        uint8_t* p = fx_pkt(0);
+        p[0] = 0x12;
+        mem_save(g_snap);
+        Result ro;
+        const bool done = fx_run_timed(f, false, {U(c), 0, U(p), 1}, &ro);
+        fx_check(!done || fx_broke(f, ro), "a car packet of 1 byte: the original runs ~178 million records");
+        mem_load(g_snap);
+        Result rn = fx_run(f, true, {U(c), 0, U(p), 1});
+        fx_check(fx_clean(f, rn) && fx_count('NEWP') == 0 && !fx_outside(g_snap, {{&c->last_race_pkt, 4}}),
+                 "a car packet of 1 byte: the rewrite reads no records", &rn);
+        mem_load(g_snap);
+        for (int k = 0; k < 9; k++) p[2 + 24 * k] = (uint8_t)(k & 7);
+        fx_same(f, {U(c), 0, U(p), 2 + 24 * 9}, "a car packet of 9 records");
+        fx_same(f, {U(c), 0, U(p), 2}, "a car packet of 2 bytes (no records)");
+    }
+    // ---- DeityCast: longer than the packet --------------------------------------------------------------------------------------------
+    {
+        const Ent& f = fx_fn(0x004a8e80);
+        RaceClient* c = fx_world(false);
+        uint8_t* d = sv(0x200);
+        memset(d, 0xee, 0x200);
+        for (int32_t len : {0x100, -1}) {
+            mem_save(g_snap);
+            if (len > 0) {                                           // (-1: the original's copy runs over the whole stack, the harness's too)
+                Result ro = fx_run(f, false, {U(c), 0, U(d), (uint32_t)len});
+                sprintf(m, "a deity cast of %d bytes: the original copies it past its frame", len);
+                fx_check(fx_broke(f, ro), m, &ro);
+                mem_load(g_snap);
+            }
+            Result rn = fx_run(f, true, {U(c), 0, U(d), (uint32_t)len});
+            sprintf(m, "a deity cast of %d bytes: the rewrite sends nothing", len);
+            fx_check(fx_clean(f, rn) && fx_count('SREL') == 0, m, &rn);
+            mem_load(g_snap);
+        }
+        fx_same(f, {U(c), 0, U(d), 0xe0}, "a deity cast of 0xe0 bytes");
+    }
+    // ---- GetPacketTypeString: outside its table ----------------------------------------------------------------------------------------
+    {
+        const Ent& f = fx_fn(0x004aa4f0);
+        fx_world(false);
+        mem_save(g_snap);
+        Result ro = fx_run(f, false, {0x10000020u});
+        fx_check(ro.fault || ro.ret != 0x004fd80c, "GetPacketTypeString of 0x10000020: the original reads far past its table", &ro);
+        mem_load(g_snap);
+        Result rn = fx_run(f, true, {0x10000020u});
+        fx_check(fx_clean(f, rn) && rn.ret == 0x004fd80c, "GetPacketTypeString of 0x10000020: the rewrite gives PT_INVALID", &rn);
+        for (uint32_t t = 0x20; t <= 0x3e; t++) {
+            sprintf(m, "GetPacketTypeString of 0x%x", t);
+            fx_same(f, {t}, m);
+        }
+    }
+    // ---- clear_screen: no screen to grab --------------------------------------------------------------------------------------------------
+    {
+        const Ent& f = fx_fn(0x004a2700);
+        fx_world(true);
+        HS()->grab_never = 1;
+        mem_save(g_snap);
+        Result ro;
+        const bool done = fx_run_timed(f, false, {U(g_arena + A_NAMES)}, &ro);
+        fx_check(!done, "clear_screen with no screen to grab: the original never returns");
+        mem_load(g_snap);
+        Result rn = fx_run(f, true, {U(g_arena + A_NAMES)});
+        fx_check(fx_clean(f, rn) && fx_count('GGRB') == 200 && fx_count('SPLS') == 1,
+                 "clear_screen with no screen to grab: the rewrite gives up after 200 tries and draws the text", &rn);
+        mem_load(g_snap);
+        HS()->grab_never = 0;
+        HS()->grab_fail_mask = 0xffffffffu;
+        HS()->grab_calls = 0;
+        fx_same(f, {U(g_arena + A_NAMES)}, "clear_screen with 32 failed grabs, then 4");
+    }
+    // ---- MultiSynchronize: no proposal ------------------------------------------------------------------------------------------------------
+    {
+        const Ent& f = fx_fn(0x004a2850);
+        fx_world(true);
+        HState* s = HS();
+        LiveMultiInfo* lm = (LiveMultiInfo*)(g_arena + A_LMI);
+        lm->server = 0;
+        lm->owner = s->task_cur;
+        *fcl_state(lm->client) = 0xf;
+        s->cl_n = 2; s->cl_i = 0;
+        s->cl_states[0] = 0xf; s->cl_states[1] = 0x12;
+        s->no_proposal = 1;
+        char* track = (char*)sv(0x40);
+        strcpy(track, "unchanged");
+        uint8_t* cars = sv(0xc84);
+        mem_save(g_snap);
+        Result ro = fx_run(f, false, {U(lm), U(cars), U(track)});
+        fx_check(ro.fault, "MultiSynchronize with no proposal: the original reads the track through 0", &ro);
+        mem_load(g_snap);
+        Result rn = fx_run(f, true, {U(lm), U(cars), U(track)});
+        fx_check(fx_clean(f, rn) && rn.ret == 1 && !strcmp(track, "unchanged") && fx_count('CSYN') == 1,
+                 "MultiSynchronize with no proposal: the rewrite synchronizes, the track name as it was", &rn);
+        mem_load(g_snap);
+        s->no_proposal = 0;
+        fx_same(f, {U(lm), U(cars), U(track)}, "MultiSynchronize with the proposal");
+    }
+    // ---- MultiAdjustPacketDelay: the sum past 32 bits -------------------------------------------------------------------------------------
+    {
+        const Ent& f = fx_fn(0x004a2ab0);
+        fx_world(true);
+        hs32(G_LMI, U(g_arena + A_LMI));
+        hs32(G_PACKET_DELAY, 2000);
+        mem_save(g_snap);
+        Result ro = fx_run(f, false, {0x7fffffffu});
+        fx_check(ro.fault || hg32(G_PACKET_DELAY) != 2000, "MultiAdjustPacketDelay(2000 + 2^31 - 1): the original's sum wraps (a delay of 0)", &ro);
+        mem_load(g_snap);
+        Result rn = fx_run(f, true, {0x7fffffffu});
+        fx_check(fx_clean(f, rn) && hg32(G_PACKET_DELAY) == 2000, "MultiAdjustPacketDelay(2000 + 2^31 - 1): the rewrite's delay is 2000", &rn);
+        for (int32_t d : {-3000, -2000, 0, 1, 2400}) {
+            mem_load(g_snap);
+            sprintf(m, "MultiAdjustPacketDelay(%d)", d);
+            fx_same(f, {(uint32_t)d}, m);
+        }
+    }
+    printf("the fix build: %d directed checks (%d boundary cases on both), %d failed\n", g_fx_n, g_fx_same_n, g_fx_bad);
+}
+#endif
+
 // ---- main ---------------------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -1082,6 +1497,7 @@ int main(int argc, char** argv) {
     static Footprint fp;
     long long checks = 0, log_words = 0, faulted = 0;
     int differ = 0, fp_bad = 0, bad_fns = 0, nfn = 0, skipped = 0;
+    int fixed_rounds = 0, fixed_bad = 0;                           // (the fix build: rounds kept out, a fixed case)
     for (int fi = 0; fi < g_nfns; fi++) {
         const Ent& f = g_fns[fi];
         if (f.leftover) continue;
@@ -1105,6 +1521,7 @@ int main(int argc, char** argv) {
             if (!ok) { skipped++; continue; }
             fp.n = 0; fp.replay_only = 0; fp.pure = false;
             f.fp(fp, words);
+            const bool pre_fixed = NET_FIXES && fx_pre_case(f, words);
             mem_save(g_snap);
             const Result ro = run(f, false, words);
             if (!fp.replay_only) {
@@ -1145,6 +1562,19 @@ int main(int argc, char** argv) {
             checks++; fn_checks++;
             log_words += g_log_orig.n;
             if (ro.fault) { faulted++; fn_faults++; }
+            if (pre_fixed || (NET_FIXES && fx_post_case(f, ro, rn))) {   // a fixed case: not compared; the rewrite returns cleanly
+                fixed_rounds++;
+                const bool clean = !rn.fault && rn.pops == (f.fast ? 4u * (uint32_t)f.nstack : 0u) && rn.regs[0] == 0x0b0b0b0b &&
+                                   rn.regs[1] == 0x05050505 && rn.regs[2] == 0x0d0d0d0d && rn.regs[3] == 0x0e0e0e0e;
+                // (or a fault just where the original's: in an original callee, on the round's own damage)
+                const bool same_fault = ro.fault && rn.fault && ro.code == rn.code && ro.eip == rn.eip;
+                if (!clean && !same_fault) {
+                    printf("  FIXED CASE %08x %s (round %d): the rewrite didn't return cleanly (fault %d %08x at %08x)\n", f.v10, f.name,
+                           rd, rn.fault, rn.code, rn.eip);
+                    fixed_bad++; fn_bad = true;
+                }
+                continue;
+            }
             bool same = ro.fault == rn.fault && ro.code == rn.code && ro.ret == rn.ret && ro.pops == rn.pops &&
                         !memcmp(ro.regs, rn.regs, sizeof ro.regs) && ro.top == rn.top;
             const uint32_t where = mem_diff(g_after);
@@ -1185,5 +1615,14 @@ int main(int argc, char** argv) {
     printf("%d functions, %d listed twice; %lld checks (%d skipped), %lld logged words compared, %lld checks where the original "
            "faulted (both alike unless counted below): %d differ, %d footprint violations; %d functions bad\n", nfn, dup, checks,
            skipped, log_words, faulted, differ, fp_bad, bad_fns);
+#if NET_FIXES
+    printf("the fix build: %d rounds reached a fixed case (kept out of the comparison), %d where the rewrite didn't return cleanly\n",
+           fixed_rounds, fixed_bad);
+    if (!only[0] || !strcmp(only, "fix")) directed_fix_tests();         // (VP_ONLY=fix: those alone)
+    mem_load(g_pristine);
+    return differ || fp_bad || dup || fixed_bad || g_fx_bad ? 1 : 0;
+#else
+    (void)fixed_rounds;
     return differ || fp_bad || dup ? 1 : 0;
+#endif
 }

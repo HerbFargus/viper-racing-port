@@ -34,10 +34,11 @@
 // hands back the lock, creates or destroys tasks, allocates, or draws is replay_only (the session replay of a network game is
 // its in-game check; test/world_net_client.cpp checks every one offline).
 //
-// FIX CANDIDATEs (left faithful): clear_screen loops forever if gxGrabScreen never succeeds (no screen to grab: 4 grabs are
-// counted, not 4 tries); MultiSynchronize reads the proposal's track through GetProposal's result unchecked (0 if the client
-// has none -- only in state 0xf, where the server has sent one); MultiAdjustPacketDelay's sum wraps (an int add, then the
-// sign); MultiBGRecv / MultiFGTick / the car registration assume a client (LiveMultiInfo::Create always makes one).
+// The fixes (docs/PORTING.md, "Fixes"; `// FIX:` in place, VP_FIX): clear_screen gives up after 200 failed screen grabs (it
+// counts 4 grabs, not 4 tries, so a screen that could never be grabbed hung the game; the window being away doesn't count,
+// Win32Idle waits for it to come back); MultiSynchronize leaves the track name alone when the client has no proposal
+// (GetProposal's 0); MultiAdjustPacketDelay's sum saturates instead of wrapping (never called in v1.0). Left as is:
+// MultiBGRecv / MultiFGTick / the car registration assume a client (LiveMultiInfo::Create always makes one).
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -262,6 +263,7 @@ PORT_FN(0x004a2690, "MultiFGTick", MultiFGTick_c, fp_fgtick)
 static void __cdecl clear_screen_c(const char* text) {
     uint8_t canvas[0x24];                                               // a gxCanvas (made current: left aimed at this frame)
     int32_t n = 4;
+    int32_t failed = 0;
     do {
         if (ccall<uint8_t>(F_gxGrabScreen, (void*)canvas)) {
             n--;
@@ -269,6 +271,10 @@ static void __cdecl clear_screen_c(const char* text) {
             ccall<void>(F_gxClear, 0u);
             ccall<void>(F_gxReleaseScreen);
             ccall<void>(F_gxFlip);
+        } else if (VP_FIX && ++failed >= 200) {
+            // FIX: a screen that can't be grabbed (200 failures; a lost surface comes back at the next try, and a window
+            // switched away from waits in Win32Idle) is left uncleared; the original counted only grabs, so it hung
+            n = 0;
         }
         ccall<void>(F_Win32Idle);
     } while (n);
@@ -342,8 +348,12 @@ static uint8_t __cdecl MultiSynchronize_c(LiveMultiInfo* m, void* cars, char* tr
             if (client_state(c) == 0xf) {
                 vcall<void>(c, RC_GET_CAR_LIST, cars);
                 const uint8_t* const prop = vcall<const uint8_t*>(m->client, RC_GET_PROPOSAL);
-                const char* const name = ccall<const char*>(F_GetTrackName, *(const volatile int32_t*)(prop + 0x30));
-                crt_strcpy(track, name);
+                // FIX: a client with no proposal (GetProposal's 0) leaves the track name as it is; the original read
+                // through the 0. (In state 0xf the server has always sent one.)
+                if (!(VP_FIX && !prop)) {
+                    const char* const name = ccall<const char*>(F_GetTrackName, *(const volatile int32_t*)(prop + 0x30));
+                    crt_strcpy(track, name);
+                }
                 vcall<void>(m->client, RC_SYNCHRONIZE);
             }
             st = client_state(m->client);
@@ -393,7 +403,14 @@ PORT_FN(0x004a2a90, "MultiSendChat", MultiSendChat_c, fp_send_chat)
 
 static void __cdecl MultiAdjustPacketDelay_c(int d) {
     if (!multi_enabled()) return;
-    int32_t v = wrap_add(NT_G32(G_PACKET_DELAY), d);
+    const int32_t cur = NT_G32(G_PACKET_DELAY);
+    int32_t v = wrap_add(cur, d);
+    // FIX: the sum saturates instead of wrapping (a step that took it past 2^31 came out negative, so a delay of 0 where it
+    // should be 2000, or the reverse); never called in v1.0
+    if (VP_FIX) {
+        const int64_t s64 = (int64_t)cur + d;
+        v = s64 > INT32_MAX ? INT32_MAX : s64 < INT32_MIN ? INT32_MIN : (int32_t)s64;
+    }
     NT_G32(G_PACKET_DELAY) = v;
     if (v < 0) {
         v = 0;
