@@ -287,7 +287,15 @@ static int __cdecl stub_strnicmp(const char* a, const char* b, size_t n) { L('ST
 static const char* g_tracks[8] = {"Bemidji", "Kenyon", "Hawaii", "Nfield", "Arena", "Coliseum", "Rotunda", "Temple"};
 static const char* __cdecl stub_GetTrackName(int i) { L('TRKN'); L((uint32_t)i); return g_tracks[(uint32_t)i & 7]; }
 static int __cdecl stub_GetLapCount(int type, const char* name) { L('LAPS'); L((uint32_t)type); L_str(name); return type * 3 + 1; }
-static void __cdecl stub_CarSetup(uint8_t* p) { L('CSET'); for (int i = 0; i < 0x8c; i++) p[i] = (uint8_t)(i * 7 + 1); }
+// the whole CarSetup (0xd4), as CarFileMakeDefaultSetup writes it: the data (0x8c), +0x8c = 1, +0x90 = 0xd4, the name
+// "Default Setup" at +0x94 -- and the rest of the struct too, so a caller with less room than the struct is caught
+static void __cdecl stub_CarSetup(uint8_t* p) {
+    L('CSET');
+    for (int i = 0; i < 0xd4; i++) p[i] = (uint8_t)(i * 7 + 1);
+    *(int32_t*)(p + 0x8c) = 1;
+    *(int32_t*)(p + 0x90) = 0xd4;
+    memcpy(p + 0x94, "Default Setup", 14);
+}
 static int __cdecl stub_FileOpen(const char* path) { L('FOPN'); L_str(path); return (int)HS()->file_handle; }
 static uint8_t __cdecl stub_FileReadExact(int fh, uint8_t* buf, int n) {
     L('FRDX'); L((uint32_t)fh); L((uint32_t)n);
@@ -867,6 +875,26 @@ static bool args_for(const Ent& f, uint32_t* w) {
                 bool has = false;
                 for (int k = 0; k < r->ncars; k++) has |= r->cars[k].info.user == r->iroc_user && r->cars[k].info.human;
                 if (!has) *((uint8_t*)&r->prop + 4) = 0;
+            }
+            // directed: an IROC race, the car asked for the IROC user's own, its name run on unterminated through its setup
+            // for 0xc5 characters -- the strcpy then ends at byte 0xdf of the packet, past the 0xde sent but inside the
+            // original's frame (0xe0 from the packet)
+            if (r->ncars > 0 && r->iroc_user && chance(30)) {
+                const int k = irange(0, r->ncars - 1);
+                ServerNetCarInfo* c = &r->cars[k];
+                if (r->iroc_user) {
+                    c->info.user = r->iroc_user;
+                    c->info.human = 1;
+                    *((uint8_t*)&r->prop + 4) = 1;
+                    p[4] = (uint8_t)k;
+                    for (int m = 0; m < r->ncars; m++)                 // the car get_iroc_car finds (the first)
+                        if (r->cars[m].info.user == r->iroc_user && r->cars[m].info.human) {
+                            uint8_t* b = (uint8_t*)&r->cars[m];
+                            for (int q = 0x15; q < 0x15 + 0xc5; q++) if (!b[q]) b[q] = (uint8_t)(0x41 + q % 26);
+                            b[0x15 + 0xc5] = 0;
+                            break;
+                        }
+                }
             }
         }
         if (t == 0x30 && r->ncars >= 8) return false;

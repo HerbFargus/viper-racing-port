@@ -301,8 +301,8 @@ static void __fastcall add_ai_cars(RaceServer* self, Edx) {
         crt_strcpy((char*)car + 0x15, CP(0x004fd8bc));       // "viper"
         WR32(car + 0xc4, k & 7);                             // the car's argument
         car[0xc8] = 0;                                       // no hornball
-        uint8_t setup[0x8c];
-        ccall<void>(F_CarFileMakeDefaultSetup, (void*)setup);
+        uint8_t setup[0xd4];                                 // a whole CarSetup, as the original's frame holds: the call
+        ccall<void>(F_CarFileMakeDefaultSetup, (void*)setup);    // writes past the 0x8c copied (+0x8c, +0x90, the name at +0x94)
         crt_copy(car + 0x38, setup, 0x8c);
         crt_strcpy((char*)car + 8, CP(0x004fd8c4));          // "#!@^&*"
         car[0xd8] = 0;
@@ -616,7 +616,7 @@ PORT_FN(0x004ab770, "RaceServer::dispatch_NetCarInfoPacket", dispatch_NetCarInfo
 // car in an IROC race the IROC car's name and setup. FIX CANDIDATE: the car index unchecked (and so the session from the
 // owner's id); get_iroc_car's 0 used.
 static void __fastcall dispatch_NetCarInfoRequestPacket(RaceServer* self, Edx, uint8_t* pkt, int sess) {
-    uint8_t p[0xde];
+    uint8_t p[0xe0];                                         // 0xde sent; the original's frame has 0xe0 behind it (the strcpy)
     p[3] = 0x33;
     const int ci = (int8_t)pkt[4];
     p[4] = (uint8_t)ci;

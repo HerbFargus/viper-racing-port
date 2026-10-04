@@ -30,7 +30,8 @@
 //   copy2    copy 2 records to sessions-2\ and binds 2002; copy 1 (two_copies) sends its broadcasts to 2002 too; a
 //            single copy (copy 1) replays copy 2's recording by its bare name, identically;
 //   (each also sends packets with stack garbage as the game's builders leave it -- byte 1 of a broadcast service
-//   request, bit 7 of a car packet's last byte, most of a "back to car choice" 0x30 -- different in every run, which
+//   request, bit 7 of a car packet's last byte, most of a "back to car choice" 0x30, an AI car's 0x33 setup's four
+//   unwritten dwords -- different in every run, which
 //   must not count; and the physics reads the clock straight, as TimerConditioner does, its "since the base" value
 //   shown in the frames and gating its sends, which the replay must feed)
 //   solorace a single-player race in a session: no network or physics-clock record, replayed identically;
@@ -397,6 +398,24 @@ static unsigned __stdcall lobby_thread(void*) {
                 for (int z = 0; z < 8; z++) to.sin_zero[z] = (char)garbage();   // (UDPSocket::Send never writes sin_zero)
                 to.sin_family = AF_INET, to.sin_port = bs16(2001), to.sin_addr.s_addr = bs32(0x0a000009);
                 saw_v(R_LOBBY, w_sendto(g_sock, (const char*)ci, sizeof ci, 0, (const sockaddr*)&to, sizeof to));
+            }
+            if (g_shown.lobby_ticks % 4 == 3) {                        // the server's car info replies (0x33): an AI car's,
+                for (int human = 0; human < 2; human++) {               // then a human's
+                    uint8_t ci[222];
+                    for (int i = 0; i < 222; i++) ci[i] = (uint8_t)(i * 7 + g_shown.lobby_ticks + human);
+                    ci[0] = 0x21, ci[1] = (uint8_t)g_shown.lobby_ticks, ci[2] = 7, ci[3] = 0x33;
+                    ci[221] = (uint8_t)human;                           // the record's human flag
+                    if (!human)                                         // add_ai_cars' setup: dwords +0x14 / +0x1c / +0x24 /
+                        for (int b : {81, 89, 97, 105})                 // +0x2c never written (make_default_setup)
+                            for (int k = 0; k < 4; k++) ci[b + k] = garbage();
+                    else if (g_fault == "human33" && g_shown.lobby_ticks == 7)
+                        ci[81] ^= 0x40;                                 // a human's setup is compared: a replay's difference
+                    sockaddr_in to;
+                    memset(&to, 0, sizeof to);
+                    for (int z = 0; z < 8; z++) to.sin_zero[z] = (char)garbage();
+                    to.sin_family = AF_INET, to.sin_port = bs16(2002), to.sin_addr.s_addr = bs32(0x0a000009);
+                    saw_v(R_LOBBY, w_sendto(g_sock, (const char*)ci, sizeof ci, 0, (const sockaddr*)&to, sizeof to));
+                }
             }
         }
         w_TaskSleep(250);
@@ -824,6 +843,12 @@ static int parent() {
     check(num(f2, "sends_differ") >= 1 && num(f2, "first_part") >= 0 &&
               log.find("on the lobby task differs from the recording's") != std::string::npos,
           ("the lobby task's: named, frames part at " + field(f2, "first_part")).c_str());
+    write_ini(d, (std::string("[session]\nplay=") + name + "\nlabel=fault-human33\n").c_str());
+    child(g_exe, d, "play", "net", "human33");
+    std::string f3 = read_file(d + "\\result-play.txt");
+    log = read_file(d + "\\test.log");
+    check(num(f3, "sends_differ") >= 1 && log.find("at byte 81 (") != std::string::npos,
+          "a human car's 0x33 setup byte (81) still compared, where an AI car's four setup dwords aren't");
 
     printf("  oldrec (recorded as the 22:22 DLL did, sin_zero garbage in the destination and the hash, packets unmasked; replayed now)\n");
     {
@@ -933,7 +958,7 @@ int main(int argc, char** argv) {
     if (argc >= 6 && !strcmp(argv[1], "child")) {
         g_root = argv[2], g_mode = argv[3], g_scenario = argv[4];
         const std::string extra = argv[5];
-        if (extra == "main" || extra == "lobby") g_fault = extra;
+        if (extra == "main" || extra == "lobby" || extra == "human33") g_fault = extra;
         if (extra == "copy2") g_copy = 2, g_two = true;
         if (extra == "copy1" || extra == "copy1-bcast") g_copy = 1, g_two = true;
         g_logfile = fopen((g_root + "\\test.log").c_str(), g_mode == "record" ? "w" : "a");

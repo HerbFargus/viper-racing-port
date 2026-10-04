@@ -282,6 +282,14 @@ bool unflatten(const uint8_t* p, size_t n, char* buf, size_t cap) {
 //       0x30 car info: with user id 0 at 5 (transPGS_CAR_WAITING_PGS_CAR_CHOICE 0x4aa1b0, 222 bytes) only 3 and 5-8
 //            are written: 4 and 9-221 aren't; otherwise (transPGS_CAR_CHOICE_PGS_CAR_WAITING 0x4aa100) bytes 4, 9-12,
 //            15-25, 58-60 and 206-221 aren't, and the 32-byte car name at 26 (smart_strncpy) after its NUL;
+//       0x33 car info reply (RaceServer::dispatch_NetCarInfoRequestPacket 0x4ab980, 222 bytes: [4] the car, 5-221 the
+//            server's ServerNetCarInfo record 0..0xd8, 217-220 then the round trip): an AI car's record (its human flag,
+//            record +0xd8 = byte 221, is 0: add_ai_cars 0x4aafc6; every car already in gets 1 there, 0x4aae97) holds a
+//            setup (record +0x38 = byte 61) copied from add_ai_cars' stack (rep movsd 0x4aaf99 from [esp+0x1c]), which
+//            CarFileMakeDefaultSetup 0x465780 -> make_default_setup 0x4657d0 fills all but its dwords +0x14, +0x1c, +0x24
+//            and +0x2c: bytes 81-84, 89-92, 97-100 and 105-108 (seen in game: "at byte 81 (58, recorded 10), 82 (0b, e7),
+//            83 (78, 1a), 89 (f4, 64), 90 (e6, ff), 97 (30, 12)" -- recorded 0x001ae710 / 0x001aff64: stack addresses).
+//            A human car's setup (its 0x30, or the IROC car's) is written whole and stays compared;
 //       0x37 / 0x38 sync (transPGS_RACE_BEGIN_PGS_SYNCHRONIZING 0x4aa030 writes 3-7 of 52; the server's 0x37 and the
 //            client's 0x38 replies echo the rest): 8-51;
 //       0x3b deity cast (RaceDeity::record_newlap / newstage 0x443520 / 0x4435b0 build a 12-byte DeityPacket and
@@ -338,6 +346,14 @@ void net_send_mask(const uint8_t* p, int n, uint8_t* m) {
         }
         break;
     }
+    case 0x33:
+        if (n >= 222 && p[221] == 0) {                                // an AI car: its setup's four unwritten dwords
+            mask_range(m, n, 81, 84);
+            mask_range(m, n, 89, 92);
+            mask_range(m, n, 97, 100);
+            mask_range(m, n, 105, 108);
+        }
+        break;
     case 0x37: case 0x38: mask_range(m, n, 8, 51); break;
     case 0x3b: case 0x3c: mask_range(m, n, 15, 15); break;
     }
