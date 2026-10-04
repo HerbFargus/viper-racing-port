@@ -693,6 +693,13 @@ static ListGeom vehicle_list_geometry() {
 // room; it sits in MenuDoOptions's frame among the other tabs), one at a time as the Options screen is. When the chosen
 // car is below the first page the list opens scrolled to show it at the top (kept to the last page). A list too small
 // for a bar (only a custom vrmod size under 64 x 32) is built as before.
+// The bar's place is also covered by a plain Widget (the toolkit's base class: draws nothing, no tab stop, ignores the
+// mouse), added before the tab's other widgets so the bar's three sit above it. The ScrollBar's own rectangle is its
+// track's less the stamp's hot spot each side (vslider.stp's 4, 7: ScrollBar::ScrollBar), and its Draw paints the whole
+// track round that by its own clip; a window clears a hidden widget's rectangle only, so leaving the Hacks tab left the
+// track's edges on screen (a hidden ScrollBar had never happened: the game's other scroll bars are never hidden). The
+// cover is in the tab's group too, so hiding the tab clears the bar's whole column; shown, it's cleared and the bar's
+// widgets over it are drawn again.
 static UIScrollAxis s_vehicle_axis;
 enum : uint32_t { BAR_W = 0x10, BAR_GAP = 2 };
 
@@ -708,6 +715,12 @@ static void __fastcall Hack_Added_n(HackOptionsControl* self, Edx) {
     xl(0x005d5bb0);
     RAW(0x1c0 + k, 5, 0, 0x122, 0x82, 0, 0, G(0x005d5bb4), 0, 0, 0xb, 0, 0, 0, 0);
     if (bar) {
+        void* p = ccall<void*>(F_MemAlloc, (uint32_t)sizeof(Widget));             // FIX: (above) the bar's cover
+        if (p) {
+            const int32_t bx = (int32_t)(g.x + g.w - BAR_W);
+            tcall<Widget*>(F_Widget_ctor, p, bx, (int32_t)g.y, bx + (int32_t)BAR_W, (int32_t)(g.y + g.h));
+            ccall<void>(F_WidgetAddItem, (void*)self->widget->window, p);
+        }
         s_vehicle_axis.total = 0;
         s_vehicle_axis.visible = 0;
         s_vehicle_axis.pos = 0;

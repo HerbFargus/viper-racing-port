@@ -366,7 +366,8 @@ translation, or the command line.
 - The Hacks screen's Vehicle list (Options, Hacks: the only place to change cars) had no scroll bar. It showed its first
   13 cars (17 with vrmod's taller list), in alphabetical order, and any car after them couldn't be chosen. It now has a
   scroll bar down its right edge, inside the list's old outline, so nothing else on the screen moves; drag it, click its
-  arrows, or drag a selection past the list's top or bottom. The list opens scrolled to the chosen car. A race.exe with
+  arrows, or drag a selection past the list's top or bottom. The list opens scrolled to the chosen car, and the bar goes
+  with the rest of the tab when you switch to another (none of its edges left behind). A race.exe with
   vrmod's car-list patch (the list moved up and made taller) is recognised: the list and its bar go where the patch puts
   them.
 - The starting grid built each car's model name ("<car>3.mod") and its paint job's texture name ("~<car>.tex") in 32 bytes

@@ -69,7 +69,9 @@
 // UIDialogItem's and Xlator's constructors, HackEnabled, the Vid* queries, strnicmp, __ftol.
 //
 // In both builds hack_list_tests then runs HackOptionsControl::Added on stock and vrmod-moved Vehicle lists of 0 to 200
-// cars (see there); the fix build leaves that function out of the random rounds (its scroll bar is always added).
+// cars (see there); the fix build leaves that function out of the random rounds (its scroll bar is always added), and
+// first runs hack_hide_tests: the Hacks tab switched away from and back, the bar's pixels checked on a pixel model of
+// the window's canvas.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <float.h>
@@ -459,6 +461,29 @@ static int32_t fake_val(const void* p, int which) {
     const int32_t v[] = {(int32_t)(8 + h % 20), (int32_t)(6 + (h >> 8) % 20), (int32_t)(1 + (h >> 16) % 4), 1, 2, 8, 2, 6};
     return v[which];
 }
+// A pixel model of one canvas, off except in hack_hide_tests (fix build): what the stubs below paint on it -- 0 where the
+// window's background is drawn or the canvas cleared (the background stamp stands for the whole full-screen picture),
+// 2 where one of the Vehicle list's bar stamps lands (its hot spot taken off, as gxDrawStamp does), 1 for anything else
+// (other stamps, rectangles) -- each clipped to the canvas's clip rectangle as the game's own drawing is.
+static bool g_pm_on;
+static const gxCanvas* g_pm_canvas;
+static const void* g_pm_bg;
+static const void* g_pm_bar[3];
+static uint8_t g_pm[480][640];
+static void pm_fill(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t v) {
+    const gxCanvas* c = UI_GP(gxCanvas, S_GX_CANVAS);
+    if (!g_pm_on || c != g_pm_canvas) return;
+    if (x0 < c->cx0) x0 = c->cx0;
+    if (y0 < c->cy0) y0 = c->cy0;
+    if (x1 > c->cx1) x1 = c->cx1;
+    if (y1 > c->cy1) y1 = c->cy1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > 640) x1 = 640;
+    if (y1 > 480) y1 = 480;
+    for (int32_t y = y0; y < y1; y++)
+        for (int32_t x = x0; x < x1; x++) g_pm[y][x] = v;
+}
 static void* __cdecl stub_gxGetStamp(const char* name) { L('GSTP'); LS(name); return fake_for(name, 'STMP'); }
 static void __cdecl stub_gxForgetStamp(void* s) { L('FSTP'); L(P(s)); }
 static int32_t __cdecl stub_gxStampWidth(const void* s) { L('STW '); L(P(s)); return fake_val(s, 0); }
@@ -468,6 +493,13 @@ static void __cdecl stub_gxStampHotSpot(const void* s, int32_t* x, int32_t* y) {
 static uint8_t __cdecl stub_gxStampHitTest(const void* s, int32_t x, int32_t y) { L('STHT'); L(P(s)); L((uint32_t)x); L((uint32_t)y); return (uint8_t)((x ^ y) & 1); }
 static void __cdecl stub_gxDrawStamp(const void* s, int32_t x, int32_t y, int32_t frame, const void* pal) {
     L('DSTP'); L(P(s)); L((uint32_t)x); L((uint32_t)y); L((uint32_t)frame); L(P(pal)); L_canvas();
+    if (g_pm_on) {
+        if (s == g_pm_bg) pm_fill(0, 0, 640, 480, 0);
+        else {
+            const int32_t x0 = x - fake_val(s, 3), y0 = y - fake_val(s, 4);
+            pm_fill(x0, y0, x0 + fake_val(s, 0), y0 + fake_val(s, 1), s == g_pm_bar[0] || s == g_pm_bar[1] || s == g_pm_bar[2] ? 2 : 1);
+        }
+    }
 }
 static void* __cdecl stub_gxFontGet(const char* name) { L('FGET'); LS(name); return fake_for(name, 'FONT'); }
 static void __cdecl stub_gxFontForget(void* f) { L('FFGT'); L(P(f)); }
@@ -494,8 +526,11 @@ static gxCanvas* __cdecl stub_gxSetCanvas(gxCanvas* c) {
     UI_GP(gxCanvas, S_GX_CANVAS) = c;
     return old;
 }
-static void __cdecl stub_gxClear(uint32_t c) { L('CLR '); L(c); L_canvas(); }
-static void __cdecl stub_gxRect(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t col) { L('RECT'); L(a); L(b); L(c); L(d); L(col); L_canvas(); }
+static void __cdecl stub_gxClear(uint32_t c) { L('CLR '); L(c); L_canvas(); pm_fill(0, 0, 640, 480, 0); }
+static void __cdecl stub_gxRect(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t col) {
+    L('RECT'); L(a); L(b); L(c); L(d); L(col); L_canvas();
+    pm_fill(a, b, c, d, 1);
+}
 static void __cdecl stub_gxLine(int32_t a, int32_t b, int32_t c, int32_t d, uint32_t col) { L('LINE'); L(a); L(b); L(c); L(d); L(col); L_canvas(); }
 static void __cdecl stub_gxPaste(const gxCanvas* src, int32_t x, int32_t y) { L('PAST'); L(P(src)); L((uint32_t)x); L((uint32_t)y); L_canvas(); }
 static void __cdecl stub_gxText(int32_t x, int32_t y, const char* s, uint32_t col) { L('TEXT'); L((uint32_t)x); L((uint32_t)y); LS(s); L(col); L_canvas(); }
@@ -1347,8 +1382,9 @@ static int directed_fix_tests() {
 // Faithful build: the rewrite against the original, bit for bit (memory, call logs, return, registers), on each.
 // Fix build: the original and the rewrite from the same state, the stamps given their real sizes (uscroll / dscroll.stp
 // 15 x 18, vslider.stp 16 x 400 with its hot spot at 4, 7): the rewrite returns cleanly and adds the original's widgets,
-// the same, in order, but for the ListBox, which is 18 pixels narrower and has a scroll axis, followed by a ScrollBar
-// and two ScrollButtons on that same axis; the axis counts the cars and the ListBox's rows (the original's); every bar
+// the same, in order, after a plain Widget (the toolkit's base class) over the bar's column, in the same group, but for
+// the ListBox, which is 18 pixels narrower and has a scroll axis, followed by a ScrollBar and two ScrollButtons on that
+// same axis; the axis counts the cars and the ListBox's rows (the original's); every bar
 // widget (and the track the ScrollBar draws round itself) lies in the list's right 16 pixels, the ListBox left of them,
 // so nothing is outside the original list's rectangle; the chosen car is in view. A list too small for a bar (h 40)
 // gives the original's result bit for bit.
@@ -1384,6 +1420,129 @@ static bool hl_same(const Result& a, const Result& b) {
 static bool hl_inside(const Widget* w, int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t mx = 0, int32_t my = 0) {
     return w->x0 - mx >= x0 && w->y0 - my >= y0 && w->x1 + mx <= x1 && w->y1 + my <= y1;
 }
+// Fix build, the bar hidden with its tab (hack_list_tests runs it with the stamps' real sizes set): the Options screen's
+// tab switch as the game does it. Vrmod's list (390, 124, 111, 255) of 33 cars; HackOptionsControl::Added (the rewrite)
+// run inside a group of the running window (EnterGroup, as MenuDoOptions's items put the Hacks tab in one), the world's
+// other widgets standing for another tab (the Sound tab: a second group, hidden while Hacks shows). The window drawn
+// whole (the game's own WidgetWindow::Draw, onto the pixel model); then the switch -- UIHideGroup of the Hacks group and
+// UIShowGroup of the other, what the tabs' RadioButton::Callback calls -- and one ordinary (not full) Draw. Checked: the
+// bar's three widgets (and its cover) hidden and in the Hacks group; none of the bar's stamps drawn in that Draw; no
+// pixel of them left anywhere on the canvas, and nothing in the bar's column outside a visible widget. Then back to
+// Hacks: the bar's column drawn again exactly as at first. And the cause, as a check: with the cover given no area (as
+// before the fix), the same switch leaves the ScrollBar's track edges on the canvas (its stamp drawn round its own
+// rectangle by the hot spot, a hidden widget cleared by its rectangle only).
+static int hack_hide_case(const Ent& f, bool cover, int* leftover) {
+    int bad = 0;
+    auto ck = [&](bool ok, const char* what) { hl_check(ok, what); bad += !ok; };
+    const int32_t gx = 390, gy = 124, gw = 111, gh = 255, bx = gx + gw - 16;
+    hl_set_geometry(gx, gy, gw, gh);
+    hl_world(33, 20);
+    WidgetWindow* win = W.win;
+    win->hidden = 0;
+    win->disabled = 0;
+    win->full_redraw = 0;
+    // the world's widgets: the other tab, but for those over the bar's column (the world's tabs' CustomWidgets have
+    // large rectangles; the game's are empty), kept hidden in a third group throughout
+    static uint32_t g_other, g_hacks, g_off;
+    call_orig(F_WW_EnterGroup, 1, {U32(win), 0, U32(&g_other)});
+    call_orig(F_WW_EnterGroup, 1, {U32(win), 0, U32(&g_off)});
+    for (int i = 0; i < win->count; i++) {
+        Widget* w = (Widget*)win->widgets[i];
+        const bool over = w->x0 < gx + gw + 2 && w->x1 > bx - 2 && w->y0 < gy + gh + 2 && w->y1 > gy - 2;
+        w->groups = over ? g_off : g_other; w->visible = 1; w->enabled = 1; w->dirty = 0; w->over = 0; w->focus = 0;
+    }
+    win->group = 0;
+    call_orig(F_UIHideGroup, 0, {g_off});
+    call_orig(F_WW_EnterGroup, 1, {U32(win), 0, U32(&g_hacks)});
+    const int before = win->count;
+    uint32_t w[72] = {};
+    w[0] = U32(W.hack);
+    g_pc = _PC_53;
+    const Result r = run(f, true, w);
+    call_orig(F_WW_LeaveGroup, 1, {U32(win), 0, U32(&g_hacks)});
+    ck(!r.fault, "the bar hidden with its tab: HackOptionsControl::Added returns cleanly");
+    Widget *cv = 0, *sb = 0, *up = 0, *dn = 0;
+    for (int i = before; i < win->count; i++) {
+        Widget* x = (Widget*)win->widgets[i];
+        const uint32_t vt = U32(x->vtbl);
+        if (vt == VT_Widget && !cv) cv = x;
+        if (vt == VT_ScrollBar) sb = x;
+        if (vt == VT_ScrollButton) (up ? dn : up) = x;
+    }
+    ck(cv && sb && up && dn && cv == (Widget*)win->widgets[before], "the bar hidden with its tab: a cover (first) and the bar's three widgets");
+    if (!(cv && sb && up && dn)) return bad;
+    ck(cv->x0 == bx && cv->y0 == gy && cv->x1 == gx + gw && cv->y1 == gy + gh, "the bar hidden with its tab: the cover is the bar's column");
+    bool grouped = true;
+    for (int i = before; i < win->count; i++) grouped &= ((Widget*)win->widgets[i])->groups == g_hacks;
+    ck(grouped, "the bar hidden with its tab: every widget the tab added is in its group");
+    if (!cover) cv->x1 = cv->x0;                       // the cause: no cover (an empty rectangle is never cleared)
+    call_orig(F_UIHideGroup, 0, {g_other});            // the Hacks tab showing
+    // drawn whole
+    memset(g_pm, 0xee, sizeof g_pm);
+    g_pm_on = true;
+    g_pm_canvas = &win->canvas;
+    g_pm_bg = win->background;
+    win->full_redraw = 1;
+    call_orig(F_WW_Draw, 1, {U32(win), 0, U32(W.screen)});
+    static uint8_t first[480][640];
+    memcpy(first, g_pm, sizeof g_pm);
+    int track = 0;                                     // the track's edges, round the ScrollBar's own rectangle
+    for (int y = gy; y < gy + gh; y++)
+        for (int x = bx; x < gx + gw; x++)
+            if (g_pm[y][x] == 2 && !(x >= sb->x0 && x < sb->x1 && y >= sb->y0 && y < sb->y1)) track++;
+    ck(track > 0, "the bar hidden with its tab: drawn whole, the ScrollBar's track reaches past its own rectangle (the case)");
+    // the switch, and one frame's Draw
+    call_orig(F_UIHideGroup, 0, {g_hacks});
+    call_orig(F_UIShowGroup, 0, {g_other});
+    ck(!cv->visible && !sb->visible && !up->visible && !dn->visible, "the bar hidden with its tab: the bar's widgets hidden");
+    call_orig(F_WW_Draw, 1, {U32(win), 0, U32(W.screen)});
+    int drawn = 0;                                     // the bar's stamps drawn by that Draw (the call log)
+    for (uint32_t i = 0; i + 1 < g_log.n && i + 1 < LOG_MAX; i++)
+        if (g_log.w[i] == 'DSTP' && (g_log.w[i + 1] == P(g_pm_bar[0]) || g_log.w[i + 1] == P(g_pm_bar[1]) || g_log.w[i + 1] == P(g_pm_bar[2]))) drawn++;
+    int left = 0, stray = 0;
+    for (int y = 0; y < 480; y++)
+        for (int x = 0; x < 640; x++) {
+            if (g_pm[y][x] == 2) left++;
+            if (x >= bx && x < gx + gw && y >= gy && y < gy + gh && g_pm[y][x] != 0) {
+                bool in = false;
+                for (int i = 0; i < win->count && !in; i++) {
+                    const Widget* o = (const Widget*)win->widgets[i];
+                    in = o->visible && x >= o->x0 && x < o->x1 && y >= o->y0 && y < o->y1;
+                }
+                stray += !in;
+            }
+        }
+    *leftover = left;
+    if (cover) {
+        char m[200];
+        sprintf(m, "the bar hidden with its tab: none of its stamps drawn (%d), none of their pixels left (%d), nothing stray in its column (%d)",
+                drawn, left, stray);
+        ck(drawn == 0 && left == 0 && stray == 0, m);
+        // back to the Hacks tab
+        call_orig(F_UIHideGroup, 0, {g_other});
+        call_orig(F_UIShowGroup, 0, {g_hacks});
+        call_orig(F_WW_Draw, 1, {U32(win), 0, U32(W.screen)});
+        bool same = true;
+        for (int y = gy; y < gy + gh; y++)
+            for (int x = bx; x < gx + gw; x++) same &= g_pm[y][x] == first[y][x];
+        ck(same && cv->visible && sb->visible && up->visible && dn->visible, "the bar hidden with its tab: shown again, its column drawn as at first");
+    }
+    g_pm_on = false;
+    return bad;
+}
+static int hack_hide_tests(const Ent& f, void* const* bar_stamps) {
+    for (int i = 0; i < 3; i++) g_pm_bar[i] = bar_stamps[i];
+    int with = 0, without = 0;
+    const int bad = hack_hide_case(f, true, &with);
+    hack_hide_case(f, false, &without);
+    char m[200];
+    sprintf(m, "the bar hidden with its tab: without the cover the switch leaves %d pixels of the bar's stamps (with it, %d)", without, with);
+    hl_check(without > 0, m);
+    printf("  %s\n", m);
+    mem_load(g_pristine);
+    return bad + (without > 0 ? 0 : 1);
+}
+
 static int hack_list_tests() {
     const Ent* f = 0;
     for (int i = 0; i < g_nfns; i++)
@@ -1398,6 +1557,9 @@ static int hack_list_tests() {
     if (MENU_FIXES) {
         for (int i = 0; i < 2; i++) { fk[i]->w = 15; fk[i]->h = 18; fk[i]->hx = 0; fk[i]->hy = 0; fk[i]->count = 2; }
         fk[2]->w = 16; fk[2]->h = 400; fk[2]->hx = 4; fk[2]->hy = 7; fk[2]->count = 1;
+        void* const bar_stamps[3] = {fk[0], fk[1], fk[2]};
+        hack_hide_tests(*f, bar_stamps);
+        memcpy((void*)(uintptr_t)0x0048635f, saved, sizeof saved);
     }
     struct G { uint32_t x, y, w, h; const char* what; } geoms[] = {
         {0, 0, 0, 0, "stock (the image's own bytes)"}, {390, 124, 111, 255, "vrmod's car-list patch"},
@@ -1446,9 +1608,13 @@ static int hack_list_tests() {
                 std::string what = m;
                 hl_check(!ro.fault && !rn.fault && hl_same(ro, rn), (what + ": a clean return, the original's registers").c_str());
                 const int nn = W.win->count - before;
-                hl_check(nn == on + 3, (what + ": the original's widgets and three more").c_str());
-                if (nn != on + 3 || on > 60) continue;
-                int k = 0;
+                hl_check(nn == on + 4, (what + ": the original's widgets and four more").c_str());
+                if (nn != on + 4 || on > 60) continue;
+                const Widget* cv = (Widget*)W.win->widgets[before];
+                hl_check(U32(cv->vtbl) == VT_Widget && cv->x0 == gx + gw - 16 && cv->y0 == gy && cv->x1 == gx + gw && cv->y1 == gy + gh &&
+                             cv->groups == ((Widget*)W.win->widgets[before + 1])->groups,
+                         (what + ": first a plain Widget over the bar's column, in the tab's group").c_str());
+                int k = 1;
                 ListBox* lb = 0;
                 bool order = true;
                 for (int i = 0; i < on; i++, k++) {
