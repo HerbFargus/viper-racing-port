@@ -185,12 +185,13 @@ where the original would crash, hang or overrun, so a race replays identically o
 until one of those comes up. The AI crash is the one that comes up in ordinary racing (after the
 stranded-car teleport), so a recording can part from the original there. They are listed in
 `docs/FIXES.md`. Switching away from a single-player race (Alt-Tab) pauses it, where the original's
-physics carried on unseen; the sound goes quiet while away, as DirectSound's did. A `race.exe` carrying vrmod's two engine fixes is recognised, and the rewrites, which
-fix the same bugs, replace them.
+physics carried on unseen; the sound goes quiet while away, as DirectSound's did. A `race.exe` carrying vrmod's patches
+is recognised: the rewrites carry its fixes, do what its features do and read the values it writes (the resolutions, the
+hornball), and replace every patched function (`docs/FIXES.md`, "vrmod's patches").
 
 A rewrite replaces only the exact stock v1.0 function it was written from: before anything is patched,
 the DLL fingerprints each function's code and the read-only constants it reads (`hook/stock.inc`), and
-a function a vrmod fix has patched stays original, so the fix keeps working.
+a function patched by anything but vrmod (as the port knows its patches) stays original, so the patch keeps working.
 
 Each is checked in game in shadow mode, or, where the game never reaches it, offline. A race recorded
 with all of them running and replayed on the original code is identical tick for tick, up to a fix

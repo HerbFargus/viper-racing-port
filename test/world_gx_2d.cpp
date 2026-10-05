@@ -6,6 +6,10 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_gx_2d.cpp
 //        /Fo<dir>\ /Fe<dir>\world_gx_2d.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_gx_2d.exe [worlds] [seed]
+//   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS -- the rewrites as the game has them: every random
+//   world must still equal the original (canvases up to 96 rows), and then gxTriangle / fill_line's fix (docs/FIXES.md,
+//   "Drawing") on canvases 600 to 3000 rows tall against vrmod's tablefix + needlefix race.exe (test/vrmod_image.h, the
+//   same 2048-row tables and bounds), and against the stock original where that survives (up to 1024 rows).
 //
 // Loads out\race_v10.exe at 0x400000 the way test/fuzz.cpp does and includes the rewrite file itself. First the pure
 // pixel converters are run exhaustively (every 16-bit input; millions of 32-bit and blend inputs; every get_cvt_fn
@@ -37,7 +41,9 @@
 #include <type_traits>
 #include <utility>
 
-#define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
+#ifndef FIX_TESTS
+#define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes"; the fixes: /DFIX_TESTS)
+#endif
 #include "../hook/port.h"
 #undef PORT_FN_BUILDS
 #define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
@@ -1122,6 +1128,84 @@ static void pure_tests() {
 
 // ---- main --------------------------------------------------------------------------------------------------------
 enum : uint32_t { CMP_BYTES = A_PIX + 8 * 0x20000 };
+#ifdef FIX_TESTS
+#include "vrmod_image.h"
+// gxTriangle / fill_line on a tall canvas: the fixed rewrite against vrmod's patched original (2048-row tables, both
+// bounds), pixel for pixel, and against the stock original up to 1024 rows. A canvas 16 pixels wide (565), a triangle
+// with corners off every edge; the canvas's buffer is compared whole.
+static int g_fix_fail;
+typedef void(__cdecl* Tri_t)(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t);
+static int tri_guarded(Tri_t f, const int32_t* v, uint32_t c) {
+    __try {
+        f(v[0], v[1], v[2], v[3], v[4], v[5], c);
+    } __except (fault_filter(GetExceptionInformation())) { return 1; }
+    return 0;
+}
+static void fix_tests() {
+    enum { W = 16, HMAX = 3100 };
+    const uint32_t bytes = W * 2 * HMAX;
+    uint8_t* px = (uint8_t*)VirtualAlloc(0, bytes, MEM_COMMIT, PAGE_READWRITE);
+    uint8_t* start = (uint8_t*)malloc(bytes);
+    uint8_t* after_orig = (uint8_t*)malloc(bytes);
+    static gxCanvas tall;
+    const int heights[] = {600, 1024, 1025, 1080, 1100, 1536, 2047, 2048, 2049, 2100, 3000};
+    int vs_vrmod = 0, vs_stock = 0, rows_past = 0;
+    for (int hi = 0; hi < (int)(sizeof heights / sizeof heights[0]); hi++) {
+        const int H = heights[hi];
+        for (int t = 0; t < 400; t++) {
+            tall.format = 4;
+            tall.flags = 0x80;
+            tall.pixels = px;
+            tall.w = W;
+            tall.h = H;
+            tall.pitch = W * 2;
+            tall.cx0 = 0; tall.cy0 = 0; tall.cx1 = W; tall.cy1 = H;
+            set_cur(&tall);
+            int32_t v[6];
+            for (int k = 0; k < 3; k++) {
+                v[2 * k] = irange(-8, W + 8);
+                v[2 * k + 1] = chance(70) ? irange(H - 120, H + 40) : irange(-40, H + 40);   // mostly near the bottom
+            }
+            if (H > 1024) for (int k = 1; k < 6; k += 2) if (v[k] > 1024) rows_past++;
+            const uint32_t c = rnd();
+            for (uint32_t i = 0; i < bytes; i += 4) { const uint32_t r = rnd(); memcpy(px + i, &r, 4); }
+            memcpy(start, px, bytes);
+            g_log.n = 0;
+            vrmod_apply();
+            const int fo = tri_guarded((Tri_t)0x00450760, v, c);
+            vrmod_unapply();
+            memcpy(after_orig, px, bytes);
+            memcpy(px, start, bytes);
+            g_log.n = 0;
+            const int fn = tri_guarded(&gxTriangle_n, v, c);
+            vs_vrmod++;
+            if (fo || fn || memcmp(after_orig, px, bytes)) {
+                uint32_t k = 0;
+                while (k < bytes && after_orig[k] == px[k]) k++;
+                if (g_fix_fail++ < 10)
+                    printf("  FIX gxTriangle, %d rows: (%d,%d) (%d,%d) (%d,%d): vrmod's original %s, the rewrite %s; first differing row %d\n",
+                           H, v[0], v[1], v[2], v[3], v[4], v[5], fo ? "faulted" : "ran", fn ? "faulted" : "ran",
+                           k < bytes ? (int)(k / (W * 2)) : -1);
+                continue;
+            }
+            if (H <= 1024) {                               // the stock original survives: the same pixels
+                memcpy(px, start, bytes);
+                const int fs = tri_guarded((Tri_t)0x00450760, v, c);
+                vs_stock++;
+                if (fs || memcmp(after_orig, px, bytes)) {
+                    if (g_fix_fail++ < 10) printf("  FIX gxTriangle, %d rows: the stock original %s\n", H, fs ? "faulted" : "differs");
+                }
+            }
+        }
+    }
+    printf("fix: gxTriangle / fill_line on canvases 600 to 3000 rows: %d triangles against vrmod's tablefix + needlefix "
+           "(%d corners past row 1024), %d also against the stock original\n", vs_vrmod, rows_past, vs_stock);
+    VirtualFree(px, 0, MEM_RELEASE);
+    free(start);
+    free(after_orig);
+}
+#endif
+
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
@@ -1308,5 +1392,10 @@ int main(int argc, char** argv) {
            iterations, unmasked_runs, differ, faults, fault_both, fp_bad, replay_only, pixel_bytes_changed);
     printf("per function (worlds / differing / faulted in both):\n");
     for (int i = 0; i < N_KINDS; i++) printf("  %-32s %6d / %d / %d\n", kind_names[i], per[i], per_bad[i], per_fault[i]);
+#ifdef FIX_TESTS
+    fix_tests();
+    printf("fix tests: %d failures\n", g_fix_fail);
+    if (g_fix_fail) return 1;
+#endif
     return differ || fp_bad || g_pure_bad ? 1 : 0;
 }

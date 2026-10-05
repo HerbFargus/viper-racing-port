@@ -9,7 +9,7 @@ rem dinput.dll (built by hook\build.bat) and SDL2.dll there.
 call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x86 >nul || exit /b 1
 set OUT=%~dp0build
 if not exist "%OUT%" mkdir "%OUT%"
-cl /nologo /O2 /MT /W3 /EHsc /std:c++17 "%~dp0viperport_main.cpp" /Fo"%OUT%\\" /Fe"%OUT%\viperport.exe" /link /SUBSYSTEM:WINDOWS /BASE:0x00800000 /FIXED /DYNAMICBASE:NO /STACK:0x100000,0x1000 /MACHINE:X86 kernel32.lib user32.lib gdi32.lib bcrypt.lib || exit /b 1
+cl /nologo /O2 /MT /W3 /EHsc /std:c++17 "%~dp0viperport_main.cpp" /Fo"%OUT%\\" /Fe"%OUT%\viperport.exe" /link /SUBSYSTEM:WINDOWS /BASE:0x00800000 /FIXED /DYNAMICBASE:NO /STACK:0x100000,0x1000 /MACHINE:X86 kernel32.lib user32.lib gdi32.lib bcrypt.lib advapi32.lib || exit /b 1
 if /i not "%~1"=="dll" exit /b 0
 set H=%~dp0..\hook
 set SDL=%~dp0..\..\sdl2\SDL2-2.32.10

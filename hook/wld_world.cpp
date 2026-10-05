@@ -1146,6 +1146,8 @@ static void fp_hermite(Footprint& f, Point2D* out, const Point2D*, const Point2D
 PORT_FN(0x004635f0, "HermiteEval(world.obj)", HermiteEval_rw, fp_hermite)
 
 // ==== create_ball (0x4636a0): a 'BALL' ModelObject (ball.mod) 5000 m above the ground at the origin ========================
+// Its mass (3000) and collision radius (18 inches) are immediates vrmod's hornball.py sets to the player's values: they
+// are read from the original's instructions (port.h, vrmod_operand: the stock values in a stock race.exe).
 static void __cdecl create_ball_rw(int car) {
     BallData b;
     b.h.type = 0x42414c4c;                                       // 'BALL'
@@ -1159,7 +1161,9 @@ static void __cdecl create_ball_rw(int car) {
     b.pos.y = (float)h;
     memcpy(&b.inertia[2], &k5000, 4);
     memcpy(&b._28, &k5000, 4);
-    const uint32_t k3000 = 0x453b8000, k18 = 0x41900000, k06 = 0x3f19999a, k5 = 0x40a00000;
+    const uint32_t k3000 = vrmod_operand(0x004636f2);            // mov [esp+8], 3000.0 (the mass)
+    const uint32_t k18 = vrmod_operand(0x00463700);              // mov [esp+0x28], 18.0 (the radius, inches)
+    const uint32_t k06 = 0x3f19999a, k5 = 0x40a00000;
     memcpy(&b.mass, &k3000, 4);
     memcpy(&b.radius, &k18, 4);
     memcpy(&b._2c, &k06, 4);

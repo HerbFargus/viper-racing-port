@@ -6,8 +6,10 @@
 //        /Fo%TEMP%\k1\ /Fe%TEMP%\k1\world_krn_core.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_krn_core.exe [worlds] [seed]
 //   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS -- the rewrites as the game has them, on the same
-//   worlds (ExceptBegin, the one fixed function, is left out of them and of the chain), then ExceptBegin's crash log in
-//   <race.exe's folder>\log\ (fix_except_begin; CreateDirectoryA is a stub that makes nothing).
+//   worlds (ExceptBegin and unsafe_check, the fixed functions, are left out of them and of the chain, and so are
+//   _SingleEnter / _SingleLeave, which call unsafe_check), then ExceptBegin's crash log in <race.exe's folder>\log\
+//   (fix_except_begin; CreateDirectoryA is a stub that makes nothing) and unsafe_check's owner check that no longer
+//   panics (fix_unsafe_check).
 //
 // Loads out\race_v10.exe at 0x400000 in a child process (as test/fuzz.cpp) and resolves its KERNEL32 / USER32 / WINMM
 // imports; then every import slot the kernel uses holds a logging stub instead -- the heap (a bump heap in the arena),
@@ -184,6 +186,7 @@ static void chain_patch() {
     for (ChainReg* r = ChainReg::head(); r; r = r->next) {
 #ifdef FIX_TESTS
         if (r->at == 0x004154a0) continue;             // (the fixed ExceptBegin: checked on its own, fix_except_begin)
+        if (r->at == 0x00415020) continue;             // (the fixed unsafe_check: checked on its own, fix_unsafe_check)
 #endif
         if (r->at == 0x004188ad) {
             chain_save(0x004188ad);
@@ -1209,9 +1212,11 @@ static void check_sync() {
     CHECK0_BOTH(SyncBegin_rw);
     const char* n = rand_name();
     if (n) CHECK_BOTH(SingleBegin_rw, n);
+#ifndef FIX_TESTS
     CHECK_BOTH(SingleEnter_rw, rand_single(), (const char*)0, ri(0, 100));
     CHECK_BOTH(unsafe_check_rw, rand_single(), (const char*)0, 0);
     CHECK_BOTH(SingleLeave_rw, rand_single(), (const char*)0, 0);
+#endif                                                   // (the fix build: fix_unsafe_check)
     CHECK_BOTH(SingleEnd_rw, rand_single(), (const char*)0, 0);
     n = rand_name();
     if (n) CHECK_BOTH(MultiBegin_rw, n);
@@ -1527,6 +1532,75 @@ static int fix_except_begin() {
     printf("fix build: ExceptBegin's crash log in <race.exe's folder>\\log\\: %d cases, %d wrong\n", (int)(sizeof cases / sizeof *cases), bad);
     return bad;
 }
+
+// unsafe_check's FIX: a thread entering a module another thread owns (or none) no longer panics; the check writes
+// nothing. On random worlds and handles: where the original returns, the rewrite does the same thing (the same arena,
+// globals and stub calls); where the original panics, the rewrite returns and the arena and globals are as they were.
+// _SingleEnter / _SingleLeave (which call unsafe_check through its address) likewise, with the fixed unsafe_check in
+// place (the chain), against the originals.
+typedef void(__cdecl* Lock3_fix_t)(int, const char*, int);
+static int fix_one(Lock3_fix_t f, int h) {
+    uint64_t ret;
+    uint16_t cw;
+    auto run = [&]() -> uint64_t { f(h, 0, 0); return 0; };
+    fpu_start(0x027f);
+    const int r = guarded(run, &ret, &cw);
+    fpu_reset();
+    return r;
+}
+static int fix_unsafe_check() {
+    static Snapshot s0, a;
+    int bad = 0, panics = 0, same = 0;
+    struct Fn { const char* name; uint32_t orig; Lock3_fix_t fixed; } fns[] = {
+        {"unsafe_check", 0x00415020, &unsafe_check_rw},
+        {"_SingleEnter", 0x00415000, &SingleEnter_rw},
+        {"_SingleLeave", 0x00415070, &SingleLeave_rw},
+    };
+    for (int w = 0; w < 600; w++) {
+        random_world();
+        ctrl()->panic_returns = 0;                       // (LogPanic ends the call, as in the game)
+        const Fn& fn = fns[w % 3];
+        const int h = ri(1, 16);
+        save(s0);
+        g_pass = 0; g_nlog[0] = 0; g_si = 0;
+        const int ro = fix_one((Lock3_fix_t)(uintptr_t)fn.orig, h);
+        save(a);
+        load(s0);
+        uint8_t saved[5];
+        memcpy(saved, (void*)0x00415020, 5);
+        patch_jmp(0x00415020, (void*)&unsafe_check_rw);  // the fixed check where the callers reach it
+        g_pass = 1; g_nlog[1] = 0; g_si = 0;
+        const int rn = fix_one(fn.fixed, h);
+        memcpy((void*)0x00415020, saved, 5);
+        static Snapshot b;
+        save(b);
+        const bool logs_same = g_nlog[0] == g_nlog[1] && !memcmp(g_log[0], g_log[1], sizeof(LogEntry) * (g_nlog[0] < LOGN ? g_nlog[0] : LOGN));
+        // the owner check's panic ("\"%s\" called module %s owned by \"%s\"", 0x4e68cc); another (current_taskid's
+        // "Current thread is unlisted", in a world whose thread isn't listed) happens in both, the same way
+        auto owner_panic = [](int pass) {
+            for (int i = 0; i < g_nlog[pass] && i < LOGN; i++)
+                if (g_log[pass][i].kind == L_PANIC && g_log[pass][i].a[0] == 0x004e68ccu) return true;
+            return false;
+        };
+        bool ok;
+        if (ro == R_PANIC && owner_panic(0)) {
+            panics++;
+            ok = rn == R_RAN && !owner_panic(1) && !memcmp(b.arena + sizeof(Ctrl), s0.arena + sizeof(Ctrl), ARENA_SIZE - sizeof(Ctrl)) &&
+                 !memcmp(b.globals, s0.globals, GLOBALS_BYTES);
+        } else {
+            same++;
+            ok = rn == ro && !memcmp(b.arena, a.arena, ARENA_SIZE) && !memcmp(b.globals, a.globals, GLOBALS_BYTES) && logs_same;
+        }
+        if (!ok) {
+            if (bad++ < 5) printf("  FAIL %s(%d), world %d: the original %s, the fixed one %s%s\n", fn.name, h, w, k_result[ro],
+                                  k_result[rn], rn == ro ? " but differently" : "");
+        }
+        load(a);
+    }
+    printf("fix build: unsafe_check's owner check: %d calls panicked in the original (none in the fixed: nothing written), "
+           "%d ran the same; %d wrong\n", panics, same, bad);
+    return bad;
+}
 #endif
 static int live_check() {
     LiveResult o = live_run(false), n = live_run(true);
@@ -1611,6 +1685,7 @@ int main(int argc, char** argv) {
     int live = live_check();
 #ifdef FIX_TESTS
     failed += fix_except_begin();
+    failed += fix_unsafe_check();
 #endif
     return failed || live ? 1 : 0;
 }

@@ -45,6 +45,7 @@
 #include "ui_types.h"
 #include "x87.h"
 #include "career_types.h"
+#include "fix_paths.h"
 
 namespace {
 namespace career_main {
@@ -131,7 +132,15 @@ PORT_FN(0x004bc4f0, "CareerLog", CareerLog_c, fp_CareerLog)
 static void __cdecl CareerDo_c() {
     ccall<void>(F_HackDisable);
     uint8_t done = 0;
-    CA_G32(S_LOG) = ccall<int32_t>(F_FileAppend, CA_CP(0x004ff5ec));                             // "c:\career.log"
+    // FIX: the career log went to the root of C: ("c:\career.log", the literal at 0x4ff5ec), which isn't writable without
+    // elevation on NT 6+, so there was none; vrmod's writepaths.py makes the literal "log\career.log", relative to the
+    // current directory. It is <race.exe's folder>\log\career.log now, the folder made, like the other logs
+    // (fix_paths.h: log-2\ for the second copy under [test] two_copies). A folder too long for the file table's 0x100-byte
+    // names keeps the literal.
+    const char* log_name = CA_CP(0x004ff5ec);
+    char log_path[0x100];
+    if (VP_FIX && vp_log_path(log_path, sizeof log_path, "career.log")) log_name = log_path;
+    CA_G32(S_LOG) = ccall<int32_t>(F_FileAppend, log_name);
     do {
         const int32_t slot = ccall<int32_t>(F_CareerChooser);
         if (slot < 0) done = 1;

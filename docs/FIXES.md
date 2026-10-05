@@ -81,10 +81,12 @@ dozen places and the game dies.
   already use `Config\`. The first time the folder is made, the old user directory is copied into it,
   the UAC VirtualStore copy first; the old files are only read. A game folder over 200 characters keeps
   the old behaviour (the game's own limit).
-- `log_file_begin`, `ExceptBegin`, `TimerWatchdog::dump`: `log.log`, `except.log` and `timer.log` go to
-  `<game folder>\log\` instead of the root of C:, which isn't writable without elevation, so there was
-  no log at all (and every race end tried to create `c:\timer.log`). `c:\career.log` is written by the
-  career code, which isn't ported yet.
+- `log_file_begin`, `ExceptBegin`, `TimerWatchdog::dump`, `CareerDo`: `log.log`, `except.log`, `timer.log`
+  and `career.log` go to `<game folder>\log\` instead of the root of C:, which isn't writable without
+  elevation, so there was no log at all (and every race end tried to create `c:\timer.log`). vrmod's
+  writepaths patch makes the literals `log\...`, relative to the current directory: the same files when the
+  game is started from its folder. The second copy under `[test] two_copies` uses `log-2\`. A game folder
+  too long for the file table's 256-byte names keeps the old name.
 
 ## Files and resources
 
@@ -105,6 +107,21 @@ dozen places and the game dies.
   language name cut, instead of overrunning the table.
 
 ## Drawing
+
+- `gxTriangle` / `fill_line`, the 2D filled triangle (the dashboard's tachometer needle, the replay graphs):
+  its two edge tables on the stack hold 1024 rows, and both the edge walker and the fill tested a row only
+  against the canvas's height. On a canvas taller than 1024 rows the walker wrote past the tables (the
+  stack: at 1920x1080 under the game's own DirectDraw the needle, drawn near the bottom, crashed the race at
+  a garbage address) and the fill read one table into the other (red streaks). The tables now hold 2048
+  rows each and both tests skip a row past them too, as vrmod's tablefix and needlefix patches make the
+  original; the rows of a canvas taller than 2048 below that aren't drawn. `gxTriangle`'s rewrite calls
+  `fill_line`'s directly, so the two halves always agree on the tables. A canvas up to 1024 rows (the
+  OpenGL renderer's 640x480 page) draws exactly as before.
+- `find_mem`: the start-up's video-memory check adds 600 KB (a 640x480 front buffer) to the total
+  DirectDraw reports, and a card reporting within 600 KB of 4 GB wrapped it to almost nothing: "unsupported:
+  0 megs of vram" and the game quit (with the game's own DirectDraw on a modern card; the OpenGL renderer
+  reports 64 MB). A total the add would wrap is taken as it is -- what vrmod's vrampatch does for every
+  total, by removing the add. Below that, as the original.
 
 - Texture names of 16 characters or more overran the texture table's 16-byte name field: a keyed
   16-character name (a car's damaged copy) was never found again, so every use loaded another copy;
@@ -159,6 +176,14 @@ dozen places and the game dies.
 - The 2D page was stretched to the window with a plain linear filter, which blurred it (at 4K each game pixel spans
   4.5 screen pixels). It's now drawn sharp: each game pixel is a solid block, blended only across the one screen pixel
   where two blocks meet, as fits the game's 640x480 art. (Display only, `gl_core.cpp`.)
+
+## Threads
+
+- `unsafe_check` (`_SingleEnter` / `_SingleLeave`'s owner check): a thread entering a module another thread
+  holds -- or one nobody has taken yet -- panicked "\"%s\" called module %s owned by \"%s\"". The v1.0 build
+  keeps this release-candidate assert, and it fires at random ("module mouse owned by (null)"); the released
+  `race.bin` compiles it out, and vrmod's modassert patch makes it a bare `ret`. The rewrite still makes the
+  test (it only reads) and returns instead of panicking.
 
 ## Switching away
 
@@ -621,6 +646,40 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
   and the log says so once.
 - Sounds: the sound manager's table 384 -> 1024 (the 385th overran the heap) and the software mixer's list
   256 -> 1024 (the 257th panicked "full"). Past 1024 a new sound is silent.
+- A model's vertices: the lit-vertex buffer every model is lit into (`mr_model_begin`) held 1,500 vertices, and
+  a model with more wrote past it on the heap; it now holds 32,768, every vertex a face's 16-bit index can name
+  (1 MB, made once). Mod cars past 1,500 vertices (the jeeps: up to 16,384) needed vrmod's vertexbuffer patch
+  for this; a race.exe with that patch is replaced too, and gets the full 32,768. (In the rewrite, not M1:
+  with `mr_model_begin` left original, the buffer is the original's.)
+
+## vrmod's patches
+
+vrmod (viper-mod-manager) patches fifteen of the functions the port rewrites, and a few constants they read. The
+rewrites take every one of them over, so on a vrmod `race.exe` every function runs as a rewrite -- on the
+`dinput.dll` route and in `viperport.exe`, whose `--check` accepts such a `race.exe` -- with the same behaviour
+as the patch. The stock check (`tools/gen_port_tables.py`: `VRMOD_PATCHES`, `VRMOD_MASKS`, `LIVE_CONSTS`)
+accepts exactly vrmod's bytes for each (with any value where the player chooses one), and `viperport.log` names
+each one it finds ("has vrmod's patch (...); the rewrite takes it over"). Any other change to one of them still
+leaves it original.
+
+- Fixes the rewrites carry themselves: the obstacle wake (`Obstacle::Reset`) and the AI bead guard
+  (`IdealLine::advance_bead`; the rewrite puts the car at the nearest point of its line, not the head), above;
+  vrampatch (`find_mem`), tablefix + needlefix (`gxTriangle`, `fill_line`) and modassert (`unsafe_check`),
+  above. tablefix's stub in the code section's slack (0x4da490) is outside every function: left as it is.
+- Values the rewrites read from the installed `race.exe`, as the patched originals do (a stock file gives the
+  stock values, bit for bit): the four screen modes' sizes (resolution: `gxSetMode`, `gxChangeMode`, `set_mode`,
+  `mode_callback`; the menu's "W x H" labels are data the game reads as it always did), the hornball's mass and
+  collision radius (`create_ball`) and its cooldown, throw speed and spawn point (`Ball::Throw`'s four floats),
+  and the Hacks screen's Vehicle list (carlist, under "Menus").
+- aspectfix (`dviewport::set_viewport`, Hor+): the rewrite recognises vrmod's code and does what it does --
+  R = max(R0, h/w), the clip window 2R/(h/w) wide -- with the player's R0, read through the code's own address.
+  Under the OpenGL renderer the game draws at 4:3 sizes and the renderer widens the picture itself; a viewport
+  at least as tall as R0 (640x416 under the dash at the default 0.65) comes out exactly as stock either way,
+  and a narrower one (the 512x384 mode's race view) as under vrmod's original.
+- vertexbuffer (`mr_model_begin`): superseded by the lift under "Limits lifted" (32,768 vertices, whatever the
+  patch asked for).
+- writepaths: the `.data` path strings it rewrites are read by rewrites that put the files under the game's own
+  folder anyway (`Config\`, `log\`), under "Where the game writes".
 
 ## Not fixed
 

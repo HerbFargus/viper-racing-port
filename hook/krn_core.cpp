@@ -1287,9 +1287,15 @@ static void __cdecl SingleEnter_rw(int h, const char* file, int line) { unsafe_c
 static void fp_lock3_none(Footprint&, int, const char*, int) {}
 PORT_FN(0x00415000, "_SingleEnter", SingleEnter_rw, fp_lock3_none)
 
+// FIX: the module-owner check panics "\"%s\" called module %s owned by \"%s\"" when a thread enters a module another
+// thread owns -- or one nobody has taken: in v1.0 (the RC build) the mouse module is entered before it has an owner, and
+// the game dies with "module mouse owned by (null)" at random. The released race.bin compiles the check out (a bare
+// ret), as vrmod's modassert.py does to race.exe; it writes nothing either way. The test is still made (it reads only),
+// and a mismatch returns instead of panicking.
 static void __cdecl unsafe_check_rw(int h, const char*, int) {
     VSync* e = single_entry(h);
     if ((uint32_t)TaskGetID() != e->v) {
+        if (VP_FIX) return;
         const char* owner = TaskGetName((int)e->v);
         const char* module = e->name;
         const char* me = TaskGetName(TaskGetID());

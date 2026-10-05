@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 
 #ifndef VP_GX_FIXES                 // (built with /DVP_GX_FIXES: the fixes on, and tested -- see main)
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
@@ -1223,8 +1224,85 @@ static int directed_fix_tests() {
         if (bad) break;
     }
     check(clamped_total > 0 && same_total > 0, "(d) both in-table and clamped entries were seen");
+    // (e) the lit-vertex buffer LIFT: mr_model_begin makes it 32,768 vertices (1 MB), every other allocation and store as
+    // the original's. MemAlloc is a recorder here (the arena's heap is too small for the lifted buffer): its sizes, in
+    // order, must be the original's but for the lit buffer's (0xbb80 -> 0x100000); then a model with 32,768 vertices is
+    // lit into it by the rewrite's own lighting (the light function the surfaces use, on a surface spanning them all),
+    // with nothing written past its end.
+    {
+        static std::vector<int> sizes[3];                              // [2]: the set-up's own
+        static uint8_t* big;
+        static uint32_t big_used;
+        if (!big) big = (uint8_t*)VirtualAlloc(0, 0x800000, MEM_COMMIT, PAGE_READWRITE);
+        struct A {
+            static void* __cdecl alloc(int n) {
+                sizes[g_t_m].push_back(n);
+                if (n < 0 || big_used + (uint32_t)n + 64 > 0x7f0000) return 0;
+                uint8_t* p = big + big_used;
+                big_used += ((uint32_t)n + 64 + 15) & ~15u;   // 64 guard bytes after each block
+                memset(p, 0xcd, (uint32_t)n + 64);
+                return p;
+            }
+            static void orig() { ((void(__cdecl*)())0x004556f0)(); }
+            static void rw() { mr_model_begin(); }
+        };
+        uint8_t saved[5];
+        memcpy(saved, (void*)0x004140e0, 5);
+        patch_jmp(0x004140e0, (void*)&A::alloc);
+        int f[2];
+        uint8_t* lit[2];
+        for (int k = 0; k < 2; k++) {
+            g_t_m = 2;
+            setup_world();
+            g_t_m = k;
+            sizes[k].clear();
+            big_used = 0;
+            vp_g_lit_buf_bytes = VP_LIT_BUF_STOCK;
+            f[k] = guarded(k ? A::rw : A::orig);
+            lit[k] = *(uint8_t**)S_LIT_BUF;
+        }
+        memcpy((void*)0x004140e0, saved, 5);
+        bool same_but_lit = sizes[0].size() == sizes[1].size();
+        int lifted = 0;
+        for (size_t i = 0; same_but_lit && i < sizes[0].size(); i++)
+            if (sizes[0][i] == 0xbb80 && sizes[1][i] == 0x100000) lifted++;
+            else if (sizes[0][i] != sizes[1][i]) same_but_lit = false;
+        const bool e_ok = !f[0] && !f[1] && same_but_lit && lifted == 1 && lit[1] && vp_g_lit_buf_bytes == 0x100000;
+        if (!e_ok) {
+            printf("  (e): faults %d / %d, %zu / %zu allocations, %d lifted, buffer %p, %u bytes; sizes:", f[0], f[1], sizes[0].size(),
+                   sizes[1].size(), lifted, (void*)lit[1], vp_g_lit_buf_bytes);
+            for (size_t i = 0; i < sizes[0].size() || i < sizes[1].size(); i++)
+                printf(" %x/%x", i < sizes[0].size() ? sizes[0][i] : -1, i < sizes[1].size() ? sizes[1][i] : -1);
+            printf("\n");
+        }
+        check(e_ok, "(e) mr_model_begin: the lit-vertex buffer 1 MB (32,768 vertices), every other allocation the original's");
+        // light 32,767 vertices into it (one surface 0..32766, an int16's reach) with the rewrite's lighting
+        if (lit[1]) {
+            static float verts[32768 * 8];
+            for (int i = 0; i < 32768 * 8; i++) verts[i] = (float)(i % 97) * 0.01f - 0.4f;
+            static uint8_t surf[0x20];
+            memset(surf, 0, sizeof surf);
+            *(int16_t*)(surf + 0x1a) = (int16_t)0x7fff;
+            random_statics();
+            *(int32_t*)L_BASE = 0x80;
+            static const uint8_t untouched[32] = {0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
+                                                  0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
+                                                  0xcd, 0xcd, 0xcd, 0xcd};
+            uint8_t guard_before[64];
+            memcpy(guard_before, lit[1] + 0x100000, 64);
+            int fl;
+            __try {
+                light_nopre_nofog_someenv(surf, (uint8_t*)verts, lit[1]);
+                fl = 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { fl = 1; }
+            check(!fl && !memcmp(guard_before, lit[1] + 0x100000, 64) && memcmp(lit[1] + 32 * 32766, untouched, 32) != 0,
+                  "(e) 32,767 vertices lit into the lifted buffer: the last one written, nothing past its end");
+        }
+        vp_g_lit_buf_bytes = VP_LIT_BUF_STOCK;
+    }
     printf("directed fix tests (50 rounds): %s -- the original fetched %d textures again on rebuilds, the fixed %s; lighting: %d "
-           "values unchanged, %d clamped\n", bad ? "FAILED" : "all passed", orig_refetch, bad ? "?" : "none", same_total, clamped_total);
+           "values unchanged, %d clamped; the lit-vertex buffer lifted to 32,768 vertices\n", bad ? "FAILED" : "all passed",
+           orig_refetch, bad ? "?" : "none", same_total, clamped_total);
     return bad;
 }
 #endif

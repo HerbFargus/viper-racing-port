@@ -104,11 +104,12 @@ def prologue(exe, secs, md, va: int, size: int) -> tuple[bytes, int]:
 
 
 # ---- stock fingerprints ---------------------------------------------------------------------------------
-# A rewrite reproduces the STOCK v1.0 function. If the installed race.exe has that function patched --
-# vrmod's engine fixes, hornball, the AI crash fix -- replacing it would silently undo the patch. So for
-# each rewritten function this records a fingerprint of its code and of every read-only constant it reads
-# (.rdata operands); the DLL recomputes it before patching anything and keeps a mismatching function
-# original. {address, code bytes, hash, count of constants, their addresses and widths}.
+# A rewrite reproduces the STOCK v1.0 function. If the installed race.exe has that function patched,
+# replacing it could silently undo the patch. So for each rewritten function this records a fingerprint of its
+# code and of every read-only constant it reads (.rdata operands, less LIVE_CONSTS); the DLL recomputes it
+# before patching anything and keeps a mismatching function original -- unless it matches one of vrmod's
+# patches the rewrites take over (VRMOD_PATCHES, VRMOD_MASKS below: every patch vrmod makes to v1.0 race.exe).
+# {address, code bytes, hash, count of constants, their addresses and widths}.
 RDATA = (0x4DB000, 0x4E1000)
 
 
@@ -127,35 +128,106 @@ def port_fn_addresses() -> list[int]:
     return sorted(found)
 
 
-# vrmod's two always-on engine fixes (viper-mod-manager vrmod/enginefix.py), as edits to the stock
-# function's bytes. The rewrites carry both fixes, so a function with exactly this patch is replaced too.
-VRMOD_FIXES = {
-    0x0043D3C0: (0x1D, bytes.fromhex("909090")),              # Obstacle::Reset: fall through into Perturb
-    0x00421840: (0x09, bytes.fromhex(                          # IdealLine::advance_bead: the bead guard
-        "c744242cffffffff31db837f040075098b472c894704895f08" + "90" * 7)),
+# ---- vrmod's patches inside rewritten functions (viper-mod-manager vrmod/*.py) ----------------------------------
+# A rewrite replaces an installed function that isn't stock only where it reproduces what vrmod's patch does (or fixes
+# the same bug), so a vrmod race.exe runs every function as a rewrite with the same behaviour as today. Two ways:
+#
+# VRMOD_PATCHES: vrmod's exact bytes, as edits to the stock function ({va: [(what, [(offset, hex bytes), ...]), ...]});
+# each gives one more accepted fingerprint (with the function's VRMOD_MASKS bytes as zeros, if it has any).
+VRMOD_PATCHES = {
+    # enginefix.py, always on: the rewrites carry both fixes (docs/FIXES.md, "Obstacles", "The AI crash")
+    0x0043D3C0: [("enginefix: obstacle wake", [(0x1D, "909090")])],     # Obstacle::Reset: fall through into Perturb
+    0x00421840: [("enginefix: the AI bead guard", [(0x09,               # IdealLine::advance_bead
+        "c744242cffffffff31db837f040075098b472c894704895f08" + "90" * 7)])],
+    # vrampatch.py, always on: the video-memory add NOP'd; the rewrite leaves out an add that would wrap (gx_dx.cpp)
+    0x00455130: [("vrampatch", [(0x26, "90" * 8)])],
+    # modassert.py: unsafe_check a bare ret; the rewrite's fix never panics (krn_core.cpp). It is the function's first
+    # byte: port.cpp's live_prologue takes the trampoline's copy of it as it is (the ret runs, as vrmod's function does)
+    0x00415020: [("modassert", [(0x00, "c3")])],
+    # aspectfix.py, always on: Hor+ at widescreen DirectDraw modes; the rewrite does the same (gx_dd.cpp), reading R0 and
+    # -0.5 through the code's own two addresses (VRMOD_MASKS: any addresses)
+    0x0045EC20: [("aspectfix", [(0x3F,
+        "da742414d9c0d90594024e00d8d1dfe09e7604ddd9eb02ddd8d9542420d8c0d8f1ddd9d9542424d80d54b04d00d95c241cc744243000"
+        "00803fd9442420d8c0909090")])],
+    # tablefix.py + needlefix.py (entries 0x800), always on: the triangle's edge tables doubled and both row tests bound
+    # by them; the rewrites fix the same overrun with tables of 2048 rows (gx_2d.cpp). gxTriangle's fill test jumps to a
+    # stub in .text slack (0x4da490), outside every function: data to the port, left as it is
+    0x00450760: [("tablefix + needlefix", [(0x02, "40"), (0x21, "40"), (0x28, "40"), (0x2F, "40"), (0x36, "40"),
+                                          (0x44, "40"), (0x52, "40"), (0x62, "20"), (0x71, "40"), (0x81, "20"),
+                                          (0x8C, "40"), (0x98, "40"), (0xA8, "20"), (0xB3, "40"), (0xC5, "40"),
+                                          (0xD5, "20"), (0xE0, "40"), (0xEC, "40"), (0xFC, "20"), (0x107, "40"),
+                                          (0x144, "40"), (0x14B, "e9e09b08009090909090"), (0x15D, "20"),
+                                          (0x195, "40")])],
+    0x00450900: [("needlefix", [(0x8C, "81fb0008000090907d")])],
 }
-# vrmod's car-list patch (viper-mod-manager vrmod/carlist.py) moves and resizes the Hacks screen's Vehicle list: it
-# rewrites the four immediates of the list item's `push h / push w (imm8) / push y / push x`, to any values. The
-# rewrite reads them from the installed race.exe's own instructions (hook/menu_options.cpp), so a function that
-# differs from stock only in those bytes is replaced too: its `vrmod` fingerprint is taken with them as zeros, and the
-# DLL zeroes the same bytes (stock.inc's VP_STOCK_MASKS: {address, first byte, a bit per byte from it}).
+# VRMOD_MASKS: bytes vrmod sets to the player's values, which the rewrite reads from the installed race.exe's own
+# instructions ({va: (vrmod's patch, [(offset, bytes), ...])}). Taken as zeros in the vrmod fingerprints, and the DLL zeroes the same
+# bytes (stock.inc's VP_STOCK_MASKS: {address, offset, bytes}). A function with masks but no VRMOD_PATCHES entry is
+# accepted as stock with any values there; one with both, only as each patch with any values there.
 VRMOD_MASKS = {
-    0x00486230: (0x130, 0xF7AF),        # HackOptionsControl::Added: h at +0x130, w +0x135, y +0x137, x +0x13c
+    # carlist.py: the Hacks screen's Vehicle list's push h / push w (imm8) / push y / push x (menu_options.cpp)
+    0x00486230: ("carlist", [(0x130, 4), (0x135, 1), (0x137, 4), (0x13C, 4)]),
+    # resolution.py: the four menu modes' widths and heights (gx_tex.cpp, gx_dx.cpp: vrmod_operand)
+    0x0044DF20: ("resolution", [(o, 4) for o in (0x4A, 0x54, 0x62, 0x6C, 0x78, 0x82, 0x8E, 0x98)]),     # gxSetMode: mov [gxScreenWid/Hit]
+    0x0044E040: ("resolution", [(o, 4) for o in (0x4D, 0x57, 0x65, 0x6F, 0x7B, 0x85, 0x91, 0x9B)]),     # gxChangeMode: the same
+    0x00454B50: ("resolution", [(o, 4) for o in (0x26, 0x2B, 0x39, 0x3E, 0x4C, 0x51, 0x5F, 0x64)]),     # set_mode: mov eax, w / mov ecx, h
+    0x00455330: ("resolution", [(o, 4) for o in (0x29, 0x32, 0x49, 0x52, 0x69, 0x72, 0x89, 0x92)]),     # mode_callback: cmp ecx, w / [eax+8], h
+    # hornball.py: create_ball's mass and collision radius (wld_world.cpp: vrmod_operand)
+    0x004636A0: ("hornball", [(0x52, 4), (0x60, 4)]),
+    # vertexbuffer.py (opt-in --max-verts): mr_model_begin's push of the lit-vertex buffer's size, up to 32,768 vertices;
+    # the rewrite always makes it that big (gx_model.cpp, port.h VP_LIT_BUF_BYTES), so the value isn't read
+    0x004556F0: ("vertexbuffer", [(0x7B, 4)]),
+    # aspectfix.py: the addresses of R0 (fld dword [R0]) and of -0.5 (fmul dword [-0.5]) in its code (gx_dd.cpp)
+    0x0045EC20: ("aspectfix", [(0x47, 4), (0x68, 4)]),
+}
+# .rdata the rewrites read at run time, whatever it holds: left out of every fingerprint. hornball.py's four Ball::Throw
+# tunings (phys_dyno.cpp): the cooldown, the throw speed, the spawn's distance ahead and height; nothing else reads them.
+LIVE_CONSTS = {0x004DC39C, 0x004DC3A4, 0x004DC3A8, 0x004DC3AC}
+
+
+def masked(code: bytes, runs) -> bytes:
+    b = bytearray(code)
+    for at, n in runs:
+        b[at:at + n] = bytes(n)
+    return bytes(b)
+
+
+def patched(code: bytes, edits) -> bytes:
+    b = bytearray(code)
+    for at, hx in edits:
+        e = bytes.fromhex(hx)
+        assert at + len(e) <= len(b), (at, hx)
+        b[at:at + len(e)] = e
+    return bytes(b)
+
+
+# masked values a rewrite doesn't read through vrmod_operand (port.h), and why
+VRMOD_MASKS_NOT_READ = {
+    0x00486230: "menu_options.cpp's vehicle_list_geometry reads them, with its own check of the opcodes",
+    0x004556F0: "the rewrite allocates for 32,768 vertices, past any value vertexbuffer.py writes",
 }
 
 
-def masked(code: bytes, at: int, bits: int) -> bytes:
-    b = bytearray(code)
-    for i in range(32):
-        if bits >> i & 1:
-            b[at + i] = 0
-    return bytes(b)
+def check_vrmod_operands():
+    """Every masked operand is read by its rewrite with vrmod_operand(address), and every vrmod_operand names one."""
+    src = "".join(f.read_text(encoding="utf-8") for f in sorted(HOOK.glob("*.cpp")))
+    lits = {int(m, 16) for m in re.findall(r"\bvrmod_operand(?:_at)?\(\s*(0x[0-9a-fA-F]+)\s*\)", src)}
+    want = {va + at for va, (_w, runs) in VRMOD_MASKS.items() if va not in VRMOD_MASKS_NOT_READ for at, n in runs if n == 4}
+    errs = [f"the rewrite of the function holding {a:08x} doesn't read vrmod's operand there with vrmod_operand"
+            for a in sorted(want - lits)]
+    errs += [f"vrmod_operand({a:08x}) isn't an operand VRMOD_MASKS names" for a in sorted(lits - want)]
+    if errs:
+        raise SystemExit(chr(10).join(errs))
 
 
 def write_stock(exe, secs, sizes):
     md = Cs(CS_ARCH_X86, CS_MODE_32)
-    rows, all_consts, masks = [], [], []
-    for va in port_fn_addresses():
+    rows, all_consts, masks, variants = [], [], [], []
+    addrs = port_fn_addresses()
+    for va in list(VRMOD_PATCHES) + list(VRMOD_MASKS):
+        if va not in addrs:
+            raise SystemExit(f"gen_port_tables: VRMOD_PATCHES / VRMOD_MASKS name {va:08x}, which no PORT_FN rewrites")
+    for va in addrs:
         size = sizes.get(va, 0)
         if size <= 0:
             continue
@@ -166,38 +238,39 @@ def write_stock(exe, secs, sizes):
             for m in re.finditer(r"(byte|word|dword|qword|tbyte|xword) ptr \[(0x[0-9a-f]+)\]", ins.op_str):
                 a = int(m.group(2), 16)
                 w = {"byte": 1, "word": 2, "dword": 4, "qword": 8, "tbyte": 10, "xword": 10}[m.group(1)]
-                if RDATA[0] <= a < RDATA[1] and (a, w) not in consts:
+                if RDATA[0] <= a < RDATA[1] and (a, w) not in consts and a not in LIVE_CONSTS:
                     consts.append((a, w))
         consts.sort()
-        hc = h = fnv(code)
-        for a, w in consts:
-            fo = file_off(secs, a)
-            h = fnv(exe[fo:fo + w], h)
-        hv = 0
-        if va in VRMOD_FIXES:                     # the same fingerprint over the vrmod-fixed bytes
-            at, patch = VRMOD_FIXES[va]
-            hv = fnv(code[:at] + patch + code[at + len(patch):])
+
+        def fp(c: bytes) -> int:
+            h = fnv(c)
             for a, w in consts:
                 fo = file_off(secs, a)
-                hv = fnv(exe[fo:fo + w], hv)
-        elif va in VRMOD_MASKS:                   # ... with the bytes vrmod may change as zeros
-            at, bits = VRMOD_MASKS[va]
-            hv = fnv(masked(code, at, bits))
-            for a, w in consts:
-                fo = file_off(secs, a)
-                hv = fnv(exe[fo:fo + w], hv)
-            masks.append(f"    {{0x{va:08x}, 0x{at:x}, 0x{bits:08x}}},")
-        rows.append(f"    {{0x{va:08x}, {size}, 0x{hc:08x}, 0x{h:08x}, {len(all_consts)}, {len(consts)}, 0x{hv:08x}}},")
+                h = fnv(exe[fo:fo + w], h)
+            return h
+
+        hc = fnv(code)
+        h = fp(code)
+        mwhat, runs = VRMOD_MASKS.get(va, ("", []))
+        for at, n in runs:
+            masks.append(f"    {{0x{va:08x}, 0x{at:x}, {n}}},")
+        if runs and va not in VRMOD_PATCHES:
+            variants.append(f'    {{0x{va:08x}, 0x{fp(masked(code, runs)):08x}, "{mwhat}"}},')
+        for what, edits in VRMOD_PATCHES.get(va, []):
+            variants.append(f'    {{0x{va:08x}, 0x{fp(masked(patched(code, edits), runs)):08x}, "{what}"}},')
+        rows.append(f"    {{0x{va:08x}, {size}, 0x{hc:08x}, 0x{h:08x}, {len(all_consts)}, {len(consts)}}},")
         all_consts += consts                      # every constant: the DLL must hash exactly what this did
     (HOOK / "stock.inc").write_text(
         "// generated by tools/gen_port_tables.py: stock v1.0 fingerprints of every rewritten function\n"
         "#ifdef VP_STOCK\n"
-        "// {address, code bytes, FNV-1a of the code then each constant, first constant, constants,\n"
-        "//  the same fingerprint with vrmod's patch applied (0: none)}\n"
+        "// {address, code bytes, FNV-1a of the code then each constant, first constant, constants}\n"
         + "\n".join(rows) + "\n#endif\n#ifdef VP_STOCK_CONSTS\n// {address, width}\n"
         + "\n".join(f"    {{0x{a:08x}, {w}}}," for a, w in all_consts) + "\n#endif\n"
-        + "#ifdef VP_STOCK_MASKS\n// {address, first byte, a bit per byte from it}: zeros in the vrmod fingerprint\n"
-        + "\n".join(masks) + "\n#endif\n", encoding="utf-8")
+        + "#ifdef VP_STOCK_MASKS\n// {address, offset, bytes}: zeros in the vrmod fingerprints (VRMOD_MASKS)\n"
+        + "\n".join(masks) + "\n#endif\n"
+        + "#ifdef VP_STOCK_VARIANTS\n// {address, fingerprint, what}: vrmod's patched functions the rewrites replace too "
+          "(VRMOD_PATCHES, VRMOD_MASKS)\n"
+        + "\n".join(variants) + "\n#endif\n", encoding="utf-8")
     return len(rows)
 
 
@@ -425,6 +498,7 @@ def main():
     sizes = {int(r["va"], 16): int(r["size"]) for r in csv.DictReader(open(OUT / "inventory.csv", encoding="utf-8"))}
     types = json.loads((OUT / "types.json").read_text(encoding="utf-8"))
     check_m1_operands(sizes)
+    check_vrmod_operands()
     n = write_prologues(exe, secs, sizes)
     ns = write_stock(exe, secs, sizes)
     c, f = write_layout(types)

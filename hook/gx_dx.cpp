@@ -536,15 +536,17 @@ static void fp_hardware_callback(Footprint& f, void* guid, char*, char*, void*) 
 }
 PORT_FN(0x00454ac0, "hardware_callback", hardware_callback_rw, fp_hardware_callback)
 
-// set_mode (0x454b50)
+// set_mode (0x454b50). The four modes' sizes (512x384, 640x480, 800x600, 1024x768) are the immediates of its own
+// `mov eax, w / mov ecx, h`, which vrmod's resolution.py sets to the player's modes: read from there (port.h,
+// vrmod_operand), as gxSetMode, gxChangeMode (gx_tex.cpp) and mode_callback (below) read theirs.
 static uint8_t __cdecl set_mode_rw(int mode) {
     uint8_t ok = 1;
     int bpp = 0, w, h;
     switch (mode) {
-    case 1: w = 0x200; h = 0x180; B8(V_SCREEN_FMT) = 4; bpp = 16; break;
-    case 2: w = 0x280; h = 0x1e0; B8(V_SCREEN_FMT) = 4; bpp = 16; break;
-    case 3: w = 0x320; h = 0x258; B8(V_SCREEN_FMT) = 4; bpp = 16; break;
-    case 4: w = 0x400; h = 0x300; B8(V_SCREEN_FMT) = 4; bpp = 16; break;
+    case 1: w = (int)vrmod_operand(0x00454b76); h = (int)vrmod_operand(0x00454b7b); B8(V_SCREEN_FMT) = 4; bpp = 16; break;
+    case 2: w = (int)vrmod_operand(0x00454b89); h = (int)vrmod_operand(0x00454b8e); B8(V_SCREEN_FMT) = 4; bpp = 16; break;
+    case 3: w = (int)vrmod_operand(0x00454b9c); h = (int)vrmod_operand(0x00454ba1); B8(V_SCREEN_FMT) = 4; bpp = 16; break;
+    case 4: w = (int)vrmod_operand(0x00454baf); h = (int)vrmod_operand(0x00454bb4); B8(V_SCREEN_FMT) = 4; bpp = 16; break;
     default: ok = 0; w = I32(V_SCREEN_WID); h = I32(V_SCREEN_HIT); break;
     }
     I32(V_SCREEN_WID) = w;
@@ -762,7 +764,11 @@ PORT_FN(0x00455120, "_VidActivate", VidActivate_rw, fp_vid_activate)
 static void __cdecl find_mem_rw() {
     uint32_t caps = 0x4000, total = 0, free_ = 0;        // DDSCAPS_VIDEOMEMORY (the original's totals are
     ddraw_get_mem(PV(V_DD), &caps, &total, &free_);      // uninitialised if the call fails: FIX CANDIDATE)
-    total += 0x96000;
+    // FIX: the original adds 0x96000 (a 640x480 16-bit front buffer) to the reported total, and a card reporting within
+    // 600 KB of 4 GB wraps it to a few hundred KB: "unsupported: 0 megs of vram" and the game quits (the OpenGL
+    // renderer reports 64 MB; the game's own DirectDraw on a modern card can report ~4 GB). A total the add would wrap
+    // is left as it is -- what vrmod's vrampatch.py does for every total (it NOPs the add). Below that, as the original.
+    if (!VP_FIX || total <= 0xffffffffu - 0x96000u) total += 0x96000;
     int32_t megs = total < 2000000 ? 0 : total < 4000000 ? 2 : total < 8000000 ? 4 : total < 16000000 ? 8 : 16;
     I32(V_MEGS) = megs;
     // fild qword (the total, zero-extended); fmul dword 2^-20; fstp qword
@@ -804,15 +810,17 @@ static void fp_find_mem(Footprint& f) {
 }
 PORT_FN(0x00455130, "find_mem", find_mem_rw, fp_find_mem)
 
-// mode_callback (0x455330): EnumDisplayModes' callback
+// mode_callback (0x455330): EnumDisplayModes' callback. The four menu modes' sizes are the immediates of its own
+// `cmp ecx, w / cmp dword [eax+8], h`, which vrmod's resolution.py sets to the player's modes: read from there
+// (port.h, vrmod_operand). 320x200 isn't one of them.
 static int32_t __stdcall mode_callback_rw(const uint32_t* d, void*) {
     const volatile uint32_t* v = d;
     uint32_t w = v[3];
     if (w == 320 && v[2] == 200) { B8(V_MODE_OK + 5) = 1; return 1; }
-    if (w == 512 && v[2] == 384) { B8(V_MODE_OK + 1) = 1; return 1; }
-    if (w == 640 && v[2] == 480) { B8(V_MODE_OK + 2) = 1; return 1; }
-    if (w == 800 && v[2] == 600) { B8(V_MODE_OK + 3) = 1; return 1; }
-    if (w == 1024 && v[2] == 768) B8(V_MODE_OK + 4) = 1;
+    if (w == vrmod_operand(0x00455359) && v[2] == vrmod_operand(0x00455362)) { B8(V_MODE_OK + 1) = 1; return 1; }
+    if (w == vrmod_operand(0x00455379) && v[2] == vrmod_operand(0x00455382)) { B8(V_MODE_OK + 2) = 1; return 1; }
+    if (w == vrmod_operand(0x00455399) && v[2] == vrmod_operand(0x004553a2)) { B8(V_MODE_OK + 3) = 1; return 1; }
+    if (w == vrmod_operand(0x004553b9) && v[2] == vrmod_operand(0x004553c2)) B8(V_MODE_OK + 4) = 1;
     return 1;
 }
 static void fp_mode_callback(Footprint& f, const uint32_t*, void*) { fp_at(f, V_MODE_OK + 1, 5, "vid mode_ok[1..5]"); }

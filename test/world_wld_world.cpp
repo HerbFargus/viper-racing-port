@@ -84,6 +84,10 @@ void Footprint::add(void* p, uint32_t bytes, const char* what) {
 void Footprint::object(void* obj, const char* what) { add(obj, 0x844, what); }
 
 #include "../hook/wld_world.cpp"
+#include "vrmod_image.h"
+// VP_VRMOD=1: vrmod's hornball.py tunings -- create_ball's mass and collision radius immediates -- set to random player
+// values before each check of it (docs/FIXES.md, "vrmod's patches": the rewrite reads them from the code)
+static bool g_vrmod;
 
 // ---- random values ------------------------------------------------------------------------------------------------
 static uint32_t g_rng = 0x2545f491u;
@@ -1210,7 +1214,17 @@ static void small_checks(int steps) {
                   (const Point2D*)(seg_at(a) + 0xc), (const Point2D*)(seg_at(b) + 0xc), t);
             break;
         }
-        case 16: CHECK(create_ball_rw, ri(-1, 16)); break;
+        case 16:
+            if (g_vrmod) {
+                float m = (float)ri(300, 60000), r = (float)ri(4, 180);
+                uint32_t mb, rb;
+                memcpy(&mb, &m, 4);
+                memcpy(&rb, &r, 4);
+                vrmod_put32(0x004636f2, chance(5) ? rnd() : mb);
+                vrmod_put32(0x00463700, chance(5) ? rnd() : rb);
+            }
+            CHECK(create_ball_rw, ri(-1, 16));
+            break;
         case 17: if (*(int32_t*)0x00553368 > 0) CHECK0_BOTH(sort_objects_rw); break;
         case 18: {
             int n = *(int32_t*)0x00553368;
@@ -1357,6 +1371,8 @@ int main(int argc, char** argv) {
     char* s = strstr(exe, "\\test\\world_wld_world.cpp");
     if (s) strcpy(s, "\\out\\race_v10.exe");
     if (!load_race_exe(exe)) return 2;
+    g_vrmod = getenv("VP_VRMOD") && atoi(getenv("VP_VRMOD"));
+    if (g_vrmod) puts("vrmod's hornball: create_ball's mass and radius random");
     install_stubs();
     g_arena = (uint8_t*)VirtualAlloc(0, ARENA_SIZE, MEM_COMMIT, PAGE_READWRITE);
     if (!g_arena) return 2;

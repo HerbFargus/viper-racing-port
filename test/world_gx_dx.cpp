@@ -7,6 +7,11 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_gx_dx.cpp
 //        /Fo%TEMP%\g1dw\ /Fe%TEMP%\g1dw\world_gx_dx.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_gx_dx.exe [rounds] [seed] [isolated|chain|both]      (from the repository root: out\race_v10.exe)
+//   VP_VRMOD=1: the same against vrmod's race.exe (test/vrmod_image.h), the four menu modes' sizes in set_mode and
+//   mode_callback set to random player values before every check (docs/FIXES.md, "vrmod's patches": the rewrites read
+//   them from the code); find_mem is compared with its stock bytes there (vrampatch's NOP'd add is replaced by the fix).
+//   /DFIX_TESTS: the rewrites as the game has them (the rounds draw no video-memory total the fix changes), then
+//   find_mem's fix: a total within 600 KB of 4 GB, which the original wraps to "unsupported: 0 megs" and an exit.
 //
 // The five draw wrappers (dxDPDraw, dxDrawTriangle(s), dxDrawIndexTriangles, dxDrawScreenIndexTriangles) call the
 // renderer's gfx_draw_triangles (hook/gx_gl.h) since G2, where the originals call the device's DrawPrimitive /
@@ -57,7 +62,9 @@
 #include <utility>
 #include <vector>
 #include <type_traits>
-#define VP_FAITHFUL
+#ifndef FIX_TESTS
+#define VP_FAITHFUL                      // the original's behaviour, bit for bit (the fixes: /DFIX_TESTS)
+#endif
 #define VP_PORT_NEEDS_RENDERER(NEW)      // PORT_FN_GL: no PortFn to mark here (the registry below replaces PORT_FN)
 #include "../hook/port.h"
 
@@ -108,6 +115,11 @@ void Footprint::add(void* p, uint32_t bytes, const char* what) {
 void Footprint::object(void* obj, const char* what) { add(obj, 4, what); }
 
 #include "../hook/gx_dx.cpp"
+#include "vrmod_image.h"
+static bool g_vrmod;                                 // VP_VRMOD=1: vrmod's race.exe
+// the operands vrmod's resolution.py writes: modes 1-4, width then height, in set_mode and mode_callback
+static const uint32_t k_set_mode_imm[8] = {0x00454b76, 0x00454b7b, 0x00454b89, 0x00454b8e, 0x00454b9c, 0x00454ba1, 0x00454baf, 0x00454bb4};
+static const uint32_t k_mode_cb_imm[8] = {0x00455359, 0x00455362, 0x00455379, 0x00455382, 0x00455399, 0x004553a2, 0x004553b9, 0x004553c2};
 
 // The renderer's draw (gx_gl.h), as this harness has it: what the original draw wrappers do with the same arguments --
 // the d3d's device (read at the call, as they read it) gets DrawIndexedPrimitive (vtable 0x78) when there are indices,
@@ -465,6 +477,9 @@ static int32_t __stdcall f_set_mode(FakeObj* o, uint32_t w, uint32_t h, uint32_t
     lg(fl);
     return pick_hr();
 }
+#ifdef FIX_TESTS
+static uint32_t g_force_total;                       // find_mem's fix test: the total every GetAvailableVidMem reports
+#endif
 static int32_t __stdcall f_get_vidmem(FakeObj* o, const uint32_t* caps, uint32_t* total, uint32_t* free_) {
     lm(o, 23);
     lg(caps ? caps[0] : 0xdead);
@@ -476,6 +491,10 @@ static int32_t __stdcall f_get_vidmem(FakeObj* o, const uint32_t* caps, uint32_t
     // (written whatever the result: the game reads them regardless -- the original's locals would be garbage)
     *total = frnd() % 10 ? amounts[frnd() % 15] : frnd();
     *free_ = frnd() % 3 == 0 ? 0 : amounts[frnd() % 15];
+#ifdef FIX_TESTS
+    if (*total > 0xffffffffu - 0x96000u) *total &= 0x7fffffffu;   // (the rounds: inputs the fix leaves alone)
+    if (g_force_total) *total = g_force_total;
+#endif
     return hr;
 }
 // surfaces (IDirectDrawSurface and IDirectDrawSurface3 alike)
@@ -1290,6 +1309,21 @@ static void random_dxstate(uint8_t* s) {
     int32_t blend = chance(95) ? ri(0, 4) : ri(-1, 7);
     memcpy(s + 0x10, &blend, 4);
 }
+// random player modes for vrmod's resolution patch (any values: stock ones, common screens, anything)
+static void vrmod_modes() {
+    static const uint32_t screens[][2] = {{512, 384}, {640, 480}, {800, 600}, {1024, 768}, {1920, 1080}, {2560, 1440},
+                                          {3840, 2160}, {1280, 720}, {1600, 1200}, {320, 200}};
+    for (int k = 0; k < 4; k++) {
+        uint32_t w, h;
+        if (chance(80)) { const int i = (int)(rnd() % 10); w = screens[i][0]; h = screens[i][1]; }
+        else { w = rnd() % 8192; h = chance(50) ? rnd() % 8192 : rnd(); }
+        // set_mode's and mode_callback's own: the same mode usually, sometimes not (vrmod writes all four together)
+        vrmod_put32(k_set_mode_imm[2 * k], w);
+        vrmod_put32(k_set_mode_imm[2 * k + 1], h);
+        vrmod_put32(k_mode_cb_imm[2 * k], chance(90) ? w : rnd() % 4096);
+        vrmod_put32(k_mode_cb_imm[2 * k + 1], chance(90) ? h : rnd() % 4096);
+    }
+}
 static void reset_world(int round) {
     memset(g_ar, 0, GAME_OFF);
     Ctrl* c = C();
@@ -1453,7 +1487,10 @@ static void call(uint32_t at) {
         ck(at, {chance(20) ? 0 : U(wbuf(16)), U(d), U(nm), U(wbuf(4))});
         break;
     }
-    case 0x00454b50: ck(at, {(uint32_t)ri(-1, 6)}); break;   // set_mode
+    case 0x00454b50:                                      // set_mode
+        if (g_vrmod) vrmod_modes();
+        ck(at, {(uint32_t)ri(-1, 6)});
+        break;
     case 0x00454c30: ck(at, {rbyte()}); break;
     case 0x00454ca0: ck(at, {rbyte(), U(wbuf(0x20))}); break;
     case 0x00454ea0: ck(at, {U(wbuf(0x20))}); break;
@@ -1465,6 +1502,12 @@ static void call(uint32_t at) {
         uint32_t m = rnd() % 8;
         d[3] = m < 7 ? modes[m][0] : rnd() % 1500;
         d[2] = m < 7 ? modes[m][1] : rnd() % 1500;
+        if (g_vrmod) {                                    // the player's modes, and now and then one of them offered
+            vrmod_modes();
+            const int k = (int)(rnd() % 4);
+            if (chance(50)) d[3] = vrmod_get32(k_mode_cb_imm[2 * k]), d[2] = vrmod_get32(k_mode_cb_imm[2 * k + 1]);
+            if (chance(10)) d[2] = rnd() % 2200;
+        }
         ck(at, {U(d), U(wbuf(4))});
         break;
     }
@@ -1621,6 +1664,12 @@ static int main2(int argc, char** argv) {
     if (!g_rng) g_rng = 1;
     const char* modes = argc > 3 ? argv[3] : "both";
     if (!load_race_exe("out\\race_v10.exe")) return 2;
+    g_vrmod = getenv("VP_VRMOD") && atoi(getenv("VP_VRMOD"));
+    if (g_vrmod) {
+        vrmod_apply();
+        memcpy((void*)0x00455156, "\x81\x44\x24\x04\x00\x60\x09\x00", 8);   // find_mem: stock (see the top)
+        printf("vrmod's race.exe (test/vrmod_image.h), random player modes\n");
+    }
     g_ar = (uint8_t*)VirtualAlloc(0, ARENA_SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
     g_sh = (uint8_t*)VirtualAlloc(0, ARENA_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     g_ww = (ULONG_PTR*)malloc(sizeof(ULONG_PTR) * NPAGES);
@@ -1672,7 +1721,48 @@ static int main2(int argc, char** argv) {
     }
     printf("%ld checks, %ld differ, %ld footprint misses, %zu functions never checked\n", g_checks_total, g_mismatch_total,
            g_fp_total, unchecked);
-    return g_mismatch_total || g_fp_total || unchecked ? 1 : 0;
+    int fix_fail = 0;
+#ifdef FIX_TESTS
+    // find_mem's fix: totals the original's add wraps (and the largest it doesn't), each with a fresh world. The original
+    // reports "unsupported: 0 megs" and exits; the rewrite counts the card as 16 MB. The largest total that doesn't wrap
+    // runs the same in both.
+    {
+        Reg* r = g_regs[0x00455130];
+        int wrapped = 0, same = 0;
+        for (uint32_t total : {0xffffffffu, 0xfffff000u, 0xfff6a001u, 0xfff69fffu, 0xfff00000u, 0x80000000u}) {
+            for (int rep = 0; rep < 8; rep++) {
+                const bool wraps = total > 0xffffffffu - 0x96000u;
+                g_force_total = total;
+                uint32_t a[12] = {0};
+                uint64_t ret;
+                const uint32_t seed = g_rng;
+                reset_world(rep);
+                snap_statics(g_s0);
+                const int fo = guarded(r, 0, a, &ret);
+                const uint32_t fo_code = g_fault_code, fo_at = g_fault_at;
+                const int32_t mo = I32(V_MEGS);
+                load_statics(g_s0);
+                g_rng = seed;
+                reset_world(rep);
+                const int fn = guarded(r, 1, a, &ret);
+                const int32_t mn = I32(V_MEGS);
+                g_force_total = 0;
+                if (fo == 2 && fn == 2) continue;                 // a world without the DirectDraw object: both fault
+                if (wraps ? !(fo == 3 && fn == 0 && mn == 16) : !(fo == fn && mo == mn)) {
+                    fix_fail++;
+                    printf("  FIX find_mem, total %08x: original %s (%d megs), rewrite %s (%d megs); %08x at %08x / %08x at %08x\n",
+                           total, fo == 3 ? "exits" : fo ? "faults" : "runs", mo, fn == 3 ? "exits" : fn ? "faults" : "runs", mn,
+                           fo_code, fo_at, g_fault_code, g_fault_at);
+                } else if (wraps) wrapped++;
+                else same++;
+            }
+        }
+        printf("fix: find_mem: %d totals the original wraps (it exits; the rewrite: 16 MB), %d it doesn't (the same)\n",
+               wrapped, same);
+    }
+    printf("fix tests: %d failures\n", fix_fail);
+#endif
+    return g_mismatch_total || g_fp_total || unchecked || fix_fail ? 1 : 0;
 }
 }  // namespace hx
 

@@ -430,7 +430,7 @@ static const DrawTree_t draw_tree_o = (DrawTree_t)0x0046dff0;
 // matrices, the view (mrView 0x5229a0: viewport, projection, dxState), the model clip distances and deferred flag
 // (0x522d28..), the feature stack (0x522df0..), dx_result, dxProjectPoint's transform data (0x522f0c..), the texture
 // table (M1 moves it: m1_operand), light.obj's statics (0x525f50..0x5261c8), the dxState cache (0x5265f4..) and the
-// lit-vertex buffer (*0x4f2198, 48000 bytes). Not listed: a texture loaded on a cache miss (its surfaces, the
+// lit-vertex buffer (*0x4f2198: 48000 bytes stock, 1 MB once mr_model_begin's rewrite lifts it). Not listed: a texture loaded on a cache miss (its surfaces, the
 // resource and file code under it: an allocation) and the deferred-draw pool (only in deferred mode: GrafDraw).
 static void fp_render(Footprint& f) {
     f.add(P<uint8_t>(0x004f2184), 0x10, "mr: model alpha / deferred / env-map / draw flags");
@@ -451,7 +451,7 @@ static void fp_render(Footprint& f) {
     f.add(P<uint8_t>(0x00525f50), 0x278, "light: the lighting state");
     f.add(P<uint8_t>(0x005265f4), 0x30, "dx: the dxState cache");
     uint8_t* lit = *P<uint8_t*>(0x004f2198);
-    if (lit) f.add(lit, 0xbb80, "mr: the lit-vertex buffer");
+    if (lit) f.add(lit, vp_g_lit_buf_bytes, "mr: the lit-vertex buffer");      // (48000 bytes stock; port.h)
 }
 static void fp_terrain(Footprint& f) { f.add(P<uint8_t>(0x004f50c8), 4, "terrain: BPPFinder's last node"); }
 

@@ -51,6 +51,25 @@ static inline uint32_t m1_operand_hooked(uint32_t at, uint32_t fn, uint8_t first
     return *(const volatile uint8_t*)fn == first ? m1_operand(at) : m1_operand(other) + (uint32_t)delta;
 }
 
+// vrmod (viper-mod-manager) patches some of the functions the port replaces with values the player chooses: the four
+// screen modes' sizes (resolution.py), the hornball's mass and radius (hornball.py), the addresses of aspectfix.py's two
+// constants (where it found or put them). The stock check accepts those
+// functions with any value in those bytes (tools/gen_port_tables.py, VRMOD_MASKS), so a rewrite of one reads each such
+// value from the original's own instruction, vrmod_operand(address of the operand): the player's value in a patched
+// race.exe, the stock one in a stock race.exe or a harness. The standalone keeps these bytes out of its int3 fill
+// (tools/gen_standalone.py finds every vrmod_operand literal). docs/FIXES.md, "vrmod's patches".
+static inline uint32_t vrmod_operand(uint32_t at) { return *(const volatile uint32_t*)at; }
+// an operand's address kept in a table for vrmod_operand to read later (the tools find it by this name too)
+constexpr uint32_t vrmod_operand_at(uint32_t at) { return at; }
+
+// The lit-vertex buffer (mr_model_begin: one model's vertices, lit, 32 bytes each, reused for every model). Stock it
+// holds 1,500 vertices, and a model with more writes past it; the rewrite allocates room for 32,768, every vertex an
+// int16 face index can name (docs/FIXES.md, "Limits lifted"; vrmod's vertexbuffer.py raises the same push, to at most
+// that). vp_g_lit_buf_bytes is what the buffer in use holds: the rewrite's size once it has made it, the original's
+// otherwise (footprints read it).
+enum : uint32_t { VP_LIT_BUF_STOCK = 0xbb80, VP_LIT_BUF_BYTES = VP_FIX ? 32768u * 32u : VP_LIT_BUF_STOCK };
+inline uint32_t vp_g_lit_buf_bytes = VP_LIT_BUF_STOCK;
+
 enum PortMode { PORT_ORIGINAL, PORT_NEW, PORT_SHADOW };
 
 // ---- footprints: the memory a function may change, besides the physics and AI globals ----------------
@@ -83,6 +102,7 @@ struct PortFn {
     volatile long raced = 0;          // differences while the physics thread dented a car's models: not counted
     int budget_tick = -1, budget_used = 0;         // shadow_per_tick bookkeeping
     bool patched = false;                          // the installed function isn't stock v1.0: left original
+    const char* vrmod_patch = 0;                   // it is vrmod's patch the rewrite takes over (port_check_stock)
     bool needs_renderer = false;                   // calls the OpenGL renderer directly (gx_dd.cpp): original without it
     bool needs_audio = false;                      // calls the SDL audio core directly (snd_mix.cpp's wave.obj): likewise
     PortFn(uint32_t v, const char* nm, void* r, void* s, const uint8_t* op = 0, uint8_t ol = 0);

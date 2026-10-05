@@ -209,6 +209,28 @@ int map_image(Image& im, const std::string& path) {
     return 0;
 }
 
+// The DPI behaviour Windows would give race.exe. A player who set race.exe's Compatibility -> "Change high DPI settings ->
+// Override high DPI scaling: Application" (the registry's AppCompatFlags\Layers value for its path holds HIGHDPIAWARE)
+// gets the game at the screen's real size; viperport.exe is another exe, so Windows wouldn't apply that to it and
+// would draw the game DPI-virtualised (1536x864 on a 3840x2160 screen at 250%) -- and a session recorded through race.exe
+// wouldn't replay here. The same setting is honoured: made system DPI-aware, as the flag does, before any window.
+void mirror_dpi_compat(const std::string& exe) {
+    static const char* const key = "Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers";
+    for (HKEY root : {HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE}) {
+        HKEY k;
+        if (RegOpenKeyExA(root, key, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) continue;
+        char data[512] = {};
+        DWORD type = 0, n = sizeof data - 1;
+        const LONG r = RegQueryValueExA(k, exe.c_str(), 0, &type, (BYTE*)data, &n);
+        RegCloseKey(k);
+        if (r != ERROR_SUCCESS || type != REG_SZ) continue;
+        if (strstr(data, "HIGHDPIAWARE")) {
+            SetProcessDPIAware();
+            return;
+        }
+    }
+}
+
 // race.exe's GetModuleFileNameA import: its own module (NULL, or the image's handle) is race.exe, as it would be had
 // Windows started it -- the game's paths come from its folder, and its crash report reads the link map appended to the
 // exe it names. Any other module: the real thing.
@@ -343,6 +365,7 @@ int run(int argc_unused) {
     dll = resolve_path(dll, self_dir);
     g_race_path = exe;
     g_race_cmdline = "\"" + exe + "\"" + game_args;   // what the game's GetCommandLineA returns
+    mirror_dpi_compat(exe);                           // before anything makes a window
     // (in a child the parent reserved the range for us: map_image releases it and maps there)
 
     // race.exe: v1.0 only

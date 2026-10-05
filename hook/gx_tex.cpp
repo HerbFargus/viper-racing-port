@@ -527,24 +527,35 @@ static void fp_gx_restore(Footprint& f) { fp_release_all(f, 0); }
 PORT_FN(0x0044df00, "gxRestore", gxRestore_rw, fp_gx_restore)
 
 // the screen size of a mode (1 512x384 -- which also asks VidSetMode for its flag --, 2 640x480, 3 800x600,
-// 4 1024x768); anything else panics "unknown video mode" and leaves the size alone
-static uint8_t set_screen_size(int mode, uint32_t panic_fmt) {
+// 4 1024x768); anything else panics "unknown video mode" and leaves the size alone. The eight sizes are the immediates
+// of the function's own `mov [gxScreenWid/Hit], imm32` instructions, which vrmod's resolution.py sets to the player's
+// modes (port.h, vrmod_operand): `imm` holds their addresses, width and height for modes 1-4.
+static uint8_t set_screen_size(int mode, uint32_t panic_fmt, const uint32_t (&imm)[8]) {
     uint8_t bl = 0;
     switch ((uint32_t)(mode - 1)) {
-    case 0: GI(X_SCREEN_W) = 0x200; GI(X_SCREEN_H) = 0x180; bl = 1; break;
-    case 1: GI(X_SCREEN_W) = 0x280; GI(X_SCREEN_H) = 0x1e0; break;
-    case 2: GI(X_SCREEN_W) = 0x320; GI(X_SCREEN_H) = 0x258; break;
-    case 3: GI(X_SCREEN_W) = 0x400; GI(X_SCREEN_H) = 0x300; break;
+    case 0: GI(X_SCREEN_W) = (int32_t)vrmod_operand(imm[0]); GI(X_SCREEN_H) = (int32_t)vrmod_operand(imm[1]); bl = 1; break;
+    case 1: GI(X_SCREEN_W) = (int32_t)vrmod_operand(imm[2]); GI(X_SCREEN_H) = (int32_t)vrmod_operand(imm[3]); break;
+    case 2: GI(X_SCREEN_W) = (int32_t)vrmod_operand(imm[4]); GI(X_SCREEN_H) = (int32_t)vrmod_operand(imm[5]); break;
+    case 3: GI(X_SCREEN_W) = (int32_t)vrmod_operand(imm[6]); GI(X_SCREEN_H) = (int32_t)vrmod_operand(imm[7]); break;
     default: LogPanic(S(panic_fmt)); break;
     }
     return bl;
 }
+// (each address written out: gen_standalone.py keeps every vrmod_operand literal out of the int3 fill)
+static const uint32_t k_gx_set_mode_imm[8] = {vrmod_operand_at(0x0044df6a), vrmod_operand_at(0x0044df74),
+                                              vrmod_operand_at(0x0044df82), vrmod_operand_at(0x0044df8c),
+                                              vrmod_operand_at(0x0044df98), vrmod_operand_at(0x0044dfa2),
+                                              vrmod_operand_at(0x0044dfae), vrmod_operand_at(0x0044dfb8)};
+static const uint32_t k_gx_change_mode_imm[8] = {vrmod_operand_at(0x0044e08d), vrmod_operand_at(0x0044e097),
+                                                 vrmod_operand_at(0x0044e0a5), vrmod_operand_at(0x0044e0af),
+                                                 vrmod_operand_at(0x0044e0bb), vrmod_operand_at(0x0044e0c5),
+                                                 vrmod_operand_at(0x0044e0d1), vrmod_operand_at(0x0044e0db)};
 
 // gxSetMode (0x44df20)
 static void __cdecl gxSetMode_rw(int mode) {
     SingleEnter(GI(X_GX_SYNC), 0, 0);
     if (mode != GI(X_MODE)) {
-        const uint8_t bl = set_screen_size(mode, 0x004eefb0);
+        const uint8_t bl = set_screen_size(mode, 0x004eefb0, k_gx_set_mode_imm);
         VidSetMode(mode, bl);
         pal_build_system();
         mr_set_mode();
@@ -573,7 +584,7 @@ static void __cdecl gxChangeMode_rw(int mode) {
     Canvas c;
     SingleEnter(GI(X_GX_SYNC), 0, 0);
     if (mode != GI(X_MODE)) {
-        const uint8_t bl = set_screen_size(mode, 0x004eefc4);
+        const uint8_t bl = set_screen_size(mode, 0x004eefc4, k_gx_change_mode_imm);
         mr_release();
         VidSetMode(mode, bl);
         mr_restore();

@@ -1679,9 +1679,15 @@ PORT_FN(0x00441270, "Ball::Reset", Ball_Reset, fp_ball_self)
 // ball put at the thrower's frame and sent forward -- for the plane with the plane's velocity plus 31.1 m/s
 // (and dropped 1 m along its up axis), for anything else at |velocity| + 31.1 m/s from 3.5 m + 31.1 m/s x
 // the delay ahead, 0.5 m up. The spin is stopped whether or not it's thrown.
+// The four tunings -- the 2 s cooldown, the 31.1 m/s, the 3.5 m ahead, the 0.5 m up -- are .rdata floats only this
+// function reads, and vrmod's hornball.py sets them to the player's values: they are read from the image as the
+// original reads them (a stock race.exe: the stock values, bit for bit), and the stock check doesn't fingerprint them
+// (tools/gen_port_tables.py, LIVE_CONSTS).
+enum : uint32_t { K_BALL_COOLDOWN = 0x004dc39c, K_BALL_SPEED = 0x004dc3a4, K_BALL_AHEAD = 0x004dc3a8, K_BALL_UP = 0x004dc3ac };
+static __forceinline float ball_k(uint32_t at) { return *(const volatile float*)(uintptr_t)at; }
 static void __fastcall Ball_Throw(Ball* self, Edx, const Frame* frame, const P3* vel, float time) {
     float now = (float)PhysicsGetTime();
-    double early = D(now) - 2.0f;
+    double early = D(now) - ball_k(K_BALL_COOLDOWN);
     set_bits(&self->angular_velocity.x, 0);
     set_bits(&self->angular_velocity.y, 0);
     set_bits(&self->angular_velocity.z, 0);
@@ -1696,21 +1702,21 @@ static void __fastcall Ball_Throw(Ball* self, Edx, const Frame* frame, const P3*
     P3& pos = self->frame.pos;
     if (game_stricmp(GetCarFileName(HackGetCarIndex()), (const char*)0x004edb20) == 0) {   // "plane"
         movsd(&self->velocity, vel, 3);
-        self->velocity.x = (float)(D(m[6]) * 31.11111068725586f + self->velocity.x);
-        self->velocity.y = (float)(D(m[7]) * 31.11111068725586f + self->velocity.y);
-        self->velocity.z = (float)(D(m[8]) * 31.11111068725586f + self->velocity.z);
+        self->velocity.x = (float)(D(m[6]) * ball_k(K_BALL_SPEED) + self->velocity.x);
+        self->velocity.y = (float)(D(m[7]) * ball_k(K_BALL_SPEED) + self->velocity.y);
+        self->velocity.z = (float)(D(m[8]) * ball_k(K_BALL_SPEED) + self->velocity.z);
         pos.x = (float)(D(pos.x) - m[3]);
         pos.y = (float)(D(pos.y) - m[4]);
         pos.z = (float)(D(pos.z) - m[5]);
         return;
     }
-    double k = D(dt) * 31.11111068725586f + 3.5f;
+    double k = D(dt) * ball_k(K_BALL_SPEED) + ball_k(K_BALL_AHEAD);
     const float* fm = frame->rot.m;
     pos.x = (float)(D(fm[6]) * k + pos.x);
     pos.y = (float)(D(fm[7]) * k + pos.y);
     pos.z = (float)(k * fm[8] + pos.z);
-    pos.y = (float)(D(pos.y) + 0.5f);
-    double s = x87_sqrt((D(vel->z) * vel->z + D(vel->y) * vel->y) + D(vel->x) * vel->x) + 31.11111068725586f;
+    pos.y = (float)(D(pos.y) + ball_k(K_BALL_UP));
+    double s = x87_sqrt((D(vel->z) * vel->z + D(vel->y) * vel->y) + D(vel->x) * vel->x) + ball_k(K_BALL_SPEED);
     self->velocity.x = (float)(D(m[6]) * s);
     self->velocity.y = (float)(D(m[7]) * s);
     self->velocity.z = (float)(s * m[8]);

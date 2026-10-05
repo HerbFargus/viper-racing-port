@@ -327,7 +327,15 @@ def main():
     keep = [(a, 4, "an operand M1 patches (read with m1_operand)") for a in m1 if TEXT[0] <= a < TEXT[1]]
     keep += [
         (0x0048635F, 20, "vehicle_list_geometry (menu_options.cpp) reads the Vehicle list's push immediates"),
+        (0x0045EC5F, 8, "aspectfix_r0 (gx_dd.cpp) tells vrmod's aspectfix code by its first instructions"),
+        (0x0045EC86, 2, "aspectfix_r0 (gx_dd.cpp) checks aspectfix's fmul [-0.5]"),
     ]
+    # vrmod's values in the code (port.h, vrmod_operand / vrmod_operand_at): the rewrites read them at run time
+    vrm = set()
+    for f in sorted(HOOK.glob("*.cpp")):
+        for m in re.finditer(r"\bvrmod_operand(?:_at)?\(\s*0x([0-9a-fA-F]+)\s*\)", f.read_text(encoding="utf-8")):
+            vrm.add(int(m.group(1), 16))
+    keep += [(a, 4, "vrmod's value, read with vrmod_operand") for a in sorted(vrm) if TEXT[0] <= a < TEXT[1]]
     # every m1_operand / m1_operand_hooked literal must be one of M1's operands
     lits = set()
     for f in sorted(HOOK.glob("*.cpp")):

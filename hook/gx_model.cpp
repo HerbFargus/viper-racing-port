@@ -181,7 +181,7 @@ enum : uint32_t {
     S_ENVMAP = 0x004f218c,          // u8: mrModelEnvMap
     S_ENVPASS = 0x004f2190,         // u8: mrModelDraw's env-map pass is on
     S_ENV_TEX = 0x004f2194,         // the env-map texture ("envmap", mr_model_first)
-    S_LIT_BUF = 0x004f2198,         // D3DLVERTEX[1500], the lit vertices
+    S_LIT_BUF = 0x004f2198,         // D3DLVERTEX[1500] stock (the rewrite: 32768, port.h), the lit vertices
     // light.obj
     L_ON = 0x00525f50,              // u8: lighting is calculated
     L_MODE = 0x00525f54,            // mrLMode: 0 day, 1 night
@@ -2218,7 +2218,11 @@ static void __cdecl mr_model_begin() {
         Ua(S_MODEL_POOL) = 0;
     }
     Ua(S_MODELS) = 0;
-    Ua(S_LIT_BUF) = (uint32_t)(uintptr_t)MemAlloc(0xbb80);
+    // LIFT: room for 32,768 lit vertices, not 1,500 (port.h, VP_LIT_BUF_BYTES; docs/FIXES.md "Limits lifted"). A vrmod
+    // race.exe's own `push` (vertexbuffer.py: up to the same 32,768) is accepted by the stock check and not read.
+    if (VP_FIX) GX_FIX_FIRED();
+    Ua(S_LIT_BUF) = (uint32_t)(uintptr_t)MemAlloc((int)VP_LIT_BUF_BYTES);
+    vp_g_lit_buf_bytes = VP_LIT_BUF_BYTES;
     Ua(S_CLIP_NEAR) = 0;
     Ba(S_HAS_ALPHA) = 0;
     Ba(S_ENVMAP) = 0;

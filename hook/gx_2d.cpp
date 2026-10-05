@@ -31,9 +31,9 @@
 // nothing) is entered and left exactly where the original does -- gxGetPixel enters and never leaves.
 //
 // FIX CANDIDATES (faithful here; see the report):
-//   * gxTriangle's edge tables are 1024-entry stack arrays indexed by row: a current canvas taller than 1024 rows
-//     writes past them (the stack). fill_line only advances x on rows inside the canvas, so a triangle poking above
-//     row 0 is drawn skewed.
+//   * (fixed: gxTriangle) gxTriangle's edge tables are 1024-entry stack arrays indexed by row: a current canvas taller
+//     than 1024 rows writes past them (the stack). fill_line only advances x on rows inside the canvas, so a triangle
+//     poking above row 0 is drawn skewed (not fixed: it is how the game draws).
 //   * gxPasteDouble clips its bottom edge against 2 x the source's height, not y + 2h, and writes one row and one
 //     column past the clip rectangle when the clipped size is odd.
 //   * cvt_555_8888 / cvt_565_8888 return unsigned short: copy_16_to_32 stores (G << 8 | B), red and alpha lost.
@@ -677,19 +677,30 @@ static void __cdecl gxRect_n(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uin
 }
 PORT_FN(0x004506e0, "gxRect", gxRect_n, fp_rect)
 
-// gxTriangle: two 1024-entry edge tables on the stack (left, right), one gxRect per row. FIX CANDIDATE: rows past
-// 1023 of a taller canvas index past the tables.
+// gxTriangle / fill_line: one edge's x per row into two edge tables on gxTriangle's stack (left, right), then one gxRect
+// per row. Both test a row against the current canvas's height, not the tables': stock they hold 1024 rows, so a canvas
+// taller than that (the dash's tachometer needle at 1920x1080, drawn at height - 80) made fill_line write past them
+// (the stack: a crash at a garbage EIP) and the fill read past the first into the second (red streaks).
+// FIX: the tables hold 2048 rows each (as vrmod's tablefix.py makes them), and both fill_line's walker and the fill
+// skip a row past them as well as one off the canvas (vrmod's needlefix.py bounds); the rows a canvas taller than
+// 2048 has below that aren't drawn (drawing is clipped to the canvas anyway). The two are one fix: gxTriangle's
+// rewrite calls fill_line's directly, never an original with other tables (vrmod's race.exe has both patched, and the
+// stock check accepts exactly those bytes for both: tools/gen_port_tables.py, VRMOD_PATCHES). Every row of a canvas
+// up to 1024 high comes out as the original's.
+enum { TRI_ROWS = VP_FIX ? 2048 : 1024 };
+static void __cdecl fill_line_n(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t* left, int32_t* right);
 static void __cdecl gxTriangle_n(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t x2, int32_t y2, uint32_t c) {
-    int32_t left[1024], right[1024];
+    int32_t left[TRI_ROWS], right[TRI_ROWS];
+    const FillLine_t fill = VP_FIX ? &fill_line_n : fill_line_o;   // FIX: (above) the two halves together
     gx_enter();
     if (imul(sub32(x1, x0), sub32(y2, y0)) < imul(sub32(x2, x0), sub32(y1, y0))) {
-        fill_line_o(x0, y0, x1, y1, left, right);
-        fill_line_o(x1, y1, x2, y2, left, right);
-        fill_line_o(x2, y2, x0, y0, left, right);
+        fill(x0, y0, x1, y1, left, right);
+        fill(x1, y1, x2, y2, left, right);
+        fill(x2, y2, x0, y0, left, right);
     } else {
-        fill_line_o(x1, y1, x0, y0, left, right);
-        fill_line_o(x2, y2, x1, y1, left, right);
-        fill_line_o(x0, y0, x2, y2, left, right);
+        fill(x1, y1, x0, y0, left, right);
+        fill(x2, y2, x1, y1, left, right);
+        fill(x0, y0, x2, y2, left, right);
     }
     int32_t lo = y2, hi = y2;
     if (!(lo < y1)) lo = y1;
@@ -698,6 +709,7 @@ static void __cdecl gxTriangle_n(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
     if (!(hi > y0)) hi = y0;
     for (int32_t y = lo; y < hi; y++) {
         if ((int32_t)((uint32_t)y * 4) < 0 || !(CUR->h > y)) continue;
+        if (VP_FIX && y >= TRI_ROWS) continue;             // FIX: (above) a row past the tables
         const int32_t l = left[y], r = right[y];
         if (l < r) gxRect_o(l, y, r, y + 1, c);
     }
@@ -707,7 +719,8 @@ static void fp_gxTriangle(Footprint& f, int32_t, int32_t, int32_t, int32_t, int3
 PORT_FN(0x00450760, "gxTriangle", gxTriangle_n, fp_gxTriangle)
 
 // fill_line: one edge's x per row into the left table (going down) or the right (going up). x only advances on
-// rows inside the current canvas (faithful: an edge starting above row 0 is shifted).
+// rows inside the current canvas (faithful: an edge starting above row 0 is shifted). FIX: (gxTriangle, above) and
+// inside the tables.
 static void __cdecl fill_line_n(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t* left, int32_t* right) {
     if (y1 == y0) return;
     int32_t* t = y1 > y0 ? left : right;
@@ -720,6 +733,7 @@ static void __cdecl fill_line_n(int32_t x0, int32_t y0, int32_t x1, int32_t y1, 
     const double s = slope;
     for (int32_t y = lo; y < hi; y++) {
         if (y < 0 || !(CUR->h > y)) continue;
+        if (VP_FIX && y >= TRI_ROWS) continue;             // FIX: (gxTriangle) a row past the tables
         t[y] = x87_ftol(x);
         x = x + s;
     }
@@ -730,6 +744,7 @@ static void fp_fill_line(Footprint& f, int32_t, int32_t y0, int32_t, int32_t y1,
     int32_t lo = y1 < y0 ? y1 : y0, hi = y1 > y0 ? y1 : y0;
     if (lo < 0) lo = 0;
     if (CUR && hi > CUR->h) hi = CUR->h;
+    if (VP_FIX && hi > TRI_ROWS) hi = TRI_ROWS;
     if (hi > lo) {
         f.add(left + lo, (uint32_t)(hi - lo) * 4, "left edges");
         f.add(right + lo, (uint32_t)(hi - lo) * 4, "right edges");

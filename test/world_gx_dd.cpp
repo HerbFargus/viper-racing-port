@@ -9,7 +9,8 @@
 //        /Fo%TEMP%\g2dd\
 //        /Fe%TEMP%\g2dd\world_gx_dd.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //        ..\sdl2\SDL2-2.32.10\lib\x86\SDL2.lib delayimp.lib /DELAYLOAD:SDL2.dll dxguid.lib
-//   run:   world_gx_dd.exe [rounds] [seed] [isolated|chain|both]      (from the repository root: out\race_v10.exe)
+//   run:   world_gx_dd.exe [rounds] [seed] [isolated|chain|both]      (VP_VRMOD=1: against vrmod's race.exe, vrmod_aspect)
+//                                                                  (from the repository root: out\race_v10.exe)
 //   (SDL2 is delay-loaded and never called: the renderer is started headless, so SDL2.dll isn't needed.)
 //   (gl_dxgi.cpp, the DXGI present, is linked but never started: start_headless leaves gl_api.SwapWindow the fake.)
 //
@@ -132,6 +133,8 @@ namespace gxdx {
 #include "../hook/gx_dx.cpp"
 }
 #include "../hook/gx_dd.cpp"
+#include "vrmod_image.h"
+static bool g_vrmod;                    // VP_VRMOD=1 (vrmod_aspect, below)
 
 // ---- what the renderer needs from the DLL (platform.cpp, viperport.cpp, port.cpp) --------------------------------------
 void logf(const char*, ...) {}                                  // (the renderer's log lines: not compared)
@@ -277,6 +280,7 @@ static void install() {
 }  // namespace gpu
 
 namespace hx {
+static void vrmod_aspect();                // VP_VRMOD (below)
 // ---- random values ------------------------------------------------------------------------------------------------
 static uint32_t g_rng = 0x2545f491u;
 static uint32_t rnd() {
@@ -1471,6 +1475,10 @@ static void call(uint32_t at) {
     case 0x0045ec20: {                                                                // dviewport::set_viewport
         uint32_t w = chance(5) ? 0 : chance(50) ? (uint32_t)gfx::st.w : (uint32_t)ri(1, 1024);
         uint32_t h = chance(50) ? (uint32_t)gfx::st.h : (uint32_t)ri(0, 768);
+        if (g_vrmod) {
+            vrmod_aspect();
+            if (chance(20)) w = 640, h = 416;                                        // aspectfix's own design point
+        }
         ck(at, {pick(W.vps), 0, (uint32_t)ri(0, 64), (uint32_t)ri(0, 64), w, h});
         break;
     }
@@ -1714,12 +1722,28 @@ static LONG WINAPI unhandled(EXCEPTION_POINTERS* e) {
     fflush(stdout);
     ExitProcess(6);
 }
+// VP_VRMOD=1: vrmod's race.exe (test/vrmod_image.h). Before each check of dviewport::set_viewport, aspectfix's R0 is
+// a random player value, and its two addresses (R0, -0.5) now and then point at other .rdata floats, as aspectfix.py
+// does when the pool already holds the value (docs/FIXES.md, "vrmod's patches": the rewrite reads both through them).
+static void vrmod_aspect() {
+    static const uint32_t pool[] = {0x004e0294, 0x004dc39c, 0x004dc3ac, 0x004db054, 0x004e0298};   // slack, 2, 0.5, -0.5, slack
+    float r0 = chance(30) ? 0.65f : chance(10) ? 0.0f : (float)ri(200, 1200) / 1000.0f;
+    uint32_t bits;
+    memcpy(&bits, &r0, 4);
+    if (chance(3)) bits = 0x7fc00000u;                                           // NaN: the jbe keeps h/w
+    vrmod_put32(0x004e0294, bits);
+    vrmod_put32(0x004e0298, chance(50) ? 0xbf000000u : rnd());                  // -0.5, or anything
+    vrmod_put32(0x0045ec67, chance(70) ? 0x004e0294 : pool[rnd() % 5]);
+    vrmod_put32(0x0045ec88, chance(70) ? 0x004db054 : pool[rnd() % 5]);
+}
 static int main2(int argc, char** argv) {
     int rounds = argc > 1 ? atoi(argv[1]) : 40;
     g_rng = argc > 2 ? (uint32_t)strtoul(argv[2], 0, 0) : 0x2545f491u;
     if (!g_rng) g_rng = 1;
     const char* modes = argc > 3 ? argv[3] : "both";
     if (!load_race_exe("out\\race_v10.exe")) return 2;
+    g_vrmod = getenv("VP_VRMOD") && atoi(getenv("VP_VRMOD"));
+    if (g_vrmod) { vrmod_apply(); puts("vrmod's race.exe (test/vrmod_image.h), random aspectfix R0"); }
     g_ar = (uint8_t*)VirtualAlloc(0, ARENA_SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
     g_sh = (uint8_t*)VirtualAlloc(0, ARENA_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     g_ww = (ULONG_PTR*)malloc(sizeof(ULONG_PTR) * NPAGES);

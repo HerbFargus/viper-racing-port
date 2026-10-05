@@ -7,6 +7,7 @@
 //   run:   world_gx_tex.exe [worlds] [seed] [game dir]
 //          (the game dir defaults to ..\game-files\installs\v1.0-RC beside the repository; it is only ever READ:
 //          the .tex resources of its archives are the texture data)
+//   VP_VRMOD=1: against vrmod's race.exe, with random player modes (see vrmod_modes below)
 //
 // Loads out\race_v10.exe at 0x400000 in a child process (the range reserved before its heap exists) and includes the
 // rewrite file itself; every PORT_FN is registered with a generic caller for the original (its address) and the
@@ -116,6 +117,26 @@ void Footprint::stack_ptr(void* p, const char* what) { add(p, 4, what); }
 void logf(const char* fmt, ...) { va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); putchar('\n'); }
 
 #include "../hook/gx_tex.cpp"
+#include "vrmod_image.h"
+// VP_VRMOD=1: vrmod's race.exe (test/vrmod_image.h), the four menu modes' sizes in gxSetMode and gxChangeMode set to
+// random player values before each of their checks (docs/FIXES.md, "vrmod's patches": the rewrites read them from the
+// code). Modes 1-4, width then height.
+static bool g_vrmod;
+static const uint32_t k_vr_imm[2][8] = {
+    {0x0044df6a, 0x0044df74, 0x0044df82, 0x0044df8c, 0x0044df98, 0x0044dfa2, 0x0044dfae, 0x0044dfb8},   // gxSetMode
+    {0x0044e08d, 0x0044e097, 0x0044e0a5, 0x0044e0af, 0x0044e0bb, 0x0044e0c5, 0x0044e0d1, 0x0044e0db}};  // gxChangeMode
+static uint32_t vr_rnd();
+static void vrmod_modes() {
+    static const uint32_t screens[][2] = {{512, 384}, {640, 480}, {800, 600}, {1024, 768}, {1920, 1080}, {2560, 1440},
+                                          {3840, 2160}, {1280, 720}};
+    for (int f = 0; f < 2; f++)
+        for (int k = 0; k < 4; k++) {
+            const uint32_t r = vr_rnd(), i = r % 10;
+            const uint32_t w = i < 8 ? screens[i][0] : vr_rnd(), h = i < 8 ? screens[i][1] : vr_rnd() % 9000;
+            vrmod_put32(k_vr_imm[f][2 * k], w);
+            vrmod_put32(k_vr_imm[f][2 * k + 1], h);
+        }
+}
 
 static Reg* reg_at(uint32_t at) { for (Reg* r = Reg::head(); r; r = r->next) if (r->at == at) return r; return 0; }
 
@@ -830,6 +851,7 @@ static void grab_first() {
     __try { ((TGR_t)0x0045a300)(id, AR(A_ARGS + 0x100)); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     __asm fninit
 }
+static uint32_t vr_rnd() { return rnd(); }
 static void gen_args(Reg* r) {
     uint32_t* a = g_args;
     memset(a, 0, sizeof g_args);
@@ -837,6 +859,7 @@ static void gen_args(Reg* r) {
     switch (r->at) {
     case 0x0044df20: case 0x0044e040:                      // gxSetMode / gxChangeMode
         a[0] = chance(30) ? (uint32_t)GI(0x004eefa8) : (uint32_t)ri(-1, 6);
+        if (g_vrmod) vrmod_modes();
         break;
     case 0x0044e1c0: a[0] = (uint32_t)(uintptr_t)canvas_arg(0); break;   // gxGrabScreen
     case 0x0044e240: case 0x0045a0c0: case 0x0045a6a0:      // gxGetTexture / TextureGet / tc_lookup
@@ -1474,6 +1497,8 @@ int main(int argc, char** argv) {
     if (argc > 3) strcpy(dir, argv[3]);
     strcat(exe, "\\out\\race_v10.exe");
     if (!load_race_exe(exe)) return 2;
+    g_vrmod = getenv("VP_VRMOD") && atoi(getenv("VP_VRMOD"));
+    if (g_vrmod) { vrmod_apply(); printf("vrmod's race.exe (test/vrmod_image.h), random player modes\n"); }
     if (!load_textures(dir)) { printf("no .tex resources found in %s\n", dir); return 2; }
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     patch_jmp(0x004cf730, (void*)&stub_crt_fatal);         // _amsg_exit

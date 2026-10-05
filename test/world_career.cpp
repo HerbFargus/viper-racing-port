@@ -57,8 +57,8 @@
 // counted (per function, listed), the rewrite still run on each and required to return cleanly (or to fault just where
 // the original does, on the round's own damage -- a null season drawn under the dialog, say): create_cb's where the
 // default name's translation is over 15 characters (the stubs' "A longer translation": the original leaves the name
-// unterminated when no player_name is saved). No other fixed case is in the random world's reach (user directories of
-// 2..60 characters, translations, track and driver names of 20 at most). Then
+// unterminated when no player_name is saved), and every CareerDo round (its career log's name). No other fixed case is in
+// the random world's reach (user directories of 2..60 characters, translations, track and driver names of 20 at most). Then
 // directed_fix_tests: for each fix, the bad case run on the rewrite alone -- no fault, the bytes popped and ebx / esi /
 // edi / ebp kept, nothing written outside what it may write (the memory around it compared; for the dialogs, what the
 // frame held after the name), and the result the fix promises -- and its boundary case (the longest input that fits) on
@@ -646,6 +646,18 @@ static uint8_t __cdecl stub_FileWrite(int32_t h, const void* p, int32_t n) {
 }
 static uint8_t __cdecl stub_FileRemove(const char* name) { L('FREM'); LS(name); return 1; }
 static uint8_t __cdecl stub_FileCreateDirectory(const char* name) { L('FMKD'); LS(name); return 1; }
+// the import slots fix_paths.h calls (the fix build's CareerDo): race.exe's path, and the log folder made (nothing is)
+static const char* g_fx_exe = "C:\\Games\\Viper Racing\\race.exe";
+static uint32_t __stdcall stub_GetModuleFileNameA(void* module, char* buf, uint32_t size) {
+    L('GMFN'); L((uint32_t)(uintptr_t)module); L(size);
+    const uint32_t n = (uint32_t)strlen(g_fx_exe);
+    if (!n || !size) return 0;
+    const uint32_t k = n < size ? n : size - 1;
+    memcpy(buf, g_fx_exe, k);
+    buf[k] = 0;
+    return n < size ? n : size;
+}
+static int __stdcall stub_CreateDirectoryA(const char* dir, void* sec) { L('MKDR'); LS(dir); L((uint32_t)(uintptr_t)sec); return 1; }
 static char g_userdir[0x100];
 static const char* __cdecl stub_Win32GetUserDirectory() {
     L('UDIR');
@@ -1430,8 +1442,11 @@ static bool is_season_end(const char* nm) {
 // (before the original runs) create_cb with a default name's translation over 15 characters: the fixed copy stops at the
 // 16-byte name, where the original's ran on (left unterminated when no saved name replaces it). Every way the Xlator can be
 // found (built fresh or stale, or not built) gives xl_text of its key.
+// CareerDo, every round: its log is <race.exe's folder>\log\career.log, not the literal "c:\career.log" (the stubs give the
+// folder: g_fx_exe).
 static bool fx_pre_case(const Ent& f, const uint32_t*) {
     if (!strcmp(f.name, "create_cb")) return strlen(xl_text(0x004ffb3c)) > 15;      // Career:DefaultPlayerName
+    if (!strcmp(f.name, "CareerDo")) return true;
     return false;
 }
 
@@ -1998,6 +2013,56 @@ static int directed_fix_tests() {
         fx_same(f, {U(&W.ints[0]), U(&W.ints[1])}, "driver_compare, names of 255 characters");
     }
 
+    // ---- CareerDo: the career log in <race.exe's folder>\log\ (fix_paths.h), the folder made; with no exe path, or one too
+    // long for the file table's 0x100-byte names, the literal as before
+    {
+        const Ent& f = fx_fn("CareerDo");
+        static char long_exe[300];
+        memcpy(long_exe, "C:\\", 3);
+        memset(long_exe + 3, 'd', 244);
+        strcpy(long_exe + 247, "\\race.exe");
+        struct { const char* exe; const char* dir; const char* file; } cases[] = {
+            {"C:\\Games\\Viper Racing\\race.exe", "C:\\Games\\Viper Racing\\log", "C:\\Games\\Viper Racing\\log\\career.log"},
+            {"D:\\race.exe", "D:\\log", "D:\\log\\career.log"},
+            {"", 0, "c:\\career.log"},                        // GetModuleFileNameA fails
+            {long_exe, 0, "c:\\career.log"},                  // too long for log\career.log in 0x100
+        };
+        // the words LS logs for a string
+        auto ls_words = [](const char* str) {
+            std::vector<uint32_t> v;
+            uint32_t w = 0;
+            int i = 0;
+            for (; str[i]; i++) {
+                w = w << 8 | (uint8_t)str[i];
+                if ((i & 3) == 3) { v.push_back(w); w = 0; }
+            }
+            v.push_back(w);
+            return v;
+        };
+        auto logged_after = [&](uint32_t tag, const char* str) {   // the first `tag` call's string is str
+            const std::vector<uint32_t> want = ls_words(str);
+            for (uint32_t i = 0; i < g_log.n && i < LOG_MAX; i++)
+                if (g_log.w[i] == tag) {
+                    for (size_t k = 0; k < want.size(); k++)
+                        if (i + 1 + k >= LOG_MAX || g_log.w[i + 1 + k] != want[k]) return false;
+                    return true;
+                }
+            return false;
+        };
+        for (auto& c : cases) {
+            fx_reset();
+            g_fx_exe = c.exe;
+            r = fx_run(f, true, {});
+            sprintf(m, "CareerDo, race.exe at \"%.40s\": a clean return", c.exe);
+            fx_check(fx_clean(f, r), m, &r);
+            sprintf(m, "CareerDo, race.exe at \"%.40s\": the career log opened as %s", c.exe, c.file);
+            fx_check(logged_after('FAPP', c.file), m);
+            sprintf(m, "CareerDo, race.exe at \"%.40s\": %s", c.exe, c.dir ? "the log folder made" : "no folder made");
+            fx_check(c.dir ? logged_after('MKDR', c.dir) : !fx_logged('MKDR'), m);
+        }
+        g_fx_exe = "C:\\Games\\Viper Racing\\race.exe";
+    }
+
     printf("the fix build: %d directed checks (%d boundary cases on both), %d failed\n", g_fx_n, g_fx_same_n, g_fx_bad);
     return g_fx_bad;
 }
@@ -2083,6 +2148,8 @@ int main(int argc, char** argv) {
     build_world();
     patch_jmp(0x004779a0, (void*)&stub_UIBegin);         // (after the world: it used the real ones)
     patch_jmp(0x00478380, (void*)&stub_UIEnd);
+    *(uint32_t*)0x005d74e4 = U(&stub_GetModuleFileNameA);  // the game's import slots (fix_paths.h: the fix build's CareerDo)
+    *(uint32_t*)0x005d7490 = U(&stub_CreateDirectoryA);
     mem_save(g_pristine);
     printf("world: %u $E initialisers run, %d widgets in the window, %u KB of heap used, %d generic stubs\n",
            (unsigned)g_setup_e.size(), (int)W.widgets.size(), (HS->heap_next - A_HEAP) / 1024, (int)N_GEN);

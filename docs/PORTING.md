@@ -166,6 +166,12 @@ code until one of those cases comes up (docs/FIXES.md).
 - Test each fix separately, without `VP_FAITHFUL`: the input that used to fail no longer does, and
   ordinary inputs still match the original.
 - The footprint covers what the fixed code writes.
-- vrmod's two engine fixes (obstacle wake, the AI bead guard) are carried by the rewrites, so the stock
-  check (`tools/gen_port_tables.py`, `VRMOD_FIXES`) also accepts exactly those two patched functions and
-  replaces them; any other patched function (the hornball) stays original.
+- vrmod's patches to the functions the port rewrites are taken over (docs/FIXES.md, "vrmod's patches"): the
+  rewrites carry its fixes or reproduce its features, and the stock check (`tools/gen_port_tables.py`) also
+  accepts exactly vrmod's bytes for those functions -- `VRMOD_PATCHES` for fixed patches, `VRMOD_MASKS` for the
+  operands where the player chooses a value, `LIVE_CONSTS` for the .rdata floats the hornball tunes -- and
+  replaces them. A rewrite reads such a player value from the installed race.exe's own instruction with
+  `vrmod_operand(address)` (port.h; `gen_port_tables.py` requires it for every masked operand, and
+  `tools/gen_standalone.py` keeps those bytes out of the standalone's int3 fill), so a harness or a stock
+  race.exe gets the stock value. `test/vrmod_image.h` turns a harness's image into vrmod's race.exe
+  (`VP_VRMOD=1` in the world harnesses that check these). Any other patched function stays original.

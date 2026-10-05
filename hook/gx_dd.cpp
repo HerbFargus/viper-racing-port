@@ -215,7 +215,25 @@ static void __fastcall dviewport_dtor_rw(DViewport* self, Edx) {
 static void fp_dviewport_dtor(Footprint& f, DViewport* self, Edx) { f.add(self, sizeof(DViewport), "dviewport"); }
 PORT_FN_GL(0x0045ebf0, "dviewport::~dviewport", dviewport_dtor_rw, fp_dviewport_dtor)
 
-// dviewport::set_viewport (0x45ec20): D3DVIEWPORT2 {x, y, w, h}, clip window (-1, h/w, 2, 2h/w), z 0..1
+// dviewport::set_viewport (0x45ec20): D3DVIEWPORT2 {x, y, w, h}, clip window (-1, h/w, 2, 2h/w), z 0..1.
+// vrmod's aspectfix.py rewrites 66 bytes of this function for Hor+ at widescreen DirectDraw modes: the clip window's
+// half-height is R = max(R0, h/w) and its width 2R/(h/w), where R0 (0.65 by default, the player's choice) is a float
+// in .rdata -- one already in the pool, or one it writes into the section's slack -- named by its `fld dword [R0]`, and
+// the -0.5 it scales the width by likewise. The stock check accepts exactly that code with any two addresses there
+// (tools/gen_port_tables.py, VRMOD_PATCHES / VRMOD_MASKS), and the rewrite tells the two apart by the code itself
+// (aspectfix_r0: its first instructions, kept out of the standalone's int3 fill), then does what that code does, x87
+// step for x87 step. The OpenGL renderer widens the clip window again for its own window, as it does under the vrmod
+// race.exe today. A viewport at least as tall as R0 comes out exactly as stock either way.
+static const volatile float* aspectfix_r0(const volatile float** half) {
+    const volatile uint8_t* p = (const volatile uint8_t*)(uintptr_t)0x0045ec5f;
+    static const uint8_t k_code[8] = {0xda, 0x74, 0x24, 0x14, 0xd9, 0xc0, 0xd9, 0x05};   // fidiv [esp+0x14]; fld st0; fld [R0]
+    for (int i = 0; i < 8; i++)
+        if (p[i] != k_code[i]) return 0;
+    const volatile uint8_t* m = (const volatile uint8_t*)(uintptr_t)0x0045ec86;          // fmul dword [-0.5]
+    if (m[0] != 0xd8 || m[1] != 0x0d) return 0;
+    *half = (const volatile float*)(uintptr_t)vrmod_operand(0x0045ec88);
+    return (const volatile float*)(uintptr_t)vrmod_operand(0x0045ec67);
+}
 static uint8_t __fastcall dviewport_set_viewport_rw(DViewport* self, Edx, int x, int y, int w, int h) {
     uint32_t d[0x2c / 4];
     memset(d, 0, sizeof d);
@@ -225,14 +243,32 @@ static uint8_t __fastcall dviewport_set_viewport_rw(DViewport* self, Edx, int x,
     d[4] = (uint32_t)h;
     double q = (double)h / (double)w;                    // fild h; fidiv w (FIX CANDIDATE: w = 0)
     d[0] = 0x2c;
-    d[5] = 0xbf800000;                                   // dvClipX -1
-    d[7] = 0x40000000;                                   // dvClipWidth 2
-    d[9] = 0;                                            // dvMinZ
-    d[10] = 0x3f800000;                                  // dvMaxZ 1
-    float cy = (float)q;                                 // fst dword
-    float ch = (float)(q * 2.0);                         // fmul dword 2.0; fstp dword
-    memcpy(&d[6], &cy, 4);
-    memcpy(&d[8], &ch, 4);
+    const volatile float* half = 0;
+    const volatile float* pr0 = aspectfix_r0(&half);
+    if (!pr0) {                                          // stock
+        d[5] = 0xbf800000;                               // dvClipX -1
+        d[7] = 0x40000000;                               // dvClipWidth 2
+        d[9] = 0;                                        // dvMinZ
+        d[10] = 0x3f800000;                              // dvMaxZ 1
+        float cy = (float)q;                             // fst dword
+        float ch = (float)(q * 2.0);                     // fmul dword 2.0; fstp dword
+        memcpy(&d[6], &cy, 4);
+        memcpy(&d[8], &ch, 4);
+    } else {                                             // vrmod's aspectfix (dvMinZ left as the rep stosd made it: 0)
+        const float r0 = *pr0;
+        // fld st0; fld [R0]; fcom st1; fnstsw; sahf; jbe -> keep q (R0 <= q, or unordered), else R0
+        const double R = (double)r0 > q ? (double)r0 : q;
+        const float cy = (float)R;                       // fst [dvClipY]
+        const double cw = (R + R) / q;                   // fadd st0; fdiv st1; fstp st1
+        const float cwf = (float)cw;                     // fst [dvClipWidth]
+        const float cx = (float)(cw * *half);            // fmul [-0.5]; fstp [dvClipX]
+        d[10] = 0x3f800000;                              // dvMaxZ 1
+        const float ch = (float)((double)cy + cy);       // fld [dvClipY]; fadd st0; fstp [dvClipHeight]
+        memcpy(&d[6], &cy, 4);
+        memcpy(&d[7], &cwf, 4);
+        memcpy(&d[5], &cx, 4);
+        memcpy(&d[8], &ch, 4);
+    }
     set_viewport(viewport(((volatile DViewport*)self)->vp), (const D3DVIEWPORT2*)d);
     I32(X_RESULT) = DD_OK;
     return 1;

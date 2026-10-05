@@ -84,6 +84,10 @@ void Footprint::object(void* obj, const char* what) {
 }
 
 #include "../hook/phys_dyno.cpp"
+#include "vrmod_image.h"
+// VP_VRMOD=1: vrmod's hornball.py tunings -- Ball::Throw's four .rdata floats (cooldown, speed, ahead, up) -- set to
+// random player values before each check of it (docs/FIXES.md, "vrmod's patches": the rewrite reads them there)
+static bool g_vrmod;
 
 // ---- random values ------------------------------------------------------------------------------------------
 static uint32_t g_state = 0x2545f491u;
@@ -727,6 +731,13 @@ static void run_world() {
                     float t = chance(70) ? now - rf(0, 0.12f) : now + rf(-1, 1);
                     g_force_time = true;                        // make_script (in CHECK) sets the clock to it
                     g_forced_time = now;
+                    if (g_vrmod) {                              // cooldown 0.05-5 s, speed x0.25-15, ahead -30..30 m, up -2..10 m
+                        vrmod_put32(0x004dc39c, ubits(rf(0.05f, 5.0f)));
+                        vrmod_put32(0x004dc3a4, ubits(31.11111f * rf(0.25f, 15.0f)));
+                        vrmod_put32(0x004dc3a8, ubits(rf(-30.0f, 30.0f)));
+                        vrmod_put32(0x004dc3ac, ubits(rf(-2.0f, 10.0f)));
+                        if (chance(5)) vrmod_put32(0x004dc3a4 + 4 * (rnd() % 3), rnd());   // anything at all
+                    }
                     CHECK(Ball_Throw, b, 0, (const Frame*)at(W_FA), p3(1), sp(t));
                     g_force_time = false;
                     if (g_script.plane) c_throw_plane++; else c_throw_other++;
@@ -821,6 +832,8 @@ int main(int argc, char** argv) {
     char* s = strstr(exe, "\\test\\world_dyno.cpp");
     if (s) strcpy(s, "\\out\\race_v10.exe");
     if (!load_race_exe(exe)) return 2;
+    g_vrmod = getenv("VP_VRMOD") && atoi(getenv("VP_VRMOD"));
+    if (g_vrmod) puts("vrmod's hornball: Ball::Throw's tunings random");
     patch_jmp(0x00465be0, (void*)&stub_terrain);
     patch_jmp(0x00465ca0, (void*)&stub_terrain_sphere);
     patch_jmp(0x0043c710, (void*)&stub_collide);
