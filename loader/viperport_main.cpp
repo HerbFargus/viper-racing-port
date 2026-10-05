@@ -1,0 +1,455 @@
+// viperport.exe -- runs the v1.0 game on the port's code alone (hook/standalone.h says how the two halves meet).
+//
+//   viperport.exe [--race file] [game arguments]      beside race.exe and the port's dinput.dll: the game
+//   viperport.exe --check [race.exe] [--dll path]     map, install, fill and verify; print the report; start nothing
+// --race names the v1.0 race.exe to run when it isn't race.exe beside viperport.exe (e.g. vrmod's stock copy,
+// race.exe.vrmod-original); a relative path is taken from the current folder, else from viperport.exe's.
+//
+// The game's code and data come from the user's own installed race.exe (v1.0 only: its PE timestamp, 0x362de68c; the
+// race.bin builds keep the dinput.dll route). It is mapped at 0x400000 as an image section (SEC_IMAGE), as Windows maps
+// an exe -- each section at its RVA with its protection, MEM_IMAGE (so its SEH handlers dispatch with DEP on); v1.0 has
+// no relocations and no TLS -- and its imports are resolved here, by name or ordinal, into its own IAT. The game sees
+// itself as the process's module through three of those slots (GetModuleHandleA(NULL) -> 0x400000, GetModuleFileNameA
+// -> race.exe's path, GetCommandLineA -> race.exe's path and the game's arguments). The port DLL is then loaded by path
+// (the same dinput.dll file the dinput.dll route uses) with VIPERPORT_STANDALONE set, and installs from its DllMain on
+// top of the resolved IAT, with GetModuleHandle(NULL) briefly race.exe's (set_process_module); the one export does the
+// rest.
+//
+// This program is linked at 0x00800000 (fixed), away from race.exe's 0x400000-0x62c000. The process heap can still
+// land there before main runs; then the program starts itself again suspended, with the range reserved before the
+// child's heap exists, and waits for it.
+#define _CRT_SECURE_NO_WARNINGS
+#define VP_LOADER
+#include <windows.h>
+#include <bcrypt.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <string>
+#include <vector>
+#include "../hook/standalone.h"
+
+namespace {
+
+const uint32_t BASE = 0x400000;
+const uint32_t V10_TIMESTAMP = 0x362de68c;
+const uint32_t V10_IMAGE = 0x22c000;                   // v1.0's SizeOfImage
+// SHA-256 of the stock v1.0 race.exe (2,404,451 bytes; the disc's Data\race.exe)
+const char* const V10_SHA256 = "739619fd213c1e8c234b4712b2bae2a8b362d19f94f6be08c477a42e39d6dd81";
+const char* const CHILD_ENV = "VIPERPORT_LOADER_CHILD";
+
+bool g_check;
+HANDLE g_stdout = INVALID_HANDLE_VALUE;
+FILE* g_report;
+std::string g_fails;                                    // the run's first FAIL lines, for the message box
+
+void __cdecl out(const char* line) {
+    if (!strncmp(line, "FAIL: ", 6) && g_fails.size() < 1500) { g_fails += line + 6; g_fails += "\n"; }
+    if (g_stdout != INVALID_HANDLE_VALUE && g_stdout) {
+        DWORD w;
+        WriteFile(g_stdout, line, (DWORD)strlen(line), &w, 0);
+        WriteFile(g_stdout, "\r\n", 2, &w, 0);
+    }
+    if (g_report) { fprintf(g_report, "%s\n", line); fflush(g_report); }
+}
+
+void say(const char* fmt, ...) {
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    line[sizeof line - 1] = 0;
+    out(line);
+}
+
+// a failure before the game starts: printed (--check) or shown (the game has no window yet)
+int refuse(const char* fmt, ...) {
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    line[sizeof line - 1] = 0;
+    out(line);
+    if (!g_check) {
+        const std::string box = g_fails.empty() ? std::string(line) : std::string(line) + "\n\n" + g_fails;
+        MessageBoxA(0, box.c_str(), "viperport", MB_OK | MB_ICONERROR);
+    }
+    return 2;
+}
+
+std::string folder_of(const std::string& path) {
+    const size_t s = path.find_last_of("\\/");
+    return s == std::string::npos ? std::string(".\\") : path.substr(0, s + 1);
+}
+
+std::string full_path(const std::string& p) {
+    char buf[MAX_PATH];
+    const DWORD n = GetFullPathNameA(p.c_str(), MAX_PATH, buf, 0);
+    return n && n < MAX_PATH ? std::string(buf) : p;
+}
+
+// a relative path: from the current folder if the file is there, else from viperport.exe's folder
+std::string resolve_path(const std::string& p, const std::string& self_dir) {
+    const std::string here = full_path(p);
+    if (GetFileAttributesA(here.c_str()) != INVALID_FILE_ATTRIBUTES) return here;
+    const bool relative = !(p.size() > 1 && (p[1] == ':' || (p[0] == '\\' && p[1] == '\\')));
+    return relative ? full_path(self_dir + p) : here;
+}
+
+std::string sha256_hex(const std::vector<uint8_t>& data) {
+    BCRYPT_ALG_HANDLE alg = 0;
+    BCRYPT_HASH_HANDLE h = 0;
+    uint8_t digest[32] = {};
+    std::string hex;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, 0, 0) == 0) {
+        if (BCryptCreateHash(alg, &h, 0, 0, 0, 0, 0) == 0) {
+            BCryptHashData(h, (PUCHAR)data.data(), (ULONG)data.size(), 0);
+            if (BCryptFinishHash(h, digest, sizeof digest, 0) == 0) {
+                char two[3];
+                for (uint8_t b : digest) { sprintf(two, "%02x", b); hex += two; }
+            }
+            BCryptDestroyHash(h);
+        }
+        BCryptCloseAlgorithmProvider(alg, 0);
+    }
+    return hex;
+}
+
+// ---- the command line ---------------------------------------------------------------------------------------------
+// the arguments after the program's own name, split the way the C runtime splits them (enough for our flags)
+struct Arg { std::string text; std::string raw; };     // unquoted, and as written
+std::vector<Arg> args_of(const char* cl) {
+    std::vector<Arg> v;
+    const char* p = cl;
+    bool first = true;
+    while (*p) {
+        while (*p == ' ' || *p == '	') p++;
+        if (!*p) break;
+        const char* start = p;
+        std::string a;
+        bool q = false;
+        while (*p && (q || (*p != ' ' && *p != '	'))) {
+            if (*p == '"') q = !q;
+            else a += *p;
+            p++;
+        }
+        if (!first) v.push_back({a, std::string(start, p)});
+        first = false;
+    }
+    return v;
+}
+
+// ---- 0x400000 ------------------------------------------------------------------------------------------------------
+// Start this program again, suspended, reserve race.exe's range in it before anything of its own runs, let it go and
+// wait: the child finds the range reserved, releases it and maps race.exe there at once.
+int relaunch_with_range_reserved() {
+    SetEnvironmentVariableA(CHILD_ENV, "1");
+    STARTUPINFOA si = {sizeof si};
+    GetStartupInfoA(&si);
+    PROCESS_INFORMATION pi;
+    char self[MAX_PATH];
+    GetModuleFileNameA(0, self, MAX_PATH);
+    std::vector<char> cl(GetCommandLineA(), GetCommandLineA() + strlen(GetCommandLineA()) + 1);
+    if (!CreateProcessA(self, cl.data(), 0, 0, TRUE, CREATE_SUSPENDED, 0, 0, &si, &pi))
+        return refuse("viperport: 0x400000 is taken in this process and a fresh one couldn't be started (%lu)", GetLastError());
+    if (!VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)BASE, V10_IMAGE, MEM_RESERVE, PAGE_NOACCESS)) {
+        TerminateProcess(pi.hProcess, 2);
+        return refuse("viperport: couldn't reserve race.exe's range 0x400000 in a fresh process (%lu)", GetLastError());
+    }
+    ResumeThread(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 2;
+    GetExitCodeProcess(pi.hProcess, &code);
+    return (int)code;
+}
+
+// ---- the image -----------------------------------------------------------------------------------------------------
+struct Image {
+    std::vector<uint8_t> file;
+    const IMAGE_NT_HEADERS32* nt = 0;
+    uint8_t* base = 0;
+};
+
+const IMAGE_NT_HEADERS32* headers_of(const std::vector<uint8_t>& f) {
+    if (f.size() < 0x400 || f[0] != 'M' || f[1] != 'Z') return 0;
+    const uint32_t pe = *(const uint32_t*)&f[0x3c];
+    if (pe + sizeof(IMAGE_NT_HEADERS32) > f.size()) return 0;
+    const IMAGE_NT_HEADERS32* nt = (const IMAGE_NT_HEADERS32*)&f[pe];
+    return nt->Signature == IMAGE_NT_SIGNATURE ? nt : 0;
+}
+
+// race.exe mapped as an image section (SEC_IMAGE) at its own base -- what the Windows loader does for an exe: each
+// section at its RVA with its own protection, the rest of .data zero, and the memory an image's (MEM_IMAGE). That last
+// part matters: the game's SEH frames name handlers inside race.exe (_WinMainCRTStartup's: _except_handler3), and with
+// DEP on Windows won't dispatch to a handler in private memory -- --check raises an exception through such a frame.
+// Writes (the IAT, the hooks, the fill) are copy-on-write: the file is never changed.
+int map_image(Image& im, const std::string& path) {
+    VirtualFree((void*)(uintptr_t)BASE, 0, MEM_RELEASE);    // our reservation (or the parent's, in a child) gives way
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_EXECUTE, FILE_SHARE_READ | FILE_SHARE_DELETE, 0,
+                           OPEN_EXISTING, 0, 0);
+    if (f == INVALID_HANDLE_VALUE) return refuse("viperport: %s doesn't open to map (%lu)", path.c_str(), GetLastError());
+    HANDLE sec = CreateFileMappingA(f, 0, PAGE_EXECUTE_READ | SEC_IMAGE, 0, 0, 0);
+    CloseHandle(f);
+    if (!sec) return refuse("viperport: %s couldn't be mapped as an image (%lu)", path.c_str(), GetLastError());
+    void* b = MapViewOfFileEx(sec, FILE_MAP_READ | FILE_MAP_EXECUTE, 0, 0, 0, (void*)(uintptr_t)BASE);
+    CloseHandle(sec);                                        // (the view keeps the section)
+    if (b != (void*)(uintptr_t)BASE)
+        return refuse("viperport: couldn't map race.exe's image at 0x400000 (%lu)", GetLastError());
+    im.base = (uint8_t*)b;
+    // the view must hold exactly the file's sections (what the audit compares against)
+    const IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(im.nt);
+    for (int i = 0; i < im.nt->FileHeader.NumberOfSections; i++) {
+        const uint32_t raw = s[i].SizeOfRawData < s[i].Misc.VirtualSize || !s[i].Misc.VirtualSize ? s[i].SizeOfRawData
+                                                                                                   : s[i].Misc.VirtualSize;
+        if (s[i].PointerToRawData + raw > im.file.size() || memcmp(im.base + s[i].VirtualAddress, &im.file[s[i].PointerToRawData], raw))
+            return refuse("viperport: race.exe's section %.8s isn't what the file holds once mapped", s[i].Name);
+    }
+    return 0;
+}
+
+// race.exe's GetModuleFileNameA import: its own module (NULL, or the image's handle) is race.exe, as it would be had
+// Windows started it -- the game's paths come from its folder, and its crash report reads the link map appended to the
+// exe it names. Any other module: the real thing.
+std::string g_race_path;
+void** g_gmfn_slot;                                     // its slot in race.exe's IAT
+DWORD WINAPI race_GetModuleFileNameA(HMODULE m, LPSTR buf, DWORD n) {
+    if (m && m != (HMODULE)(uintptr_t)BASE) return GetModuleFileNameA(m, buf, n);
+    if (!n) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+    const DWORD len = (DWORD)g_race_path.size();
+    if (len >= n) {                                     // truncated, terminated, as Windows does
+        memcpy(buf, g_race_path.c_str(), n - 1);
+        buf[n - 1] = 0;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return n;
+    }
+    memcpy(buf, g_race_path.c_str(), len + 1);
+    SetLastError(ERROR_SUCCESS);
+    return len;
+}
+
+// race.exe's GetModuleHandleA import: NULL is race.exe's image (WinMain's hInstance, the window class, LoadIcon,
+// LoadBitmap: all on 0x400000, as when Windows starts race.exe); a named module: the real thing.
+HMODULE WINAPI race_GetModuleHandleA(LPCSTR name) {
+    if (!name) { SetLastError(ERROR_SUCCESS); return (HMODULE)(uintptr_t)BASE; }
+    return GetModuleHandleA(name);
+}
+
+// race.exe's GetCommandLineA import: as if Windows had started race.exe -- its own path first, then the game's
+// arguments as written (the loader's --race / --dll / --check taken out). The C runtime's argv and WinMain's command
+// line come from it.
+std::string g_race_cmdline;
+LPSTR WINAPI race_GetCommandLineA() { return (LPSTR)g_race_cmdline.c_str(); }
+
+// race.exe's DINPUT import, until the port DLL is loaded and its own export takes the slot
+HRESULT WINAPI dinput_not_yet(HINSTANCE, DWORD, void**, void*) { return E_FAIL; }
+
+// every import into its IAT slot; DINPUT.dll's -> dinput_not_yet for now (the slots it names, returned)
+int resolve_imports(Image& im, std::vector<uint32_t*>& dinput_slots) {
+    const IMAGE_DATA_DIRECTORY d = im.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!d.VirtualAddress) return 0;
+    int n = 0;
+    for (const IMAGE_IMPORT_DESCRIPTOR* imp = (const IMAGE_IMPORT_DESCRIPTOR*)(im.base + d.VirtualAddress); imp->Name; imp++) {
+        const char* dll = (const char*)(im.base + imp->Name);
+        const bool dinput = _stricmp(dll, "DINPUT.dll") == 0;
+        HMODULE m = dinput ? 0 : LoadLibraryA(dll);
+        if (!dinput && !m) return refuse("viperport: race.exe imports %s, which didn't load (%lu)", dll, GetLastError());
+        const IMAGE_THUNK_DATA32* names = (const IMAGE_THUNK_DATA32*)(im.base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        IMAGE_THUNK_DATA32* iat = (IMAGE_THUNK_DATA32*)(im.base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; names++, iat++, n++) {
+            if (dinput) {
+                iat->u1.Function = (DWORD)(uintptr_t)&dinput_not_yet;
+                dinput_slots.push_back((uint32_t*)&iat->u1.Function);
+                continue;
+            }
+            FARPROC f;
+            char what[128];
+            if (IMAGE_SNAP_BY_ORDINAL32(names->u1.Ordinal)) {
+                f = GetProcAddress(m, (LPCSTR)(uintptr_t)IMAGE_ORDINAL32(names->u1.Ordinal));
+                _snprintf(what, sizeof what, "%s #%u", dll, (unsigned)IMAGE_ORDINAL32(names->u1.Ordinal));
+            } else {
+                const char* nm = (const char*)((const IMAGE_IMPORT_BY_NAME*)(im.base + names->u1.AddressOfData))->Name;
+                f = GetProcAddress(m, nm);
+                _snprintf(what, sizeof what, "%s!%s", dll, nm);
+            }
+            what[sizeof what - 1] = 0;
+            if (!f) return refuse("viperport: race.exe's import %s wasn't found", what);
+            if (!_stricmp(what, "KERNEL32.dll!GetCommandLineA")) f = (FARPROC)&race_GetCommandLineA;
+            if (!_stricmp(what, "KERNEL32.dll!GetModuleHandleA")) f = (FARPROC)&race_GetModuleHandleA;
+            if (!_stricmp(what, "KERNEL32.dll!GetModuleFileNameA")) {
+                f = (FARPROC)&race_GetModuleFileNameA;
+                g_gmfn_slot = (void**)&iat->u1.Function;
+            }
+            iat->u1.Function = (DWORD)(uintptr_t)f;
+        }
+    }
+    return 0;
+}
+
+// The PEB's ImageBaseAddress is what GetModuleHandle(NULL) returns to every caller that doesn't go through race.exe's
+// own import slots. It points at race.exe's image only while the port DLL loads: its DllMain identifies the build and
+// finds race.exe's imports from GetModuleHandle(NULL), exactly as on the dinput.dll route. Then it goes back to
+// viperport.exe, a module Windows loaded -- SDL and DirectInput 8 (joysticks, haptics) initialise with it, and
+// DirectInput refuses an image Windows never loaded ("Haptic error Initializing DirectInput device"). The game itself
+// gets 0x400000 from its GetModuleHandleA slot (race_GetModuleHandleA, below).
+void* set_process_module(void* base) {
+    uint8_t* peb = (uint8_t*)(uintptr_t)__readfsdword(0x30);
+    void* was = *(void**)(peb + 8);
+    *(void**)(peb + 8) = base;
+    return was;
+}
+
+int run(int argc_unused) {
+    (void)argc_unused;
+    // reserve race.exe's range first, before this program allocates anything more
+    void* reserved = VirtualAlloc((void*)(uintptr_t)BASE, V10_IMAGE, MEM_RESERVE, PAGE_NOACCESS);
+#ifdef VP_TEST_RELAUNCH                                 // (a test build: take the fresh-process route every time)
+    if (reserved && !GetEnvironmentVariableA(CHILD_ENV, 0, 0)) { VirtualFree(reserved, 0, MEM_RELEASE); reserved = 0; }
+#endif
+    const bool child = GetEnvironmentVariableA(CHILD_ENV, 0, 0) != 0;
+    if (child) SetEnvironmentVariableA(CHILD_ENV, 0);
+
+    char selfp[MAX_PATH];
+    GetModuleFileNameA(0, selfp, MAX_PATH);
+    const std::string self_dir = folder_of(selfp);
+    std::vector<Arg> args = args_of(GetCommandLineA());
+    std::string exe = self_dir + "race.exe", dll = self_dir + "dinput.dll";
+    g_check = !args.empty() && args[0].text == "--check";
+    if (!reserved && !child) return relaunch_with_range_reserved();   // (the child reports and runs)
+    // the loader's own options come out of the game's command line: --race <file> (either mode), --dll <file>, and
+    // --check [race.exe]; every other argument is the game's, as written
+    std::string game_args;
+    for (size_t i = 0; i < args.size(); i++) {
+        const std::string& t = args[i].text;
+        if ((t == "--race" || t == "--dll") && i + 1 < args.size()) {
+            (t == "--race" ? exe : dll) = args[++i].text;
+        } else if (g_check && i == 0) {
+        } else if (g_check && t.size() && t[0] != '-') {
+            exe = t;                                         // --check <race.exe>
+        } else {
+            game_args += " " + args[i].raw;
+        }
+    }
+    if (g_check) {
+        g_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (!g_stdout || g_stdout == INVALID_HANDLE_VALUE) {
+            if (AttachConsole(ATTACH_PARENT_PROCESS))
+                g_stdout = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+        }
+        g_report = fopen((self_dir + "viperport-check.txt").c_str(), "w");
+    }
+    exe = resolve_path(exe, self_dir);
+    dll = resolve_path(dll, self_dir);
+    g_race_path = exe;
+    g_race_cmdline = "\"" + exe + "\"" + game_args;   // what the game's GetCommandLineA returns
+    // (in a child the parent reserved the range for us: map_image releases it and maps there)
+
+    // race.exe: v1.0 only
+    Image im;
+    {
+        HANDLE f = CreateFileA(exe.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+        if (f == INVALID_HANDLE_VALUE) return refuse("viperport: %s doesn't open (%lu): viperport.exe goes beside race.exe", exe.c_str(), GetLastError());
+        const DWORD n = GetFileSize(f, 0);
+        im.file.resize(n);
+        DWORD got = 0;
+        const BOOL ok = ReadFile(f, im.file.data(), n, &got, 0);
+        CloseHandle(f);
+        if (!ok || got != n) return refuse("viperport: %s couldn't be read", exe.c_str());
+    }
+    im.nt = headers_of(im.file);
+    if (!im.nt || im.nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386)
+        return refuse("viperport: %s isn't a 32-bit Windows program", exe.c_str());
+    if (im.nt->FileHeader.TimeDateStamp != V10_TIMESTAMP || im.nt->OptionalHeader.ImageBase != BASE ||
+        im.nt->OptionalHeader.SizeOfImage != V10_IMAGE)
+        return refuse("viperport: %s isn't v1.0 race.exe (timestamp %08lx): the standalone runs v1.0 only -- the race.bin "
+                      "builds keep the dinput.dll route", exe.c_str(), im.nt->FileHeader.TimeDateStamp);
+    const std::string hash = sha256_hex(im.file);
+    const bool stock = hash == V10_SHA256;
+    say("viperport.exe: %s: v1.0 (timestamp %08x), SHA-256 %s%s", exe.c_str(), V10_TIMESTAMP, hash.c_str(),
+        stock ? " -- the stock file" : " -- not the stock file (the DLL checks each function it replaces)");
+    if (im.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size)
+        return refuse("viperport: %s has TLS, which v1.0 doesn't", exe.c_str());
+
+    // map, import, protect
+    if (int r = map_image(im, exe)) return r;
+    std::vector<uint32_t*> dinput_slots;
+    if (int r = resolve_imports(im, dinput_slots)) return r;
+
+
+    // the port DLL, by path, told it runs standalone
+    char v[8];
+    sprintf(v, "%d", VP_STANDALONE_VERSION);
+    SetEnvironmentVariableA(VP_STANDALONE_ENV, v);
+    if (_stricmp(folder_of(dll).c_str(), self_dir.c_str()) != 0)
+        SetDllDirectoryA(folder_of(dll).c_str());       // --dll elsewhere: SDL2.dll beside it (else the app folder has it)
+    void* own = set_process_module((void*)(uintptr_t)BASE);   // (see set_process_module)
+    HMODULE port = LoadLibraryA(dll.c_str());
+    set_process_module(own);
+    SetEnvironmentVariableA(VP_STANDALONE_ENV, 0);
+    if (!port) return refuse("viperport: the port DLL %s didn't load (%lu)", dll.c_str(), GetLastError());
+    VpStandalone_t entry = (VpStandalone_t)GetProcAddress(port, VP_STANDALONE_EXPORT);
+    FARPROC create = GetProcAddress(port, "DirectInputCreateA");
+    if (!entry || !create)
+        return refuse("viperport: %s isn't a port DLL with the standalone entry (an older build?)", dll.c_str());
+    for (uint32_t* slot : dinput_slots) {
+        DWORD old;
+        VirtualProtect(slot, 4, PAGE_READWRITE, &old);
+        if (*slot == (uint32_t)(uintptr_t)&dinput_not_yet) *slot = (uint32_t)(uintptr_t)create;   // (unless the DLL took it)
+        VirtualProtect(slot, 4, old, &old);
+    }
+
+    int loader_fails = 0;
+    if (g_check) {
+        // what the game will see of its module, through its own import slots (as it calls them)
+        char name[MAX_PATH] = "";
+        const DWORD nn = g_gmfn_slot ? ((DWORD(WINAPI*)(HMODULE, LPSTR, DWORD))*g_gmfn_slot)(0, name, MAX_PATH) : 0;
+        const HMODULE mh = race_GetModuleHandleA(0);
+        say("viperport.exe: the game's GetModuleHandleA(NULL) = %p, GetModuleFileNameA(NULL) = \"%s\"; the process's "
+            "GetModuleHandle(NULL) = %p (viperport.exe)", (void*)mh, nn ? name : "(fails)", (void*)GetModuleHandleA(0));
+        if (!nn || _stricmp(name, exe.c_str()) != 0) { say("FAIL: the game's module file name isn't race.exe's"); loader_fails++; }
+        if (GetModuleHandleA(0) == (HMODULE)(uintptr_t)BASE) { say("FAIL: the process's module is still race.exe's image"); loader_fails++; }
+        say("viperport.exe: the game's command line (its GetCommandLineA) = %s", g_race_cmdline.c_str());
+        // its resources and its window class, on its hInstance 0x400000 (an image Windows didn't load)
+        const HINSTANCE inst = (HINSTANCE)(uintptr_t)BASE;
+        HRSRC icon = FindResourceA(inst, MAKEINTRESOURCEA(1), (LPCSTR)RT_GROUP_ICON);
+        HRSRC splash = FindResourceA(inst, "SPLASH", (LPCSTR)RT_BITMAP);
+        HICON li = LoadIconA(inst, MAKEINTRESOURCEA(1));
+        HBITMAP lb = LoadBitmapA(inst, "SPLASH");
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = DefWindowProcA;
+        wc.hInstance = inst;
+        wc.lpszClassName = "viperport check window";
+        const ATOM cls = RegisterClassA(&wc);
+        HWND w = cls ? CreateWindowExA(0, wc.lpszClassName, "", WS_POPUP, 0, 0, 8, 8, 0, 0, inst, 0) : 0;   // never shown
+        say("viperport.exe: on hInstance 0x400000: icon group 1 %s, SPLASH %s; LoadIcon %s, LoadBitmap %s, RegisterClass %s, "
+            "CreateWindowEx %s", icon ? "found" : "MISSING", splash ? "found" : "MISSING", li ? "ok" : "FAILS",
+            lb ? "ok" : "FAILS", cls ? "ok" : "FAILS", w ? "ok" : "FAILS");
+        if (!icon || !splash || !li || !lb || !cls || !w) { say("FAIL: race.exe's resources or window class on 0x400000"); loader_fails++; }
+        if (w) DestroyWindow(w);
+        if (cls) UnregisterClassA(wc.lpszClassName, inst);
+        if (lb) DeleteObject(lb);
+    }
+
+    VpStandaloneArgs a = {};
+    a.size = sizeof a;
+    a.version = VP_STANDALONE_VERSION;
+    a.mode = g_check ? VP_SA_CHECK : VP_SA_RUN;
+    a.exe_path = exe.c_str();
+    a.file = im.file.data();
+    a.file_size = (uint32_t)im.file.size();
+    a.stock = stock;
+    a.out = out;
+    const int r = entry(&a);
+    if (g_check) {
+        say("viperport.exe --check: %s", r || loader_fails ? "FAILED" : "passed");
+        if (g_report) fclose(g_report);
+        // the DLL is installed in this process: end it without its exit logs touching anything else
+        ExitProcess(r || loader_fails ? 1 : 0);
+    }
+    return refuse("viperport: the game didn't start (%d checks failed): see viperport.log beside dinput.dll", r);
+}
+
+}  // namespace
+
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) { return run(0); }

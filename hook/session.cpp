@@ -22,7 +22,11 @@
 //     There is no other: the imports have no GetTickCount, GetSystemTime or C-runtime time();
 //   * the random numbers the main thread draws (Random: the world's effects, the career, the credits), and the start-up
 //     seed (Randomize, as replay.cpp chooses it);
-//   * the frame boundaries (Flip), and where each race starts and ends (PhysicsStart / PhysicsStop).
+//   * the frame boundaries (Flip), and where each race starts and ends (PhysicsStart / PhysicsStop);
+//   * the directory scans (FindFirstFileA / FindNextFileA / FindClose through the game's import slots: the car and
+//     track lists, the file boxes, the language resources, the ghost library): every entry the game was handed, so a
+//     replay lists what the recording listed without scanning (see "the directory scans" below). A recording made
+//     before scans were recorded has none, and its replay scans live, as it always did.
 // Each record is a kind byte, a u32 length and the value. A replay feeds them back in the same order: real input is
 // ignored while it plays (closing the window still quits), and the game runs as fast as the fed clock allows (vsync
 // off). Where the replay reads something other than what the recording has next, that is the first place it parts
@@ -110,10 +114,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
+#include <ctype.h>
 #include <vector>
 #include "viperport.h"
 #include "port.h"
 #include "session.h"
+#include "standalone.h"
 #include "net_wsock.h"
 #ifndef SESSION_TEST
 #include "SDL.h"
@@ -135,6 +142,7 @@ enum : uint8_t {
     K_NET = 'C',                                                      // a network read or send: u8 channel, u8 op, data
     K_LOBBY = 'Y',                                                    // the lobby steps let run at this Win32Idle (0xff: dropped)
     K_NET_ASYNC = 'V',                                                // an async winsock reply outside a Win32Idle
+    K_SCAN_FIRST = 'D', K_SCAN_NEXT = 'S', K_SCAN_CLOSE = 'O',        // a directory scan (FindFirstFileA / Next / FindClose)
 };
 enum { CH_MAIN, CH_LOBBY, CH_PHYS, CH_N };                            // the network's channels, by thread
 const char* const CH_NAME[CH_N] = {"the main thread", "the lobby task", "the physics thread"};
@@ -161,12 +169,15 @@ const char* kind_name(uint8_t k) {
     case K_NET: return "a network read";
     case K_LOBBY: return "a lobby step (the multiplayer task)";
     case K_NET_ASYNC: return "a winsock reply";
+    case K_SCAN_FIRST: return "a directory scan (FindFirstFileA)";
+    case K_SCAN_NEXT: return "a directory scan's next entry (FindNextFileA)";
+    case K_SCAN_CLOSE: return "a directory scan's end (FindClose)";
     }
     return "?";
 }
 bool is_value(uint8_t k) {
     return k == K_QPC || k == K_QPF || k == K_TGT || k == K_LOCALTIME || k == K_RANDOM || k == K_SEED || k == K_GRANT || k == SK_JOYPOS ||
-           k == SK_JOYNAME || k == SK_JOYFF;
+           k == SK_JOYNAME || k == SK_JOYFF || k == K_SCAN_FIRST || k == K_SCAN_NEXT || k == K_SCAN_CLOSE;
 }
 bool is_boundary(uint8_t k) { return k == K_IDLE || k == K_RACE_BEGIN || k == K_RACE_END || k == K_END; }
 
@@ -1217,8 +1228,14 @@ char* g_user_dir_ptr;                            // the harness's
 #define USER_DIR ((char*)0x00507f48)             // [0x104]; the game takes at most 200 characters
 #endif
 
+int g_scan_live_depth;                           // > 0: the directory scans are the port's own (live, unrecorded)
+
 uint8_t __cdecl h_get_user_directory() {
+    // (the FIX layer's user-directory migration -- fix_is_dir, fix_copy_tree in krn_file.cpp -- scans the player's real
+    // folders through the same import slots and copies what it finds: its own business, live in both runs)
+    g_scan_live_depth++;
     const uint8_t r = o_get_user_directory();
+    g_scan_live_depth--;
     if (g_session_mode == SESSION_OFF || !on_main()) return r;
 #ifndef SESSION_TEST
     // (KernelBegin has run ProfBegin by now: on a one-processor machine PTimeNow reads rdtsc, which isn't recorded)
@@ -1260,6 +1277,225 @@ uint8_t __cdecl h_get_user_directory() {
         }
     }
     return r;
+}
+
+// ---- the directory scans: FindFirstFileA / FindNextFileA / FindClose, through the game's import slots ---------------------------
+// What the game lists from its folders -- the car and track lists, the file boxes (setups, paint jobs, ghosts, replays),
+// the language resources, the ghost library -- is an input like any other: a recording keeps every scan the main thread
+// makes ('D' its first entry, 'S' each next one, 'O' its end), and a replay hands the game those listings without
+// scanning anything, so a session that made files (an export, a save) and a replay after files were added or removed
+// read the same lists. FileFindFirst / Next / Close (krn_file.cpp, and the original code) call through the slots.
+//   * a 'D' record carries the scan's id (its order in the session), a hash of its pattern and the pattern as text,
+//     case-folded and with the user directory written "<user>\" (a replay's user directory is its own copy); 'S' and 'O'
+//     carry the id of the scan they step. The game's WIN32_FIND_DATAA is the one the call filled (a zeroed buffer, so
+//     what follows the name is the same in both runs).
+//   * a replay's scan handle is a handle of its own (an event: unique, never a real search handle); its steps are fed
+//     from the recording, and once the recording has none for it (it ran out, or the replay parted and nothing in the
+//     Win32Idle call fits) the listing ends there (ERROR_NO_MORE_FILES), so no loop runs on.
+//   * a scan the recording has no record for, in a recording that has scans, is made live (counted, like a clock read
+//     that went short); a recording with no scan records at all (made before scans were recorded) has every scan live.
+//   * not recorded: other threads' scans, a shadow check's rewrite pass, and the FIX layer's own scans inside
+//     get_user_directory (g_scan_live_depth). The session's own snapshot copy (copy_tree) calls the DLL's imports.
+typedef HANDLE(WINAPI* FindFirst_t)(LPCSTR, LPWIN32_FIND_DATAA);
+typedef BOOL(WINAPI* FindNext_t)(HANDLE, LPWIN32_FIND_DATAA);
+typedef BOOL(WINAPI* FindClose_t)(HANDLE);
+FindFirst_t o_FindFirstFileA;
+FindNext_t o_FindNextFileA;
+FindClose_t o_FindClose;
+enum : uint32_t { SLOT_FINDFIRST = 0x005d74c8, SLOT_FINDNEXT = 0x005d74dc, SLOT_FINDCLOSE = 0x005d748c };
+
+#pragma pack(push, 1)
+struct ScanFirstRec { uint32_t scan, pattern; int32_t ok; uint32_t err; WIN32_FIND_DATAA fd; };   // + the pattern's text
+struct ScanNextRec { uint32_t scan; int32_t ok; uint32_t err; WIN32_FIND_DATAA fd; };
+struct ScanCloseRec { uint32_t scan; int32_t ok; };
+#pragma pack(pop)
+
+struct ScanHandle { HANDLE h; uint32_t scan; bool fake; };
+std::vector<ScanHandle> g_scan_handles;         // the scans open: record -- the real handles; play -- the fed ones
+uint32_t g_scan_ids;                            // record: scans made
+bool g_scans_in_recording;                      // play: the recording has scan records (else every scan is live)
+unsigned long g_scans, g_scan_entries, g_scans_live, g_scan_ends;   // recorded / fed; live in a replay; ended short
+
+bool scan_session() {
+    const int mode = g_session_mode;
+#ifdef SESSION_TEST
+    if (mode == SESSION_RECORD && getenv("WNS_OLD_NOSCAN")) return false;   // (the harness: a recorder from before scans)
+#endif
+    return (mode == SESSION_RECORD || (mode == SESSION_PLAY && g_scans_in_recording)) && !g_scan_live_depth && on_main();
+}
+
+// the pattern as compared: case-folded, '/' as '\', the user directory as "<user>\"; its hash
+uint32_t scan_pattern(const char* p, char* out, size_t n) {
+    char ud[MAX_PATH] = "";
+    const char* u = USER_DIR;
+    size_t nu = 0;
+    if (u) {
+        for (; u[nu] && nu + 1 < sizeof ud; nu++) ud[nu] = (char)(u[nu] == '/' ? '\\' : tolower((unsigned char)u[nu]));
+        ud[nu] = 0;
+    }
+    size_t w = 0, i = 0;
+    if (p) {
+        char lp[MAX_PATH];
+        size_t np = 0;
+        for (; p[np] && np + 1 < sizeof lp; np++) lp[np] = (char)(p[np] == '/' ? '\\' : tolower((unsigned char)p[np]));
+        lp[np] = 0;
+        if (nu && np >= nu && !memcmp(lp, ud, nu)) {
+            w = (size_t)_snprintf(out, n, "<user>%s", ud[nu - 1] == '\\' ? "\\" : "");
+            i = nu;
+        }
+        for (; i < np && w + 1 < n; i++) out[w++] = lp[i];
+    }
+    out[w < n ? w : n - 1] = 0;
+    return (uint32_t)session_hash(out, strlen(out));
+}
+
+ScanHandle* scan_handle(HANDLE h) {
+    for (ScanHandle& s : g_scan_handles)
+        if (s.h == h) return &s;
+    return 0;
+}
+
+// a replay: the next scan record of `kind` whose u32 at key_off is `key` (its first n bytes into v). Strict: the next
+// record, or the replay parts; tolerant: the next that fits in the current Win32Idle call's group. Never a fallback on
+// the last value fed (a listing that never ends): false
+bool take_scan(uint8_t kind, void* v, size_t n, size_t key_off, uint32_t key, const char* pattern) {
+    if (g_session_mode != SESSION_PLAY) return false;
+    auto fits = [&](const Rec& r) { return r.kind == kind && r.len >= n && !memcmp(payload(r) + key_off, &key, 4); };
+    if (!g_tolerant) {
+        settle();
+        if (at_end()) { end_of_recording("the recording ended"); return false; }
+        const Rec& r = g_recs[g_ri];
+        if (fits(r)) {
+            memcpy(v, payload(r), n);
+            g_used[g_ri++] = 1;
+            return true;
+        }
+        if (r.kind == kind && r.len >= n) {
+            char more[300];
+            if (kind == K_SCAN_FIRST) {
+                const int tl = (int)(r.len - n);
+                _snprintf(more, sizeof more, "the game scanned \"%.100s\" where the recording scanned \"%.*s\"",
+                          pattern ? pattern : "?", tl < 100 ? tl : 100, (const char*)payload(r) + n);
+            } else {
+                uint32_t rs;
+                memcpy(&rs, payload(r), 4);
+                _snprintf(more, sizeof more, "the game stepped directory scan %u where the recording stepped scan %u (%s)",
+                          key, rs, kind_name(kind));
+            }
+            more[sizeof more - 1] = 0;
+            part_input(kind, kind, more);
+        } else {
+            part_input(kind, r.kind);
+        }
+    }
+    settle();
+    if (g_session_mode != SESSION_PLAY) return false;
+    if (at_end()) { end_of_recording("the recording ended"); return false; }
+    for (size_t j = g_ri; j < g_recs.size() && !is_boundary(g_recs[j].kind); j++) {
+        if (g_used[j] || !fits(g_recs[j])) continue;
+        memcpy(v, payload(g_recs[j]), n);
+        g_used[j] = 1;
+        if (j == g_ri) g_ri++;
+        return true;
+    }
+    g_fallbacks++;
+    count_kind(g_fb_kind, g_fb_first, kind, g_frame);
+    return false;
+}
+
+HANDLE WINAPI h_FindFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA fd) {
+    if (!scan_session()) return o_FindFirstFileA(pattern, fd);
+    char norm[MAX_PATH];
+    const uint32_t ph = scan_pattern(pattern, norm, sizeof norm);
+    ScanFirstRec r;
+    if (g_session_mode == SESSION_PLAY) {
+        if (take_scan(K_SCAN_FIRST, &r, sizeof r, offsetof(ScanFirstRec, pattern), ph, norm)) {
+            g_scans++;
+            if (!r.ok) {
+                SetLastError(r.err);
+                return INVALID_HANDLE_VALUE;
+            }
+            if (fd) memcpy(fd, &r.fd, sizeof *fd);
+            g_scan_entries++;
+            const ScanHandle s = {CreateEventA(0, TRUE, FALSE, 0), r.scan, true};
+            g_scan_handles.push_back(s);
+            return s.h;
+        }
+        g_scans_live++;                                               // (the recording has none here: a live scan)
+        return o_FindFirstFileA(pattern, fd);
+    }
+    memset(&r, 0, sizeof r);
+    const HANDLE h = o_FindFirstFileA(pattern, &r.fd);
+    r.ok = h != INVALID_HANDLE_VALUE;
+    r.err = r.ok ? 0 : GetLastError();
+    r.scan = r.ok ? ++g_scan_ids : 0;
+    r.pattern = ph;
+    const size_t nn = strlen(norm);
+    std::vector<uint8_t> b(sizeof r + nn);
+    memcpy(b.data(), &r, sizeof r);
+    memcpy(b.data() + sizeof r, norm, nn);
+    put(K_SCAN_FIRST, b.data(), b.size());
+    g_scans++;
+    if (!r.ok) {
+        SetLastError(r.err);
+        return h;
+    }
+    g_scan_entries++;
+    const ScanHandle s = {h, r.scan, false};
+    g_scan_handles.push_back(s);
+    if (fd) memcpy(fd, &r.fd, sizeof *fd);
+    return h;
+}
+
+BOOL WINAPI h_FindNextFileA(HANDLE h, LPWIN32_FIND_DATAA fd) {
+    ScanHandle* s = scan_handle(h);
+    if (!s) return o_FindNextFileA(h, fd);
+    ScanNextRec r;
+    if (s->fake) {                                                    // a replay's: fed, or the listing ends
+        if (on_main() && take_scan(K_SCAN_NEXT, &r, sizeof r, offsetof(ScanNextRec, scan), s->scan, 0)) {
+            if (!r.ok) {
+                SetLastError(r.err);
+                return FALSE;
+            }
+            if (fd) memcpy(fd, &r.fd, sizeof *fd);
+            g_scan_entries++;
+            return TRUE;
+        }
+        g_scan_ends++;
+        SetLastError(ERROR_NO_MORE_FILES);
+        return FALSE;
+    }
+    if (g_session_mode != SESSION_RECORD || !on_main()) return o_FindNextFileA(h, fd);
+    memset(&r, 0, sizeof r);
+    r.scan = s->scan;
+    r.ok = o_FindNextFileA(h, &r.fd) ? 1 : 0;
+    r.err = r.ok ? 0 : GetLastError();
+    put(K_SCAN_NEXT, &r, sizeof r);
+    if (!r.ok) {
+        SetLastError(r.err);
+        return FALSE;
+    }
+    g_scan_entries++;
+    if (fd) memcpy(fd, &r.fd, sizeof *fd);
+    return TRUE;
+}
+
+BOOL WINAPI h_FindClose(HANDLE h) {
+    ScanHandle* p = scan_handle(h);
+    if (!p) return o_FindClose(h);
+    const ScanHandle s = *p;
+    g_scan_handles.erase(g_scan_handles.begin() + (p - g_scan_handles.data()));
+    ScanCloseRec r = {s.scan, 1};
+    if (s.fake) {                                                     // a replay's: its event closed, the recorded result
+        ScanCloseRec f;
+        if (on_main() && take_scan(K_SCAN_CLOSE, &f, sizeof f, offsetof(ScanCloseRec, scan), s.scan, 0)) r.ok = f.ok;
+        CloseHandle(s.h);
+        if (!r.ok) SetLastError(ERROR_INVALID_HANDLE);
+        return r.ok;
+    }
+    r.ok = o_FindClose(h) ? 1 : 0;
+    if (g_session_mode == SESSION_RECORD && on_main()) put(K_SCAN_CLOSE, &r, sizeof r);
+    return r.ok;
 }
 
 // ---- the frame hash ---------------------------------------------------------------------------------------------------------------
@@ -1699,7 +1935,10 @@ bool hook_all() {
     o_QPF = (Qpc_t)patch_slot(SLOT_QPF, (void*)h_QPF);
     o_timeGetTime = (Tgt_t)patch_slot(SLOT_TGT, (void*)h_timeGetTime);
     o_GetLocalTime = (LocalTime_t)patch_slot(SLOT_LOCALTIME, (void*)h_GetLocalTime);
-    return o_QPC && o_QPF && o_timeGetTime && o_GetLocalTime;
+    o_FindFirstFileA = (FindFirst_t)patch_slot(SLOT_FINDFIRST, (void*)h_FindFirstFileA);
+    o_FindNextFileA = (FindNext_t)patch_slot(SLOT_FINDNEXT, (void*)h_FindNextFileA);
+    o_FindClose = (FindClose_t)patch_slot(SLOT_FINDCLOSE, (void*)h_FindClose);
+    return o_QPC && o_QPF && o_timeGetTime && o_GetLocalTime && o_FindFirstFileA && o_FindNextFileA && o_FindClose;
 #else
     return true;
 #endif
@@ -1721,7 +1960,7 @@ void session_install_mode(const char* ini) {
     g_ev_lb_park = CreateEventA(0, FALSE, FALSE, 0);
 #ifndef SESSION_TEST
     if (!build_is_v10()) { logf("session: NOT %s -- sessions need v1.0 race.exe", play[0] ? "replaying" : "recording"); return; }
-    if (!GetPrivateProfileIntA("platform", "sdl", 0, ini)) {
+    if (!vp_standalone() && !GetPrivateProfileIntA("platform", "sdl", 0, ini)) {   // (standalone: SDL is forced on)
         logf("session: NOT %s -- sessions need the SDL platform layer ([platform] sdl=1): it's where the input is recorded",
              play[0] ? "replaying" : "recording");
         return;
@@ -1762,6 +2001,11 @@ void session_install_mode(const char* ini) {
             logf("session: NOT replaying -- %s was recorded by another version of the recorder: record it again", path);
             return;
         }
+        for (const Rec& r : g_recs)
+            if (r.kind == K_SCAN_FIRST) { g_scans_in_recording = true; break; }
+        if (!g_scans_in_recording)
+            logf("session: %s has no directory scans (recorded before they were, or it made none) -- the game's scans are"
+                 " live", g_dir);
         char snap[MAX_PATH];
         path_in(snap, sizeof snap, g_dir, "config");
         if (!is_dir(snap)) {
@@ -1852,6 +2096,7 @@ void session_report() {
         if (g_stream) fclose(g_stream), g_stream = 0;
         logf("exit: session: recorded %s: %u frames, %lu input records (%lu Win32Idle calls, %lu input events), %u races",
              g_name, g_frame, g_records, g_idles, g_events, g_races);
+        if (g_scans) logf("exit: session: recorded %lu directory scans (%lu entries)", g_scans, g_scan_entries);
     } else {
         const bool fed_all = mode == SESSION_ENDED || at_end();
         if (g_first_part == UINT32_MAX)
@@ -1864,6 +2109,10 @@ void session_report() {
         logf("exit: session: fed %lu Win32Idle calls (%lu input events); %lu reads fell back on the last value or the live one, "
              "%lu recorded reads were never taken%s", g_idles, g_events, g_fallbacks, g_left_over,
              g_redirect_ok ? "" : "; the user directory was NOT redirected");
+        if (g_scans || g_scans_live || g_scan_ends)
+            logf("exit: session: fed %lu directory scans (%lu entries) without scanning; %lu scans had no record and were"
+                 " made live; %lu listings ended short (no record for their next entry)", g_scans, g_scan_entries,
+                 g_scans_live, g_scan_ends);
         for (int k = 0; k < 256; k++)
             if (g_fb_kind[k] || g_lo_kind[k]) {
                 char a[64] = "", b[64] = "";

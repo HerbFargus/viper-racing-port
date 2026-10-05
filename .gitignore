@@ -10,3 +10,4 @@ __pycache__/
 *.exp
 *.obj
 test/build/
+loader/build/

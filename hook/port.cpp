@@ -6,6 +6,7 @@
 #include <vector>
 #include "viperport.h"
 #include "port.h"
+#include "standalone.h"
 
 // ---- the registry (filled by PORT_FN's static constructors, before DllMain) --------------------------
 static std::vector<PortFn*>& registry() {
@@ -706,6 +707,12 @@ void port_install(const char* ini) {
     char buf[64];
     GetPrivateProfileStringA("port", "default", "new", buf, sizeof buf, ini);
     PortMode dflt = parse_mode(buf, PORT_NEW);
+    // viperport.exe (standalone.h): the originals are int3, so every rewrite is new -- no shadow, no original
+    const bool standalone = vp_standalone();
+    if (standalone) {
+        if (dflt != PORT_NEW) logf("port: standalone: default=%s ignored, every rewrite is new", buf);
+        dflt = PORT_NEW;
+    }
     g_shadow_every = GetPrivateProfileIntA("port", "shadow_every", 1, ini);
     if (g_shadow_every < 1) g_shadow_every = 1;
     g_shadow_per_tick = GetPrivateProfileIntA("port", "shadow_per_tick", 4, ini);
@@ -723,7 +730,7 @@ void port_install(const char* ini) {
     int kept_for_dsound = 0;
     for (PortFn* f : registry()) {
         GetPrivateProfileStringA("port", f->name, "", buf, sizeof buf, ini);
-        f->mode = buf[0] ? parse_mode(buf, dflt) : dflt;
+        f->mode = buf[0] && !standalone ? parse_mode(buf, dflt) : dflt;
         if (f->needs_renderer && !gl && f->mode != PORT_ORIGINAL) { f->mode = PORT_ORIGINAL; kept_for_ddraw++; continue; }
         if (f->needs_audio && !sdl_audio && f->mode != PORT_ORIGINAL) { f->mode = PORT_ORIGINAL; kept_for_dsound++; continue; }
         for (const char* n : k_always_new)

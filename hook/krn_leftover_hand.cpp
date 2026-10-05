@@ -163,3 +163,31 @@ PORT_FN(0x00436080, "CollisionVolume::GetExtents", CollisionVolume_GetExtents_h,
 static void __cdecl TrackDraw_h() { lh_GrafDraw((int)LH_G32(0x00557fc8)); }
 static void fp_track_draw_h(Footprint& f) { f.replay_only = "draws the track (GrafDraw)"; }
 PORT_FN(0x004695f0, "TrackDraw", TrackDraw_h, fp_track_draw_h)
+
+// ---- ds.obj's $E initialisers that fit no generated shape ------------------------------------------------------------------
+// The hardware DirectSound mixer (ds.obj) never runs, but its static initialisers sit in the C runtime's init table and run
+// at start-up (the standalone's int3 fill found $E2 there). $E9 / $E15 clear a 0x20-dword table (rep stosd of eax = 0)
+// after zeroing the dword that follows it; $E10 / $E16 set a guard bit once (the byte at 0x578be8, bits 0 / 1).
+static void __cdecl ds_E9_h() {
+    LH_G32(0x00578c70) = 0;
+    for (uint32_t i = 0; i < 0x20; i++) LH_G32(0x00578bf0 + i * 4) = 0;
+}
+static void __cdecl ds_E15_h() {
+    LH_G32(0x00578bc8) = 0;
+    for (uint32_t i = 0; i < 0x20; i++) LH_G32(0x00578b48 + i * 4) = 0;
+}
+static void __cdecl ds_E10_h() {
+    const uint8_t b = *(volatile uint8_t*)(uintptr_t)0x00578be8;
+    if (!(b & 1)) *(volatile uint8_t*)(uintptr_t)0x00578be8 = (uint8_t)(b | 1);
+}
+static void __cdecl ds_E16_h() {
+    const uint8_t b = *(volatile uint8_t*)(uintptr_t)0x00578be8;
+    if (!(b & 2)) *(volatile uint8_t*)(uintptr_t)0x00578be8 = (uint8_t)(b | 2);
+}
+static void fp_ds_E9_h(Footprint& f) { f.add((void*)(uintptr_t)0x00578bf0, 0x84, "ds.obj table + count"); }
+static void fp_ds_E15_h(Footprint& f) { f.add((void*)(uintptr_t)0x00578b48, 0x84, "ds.obj table + count"); }
+static void fp_ds_guard_h(Footprint& f) { f.add((void*)(uintptr_t)0x00578be8, 1, "ds.obj $E guard bits"); }
+PORT_FN(0x00475600, "$E9(ds.obj)", ds_E9_h, fp_ds_E9_h)
+PORT_FN(0x00475630, "$E10(ds.obj)", ds_E10_h, fp_ds_guard_h)
+PORT_FN(0x00475660, "$E15(ds.obj)", ds_E15_h, fp_ds_E15_h)
+PORT_FN(0x00475690, "$E16(ds.obj)", ds_E16_h, fp_ds_guard_h)

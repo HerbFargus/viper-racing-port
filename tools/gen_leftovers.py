@@ -59,8 +59,8 @@ linechek, linepkt, tapidbg, crc) write theirs by hand. U5, the developer tools (
 the $E of all five object files (edit, modtool, modbuild, cvt3ds, adtools); stubs and deleting destructors of edit.obj
 and modtool.obj only -- modbuild.obj, cvt3ds.obj and adtools.obj are written by hand (group B).
 
-Left out on purpose (listed with --list): ds.obj / ds3d_x.obj except dsounderr2str (the dead hardware DirectSound
-mixer), M2's SDL platform functions (platform.cpp detours them), WinMain (the main-loop stage).
+Left out on purpose (listed with --list): ds.obj / ds3d_x.obj except dsounderr2str and their $E initialisers (the dead
+hardware DirectSound mixer: its functions never run, but its $E sit in the CRT's init table and run at start-up), M2's SDL platform functions (platform.cpp detours them), WinMain (the main-loop stage).
 """
 from __future__ import annotations
 
@@ -682,7 +682,7 @@ def main() -> int:
             continue
         if full is not None and r["object"] not in full and not r["demangled"].startswith("$E"):
             left_out.append((va, r, "not this step's: only its $E initialisers are generated here"))
-        elif r["object"] in DEAD_OBJECTS and va not in DEAD_KEEP:
+        elif r["object"] in DEAD_OBJECTS and va not in DEAD_KEEP and not r["demangled"].startswith("$E"):
             left_out.append((va, r, "the dead hardware DirectSound mixer (ds.obj / ds3d_x.obj)"))
         elif va in PLATFORM:
             left_out.append((va, r, "M2: platform.cpp detours it to its SDL version"))

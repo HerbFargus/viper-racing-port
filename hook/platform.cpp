@@ -29,6 +29,7 @@
 #include "SDL_syswm.h"
 #include "viperport.h"
 #include "session.h"
+#include "standalone.h"
 
 namespace {
 
@@ -638,18 +639,26 @@ void platform_set_view(int x0, int y0, int w, int h, int game_w, int game_h) {
 }
 
 // ---- switching it on -------------------------------------------------------------------------------------
+// viperport.exe (standalone.h): the game's own window, DirectDraw and DirectSound code is int3 there, so the platform is
+// always SDL, the OpenGL renderer and SDL audio, whatever viperport.ini says
+static int platform_ini_sdl(const char* ini) { return vp_standalone() ? 1 : GetPrivateProfileIntA("platform", "sdl", 0, ini); }
+static void platform_ini_str(const char* key, const char* dflt, const char* standalone, char* out, DWORD n, const char* ini) {
+    if (vp_standalone()) lstrcpynA(out, standalone, (int)n);
+    else GetPrivateProfileStringA("platform", key, dflt, out, n, ini);
+}
+
 bool platform_switched_away() { return G.inactive && *(volatile uint8_t*)G.inactive; }
 
 bool platform_plans_gl(const char* ini) {
     char renderer[16];
-    GetPrivateProfileStringA("platform", "renderer", "ddraw", renderer, sizeof renderer, ini);
-    return GetPrivateProfileIntA("platform", "sdl", 0, ini) && _stricmp(renderer, "gl") == 0 && LoadLibraryA("SDL2.dll");
+    platform_ini_str("renderer", "ddraw", "gl", renderer, sizeof renderer, ini);
+    return platform_ini_sdl(ini) && _stricmp(renderer, "gl") == 0 && LoadLibraryA("SDL2.dll");
 }
 
 bool platform_plans_sdl_audio(const char* ini) {
     char audio[16];
-    GetPrivateProfileStringA("platform", "audio", "dsound", audio, sizeof audio, ini);
-    return GetPrivateProfileIntA("platform", "sdl", 0, ini) && _stricmp(audio, "sdl") == 0 && LoadLibraryA("SDL2.dll");
+    platform_ini_str("audio", "dsound", "sdl", audio, sizeof audio, ini);
+    return platform_ini_sdl(ini) && _stricmp(audio, "sdl") == 0 && LoadLibraryA("SDL2.dll");
 }
 
 void platform_install(const char* build) {
@@ -660,12 +669,12 @@ void platform_install(const char* build) {
     GetModuleFileNameA(self, ini, MAX_PATH);
     char* slash = strrchr(ini, '\\');
     lstrcpyA(slash ? slash + 1 : ini, "viperport.ini");
-    if (!GetPrivateProfileIntA("platform", "sdl", 0, ini)) {
+    if (!platform_ini_sdl(ini)) {
         logf("platform: the game's own (viperport.ini [platform] sdl=0)");
         return;
     }
     char renderer[16];
-    GetPrivateProfileStringA("platform", "renderer", "ddraw", renderer, sizeof renderer, ini);
+    platform_ini_str("renderer", "ddraw", "gl", renderer, sizeof renderer, ini);
     g_gl = _stricmp(renderer, "gl") == 0;
     if (!LoadLibraryA("SDL2.dll")) {                             // delay-loaded: make sure it's there first
         logf("platform: NOT switching to SDL2 -- SDL2.dll isn't next to the game");
@@ -755,7 +764,7 @@ void platform_install(const char* build) {
         logf("platform: the OpenGL renderer isn't on after all, but the dd.obj rewrites expect it: set [port] "
              "default=original for dd.obj's functions, or fix what the log says above");
     char audio[16];
-    GetPrivateProfileStringA("platform", "audio", "dsound", audio, sizeof audio, ini);
+    platform_ini_str("audio", "dsound", "sdl", audio, sizeof audio, ini);
     const bool sdl_audio = _stricmp(audio, "sdl") == 0 && audio_install();   // M2 stage 3: SDL audio in place of DirectSound
     if (!sdl_audio && platform_plans_sdl_audio(ini))
         logf("platform: the SDL audio isn't on after all, but the wave.obj rewrites expect it: set [port] "

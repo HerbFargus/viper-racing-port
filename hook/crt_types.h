@@ -153,3 +153,65 @@ static __forceinline CrtIoinfo* crt_ioinfo(int32_t fh) {
     return blk + ((uint32_t)fh & 0x1f);
 }
 #define crt_osfile(fh)      (crt_ioinfo(fh)->osfile)
+
+// ---- group C (stage S1): start-up, exit and exception plumbing (crt_start.cpp) ----------------------------------------
+#define CRT_OSVER_VA                0x0050273cu         // _osver, then _winver 0x502740, _winmajor 0x502744, _winminor 0x502748
+#define CRT_ACMDLN_VA               0x005d6f28u         // _acmdln (GetCommandLineA's string)
+#define CRT_AENVPTR_VA              0x00502680u         // _aenvptr (__crtGetEnvironmentStringsA's block; freed by _setenvp)
+#define CRT_AW_ENV_FUSE_VA          0x00502af8u         // __crtGetEnvironmentStringsA's f_use (1 wide, 2 ANSI)
+#define CRT_ARGC_VA                 0x0050274cu         // __argc
+#define CRT_ARGV_VA                 0x00502750u         // __argv
+#define CRT_ENVIRON_VA              0x00502758u         // _environ
+#define CRT_PGMPTR_VA               0x00502768u         // _pgmptr (-> _pgmname)
+#define CRT_PGMNAME_VA              0x005d5610u         // _pgmname[260]
+#define CRT_ONEXITBEGIN_VA          0x005d6f24u         // __onexitbegin
+#define CRT_ONEXITEND_VA            0x005d6f20u         // __onexitend
+#define CRT_C_TERMINATION_DONE_VA   0x00502774u         // _C_Termination_Done
+#define CRT_FPINIT_VA               0x005024bcu         // _FPinit (-> _fpmath)
+#define CRT_ERROR_MODE_VA           0x0050268cu         // __error_mode
+#define CRT_AEXIT_RTN_VA            0x00502688u         // _aexit_rtn (-> _exit)
+#define CRT_ADBGMSG_VA              0x00503010u         // _adbgmsg (0)
+#define CRT_RTERRS_VA               0x00502f88u         // rterrs[17]: {number, text}
+#define CRT_RTERRS_END              0x00503010u
+#define CRT_STR_VCRT_VA             0x00503014u         // "Microsoft Visual C++ Runtime Library"
+#define CRT_STR_NLNL_VA             0x0050303cu         // "\n\n"
+#define CRT_STR_RUNTIMEERR_VA       0x00503040u         // "Runtime Error!\n\nProgram: " (26 bytes with the NUL)
+#define CRT_STR_DOTS_VA             0x0050305cu         // "..."
+#define CRT_STR_PROGUNKNOWN_VA      0x00503060u         // "<program name unknown>" (23 bytes)
+#define CRT_PFN_MESSAGEBOX_VA       0x005036f0u         // __crtMessageBoxA's user32 pointers
+#define CRT_PFN_GETACTIVEWINDOW_VA  0x005036f4u
+#define CRT_PFN_GETLASTACTIVEPOPUP_VA 0x005036f8u
+#define CRT_STR_GETLASTACTIVEPOPUP_VA 0x005036fcu
+#define CRT_STR_GETACTIVEWINDOW_VA  0x00503710u
+#define CRT_STR_MESSAGEBOXA_VA      0x00503720u
+#define CRT_STR_USER32_VA           0x0050372cu
+#define CRT_PNHHEAP_VA              0x005d5760u         // _pnhHeap (the new handler)
+#define CRT_XCPTACTTAB_VA           0x00502a68u         // _XcptActTab[]: {exception code, signal, action}
+#define CRT_FIRST_FPE_INDX_VA       0x00502ae0u
+#define CRT_NUM_FPE_VA              0x00502ae4u
+#define CRT_XCPTACTTABCOUNT_VA      0x00502ae8u
+#define CRT_FPECODE_VA              0x00502aecu         // _fpecode
+#define CRT_PXCPTINFOPTRS_VA        0x00502af0u         // _pxcptinfoptrs
+#define CRT_NLG_DESTINATION_VA      0x00502a58u         // __NLG_Destination {signature, destination, code, ebp}
+#define CRT_D_INF_VA                0x005028a0u         // _d_inf (double)
+#define CRT_D_MAX_VA                0x005028b0u         // _d_max (double)
+// the initialiser / terminator tables _cinit and doexit run (_initterm: [a, z))
+#define CRT_XI_A                    0x004e3738u         // C initialisers: __onexitinit, __initstdio
+#define CRT_XI_Z                    0x004e3744u
+#define CRT_XC_A                    0x004e1000u         // C++ initialisers: the game's $E functions
+#define CRT_XC_Z                    0x004e3734u
+#define CRT_XP_A                    0x004e3748u         // pre-terminators: __endstdio
+#define CRT_XP_Z                    0x004e3750u
+#define CRT_XT_A                    0x004e3754u         // terminators: none
+#define CRT_XT_Z                    0x004e3758u
+
+// The islands (crt_start.cpp): code the game still reaches that can't take a 5-byte hook jump at its own address -- 87disp's
+// result routines (reached through the transcendental tables and crt_float.cpp's 87triga rewrites), __adj_fpatan
+// (0x4cef65) and __rdtsc (0x4188ad, ProfBegin's rewrite on a one-processor machine with a TSC). Each entry is a 5-byte jmp to its
+// rewrite, or a 2-byte short jmp to a 5-byte jmp placed in dead bytes nearby (padding, or 87disp's unreferenced
+// routines). crt_islands_install() writes them, every byte checked first (v1.0's, int3, or already its own; per group,
+// all or nothing; idempotent): _WinMainCRTStartup's rewrite calls it first thing, in both routes. A standalone int3
+// fill must leave these bytes to it (they are written after the fill, at start-up) -- or call it after the fill.
+struct CrtIsland { uint32_t at; uint32_t len; uint32_t target; const char* what; };   // target: the rewrite, or the slot
+int crt_islands(const CrtIsland** list);       // the table (18 patches)
+bool crt_islands_install();                    // false if a group's bytes weren't v1.0's (logged; that group left alone)

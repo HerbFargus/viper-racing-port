@@ -7,7 +7,7 @@
 // the game by their v1.0 address (a __thiscall as __fastcall with an unused edx), so what runs there -- the original
 // or its hooked rewrite -- is what the original would have called.
 //
-// Counts by shape: $E ret 32, $E jmp 1398, $E jmp (constructor) 1, $E stores 1081, $E constructor 100, $E array constructor 6, ret 55, ret_n 17, ret_al 6, ret_ax 1, ret_this 2, ret_member 1, dtor_call 18, dtor_inline 16; 2734 in all
+// Counts by shape: $E ret 32, $E jmp 1402, $E jmp (constructor) 1, $E stores 1081, $E constructor 100, $E array constructor 6, $E call + jmp 2, $E atexit 2, ret 55, ret_n 17, ret_al 6, ret_ax 1, ret_this 2, ret_member 1, dtor_call 18, dtor_inline 16; 2742 in all
 //
 // The $E static initialisers run once, from the CRT's _initterm: replay_only (as krn_core.cpp's). A tail jump
 // (`jmp T`) stays a call to T by address. The stubs read and write nothing (pure); the deleting destructors free
@@ -27,6 +27,7 @@ typedef void*(__fastcall* LoCtor2_t)(void*, LoEdx, uint32_t, uint32_t);
 
 static void fp_lo_static_init(Footprint& f) { f.replay_only = "a static initialiser (runs once, from the CRT's _initterm)"; }
 
+typedef int(__cdecl* LoAtexit_t)(uint32_t);    // the CRT's atexit, by address
 
 // ---- log.obj ---------------------------------------------------------------------------------------------------------
 static void __cdecl E2_log_lo() {
@@ -10968,6 +10969,44 @@ static void* __fastcall ISound_scalar_deleting_destructor_lo(void* self, LoEdx, 
 }
 static void fp_ISound_scalar_deleting_destructor_lo(Footprint& f, void*, LoEdx, uint32_t) { f.replay_only = "frees the object"; }
 PORT_FN(0x004755b0, "ISound::scalar deleting destructor", ISound_scalar_deleting_destructor_lo, fp_ISound_scalar_deleting_destructor_lo)
+
+// ---- ds.obj ----------------------------------------------------------------------------------------------------------
+static void __cdecl E2_ds_lo() {
+    LO_FN(LoVoid_t, 0x004755e0)();    // jmp: $E1
+}
+PORT_FN(0x004755d0, "$E2(ds.obj)", E2_ds_lo, fp_lo_static_init)
+static void __cdecl E1_ds_lo() {
+    LO_FN(LoVoid_t, 0x00410cc0)();    // jmp: rcfunc_is_internal (a bare `ret`)
+}
+PORT_FN(0x004755e0, "$E1(ds.obj)", E1_ds_lo, fp_lo_static_init)
+static void __cdecl E13_ds_lo() {
+    LO_FN(LoVoid_t, 0x00475600)();    // call: $E9
+    LO_FN(LoVoid_t, 0x00475620)();    // jmp: $E12
+}
+PORT_FN(0x004755f0, "$E13(ds.obj)", E13_ds_lo, fp_lo_static_init)
+static void __cdecl E12_ds_lo() {
+    LO_FN(LoAtexit_t, 0x004ceff0)(0x00475630u);    // atexit($E10)
+}
+PORT_FN(0x00475620, "$E12(ds.obj)", E12_ds_lo, fp_lo_static_init)
+static void __cdecl E18_ds_lo() {
+    LO_FN(LoVoid_t, 0x00475660)();    // call: $E15
+    LO_FN(LoVoid_t, 0x00475680)();    // jmp: $E17
+}
+PORT_FN(0x00475650, "$E18(ds.obj)", E18_ds_lo, fp_lo_static_init)
+static void __cdecl E17_ds_lo() {
+    LO_FN(LoAtexit_t, 0x004ceff0)(0x00475690u);    // atexit($E16)
+}
+PORT_FN(0x00475680, "$E17(ds.obj)", E17_ds_lo, fp_lo_static_init)
+
+// ---- ds3d_x.obj ------------------------------------------------------------------------------------------------------
+static void __cdecl E2_ds3d_x_lo() {
+    LO_FN(LoVoid_t, 0x00477290)();    // jmp: $E1
+}
+PORT_FN(0x00477280, "$E2(ds3d_x.obj)", E2_ds3d_x_lo, fp_lo_static_init)
+static void __cdecl E1_ds3d_x_lo() {
+    LO_FN(LoVoid_t, 0x00410cc0)();    // jmp: rcfunc_is_internal (a bare `ret`)
+}
+PORT_FN(0x00477290, "$E1(ds3d_x.obj)", E1_ds3d_x_lo, fp_lo_static_init)
 
 // ---- shmem.obj -------------------------------------------------------------------------------------------------------
 static void __cdecl E2_shmem_lo() {

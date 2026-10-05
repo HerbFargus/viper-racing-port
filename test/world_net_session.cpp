@@ -35,7 +35,16 @@
 //   must not count; and the physics reads the clock straight, as TimerConditioner does, its "since the base" value
 //   shown in the frames and gating its sends, which the replay must feed)
 //   solorace a single-player race in a session: no network or physics-clock record, replayed identically;
-//   solo     a single-player session (no winsock call): the stream has no network record; with /DSESSION_HEAD (the
+//   scan     a single-player session that lists folders (FindFirstFileA / FindNextFileA / FindClose through the
+//            session's slot wrappers, on the real file system): a car folder, the user directory before and after the
+//            game writes a file there (an export), two scans stepped interleaved, a pattern that matches nothing, and the
+//            FIX layer's own scan inside get_user_directory. The car folder is changed (a file added, one removed) before
+//            the replay: the replay lists what the recording listed, IDENTICAL, without one real scan (the FIX layer's
+//            stays live, unrecorded);
+//   scanpart a replay of `scan` whose game lists another pattern at frame 50: it parts there, naming both patterns, and
+//            every listing still ends;
+//   scanold  the same recorded as the recorder before scans were (no scan records): its replay scans live, identically;
+//   solo     a single-player session (no winsock call): the stream has no network or scan record; with /DSESSION_HEAD (the
 //            committed session.cpp, see below) the same run writes the same bytes -- `solo` prints the files' hashes.
 //   For the byte-for-byte check against the committed recorder: git show HEAD:hook/session.cpp > %TEMP%\wnh\session_head.cpp,
 //   build this file with /DSESSION_HEAD /I%TEMP%\wnh (and without net_wsock.cpp) to world_net_head.exe, and run
@@ -500,7 +509,92 @@ static void __cdecl o_phys_start() { *g_phys_state_ptr = 3; }
 static void __cdecl o_phys_stop() { *g_phys_state_ptr = 8; }
 static uint8_t* __cdecl o_get_packet(void*, void*) { return g_packet; }
 static char g_user_dir[MAX_PATH];
-static uint8_t __cdecl o_user_dir() { return 1; }
+static bool g_in_user_dir;                               // (the scan scenarios: in get_user_directory)
+static uint8_t __cdecl o_user_dir() {
+#ifndef SESSION_HEAD
+    if (g_scenario.compare(0, 4, "scan") == 0) {          // the FIX layer's migration: scans the real Config\ (live)
+        g_in_user_dir = true;
+        WIN32_FIND_DATAA fd;
+        HANDLE h = h_FindFirstFileA((g_root + "\\Config\\fixscan*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) h_FindClose(h);
+        h = h_FindFirstFileA((g_root + "\\Config\\*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            while (h_FindNextFileA(h, &fd)) {}
+            h_FindClose(h);
+        }
+        g_in_user_dir = false;
+    }
+#endif
+    return 1;
+}
+
+#ifndef SESSION_HEAD
+// ---- directory scans (the scan scenarios): the real API behind session.cpp's slot wrappers, counted ------------------------
+static unsigned long g_real_scans;                       // FindFirstFileA calls that reached the file system (the game's)
+static unsigned long g_fix_scans;                        // ... from inside get_user_directory (the FIX layer's: always live)
+static HANDLE WINAPI r_FindFirstFileA(LPCSTR p, LPWIN32_FIND_DATAA fd) {
+    if (g_in_user_dir) g_fix_scans++;
+    else g_real_scans++;
+    return FindFirstFileA(p, fd);
+}
+static BOOL WINAPI r_FindNextFileA(HANDLE h, LPWIN32_FIND_DATAA fd) { return FindNextFileA(h, fd); }
+static BOOL WINAPI r_FindClose(HANDLE h) { return FindClose(h); }
+
+// a folder listed as the game does (FileFindFirst / Next / Close through the slots): every name, size and attribute into
+// the main thread's digest, the names onto the screen; the error that ends it too
+static void list_dir(const std::string& pattern) {
+    WIN32_FIND_DATAA fd;
+    memset(&fd, 0xcc, sizeof fd);                         // (the game's buffer: stack garbage)
+    HANDLE h = h_FindFirstFileA(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD e = saw_v(R_MAIN, GetLastError());
+        g_shown.main_hash = g_shown.main_hash * 31 + e;
+        return;
+    }
+    do {
+        saw(R_MAIN, fd.cFileName, strlen(fd.cFileName));
+        saw(R_MAIN, &fd.nFileSizeLow, 4);
+        saw(R_MAIN, &fd.dwFileAttributes, 4);
+        mixin(&g_shown.main_hash, fd.cFileName, strlen(fd.cFileName));
+    } while (h_FindNextFileA(h, &fd));
+    saw_v(R_MAIN, GetLastError());
+    saw_v(R_MAIN, h_FindClose(h));
+}
+// two scans open at once, stepped in turn
+static void list_two(const std::string& a, const std::string& b) {
+    WIN32_FIND_DATAA fa, fb;
+    HANDLE ha = h_FindFirstFileA(a.c_str(), &fa), hb = h_FindFirstFileA(b.c_str(), &fb);
+    bool ma = ha != INVALID_HANDLE_VALUE, mb = hb != INVALID_HANDLE_VALUE;
+    while (ma || mb) {
+        if (ma) {
+            saw(R_MAIN, fa.cFileName, strlen(fa.cFileName));
+            mixin(&g_shown.main_hash, fa.cFileName, strlen(fa.cFileName));
+            ma = h_FindNextFileA(ha, &fa) != 0;
+        }
+        if (mb) {
+            saw(R_MAIN, fb.cFileName, strlen(fb.cFileName));
+            mixin(&g_shown.main_hash, fb.cFileName, strlen(fb.cFileName));
+            mb = h_FindNextFileA(hb, &fb) != 0;
+        }
+    }
+    if (ha != INVALID_HANDLE_VALUE) saw_v(R_MAIN, h_FindClose(ha));
+    if (hb != INVALID_HANDLE_VALUE) saw_v(R_MAIN, h_FindClose(hb));
+}
+static void scan_frame(int f) {
+    const std::string cars = g_root + "\\cars\\";
+    const std::string user = g_user_dir_ptr;             // (a replay's is its own copy of the snapshot)
+    if (f == 10) { list_dir(cars + "*.car"); list_dir(user + "*.cfg"); }
+    if (f == 30) {                                       // the game writes a file into the user directory (an export)
+        FILE* x = fopen((user + "export.cfg").c_str(), "w");
+        if (x) fputs("exported\n", x), fclose(x);
+    }
+    if (f == 40) list_dir(user + "*");
+    if (f == 50) list_dir(cars + (g_fault == "pattern" ? "*.trk" : "*.car"));
+    if (f == 60) list_two(cars + "*", user + "*.cfg");
+    if (f == 70) list_dir(g_root + "\\nothing-here\\*.xyz");
+    if (f == 90) list_dir(cars + "*.CAR");
+}
+#endif
 
 static void draw_frame() {
     // what the screen shows: the lobby's and the race's state as read, the keys, the host found
@@ -522,6 +616,11 @@ static int run_game() {
     o_get_user_directory = o_user_dir;
     o_QPC = QueryPerformanceCounter;
     o_QPF = QueryPerformanceFrequency;
+#ifndef SESSION_HEAD
+    o_FindFirstFileA = r_FindFirstFileA;
+    o_FindNextFileA = r_FindNextFileA;
+    o_FindClose = r_FindClose;
+#endif
     g_user_dir_ptr = g_user_dir;
     _snprintf(g_user_dir, sizeof g_user_dir, "%s\\Config\\", g_root.c_str());
 #ifndef SESSION_HEAD
@@ -556,7 +655,7 @@ static int run_game() {
     if (g_session_mode == SESSION_OFF) { printf("    FAIL the session didn't start (see %s\\test.log)\n", g_root.c_str()); return 1; }
     h_get_user_directory();                                           // (the snapshot of Config\)
 
-    const bool net = g_scenario != "solo" && g_scenario != "solorace";
+    const bool net = g_scenario != "solo" && g_scenario != "solorace" && g_scenario.compare(0, 4, "scan") != 0;
     HANDLE peer = 0, lobby = 0, phys = 0;
 #ifndef SESSION_HEAD
     if (net && session_net_live()) peer = (HANDLE)_beginthreadex(0, 0, peer_thread, 0, 0, 0);
@@ -571,6 +670,7 @@ static int run_game() {
             if (!session_random_feed(100, &v)) { v = r_Random(100); session_random_saw(100, v); }
             g_shown.main_hash = g_shown.main_hash * 31 + v;
 #ifndef SESSION_HEAD
+            if (g_scenario.compare(0, 4, "scan") == 0) scan_frame(f);
             if (g_scenario == "solorace") {                           // a single-player race (in lockstep)
                 if (f == 60) { g_test_network_race = false; g_race_on = true; h_PhysicsStart(); }
                 if (g_race_on) h_PhysicsGetStatePacket(0, 0);
@@ -716,6 +816,8 @@ static int run_game() {
         fprintf(r, "lobby_ticks %u\nrace_updates %u\nbound_port %lu\ndup_to_2002 %lu\nhost_addr %08x\n", g_shown.lobby_ticks,
                 g_shown.race_updates, g_bound_port, g_dup_to_2002, g_shown.host_addr);
         fprintf(r, "parted_first_what %s\n", g_first_part == UINT32_MAX ? "-" : g_first_part_what);
+        fprintf(r, "real_scans %lu\nfix_scans %lu\nscans %lu\nscan_entries %lu\nscans_live %lu\nscan_ends %lu\nscans_open %u\n",
+                g_real_scans, g_fix_scans, g_scans, g_scan_entries, g_scans_live, g_scan_ends, (unsigned)g_scan_handles.size());
 #endif
         fclose(r);
     }
@@ -892,6 +994,97 @@ static int parent() {
     check(num(read_file(d + "\\result-record.txt"), "dup_to_2002") >= 1, "copy 1's broadcasts to 2001 go to 2002 too");
     check(num(read_file(d + "\\result-record.txt"), "bound_port") == 2001, "copy 1 binds 2001");
 
+    printf("  scan (folder listings recorded; the replay lists them after the folder changed, without scanning)\n");
+    {
+        std::string sd = make_run("scan");
+        CreateDirectoryA((sd + "\\cars").c_str(), 0);
+        const char* const cars[] = {"alpha.car", "bravo.car", "charlie.car", "readme.txt"};
+        for (const char* c : cars) {
+            FILE* x = fopen((sd + "\\cars\\" + c).c_str(), "w");
+            fputs(c, x);
+            fclose(x);
+        }
+        write_ini(sd, "[session]\nrecord=1\n");
+        if (child(g_exe, sd, "record", "scan", 0)) check(false, "the recording ran");
+        const std::string sn = session_name(sd, "");
+        const std::string srec = read_file(sd + "\\result-record.txt");
+        const std::string sst = read_file(sd + "\\sessions\\" + sn + "\\session.vps");
+        unsigned nd = 0, ns = 0, no = 0;
+        for (size_t at = 16; at + 5 <= sst.size();) {
+            const char k = sst[at];
+            uint32_t len;
+            memcpy(&len, &sst[at + 1], 4);
+            nd += k == 'D', ns += k == 'S', no += k == 'O';
+            at += 5 + len;
+        }
+        check(nd == 8 && no == 7 && ns > 10, ("the stream has the scans: " + std::to_string(nd) + " first, " + std::to_string(ns) +
+                                                 " next, " + std::to_string(no) + " close records").c_str());
+        check(sst.find("fixscan") == std::string::npos && num(srec, "fix_scans") == 2,
+              "the FIX layer's scans inside get_user_directory went live, unrecorded");
+        check(sst.find("<user>\\*.cfg") != std::string::npos, "a user-directory pattern is recorded as <user>\\");
+        check(num(srec, "scans_open") == 0, "every recorded scan was closed");
+        // the folder changes before the replay: a car added, one removed
+        DeleteFileA((sd + "\\cars\\bravo.car").c_str());
+        FILE* x = fopen((sd + "\\cars\\zulu.car").c_str(), "w");
+        fputs("new", x);
+        fclose(x);
+        write_ini(sd, (std::string("[session]\nplay=") + sn + "\nlabel=replay\n").c_str());
+        if (child(g_exe, sd, "play", "scan", 0)) check(false, "the replay ran");
+        const std::string srep = read_file(sd + "\\result-play.txt");
+        check(field(srec, "digests") == field(srep, "digests"),
+              ("the replay's game read the recording's listings (" + field(srep, "reads") + " reads)").c_str());
+        check(num(srep, "first_part") == -1 && num(srep, "differ") == 0 && num(srep, "compared") > 100,
+              ("IDENTICAL frames: " + field(srep, "compared") + " compared").c_str());
+        check(num(srep, "real_scans") == 0 && num(srec, "real_scans") == 8,
+              ("no real scan in the replay (the recording made " + field(srec, "real_scans") + ")").c_str());
+        check(num(srep, "fix_scans") == 2, "the FIX layer's scans stayed live in the replay");
+        check(num(srep, "scans") == 8 && num(srep, "scan_entries") == num(srec, "scan_entries") && num(srep, "scans_live") == 0 &&
+                  num(srep, "scan_ends") == 0 && num(srep, "scans_open") == 0,
+              ("every scan fed whole (" + field(srep, "scans") + " scans, " + field(srep, "scan_entries") +
+               " entries), every handle closed").c_str());
+
+        printf("  scanpart (a replay of it whose game lists another pattern at frame 50)\n");
+        write_ini(sd, (std::string("[session]\nplay=") + sn + "\nlabel=fault-pattern\n").c_str());
+        child(g_exe, sd, "play", "scan", "pattern");
+        const std::string fp = read_file(sd + "\\result-play.txt");
+        check(num(fp, "first_part") == 50 && field(fp, "parted_first_what").find("*.trk") != std::string::npos &&
+                  field(fp, "parted_first_what").find("*.car") != std::string::npos,
+              ("parted at frame " + field(fp, "first_part") + ": " + field(fp, "parted_first_what")).c_str());
+        check(num(fp, "real_scans") <= 1 && num(fp, "scans_open") == 0,
+              ("every listing ended, every handle closed; real scans: " + field(fp, "real_scans") + " (the unmatched one, live)").c_str());
+
+        printf("  scanold (recorded as the recorder before scans: no scan records; replayed live)\n");
+        std::string od = make_run("scanold");
+        CreateDirectoryA((od + "\\cars").c_str(), 0);
+        for (const char* c : cars) {
+            FILE* y = fopen((od + "\\cars\\" + c).c_str(), "w");
+            fputs(c, y);
+            fclose(y);
+        }
+        write_ini(od, "[session]\nrecord=1\n");
+        SetEnvironmentVariableA("WNS_OLD_NOSCAN", "1");
+        child(g_exe, od, "record", "scan", 0);
+        SetEnvironmentVariableA("WNS_OLD_NOSCAN", 0);
+        const std::string on = session_name(od, "");
+        const std::string ost = read_file(od + "\\sessions\\" + on + "\\session.vps");
+        bool noscan = !ost.empty();
+        for (size_t at = 16; at + 5 <= ost.size();) {
+            const char k = ost[at];
+            uint32_t len;
+            memcpy(&len, &ost[at + 1], 4);
+            if (k == 'D' || k == 'S' || k == 'O') noscan = false;
+            at += 5 + len;
+        }
+        check(noscan, "its stream has no scan record");
+        write_ini(od, (std::string("[session]\nplay=") + on + "\nlabel=replay\n").c_str());
+        child(g_exe, od, "play", "scan", 0);
+        const std::string orec = read_file(od + "\\result-record.txt"), orep = read_file(od + "\\result-play.txt");
+        check(field(orec, "digests") == field(orep, "digests") && num(orep, "first_part") == -1 && num(orep, "compared") > 100,
+              ("IDENTICAL: " + field(orep, "compared") + " frames compared").c_str());
+        check(num(orep, "real_scans") == 8 && num(orep, "scans") == 0, "its scans were live");
+        check(read_file(od + "\\test.log").find("has no directory scans") != std::string::npos, "the log says so");
+    }
+
     printf("  solo (a single-player session: no network records)\n");
     d = make_run("solo");
     write_ini(d, "[session]\nrecord=1\n");
@@ -903,10 +1096,10 @@ static int parent() {
         const char k = ss[at];
         uint32_t len;
         memcpy(&len, &ss[at + 1], 4);
-        if (k == 'C' || k == 'Y' || k == 'V') none = false;
+        if (k == 'C' || k == 'Y' || k == 'V' || k == 'D' || k == 'S' || k == 'O') none = false;
         at += 5 + len;
     }
-    check(none, "its stream has no network record");
+    check(none, "its stream has no network or directory-scan record");
 
     printf("  solorace (a single-player race in a session: no network or physics-clock records, replayed identically)\n");
     d = make_run("solorace");
@@ -958,7 +1151,7 @@ int main(int argc, char** argv) {
     if (argc >= 6 && !strcmp(argv[1], "child")) {
         g_root = argv[2], g_mode = argv[3], g_scenario = argv[4];
         const std::string extra = argv[5];
-        if (extra == "main" || extra == "lobby" || extra == "human33") g_fault = extra;
+        if (extra == "main" || extra == "lobby" || extra == "human33" || extra == "pattern") g_fault = extra;
         if (extra == "copy2") g_copy = 2, g_two = true;
         if (extra == "copy1" || extra == "copy1-bcast") g_copy = 1, g_two = true;
         g_logfile = fopen((g_root + "\\test.log").c_str(), g_mode == "record" ? "w" : "a");
