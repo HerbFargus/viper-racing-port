@@ -424,6 +424,16 @@ void settle() {
 
 bool at_end() { return g_ri >= g_recs.size() || g_recs[g_ri].kind == K_END; }
 
+// at_end at the exit report: the recording's last records can be the switch away as its window closed (recorded after
+// the last Win32Idle, which the replay quits in) -- no read, so the recording was fed to its end
+bool fed_to_end() {
+    for (size_t i = g_ri; i < g_recs.size(); i++) {
+        if (g_used[i] || g_recs[i].kind == K_ACTIVE || g_recs[i].kind == K_INFO) continue;
+        return g_recs[i].kind == K_END;
+    }
+    return true;
+}
+
 // move on to record `to`, passing everything before it: switches applied, reads never taken counted
 void pass_to(size_t to, bool race_end = false) {
     for (; g_ri < to && g_ri < g_recs.size(); g_ri++) {
@@ -2098,7 +2108,7 @@ void session_report() {
              g_name, g_frame, g_records, g_idles, g_events, g_races);
         if (g_scans) logf("exit: session: recorded %lu directory scans (%lu entries)", g_scans, g_scan_entries);
     } else {
-        const bool fed_all = mode == SESSION_ENDED || at_end();
+        const bool fed_all = mode == SESSION_ENDED || fed_to_end();
         if (g_first_part == UINT32_MAX)
             logf("exit: session: %s: IDENTICAL over all %u frames compared%s (%u of them in races; %u in races out of lockstep"
                  " not compared)%s", g_run, g_compared, g_session_frames ? "" : " -- none were: no frame hashes",

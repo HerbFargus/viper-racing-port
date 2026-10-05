@@ -9,7 +9,11 @@ rem dinput.dll (built by hook\build.bat) and SDL2.dll there.
 call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x86 >nul || exit /b 1
 set OUT=%~dp0build
 if not exist "%OUT%" mkdir "%OUT%"
-cl /nologo /O2 /MT /W3 /EHsc /std:c++17 "%~dp0viperport_main.cpp" /Fo"%OUT%\\" /Fe"%OUT%\viperport.exe" /link /SUBSYSTEM:WINDOWS /BASE:0x00800000 /FIXED /DYNAMICBASE:NO /STACK:0x100000,0x1000 /MACHINE:X86 kernel32.lib user32.lib gdi32.lib bcrypt.lib advapi32.lib || exit /b 1
+cl /nologo /O2 /MT /W3 /EHsc /std:c++17 "%~dp0viperport_main.cpp" /Fo"%OUT%\\" /Fe"%OUT%\viperport.exe" /link /SUBSYSTEM:WINDOWS /OSVERSION:4.00 /BASE:0x00800000 /FIXED /DYNAMICBASE:NO /STACK:0x100000,0x1000 /MACHINE:X86 kernel32.lib user32.lib gdi32.lib bcrypt.lib advapi32.lib || exit /b 1
+rem race.exe says it was made for Windows 4.0 (OS and subsystem version 4.0), and Windows treats it so: thin old-style
+rem window frames, among other things. viperport.exe says the same, so the game gets what race.exe gets (the linker goes
+rem no lower than 5.01: the subsystem version is set here, after the link).
+powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $f='%OUT%\viperport.exe'; $b=[IO.File]::ReadAllBytes($f); $o=[BitConverter]::ToInt32($b,0x3c)+24+48; $b[$o]=4; $b[$o+1]=0; $b[$o+2]=0; $b[$o+3]=0; [IO.File]::WriteAllBytes($f,$b)" || exit /b 1
 if /i not "%~1"=="dll" exit /b 0
 set H=%~dp0..\hook
 set SDL=%~dp0..\..\sdl2\SDL2-2.32.10

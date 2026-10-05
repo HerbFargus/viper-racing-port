@@ -1,0 +1,15 @@
+{
+  "about": "The regression corpus (tools/corpus.py): recorded sessions in the test install's sessions\\ (and sessions-2\\), by name only. exe = the race.exe it was recorded on (beside the port's dinput.dll). ini = extra viperport.ini settings for its replays. routes = how it must replay IDENTICAL: dll (rewrites), original (MGI's code; never for a session that visits Options), standalone (viperport.exe --race exe). provisional = recorded before the corpus existed; replaced by the fresh set.",
+  "sessions": [
+    {"name": "sp-stock", "session": "20261005-030122", "exe": "race_stock.exe", "routes": ["dll", "original", "standalone"],
+     "provisional": true, "what": "single-player race on the stock exe (S1 check; DPI-virtualised 1536x864: race_stock.exe has no HIGHDPIAWARE flag)"},
+    {"name": "vrmod-hornball", "session": "20261005-042606", "exe": "race.exe", "routes": ["dll", "standalone"],
+     "provisional": true, "what": "vrmod-patched race.exe, hornballs, a Hacks visit (so no original route)"},
+    {"name": "libc-career", "session": "20261004-165311", "exe": "race.exe", "routes": ["dll", "original", "standalone"],
+     "provisional": true, "what": "LIBC check: menus, career + paint kit saves, 2 races"},
+    {"name": "lan-ai-1", "session": "20261004-095150", "exe": "race.exe", "routes": ["dll", "original", "standalone"],
+     "provisional": true, "ini": {"test": {"two_copies": 1}}, "what": "two-copy LAN race with AI cars, copy 1 (host); replayed in the two-copies window it was recorded in"},
+    {"name": "lan-ai-2", "session": "sessions-2/20261004-095155", "exe": "race.exe", "routes": ["dll", "original", "standalone"],
+     "provisional": true, "ini": {"test": {"two_copies": 1}}, "what": "two-copy LAN race with AI cars, copy 2, replayed alone in the two-copies window"}
+  ]
+}

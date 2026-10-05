@@ -151,6 +151,12 @@ for a check on the main thread, where the physics can tick between the two passe
    and must report "IDENTICAL over all N frames compared" with 0 reads fallen back. Play through what
    the rewrite runs (the screens and dialogs that call it). This is the in-game check for `replay_only`
    functions that only run in the menus.
+6. **The regression corpus:** `python tools/corpus.py` replays every session listed in `tools/corpus.json`
+   (names only; the recordings stay in the install) on each of its routes -- `dll` (the rewrites),
+   `original` (MGI's code), `standalone` (viperport.exe) -- unattended, and reports PASS / FAIL per run
+   with the first difference. It sets and restores viperport.ini, never touches a game it didn't start,
+   and keeps each run's log beside its session. Any build change (the relink stages above all) must
+   leave the whole corpus PASS. `--list`, `--dry-run`, `--only`, `--routes`, `--selftest`.
 
 ## Fixes
 

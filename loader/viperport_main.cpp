@@ -192,6 +192,15 @@ int relaunch_with_range_reserved() {
     std::vector<char> cl(GetCommandLineA(), GetCommandLineA() + strlen(GetCommandLineA()) + 1);
     if (!CreateProcessA(self, cl.data(), 0, 0, TRUE, CREATE_SUSPENDED, 0, 0, &si, &pi))
         return refuse("viperport: 0x400000 is taken in this process and a fresh one couldn't be started (%lu)", GetLastError());
+    // the child (the game) lives only as long as this process: whoever ends viperport.exe -- a launcher, Task Manager --
+    // ends the game too, instead of leaving it running unseen. The job's handle closes when this process ends.
+    if (HANDLE job = CreateJobObjectA(0, 0)) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li) ||
+            !AssignProcessToJobObject(job, pi.hProcess))
+            CloseHandle(job);                           // (best effort: the game still runs)
+    }
     if (!VirtualAllocEx(pi.hProcess, (void*)(uintptr_t)BASE, V10_IMAGE, MEM_RESERVE, PAGE_NOACCESS)) {
         TerminateProcess(pi.hProcess, 2);
         return refuse("viperport: couldn't reserve race.exe's range 0x400000 in a fresh process (%lu)", GetLastError());
@@ -296,6 +305,16 @@ HMODULE WINAPI race_GetModuleHandleA(LPCSTR name) {
     return GetModuleHandleA(name);
 }
 
+// race.exe's TAPI32 lineInitialize import: TAPI refuses the game's hInstance 0x400000 (an image Windows didn't load:
+// "Can't initialize TAPI"), so it gets the process's module, as on the dinput.dll route where race.exe is that module.
+// The only TAPI call that takes an hInstance. Without it the modem line never starts and the game takes another path.
+typedef LONG(WINAPI* LineInitialize_t)(void* line_app, HINSTANCE inst, void* callback, LPCSTR app, DWORD* devices);
+LineInitialize_t g_line_initialize;
+LONG WINAPI race_lineInitialize(void* line_app, HINSTANCE inst, void* callback, LPCSTR app, DWORD* devices) {
+    if (inst == (HINSTANCE)(uintptr_t)BASE) inst = GetModuleHandleA(0);
+    return g_line_initialize(line_app, inst, callback, app, devices);
+}
+
 // race.exe's GetCommandLineA import: as if Windows had started race.exe -- its own path first, then the game's
 // arguments as written (the loader's --race / --dll / --check taken out). The C runtime's argv and WinMain's command
 // line come from it.
@@ -337,6 +356,10 @@ int resolve_imports(Image& im, std::vector<uint32_t*>& dinput_slots) {
             if (!f) return refuse("viperport: race.exe's import %s wasn't found", what);
             if (!_stricmp(what, "KERNEL32.dll!GetCommandLineA")) f = (FARPROC)&race_GetCommandLineA;
             if (!_stricmp(what, "KERNEL32.dll!GetModuleHandleA")) f = (FARPROC)&race_GetModuleHandleA;
+            if (!_stricmp(what, "TAPI32.dll!lineInitialize")) {
+                g_line_initialize = (LineInitialize_t)f;
+                f = (FARPROC)&race_lineInitialize;
+            }
             if (!_stricmp(what, "KERNEL32.dll!GetModuleFileNameA")) {
                 f = (FARPROC)&race_GetModuleFileNameA;
                 g_gmfn_slot = (void**)&iat->u1.Function;
@@ -573,6 +596,21 @@ int run(int argc_unused) {
         if (w) DestroyWindow(w);
         if (cls) UnregisterClassA(wc.lpszClassName, inst);
         if (lb) DeleteObject(lb);
+        // TAPI on 0x400000 straight, and through the game's slot (race_lineInitialize): the second must start it
+        if (g_line_initialize) {
+            struct Cb { static void CALLBACK f(DWORD, DWORD, DWORD_PTR, DWORD_PTR, DWORD_PTR, DWORD_PTR) {} };
+            typedef LONG(WINAPI* LineShutdown_t)(DWORD);
+            const LineShutdown_t shut = (LineShutdown_t)GetProcAddress(GetModuleHandleA("TAPI32.dll"), "lineShutdown");
+            DWORD app = 0, devs = 0;
+            const LONG raw = g_line_initialize(&app, inst, (void*)&Cb::f, "viperport check", &devs);
+            if (raw == 0 && shut) shut(app);
+            app = 0;
+            const LONG via = race_lineInitialize(&app, inst, (void*)&Cb::f, "viperport check", &devs);
+            if (via == 0 && shut) shut(app);
+            say("viperport.exe: TAPI lineInitialize on hInstance 0x400000: %s (%08lx); through the game's slot: %s (%lu "
+                "devices)", raw ? "refused" : "ok", (unsigned long)raw, via ? "FAILS" : "ok", (unsigned long)devs);
+            if (via) { say("FAIL: TAPI doesn't start for the game (the modem line)"); loader_fails++; }
+        }
     }
 
     VpStandaloneArgs a = {};
