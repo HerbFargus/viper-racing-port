@@ -2,6 +2,9 @@
 //
 //   viperport.exe [--race file] [game arguments]      beside race.exe and the port's dinput.dll: the game
 //   viperport.exe --check [race.exe] [--dll path]     map, install, fill and verify; print the report; start nothing
+//   viperport.exe --probe [race.exe] [--dll path]     "will the standalone run this race.exe?" -- exit code 0 = yes,
+//                                                     else no; one line ("yes: ..." / "no: ...") on stdout and in
+//                                                     viperport-probe.txt. No window, no SDL, no fill (see probe())
 // --race names the v1.0 race.exe to run when it isn't race.exe beside viperport.exe (e.g. vrmod's stock copy,
 // race.exe.vrmod-original); a relative path is taken from the current folder, else from viperport.exe's.
 //
@@ -39,9 +42,12 @@ const char* const V10_SHA256 = "739619fd213c1e8c234b4712b2bae2a8b362d19f94f6be08
 const char* const CHILD_ENV = "VIPERPORT_LOADER_CHILD";
 
 bool g_check;
+bool g_probe;                                           // --probe: a refusal is kept for its one line, not printed
+std::string g_probe_why;                                // (the first refusal)
 HANDLE g_stdout = INVALID_HANDLE_VALUE;
 FILE* g_report;
 std::string g_fails;                                    // the run's first FAIL lines, for the message box
+std::string g_self_dir;                                 // viperport.exe's folder (viperport-probe.txt goes there)
 
 void __cdecl out(const char* line) {
     if (!strncmp(line, "FAIL: ", 6) && g_fails.size() < 1500) { g_fails += line + 6; g_fails += "\n"; }
@@ -63,7 +69,30 @@ void say(const char* fmt, ...) {
     out(line);
 }
 
-// a failure before the game starts: printed (--check) or shown (the game has no window yet)
+// is anyone reading this process's output? (a GUI program started from Explorer or a shortcut has no stdout; a launcher
+// that pipes it, or sends it to NUL, does)
+bool have_stdout() {
+    const HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    return h && h != INVALID_HANDLE_VALUE;
+}
+
+// the one line a probe, or a launch that refuses, leaves: on stdout (if there is one) and in viperport-probe.txt
+void probe_line(const std::string& line) {
+    if (have_stdout()) {
+        DWORD w;
+        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), line.c_str(), (DWORD)line.size(), &w, 0);
+        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), "\r\n", 2, &w, 0);
+    }
+    if (FILE* f = fopen((g_self_dir + "viperport-probe.txt").c_str(), "w")) {
+        fprintf(f, "%s\n", line.c_str());
+        fclose(f);
+    }
+}
+
+// a failure before the game starts: printed (--check); kept for the one line (--probe); or, at a launch, the process
+// ends at once with exit code 2 -- before any window -- with the reason as a "no: ..." line on stdout and in
+// viperport-probe.txt, so a launcher can fall back. A message box says it too, but only when there is no stdout (started
+// from Explorer or a shortcut): a launcher that gives viperport.exe a stdout (a pipe, or NUL) is never kept waiting.
 int refuse(const char* fmt, ...) {
     char line[1024];
     va_list ap;
@@ -71,10 +100,19 @@ int refuse(const char* fmt, ...) {
     _vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
     line[sizeof line - 1] = 0;
+    if (g_probe) {
+        if (g_probe_why.empty()) g_probe_why = !strncmp(line, "viperport: ", 11) ? line + 11 : line;
+        return 2;
+    }
     out(line);
     if (!g_check) {
-        const std::string box = g_fails.empty() ? std::string(line) : std::string(line) + "\n\n" + g_fails;
-        MessageBoxA(0, box.c_str(), "viperport", MB_OK | MB_ICONERROR);
+        std::string why = !strncmp(line, "viperport: ", 11) ? line + 11 : line;
+        if (!g_fails.empty()) why += " -- " + g_fails.substr(0, g_fails.find('\n'));   // the first FAIL line says why
+        probe_line("no: " + why);
+        if (!have_stdout()) {
+            const std::string box = g_fails.empty() ? std::string(line) : std::string(line) + "\n\n" + g_fails;
+            MessageBoxA(0, box.c_str(), "viperport", MB_OK | MB_ICONERROR);
+        }
     }
     return 2;
 }
@@ -322,6 +360,86 @@ void* set_process_module(void* base) {
     return was;
 }
 
+// ---- --probe -------------------------------------------------------------------------------------------------------
+// "Will the standalone run this race.exe?", for a launcher (vrmod's Play), in a fraction of a second: what a launch
+// would refuse, found the cheap way. race.exe is read and its headers checked as a launch does, then mapped at 0x400000
+// (nothing resolved or written); dinput.dll is loaded with VP_PROBE_ENV set, so its DllMain does nothing (no log, no
+// install), and its viperport_probe export runs the same stock check the install would (port_check_stock). SDL2.dll is
+// loaded the way the DLL will load it, not started. No window, no SDL, no fill. Prints one line and ends the process:
+//   0  yes: ...                                    the standalone runs it
+//   2  no: race.exe not found ...                  (or unreadable)
+//   3  no: ... isn't v1.0 race.exe ...             (a race.bin build, another program)
+//   4  no: dinput.dll not found / didn't load ...
+//   5  no: dinput.dll isn't the port's ...         (another dinput.dll, an older port build, a different build)
+//   6  no: SDL2.dll not found ...
+//   7  no: race.exe has N functions patched in a way the port doesn't know: <name> (<address>), ...
+//   8  no: ...                                     anything else (race.exe couldn't be mapped)
+int probe(const std::string& exe, const std::string& dll, const std::string& self_dir) {
+    int code = 0;
+    std::string why;
+    auto no = [&](int c, const std::string& w) { code = c; why = w; };
+    Image im;
+    if (GetFileAttributesA(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        no(2, "race.exe not found: " + exe);
+    } else {
+        HANDLE f = CreateFileA(exe.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+        DWORD got = 0;
+        bool ok = false;
+        if (f != INVALID_HANDLE_VALUE) {
+            const DWORD n = GetFileSize(f, 0);
+            if (n != INVALID_FILE_SIZE) {
+                im.file.resize(n);
+                ok = ReadFile(f, im.file.data(), n, &got, 0) && got == n;
+            }
+            CloseHandle(f);
+        }
+        if (!ok) no(2, "race.exe couldn't be read: " + exe);
+    }
+    if (!code) {
+        im.nt = headers_of(im.file);
+        if (!im.nt || im.nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 || im.nt->FileHeader.TimeDateStamp != V10_TIMESTAMP ||
+            im.nt->OptionalHeader.ImageBase != BASE || im.nt->OptionalHeader.SizeOfImage != V10_IMAGE ||
+            im.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size)
+            no(3, exe + " isn't v1.0 race.exe (the standalone runs v1.0 only; the race.bin builds keep the dinput.dll route)");
+    }
+    if (!code && GetFileAttributesA(dll.c_str()) == INVALID_FILE_ATTRIBUTES)
+        no(4, "dinput.dll not found: " + dll + " (the port's dinput.dll goes beside viperport.exe)");
+    if (!code) {
+        if (_stricmp(folder_of(dll).c_str(), self_dir.c_str()) != 0) SetDllDirectoryA(folder_of(dll).c_str());   // as a launch
+        HMODULE sdl = LoadLibraryA("SDL2.dll");          // (only loaded: nothing of SDL starts until SDL_Init)
+        if (!sdl || !GetProcAddress(sdl, "SDL_Init"))
+            no(6, "SDL2.dll not found beside viperport.exe or dinput.dll (" + folder_of(dll) + ")");
+    }
+    if (!code && map_image(im, exe)) no(8, g_probe_why.empty() ? "race.exe couldn't be mapped" : g_probe_why);
+    if (!code) {
+        char v[8];
+        sprintf(v, "%d", VP_STANDALONE_VERSION);
+        SetEnvironmentVariableA(VP_PROBE_ENV, v);
+        HMODULE port = LoadLibraryA(dll.c_str());
+        const DWORD err = GetLastError();
+        SetEnvironmentVariableA(VP_PROBE_ENV, 0);
+        char line[1024] = "";
+        if (!port) {
+            sprintf(line, "dinput.dll didn't load (error %lu): ", err);
+            no(4, line + dll);
+        } else if (VpProbe_t pr = (VpProbe_t)GetProcAddress(port, VP_PROBE_EXPORT)) {
+            const int r = pr(VP_STANDALONE_VERSION, line, sizeof line);
+            if (r == -2) no(5, std::string("dinput.dll isn't the port's build that goes with this viperport.exe (") + line + ")");
+            else if (r == -1) no(3, exe + " isn't v1.0 race.exe (the port DLL says so)");
+            else if (r > 0) no(7, line);
+            else why = line;
+        } else if (GetProcAddress(port, VP_STANDALONE_EXPORT)) {
+            no(5, "dinput.dll is an older build of the port (it has no --probe entry): " + dll);
+        } else {
+            no(5, "dinput.dll isn't the port's (another dinput.dll): " + dll);
+        }
+    }
+    probe_line((code ? "no: " : "yes: ") + why);
+    // the DLL (if loaded) did nothing in this process; end it without running anything else
+    ExitProcess((UINT)code);
+    return code;
+}
+
 int run(int argc_unused) {
     (void)argc_unused;
     // reserve race.exe's range first, before this program allocates anything more
@@ -337,22 +455,25 @@ int run(int argc_unused) {
     const std::string self_dir = folder_of(selfp);
     std::vector<Arg> args = args_of(GetCommandLineA());
     std::string exe = self_dir + "race.exe", dll = self_dir + "dinput.dll";
+    g_self_dir = self_dir;
     g_check = !args.empty() && args[0].text == "--check";
+    g_probe = !args.empty() && args[0].text == "--probe";
     if (!reserved && !child) return relaunch_with_range_reserved();   // (the child reports and runs)
-    // the loader's own options come out of the game's command line: --race <file> (either mode), --dll <file>, and
-    // --check [race.exe]; every other argument is the game's, as written
+    // the loader's own options come out of the game's command line: --race <file> (any mode), --dll <file>, and
+    // --check / --probe [race.exe]; every other argument is the game's, as written
     std::string game_args;
     for (size_t i = 0; i < args.size(); i++) {
         const std::string& t = args[i].text;
         if ((t == "--race" || t == "--dll") && i + 1 < args.size()) {
             (t == "--race" ? exe : dll) = args[++i].text;
-        } else if (g_check && i == 0) {
-        } else if (g_check && t.size() && t[0] != '-') {
-            exe = t;                                         // --check <race.exe>
+        } else if ((g_check || g_probe) && i == 0) {
+        } else if ((g_check || g_probe) && t.size() && t[0] != '-') {
+            exe = t;                                         // --check <race.exe>, --probe <race.exe>
         } else {
             game_args += " " + args[i].raw;
         }
     }
+    if (g_probe) return probe(resolve_path(exe, self_dir), resolve_path(dll, self_dir), self_dir);
     if (g_check) {
         g_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
         if (!g_stdout || g_stdout == INVALID_HANDLE_VALUE) {

@@ -11595,6 +11595,7 @@
 // {address, fingerprint, what}: vrmod's patched functions the rewrites replace too (VRMOD_PATCHES, VRMOD_MASKS)
     {0x00415020, 0xb96b25f9, "modassert"},
     {0x00421840, 0x5bdee0a7, "enginefix: the AI bead guard"},
+    {0x004311d0, 0xcaa43297, "headon"},
     {0x0043d3c0, 0xd8a10bcb, "enginefix: obstacle wake"},
     {0x0044df20, 0x38befd21, "resolution"},
     {0x0044e040, 0xed8c490f, "resolution"},

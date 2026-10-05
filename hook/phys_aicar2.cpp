@@ -1124,7 +1124,10 @@ static void fp_ai_update(Footprint& f, AICar* self, Edx) {
 PORT_FN(0x00431010, "AICar::Update", AICar_Update, fp_ai_update)
 
 // ==== AICar::headon_panic (0x4311d0): freeze, lock the brakes, steer hard to its own side =========================
+// vrmod's headon.py (opt-in) makes the function's first byte a ret: no panic at all. On a race.exe carrying it the
+// rewrite does the same (docs/FIXES.md, "vrmod's patches"); otherwise the stock panic.
 static void __fastcall AICar_headon_panic(AICar* self, Edx) {
+    if (port_vrmod_has(0x004311d0)) return;             // headon.py: `ret` in place of `sub esp, 4`
     COPY4(self->freeze_time, self->now);
     Car_SetBraking(self, 0, 0x3dcccccdu);               // 0.1
     Car_SetEBrake(self, 0, 0x3f800000u);

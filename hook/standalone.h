@@ -41,6 +41,17 @@ struct VpStandaloneArgs {
 // start (the reason was logged and passed to out), else the game ends the process itself
 typedef int(__cdecl* VpStandalone_t)(const VpStandaloneArgs* args);
 
+// viperport.exe --probe: "will the standalone run this race.exe?" in a fraction of a second. The loader maps race.exe
+// at 0x400000 (nothing resolved, nothing filled) and loads the DLL with VP_PROBE_ENV set, which makes its DllMain do
+// nothing at all -- no viperport.log, no install. The export then identifies the build from the image's headers and runs
+// the stock check (port_check_stock) the install would run. Returns 0: every rewritten function is stock v1.0 or one of
+// vrmod's patches the rewrites take over (line: a summary); n > 0: n functions are patched in a way the port doesn't
+// know, and would stay original, which the standalone refuses (line: their names); -1: not v1.0; -2: the loader and the
+// DLL are from different builds (version).
+#define VP_PROBE_ENV "VIPERPORT_PROBE"
+#define VP_PROBE_EXPORT "viperport_probe"
+typedef int(__cdecl* VpProbe_t)(uint32_t version, char* line, uint32_t line_size);
+
 #ifndef VP_LOADER
 // the DLL side: is this process viperport.exe's? (decided once, when the DLL loads, from VP_STANDALONE_ENV)
 bool vp_standalone();

@@ -26,6 +26,7 @@ void logf(const char* fmt, ...) {
 uint32_t A(uint32_t v10) { return v10; }
 bool have(uint32_t) { return true; }
 bool build_is_v10() { return true; }
+bool port_vrmod_has(uint32_t) { return false; }          // the stock image: none of vrmod's patches
 void Footprint::add(void* p, uint32_t bytes, const char* what) {
     if (n < MAX) r[n++] = {p, bytes, what};
 }

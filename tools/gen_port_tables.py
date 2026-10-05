@@ -144,6 +144,10 @@ VRMOD_PATCHES = {
     # modassert.py: unsafe_check a bare ret; the rewrite's fix never panics (krn_core.cpp). It is the function's first
     # byte: port.cpp's live_prologue takes the trampoline's copy of it as it is (the ret runs, as vrmod's function does)
     0x00415020: [("modassert", [(0x00, "c3")])],
+    # headon.py (opt-in "Turn off the AI's head-on panic"): AICar::headon_panic's first byte (sub esp, 4) a bare ret. A
+    # behaviour, not a fix: the rewrite returns at once when the stock check found it (port_vrmod_has, phys_aicar2.cpp)
+    # and does the stock panic otherwise; as with modassert, the trampoline's copy of the first byte is vrmod's ret
+    0x004311D0: [("headon", [(0x00, "c3")])],
     # aspectfix.py, always on: Hor+ at widescreen DirectDraw modes; the rewrite does the same (gx_dd.cpp), reading R0 and
     # -0.5 through the code's own two addresses (VRMOD_MASKS: any addresses)
     0x0045EC20: [("aspectfix", [(0x3F,

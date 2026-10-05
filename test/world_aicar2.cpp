@@ -5,6 +5,7 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC test\world_aicar2.cpp
 //        /Fo<dir>\ /Fe<dir>\world_aicar2.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_aicar2.exe [iterations] [seed] [only this kind, -1 = all] [wild percentage, default 10]
+//   VP_VRMOD=1: against vrmod's race.exe (test/vrmod_image.h), with headon.py's ret in headon_panic in half the worlds
 //
 // out\race_v10.exe is loaded at 0x400000 the way test/fuzz.cpp does it. A real AICar (vtable 0x4dbc28) is built
 // in this process's memory with random state, around a small real racing line: a loop of ILSegs (6..25 nodes on
@@ -59,6 +60,11 @@
     static const uint32_t VP_CAT(addr_, NEW) = V10;                                                      \
     static constexpr auto VP_CAT(fpof_, NEW) = &FP;
 
+// VP_VRMOD=1: vrmod's race.exe (test/vrmod_image.h), and in half the worlds vrmod's opt-in headon.py on top of it --
+// AICar::headon_panic's first byte a ret (docs/FIXES.md, "vrmod's patches"). The rewrite asks port_vrmod_has, which in
+// the DLL is the stock check's verdict, taken before the hook; here it is whether the world put the ret there.
+static bool g_vrmod, g_headon;
+bool port_vrmod_has(uint32_t v10) { return v10 == 0x004311d0 && g_headon; }
 void Footprint::add(void* p, uint32_t bytes, const char* what) { if (n < MAX) r[n++] = {p, bytes, what}; }
 void Footprint::object(void* obj, const char* what) {
     uint32_t vt = *(uint32_t*)obj;
@@ -67,6 +73,7 @@ void Footprint::object(void* obj, const char* what) {
 }
 
 #include "../hook/phys_aicar2.cpp"
+#include "vrmod_image.h"
 
 // ---- random numbers --------------------------------------------------------------------------------------
 static uint32_t g_rng = 0x9e3779b9u;
@@ -1068,6 +1075,12 @@ int main(int argc, char** argv) {
     *(void**)0x004e6434 = (void*)&stub_prof_start;
     *(void**)0x004e6438 = (void*)&stub_prof_stop;
     g_carbuf = (uint8_t*)VirtualAlloc(0, CAR_BUF, MEM_COMMIT, PAGE_READWRITE);
+    g_vrmod = getenv("VP_VRMOD") && atoi(getenv("VP_VRMOD"));
+    if (g_vrmod) {
+        vrmod_apply();
+        puts("vrmod's race.exe, and headon.py's ret in AICar::headon_panic in half the worlds");
+    }
+    int headon_worlds = 0, headon_rets = 0, headon_panics = 0;
 
     static State start, orig, rew;
     static Footprint fp;
@@ -1086,6 +1099,11 @@ int main(int argc, char** argv) {
         Kind kind = (Kind)(only >= 0 ? only : k);
         randomize_world();
         randomize_args(kind);
+        if (g_vrmod) {                                  // headon.py: `ret` in place of `sub esp, 4` (0x83), or not
+            g_headon = chance(50);
+            *(uint8_t*)0x004311d0 = g_headon ? 0xc3 : 0x83;
+            if (g_headon) headon_worlds++;
+        }
         bool wild = chance(g_wild_pct);
         if (wild) { wildify(kind); wild_runs++; }
         footprint_of(kind, fp);
@@ -1137,6 +1155,15 @@ int main(int argc, char** argv) {
         if ((kind == K_CHECKER || kind == K_FAST_INTERACT || kind == K_SOCIALIZE) && oc->ahead_valid && memcmp(&sc->ahead_dist, &oc->ahead_dist, 8)) c_ahead++;
         if ((kind == K_PASSER || kind == K_FAST_INTERACT || kind == K_SOCIALIZE) && oc->contact_valid && memcmp(&sc->contact_time, &oc->contact_time, 4)) c_contact++;
         if ((kind == K_PASSER || kind == K_FAST_INTERACT) && memcmp(&sc->freeze_time, &oc->freeze_time, 4)) c_headon++;
+        if (kind == K_HEADON && g_headon) {
+            headon_rets++;
+            if (memcmp(start.car, orig.car, sizeof start.car)) {   // vrmod's ret: the original must have done nothing
+                printf("  world %d: headon_panic changed the car under headon.py's ret\n", it);
+                differ++;
+            }
+        } else if (kind == K_HEADON && memcmp(start.car, orig.car, sizeof start.car)) {
+            headon_panics++;
+        }
         if (kind == K_ANALYZE) {
             for (int i = 0; i < g_nseg; i++) {
                 if (!start.seginfo[i].locked && orig.seginfo[i].locked) c_lock++;
@@ -1171,6 +1198,9 @@ int main(int argc, char** argv) {
            "  throttle cap %d, lap change %d, fouroff %d, init_rt_lat fmod of a bad length %d, in_path NULL bead %d\n",
            c_think_drive, c_rev, c_begin, c_teleport, c_stop, c_side, c_ahead, c_contact, c_headon, c_lock, c_speed_note, c_lat_note,
            c_cold, c_angle, c_lock_steer, c_cap, c_lap, c_fouroff, c_fmod_nan, c_near_null);
+    if (g_vrmod)
+        printf("vrmod: headon.py's ret in %d worlds (%d of them calls of headon_panic: nothing done, by both); the stock "
+               "panic in %d calls without it\n", headon_worlds, headon_rets, headon_panics);
 #ifdef FIX_TESTS
     printf("fixed: %d worlds where the original faulted on a NULL bead and the fixed one ran\n", fixed);
     run_fix_tests();

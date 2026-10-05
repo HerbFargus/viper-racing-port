@@ -161,6 +161,31 @@ static bool stock_masked(uint32_t v10, uint32_t i) {
     return false;
 }
 
+// the functions the stock check accepted as vrmod's patches, for port_vrmod_has (a short list: no registry walk per call)
+static uint32_t g_vrmod_fns[64];
+static int g_nvrmod;
+bool port_vrmod_has(uint32_t v10) {
+    for (int i = 0; i < g_nvrmod; i++)
+        if (g_vrmod_fns[i] == v10) return true;
+    return false;
+}
+int port_vrmod_count() { return g_nvrmod; }
+
+// the rewritten functions the stock check left original (patched by something the port doesn't know): up to max of
+// their names into names (", "-separated, cut to n bytes); returns how many there are. After port_check_stock.
+int port_unknown_patches(char* names, size_t n, int max) {
+    int count = 0;
+    size_t used = 0;
+    if (n) names[0] = 0;
+    for (PortFn* f : registry()) {
+        if (!f->patched) continue;
+        if (count++ >= max || !n) continue;
+        const int w = _snprintf(names + used, n - used, "%s%s (%08x)", used ? ", " : "", f->name, f->v10);
+        if (w < 0) { names[n - 1] = 0; used = n - 1; } else used += (size_t)w;
+    }
+    return count;
+}
+
 void port_check_stock() {
     if (!is_v10()) return;
     for (PortFn* f : registry()) {
@@ -186,6 +211,7 @@ void port_check_stock() {
                 logf("port: %s has vrmod's patch (%s); the rewrite takes it over and replaces it (docs/FIXES.md, \"vrmod's patches\")",
                      f->name, what);
                 f->vrmod_patch = what;
+                if (g_nvrmod < (int)(sizeof g_vrmod_fns / sizeof g_vrmod_fns[0])) g_vrmod_fns[g_nvrmod++] = f->v10;
             } else {
                 f->patched = true;
                 logf("port: %s stays original -- the installed race.exe has %s patched (not by vrmod as the port knows it)",

@@ -61,6 +61,11 @@ static inline uint32_t m1_operand_hooked(uint32_t at, uint32_t fn, uint8_t first
 static inline uint32_t vrmod_operand(uint32_t at) { return *(const volatile uint32_t*)at; }
 // an operand's address kept in a table for vrmod_operand to read later (the tools find it by this name too)
 constexpr uint32_t vrmod_operand_at(uint32_t at) { return at; }
+// vrmod's opt-in patches that change behaviour rather than a value (headon.py: AICar::headon_panic a bare ret): did the
+// stock check (port_check_stock, before anything was hooked) find vrmod's patch in the installed function at v10? A
+// rewrite of it then does what the patched function does. The hook's jmp has overwritten the patched bytes by the time
+// the rewrite runs, so this is the answer recorded then, not a read of the code. (A harness defines it itself.)
+bool port_vrmod_has(uint32_t v10);
 
 // The lit-vertex buffer (mr_model_begin: one model's vertices, lit, 32 bytes each, reused for every model). Stock it
 // holds 1,500 vertices, and a model with more writes past it; the rewrite allocates room for 32,768, every vertex an
@@ -230,6 +235,8 @@ VP_SHADOW_CC(__stdcall)
 
 // ---- the framework ----------------------------------------------------------------------------------------
 void port_check_stock();                       // before anything is patched: find non-stock functions
+int port_unknown_patches(char* names, size_t n, int max);   // after it: those left original, named (viperport.exe --probe)
+int port_vrmod_count();                        // after it: how many it accepted as vrmod's patches
 void port_note_m1(uint32_t at, uint32_t n);    // M1 patched these bytes (a trampoline may copy them: see port.cpp)
 void port_install(const char* ini);            // read [port], hook every registered function
 void port_report();                            // the exit log: per function, calls / checks / mismatches

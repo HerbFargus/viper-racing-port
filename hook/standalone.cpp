@@ -10,6 +10,7 @@
 #include <intrin.h>
 #include "SDL.h"
 #include "viperport.h"
+#include "port.h"
 #include "standalone.h"
 #include "crt_types.h"                                  // crt_islands (crt_start.cpp): code too short to hook
 
@@ -244,6 +245,15 @@ int run(const VpStandaloneArgs* args) {
     if (((HMODULE(WINAPI*)(LPCSTR)) * (void* volatile*)(uintptr_t)0x005d75b4)(0) != (HMODULE)0x400000)
         fail("the game's GetModuleHandleA(NULL) isn't race.exe's image at 0x400000");
 
+    // 0. (a launch) functions the install left original because race.exe has them patched in a way the port doesn't know
+    //    (port_check_stock): said in plain words first, as viperport.exe --probe says it
+    if (!check) {
+        char names[400];
+        const int n = port_unknown_patches(names, sizeof names, 4);
+        if (n) fail("race.exe has %d function%s patched in a way the port doesn't know: %s%s", n, n == 1 ? "" : "s", names,
+                    n > 4 ? ", ..." : "");
+    }
+
     // 1. what the install hooked: every inventory entry and every PORT_FN/detour address, live
     std::vector<uint8_t> hooked(N_FUNCS);
     std::vector<Range> keep;                            // never filled: hook jmps, run-time reads
@@ -265,6 +275,10 @@ int run(const VpStandaloneArgs* args) {
     if (!hooked_at(ENTRY)) fail("the entry point 004cf5a0 (_WinMainCRTStartup) isn't hooked: the game can't start on the port's C runtime");
     for (const SaKeep& k : k_keep) keep.push_back({k.start, k.start + k.bytes});
     say("hooked: %d of %d inventory functions at their entries, %d more entries inside functions", nhooked, N_FUNCS, inner);
+    if (!check && g_failures) {                         // a launch: refuse now, before the audit and the fill
+        say("NOT starting the game: %d checks failed (the first few are above)", g_failures);
+        return g_failures;
+    }
 
     // 2. the audit of the install: every byte of .text it changed is a hook's jmp or a kept operand (M1's), or lies in
     //    code the fill overwrites (call sites the dinput.dll route redirects inside original functions)
@@ -478,6 +492,36 @@ int run(const VpStandaloneArgs* args) {
     ExitProcess(0);
 }
 }  // namespace
+
+bool vp_probe_build();                                  // viperport.cpp
+
+// viperport.exe --probe (standalone.h): the stock check alone, on race.exe's image mapped at 0x400000
+extern "C" __declspec(dllexport) int __cdecl viperport_probe(uint32_t version, char* line, uint32_t n) {
+    if (!line || n < 64) return -2;
+    if (version != VP_STANDALONE_VERSION) {
+        _snprintf(line, n, "viperport.exe and dinput.dll are from different builds");
+        line[n - 1] = 0;
+        return -2;
+    }
+    if (!vp_probe_build()) {
+        _snprintf(line, n, "race.exe isn't v1.0");
+        line[n - 1] = 0;
+        return -1;
+    }
+    port_check_stock();
+    char names[600];
+    const int bad = port_unknown_patches(names, sizeof names, 6);
+    if (bad) {
+        _snprintf(line, n, "race.exe has %d function%s patched in a way the port doesn't know: %s%s", bad, bad == 1 ? "" : "s",
+                  names, bad > 6 ? ", ..." : "");
+    } else {
+        const int vr = port_vrmod_count();
+        _snprintf(line, n, vr ? "v1.0 race.exe; every function the port replaces is stock or vrmod's (%d of vrmod's patches taken over)"
+                              : "v1.0 race.exe; every function the port replaces is stock", vr);
+    }
+    line[n - 1] = 0;
+    return bad;
+}
 
 extern "C" __declspec(dllexport) int __cdecl viperport_standalone(const VpStandaloneArgs* args) {
     if (!args || args->size < sizeof(VpStandaloneArgs) || args->version != VP_STANDALONE_VERSION) {

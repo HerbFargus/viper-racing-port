@@ -654,8 +654,8 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
 
 ## vrmod's patches
 
-vrmod (viper-mod-manager) patches fifteen of the functions the port rewrites, and a few constants they read. The
-rewrites take every one of them over, so on a vrmod `race.exe` every function runs as a rewrite -- on the
+vrmod (viper-mod-manager) patches sixteen of the functions the port rewrites (one only when the player asks), and
+a few constants they read. The rewrites take every one of them over, so on a vrmod `race.exe` every function runs as a rewrite -- on the
 `dinput.dll` route and in `viperport.exe`, whose `--check` accepts such a `race.exe` -- with the same behaviour
 as the patch. The stock check (`tools/gen_port_tables.py`: `VRMOD_PATCHES`, `VRMOD_MASKS`, `LIVE_CONSTS`)
 accepts exactly vrmod's bytes for each (with any value where the player chooses one), and `viperport.log` names
@@ -678,6 +678,12 @@ leaves it original.
   and a narrower one (the 512x384 mode's race view) as under vrmod's original.
 - vertexbuffer (`mr_model_begin`): superseded by the lift under "Limits lifted" (32,768 vertices, whatever the
   patch asked for).
+- headon (opt-in, "Turn off the AI's head-on panic"; `AICar::headon_panic`): vrmod's headon.py makes the function's
+  first byte a `ret` (0x83 -> 0xC3 at 0x4311d0, file offset 0x305d0, found by the prologue's signature; v1.0 `race.exe`
+  and the race.bin builds alike), so an AI car met head-on above 22.2 m/s no longer stamps the handbrake and throws
+  full lock. A behaviour, not a fix: the stock check records that it found vrmod's byte (`port_vrmod_has`, taken
+  before the hook's jmp covers it) and the rewrite then returns at once, as the patched function does; without it,
+  the stock panic bit for bit. `test/world_aicar2.cpp` with `VP_VRMOD=1` puts the `ret` in half the worlds.
 - writepaths: the `.data` path strings it rewrites are read by rewrites that put the files under the game's own
   folder anyway (`Config\`, `log\`), under "Where the game writes".
 

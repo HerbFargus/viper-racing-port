@@ -26,6 +26,7 @@
 #include "port.h"
 #include "session.h"
 #include "fix_paths.h"
+#include "standalone.h"
 
 // ---- the one export, forwarded ---------------------------------------------------------------------
 typedef HRESULT(WINAPI* DirectInputCreateA_t)(HINSTANCE, DWORD, void**, void*);
@@ -134,6 +135,19 @@ static const Xlat* xlat(uint32_t v10) {
 }
 
 bool build_is_v10() { return g_build && !g_build->table; }
+
+// viperport.exe --probe (standalone.h): the DLL loaded only to run the stock check on race.exe's image at 0x400000 --
+// DllMain does nothing, and this names the build from the image's own headers, as install() does from GetModuleHandle
+static bool g_probe;
+bool vp_probe_build() {
+    const uint8_t* base = (const uint8_t*)0x400000;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(base, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return false;
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+    for (const Build& b : k_builds)
+        if (nt->FileHeader.TimeDateStamp == b.timestamp) g_build = &b;
+    return build_is_v10();
+}
 
 bool have(uint32_t v10) { return !g_build->table || xlat(v10) != 0; }
 
@@ -741,6 +755,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = inst;
         DisableThreadLibraryCalls(inst);
+        if (GetEnvironmentVariableA(VP_PROBE_ENV, 0, 0)) {  // viperport.exe --probe: no log, no install (vp_probe_build)
+            g_probe = true;
+            return TRUE;
+        }
         char ini[MAX_PATH];                     // viperport.ini, beside this DLL: [test] two_copies, before the log
         GetModuleFileNameA(inst, ini, MAX_PATH);
         char* slash = strrchr(ini, '\\');
@@ -751,6 +769,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         if (*g_copy_note) logf("%s", g_copy_note);
         install();
     } else if (reason == DLL_PROCESS_DETACH) {
+        if (g_probe) return TRUE;
         logf("exit: new Obstacle::Update ran %ld times, woke obstacles %ld times, put them to sleep %ld times",
              g_calls, g_perturbs, g_sleeps);
         logf("exit: peak physics objects %ld (stock limit 512), world objects %ld and graphics objects %ld (stock 1024 each)",
