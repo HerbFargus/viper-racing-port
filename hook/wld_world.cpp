@@ -1285,7 +1285,7 @@ static void __declspec(noinline) static_rotation(const float* len_p, const float
     static const float one = 1.0f;
     float lenv = *len_p, a0 = a[0], a1 = a[1], a2 = a[2];
     float A, Bv, C, Dd, E;
-    float r0, r1, r2, r3, r4, r5, r6, r7, r8;
+    float r0, r1, r2, r3, r4, r5, r6, r7, r8_;
     __asm {
         fld     lenv
         fdivr   one                    ; 1 / len
@@ -1352,13 +1352,13 @@ static void __declspec(noinline) static_rotation(const float* len_p, const float
         _emit 0xc8
         fmul    st, st(4)
         fadd    st, st(2)
-        fstp    r8                     ; n2 n2 t + c
+        fstp    r8_                     ; n2 n2 t + c
         fstp    st(0)
         fstp    st(0)
         fstp    st(0)
         fstp    st(0)
     }
-    R[0] = r0; R[1] = r1; R[2] = r2; R[3] = r3; R[4] = r4; R[5] = r5; R[6] = r6; R[7] = r7; R[8] = r8;   // (float moves)
+    R[0] = r0; R[1] = r1; R[2] = r2; R[3] = r3; R[4] = r4; R[5] = r5; R[6] = r6; R[7] = r7; R[8] = r8_;   // (float moves)
 }
 static void __cdecl parse_static_rw(const char* line) {
     float len;                                                   // B+0x00 (then PhysicsCreate's message offset)

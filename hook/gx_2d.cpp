@@ -3242,7 +3242,7 @@ static const ToQuat_t MatrixToQuat = (ToQuat_t)0x004294c0;
 static const float k_cam_eps = 1.1920928955078125e-07f;          // 0x34000000
 // acos(q.w) through the C runtime's _CIacos (0x4cf07c: argument and result in ST0), stored to a; its sine (of the
 // unrounded acos) stored to s; true if |sine| > FLT_EPSILON (the unrounded sine is compared)
-static uint8_t cam_acos_sin(const float* qw, float* a, float* s) {
+VP_ASM_CALLS static uint8_t cam_acos_sin(const float* qw, float* a, float* s) {
     uint8_t big;
     __asm {
         mov eax, qw

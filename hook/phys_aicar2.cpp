@@ -506,7 +506,7 @@ static __forceinline uint8_t* race_record(const AICar* self) {
 }
 
 // fmod(a, b) through the CRT's __CIfmod in race.exe (0x4cf36a): a in ST1, b in ST0; the result stored as a float
-static float cifmod_f(double a, float b) {
+VP_ASM_CALLS static float cifmod_f(double a, float b) {
     float r;
     __asm {
         push ecx

@@ -376,7 +376,7 @@ static const char* const k_snd_start = (const char*)0x004eddec, *const k_snd_tic
 // fmod(x, 1.0) through the CRT's __CIfmod in race.exe (0x4cf36a): x in ST1, 1.0 in ST0, the result in ST0. fprem
 // is exact, so the result of a float-valued x is a float value; kept as a double, as the original compares it
 // in the register.
-static double cifmod_one(double x) {
+VP_ASM_CALLS static double cifmod_one(double x) {
     static const double one = 1.0;
     double r;
     __asm {

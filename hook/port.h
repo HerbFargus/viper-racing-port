@@ -167,8 +167,9 @@ template <typename F> struct Shadow;
 #define VP_SHADOW_CC(CC)                                                                                   \
     template <typename R, typename... Args> struct Shadow<R(CC*)(Args...)> {                             \
         typedef R(CC* Fn)(Args...);                                                                      \
-        template <PortFn* P, Fn NEW, void (*FP)(Footprint&, Args...)>                                    \
+        template <PortFn* P, auto NEW, void (*FP)(Footprint&, Args...)>                                  \
         static R CC call(Args... a) {                                                                    \
+            static_assert(std::is_same_v<decltype(NEW), Fn>, "the rewrite's own type");                  \
             if (!shadow_begin(P)) return ((Fn)P->orig)(a...);                                            \
             FP(shadow_footprint(), a...);                                                                \
             if (shadow_footprint().replay_only) { shadow_abandon(P); return ((Fn)P->orig)(a...); }       \
@@ -198,12 +199,14 @@ VP_SHADOW_CC(__stdcall)
 // PORT_FN_BUILDS(..., prologue, len) also names the first bytes to expect on the race.bin builds.
 #define VP_CAT2(a, b) a##b
 #define VP_CAT(a, b) VP_CAT2(a, b)
+
+#include "compiler.h"   // VP_GCC, VP_X87_CLOBBERS, VP_ASM_CALLS (MSVC and GCC builds)
 #ifdef VP_FUZZ
 // test/fuzz.cpp: the same rewrites, compiled into a test program that runs each pure one against the
 // original on random inputs, outside the game (test/fuzz.h)
 #include "../test/fuzz.h"
 #define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
-    static FuzzReg VP_CAT(fuzz_, NEW)(V10, NAME, &Fuzz<decltype(&NEW)>::run<&NEW, &FP>);
+    static FuzzReg VP_CAT(fuzz_, NEW)(V10, NAME, &Fuzz<decltype(&NEW)>::template run<&NEW, &FP>);
 #else
 #define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
     namespace { extern PortFn VP_CAT(port_, NEW); }   /* file-local: rewrites in different files */     \

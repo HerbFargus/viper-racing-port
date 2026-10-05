@@ -223,12 +223,19 @@ static void** const VT_Propeller = (void**)0x004dc8c0;
 // result is rounded once, by the fadd (precision control doesn't apply to fpatan), as the original's is
 static __forceinline float x87_atan2_plus(float neg_y, double x, float k) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %1\n\tfchs\n\tfld %2\n\tfpatan\n\tfadd %3\n\tfstp %0"
+                     : "=m"(r)
+                     : "m"(neg_y), "m"(x), "m"(k)
+                     : VP_X87_CLOBBERS);
+#else
     __asm { fld neg_y
             fchs
             fld x
             fpatan
             fadd k
             fstp r }
+#endif
     return r;
 }
 

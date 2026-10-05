@@ -17,6 +17,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "compiler.h"
 #include "ui_types.h"
 
 namespace edt {

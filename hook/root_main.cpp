@@ -923,7 +923,7 @@ PORT_FN(0x00402920, "copy_blimp_to_clipboard", copy_blimp_to_clipboard_c, fp_cop
 // convert_frame(CompactFrame&, Frame const&): the position, and the rotation as its axis * angle (the quaternion from the
 // matrix, then acos -- the game's CRT, whose result stays in a register for fsin: that sequence in asm)
 static const float k_eps = 1.1920928955078125e-07f;                  // 0x34000000
-static __forceinline bool acos_sin(const volatile float* w, volatile float* ha, volatile float* sn) {
+static VP_ASM_CALLS_INLINE bool acos_sin(const volatile float* w, volatile float* ha, volatile float* sn) {
     uint16_t sw;
     __asm {
         mov  eax, w

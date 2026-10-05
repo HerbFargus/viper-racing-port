@@ -1218,7 +1218,7 @@ static void fp_random2(Footprint&, int32_t, int32_t) {}
 PORT_FN(0x0041b700, "Random(int,int)", Random2_rw, fp_random2)
 
 // fild x; fmul qword k; fld qword y; call _CIfmod -- the remainder is exact, so a double holds it
-static double ran_fmod_scaled(int32_t x, double k, double y) {
+VP_ASM_CALLS static double ran_fmod_scaled(int32_t x, double k, double y) {
     double r;
     __asm { fild x
             fmul k
@@ -1229,7 +1229,7 @@ static double ran_fmod_scaled(int32_t x, double k, double y) {
     return r;
 }
 // fild x; fld qword y; call _CIfmod
-static double ran_fmod_int(int32_t x, double y) {
+VP_ASM_CALLS static double ran_fmod_int(int32_t x, double y) {
     double r;
     __asm { fild x
             fld y
@@ -1239,7 +1239,7 @@ static double ran_fmod_int(int32_t x, double y) {
     return r;
 }
 // (an exact remainder) fimul k; fld qword y; call _CIfmod
-static double ran_fmod_mul(double v, int32_t k, double y) {
+VP_ASM_CALLS static double ran_fmod_mul(double v, int32_t k, double y) {
     double r;
     __asm { fld v
             fimul k
@@ -1250,7 +1250,7 @@ static double ran_fmod_mul(double v, int32_t k, double y) {
     return r;
 }
 // fild l; fmul qword 53.0; fadd 1.0 (the register the original keeps); fld qword 169.0; call _CIfmod
-static double ran_fmod_lcg(int32_t l, double k53, double one, double y) {
+VP_ASM_CALLS static double ran_fmod_lcg(int32_t l, double k53, double one, double y) {
     double r;
     __asm { fild l
             fmul k53
@@ -1734,8 +1734,7 @@ PORT_FN(0x004d8df0, "MemStreamGetReal", MemStreamGetReal_rw, fp_ms_get_real)
 // That uninitialised local is the dword just below the return address (sub esp, 4), which a C function's prologue
 // would overwrite before it could be read, so this one is written in the original's frame layout: the same two
 // calls by address, the length read from that slot.
-static __declspec(naked) void __cdecl MemStreamGetString_rw(MemStreamPtr* p, char* buf, int32_t max) {
-    (void)p; (void)buf; (void)max;
+static __declspec(naked) void __cdecl MemStreamGetString_rw(MemStreamPtr*, char*, int32_t) {
     __asm {
         sub esp, 4
         lea eax, [esp]

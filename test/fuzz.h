@@ -78,8 +78,9 @@ template <typename F> struct Fuzz;
 #define VP_FUZZ_CC(CC)                                                                                     \
     template <typename R, typename... A> struct Fuzz<R(CC*)(A...)> {                                     \
         typedef R(CC* Fn)(A...);                                                                         \
-        template <Fn NEW, void (*FP)(Footprint&, A...)>                                                  \
+        template <auto NEW, void (*FP)(Footprint&, A...)>                                                \
         static int run(uint32_t original, int iterations) {                                              \
+            static_assert(std::is_same_v<decltype(NEW), Fn>, "the rewrite's own type");                  \
             static Arena ar;                                                                             \
             for (int it = 0; it < iterations; it++) {                                                    \
                 ar.used = 0;                                                                             \

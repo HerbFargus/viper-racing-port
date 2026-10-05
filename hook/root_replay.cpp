@@ -94,7 +94,7 @@ static __forceinline void set_view() { ccall<void>(F_mrSetView, 0, 0, G32(S_W), 
 static __forceinline void cb0(uint32_t fn) { ccall<uint8_t>(fn, 0); }
 typedef void(__cdecl* Sprintf_)(char*, const char*, ...);
 // a function returning a float in st0, stored as a float (`call; fstp dword`)
-static __forceinline float call_f(uint32_t fn) {
+static VP_ASM_CALLS_INLINE float call_f(uint32_t fn) {
     float r;
     __asm { mov eax, fn
             call eax
@@ -951,7 +951,7 @@ static const double k_1d = 1.0;                                 // 0x4db0a8
 static const uint32_t k_2pi = 0x40c90fdb, k_pi = 0x40490fdb, k_inv2pi = 0x3e22f983;
 // the wheel's angle, from the mouse's offset: atan2(dy, dx) - frac(time / 5) x 2pi, compared with pi (the status word) as
 // it's stored: `PhysicsGetTime; fdiv 5; fild dy; fild dx; fpatan; fld 1.0; fxch x3; _CIfmod; fmul 2pi; fsubp; fcom pi; fstp`
-static void jog_angle(int32_t my_dy, int32_t my_dx, float* out, uint16_t* sw) {
+VP_ASM_CALLS static void jog_angle(int32_t my_dy, int32_t my_dx, float* out, uint16_t* sw) {
     float a;
     uint16_t s;
     __asm {
@@ -1004,7 +1004,7 @@ static void fp_jog_cb(Footprint& f, JogControl* self, Edx, int32_t, const void*)
 PORT_FN(0x00409510, "JogControl::Callback", JogControl_Callback_n, fp_jog_cb)
 
 // Draw: the wheel, and the detent on its rim, turned by the time
-static void jog_cos_sin(float* c, float* s) {
+VP_ASM_CALLS static void jog_cos_sin(float* c, float* s) {
     float v_c, v_s;
     __asm {
         mov eax, 0x0042bc80

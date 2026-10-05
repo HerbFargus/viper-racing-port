@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "vp_seh.h"                                  // vp_guard: __try / __except, or its GCC stand-in
 #define VP_FUZZ                                     // PORT_FN registers with fuzz.h, not the DLL's port table
 #include "../hook/phys_engine.cpp"                  // the rewrites themselves (file-local functions)
 
@@ -52,8 +53,12 @@ float fuzz_float() { return 0.0f; }
 void fuzz_fill(Arena&) {}
 int fuzz_report(int it, const Arena&, const void*, const void*, size_t) { return it + 1; }
 int fuzz_guarded(void (*fn)(void*), void* arg) {
+#if defined(__GNUC__) && !defined(__clang__)
+    return vp_guard(fn, arg) ? 1 : 0;
+#else
     __try { fn(arg); } __except (EXCEPTION_EXECUTE_HANDLER) { return 1; }
     return 0;
+#endif
 }
 
 // ---- random values ------------------------------------------------------------------------------------------
