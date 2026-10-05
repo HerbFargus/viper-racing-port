@@ -6,6 +6,7 @@
     python tools/gen_leftovers.py --lib root [--list]
     python tools/gen_leftovers.py --lib career [--list]  (U4: libraries career, paintkit and intro, one file)
     python tools/gen_leftovers.py --lib multi [--list]   (N1: the multiplayer library -> hook/net_leftover.cpp)
+    python tools/gen_leftovers.py --lib edit [--list]    (U5: the developer tools -> hook/edit_leftover.cpp)
 
 M3 UI stage, step U0. The libraries whose stages are done -- physics, world, gx, ai, kernel, useful, state, sound --
 still hold functions no hook/*.cpp registers: the $E static initialisers, empty virtual stubs, compiler-generated
@@ -23,6 +24,8 @@ Shapes (the whole body, to its `ret`, plus the linker's padding):
                                              stores (eax tracked: zero or a loaded value)
     mov ecx, [A] / mov [A], ecx              the same through ecx (U4: paintkit.obj's $E56)
     [push imm]* ; mov ecx, C ; [push imm]* ; call F      a static's constructor (__thiscall, checked against the map)
+    call E1 ; jmp E2                         U5: this file's $E, then a tail jump to another of its $E
+    push F ; call atexit ; add esp, 4        U5: a static's destructor registered at exit
     push esi ; push edi ; ... ; pop edi ; pop esi        around array-constructor loops:
       mov edi, BASE ; mov esi, N ; L: mov ecx, edi ; add edi, STRIDE ; call F ; dec esi ; jns L   (N + 1 calls)
   stubs: ret / ret N / mov al, imm ; ret / xor al, al ; ret / xor ax, ax ; ret / mov eax, ecx ; ret /
@@ -52,7 +55,9 @@ destructors and destructor helpers of group A's seven (career, chooser, events, 
 N1, the multiplayer library (`--lib multi`, into hook/net_leftover.cpp): the $E of all sixteen object files; stubs and
 deleting destructors of group B's six (dataport, hostent, datamod, delqueue, nettypes, session) and of N2's four
 (client, server, multi, ded: until N2's hand-written files take theirs out) -- group A's transports (socket, line,
-linechek, linepkt, tapidbg, crc) write theirs by hand.
+linechek, linepkt, tapidbg, crc) write theirs by hand. U5, the developer tools (`--lib edit`, into hook/edit_leftover.cpp):
+the $E of all five object files (edit, modtool, modbuild, cvt3ds, adtools); stubs and deleting destructors of edit.obj
+and modtool.obj only -- modbuild.obj, cvt3ds.obj and adtools.obj are written by hand (group B).
 
 Left out on purpose (listed with --list): ds.obj / ds3d_x.obj except dsounderr2str (the dead hardware DirectSound
 mixer), M2's SDL platform functions (platform.cpp detours them), WinMain (the main-loop stage).
@@ -96,6 +101,10 @@ STAGES = {
                                   "// the stubs and deleting destructors of dataport.obj, hostent.obj, datamod.obj, delqueue.obj,\n"
                                   "// nettypes.obj, session.obj, client.obj, server.obj, multi.obj and ded.obj",
               "hook/net_*.cpp", "test/world_net_core.cpp"),
+    "edit": ("edit_leftover.cpp", "M3 UI stage, step U5: the $E static initialisers of all five object files of the developer\n"
+                                  "// tools (library `edit`: edit.obj, modtool.obj, modbuild.obj, cvt3ds.obj, adtools.obj), and the\n"
+                                  "// stubs and deleting destructors of edit.obj and modtool.obj",
+             "hook/edit_*.cpp", "test/world_edit_tool.cpp"),
 }
 # --lib: the libraries a stage covers (absent: the one it's named after)
 STAGE_LIBS = {"career": ("career", "paintkit", "intro")}
@@ -106,7 +115,9 @@ STAGE_FULL = {"menu": ("moptions.obj", "mrace.obj", "mmixer.obj"),
                          "testing.obj"),
               # N1: group B's six and N2's four; group A's (socket, line, linechek, linepkt, tapidbg, crc) are by hand
               "multi": ("dataport.obj", "hostent.obj", "datamod.obj", "delqueue.obj", "nettypes.obj", "session.obj",
-                        "client.obj", "server.obj", "multi.obj", "ded.obj")}
+                        "client.obj", "server.obj", "multi.obj", "ded.obj"),
+              # U5: group A's two; group B's (modbuild, cvt3ds, adtools) write their real functions by hand
+              "edit": ("edit.obj", "modtool.obj")}
 # --lib: objects a LATER stage writes by hand (N2: the client, the server, the lobby, the dedicated server): their
 # mechanical functions are generated now, the rest left out (not refused) until that stage's files take them
 STAGE_LATER = {"multi": ("client.obj", "server.obj", "multi.obj", "ded.obj")}
@@ -122,6 +133,13 @@ PLATFORM = {                                              # M2: platform.cpp det
 MAIN_LOOP = {0x00412260: "WinMain@16"}
 RCFUNC = 0x00410CC0                                        # rcfunc_is_internal: a bare `ret`
 OP_DELETE = 0x00414390
+ATEXIT = 0x004CEFF0                                        # the CRT's atexit (U5: modtool.obj's $E64 / $E69)
+
+
+def same_file_e(inv: dict, t: int, obj: str) -> bool:
+    """Is t a $E static initialiser of the object file obj?"""
+    tr = inv.get(t)
+    return bool(tr and tr["object"] == obj and tr["demangled"].startswith("$E"))
 
 
 class Refused(Exception):
@@ -347,6 +365,24 @@ def parse_e(img: Image, inv: dict, va: int, size: int, obj: str) -> tuple[list[s
             if r8 == "cl" and not pushes:
                 ecx = None                                     # (a value, not a constructor's this)
             i += k + 4
+        elif b in (0xE8, 0xE9) and ecx is None and not pushes and same_file_e(inv, rel32(code, i, va), obj):
+            # U5 (modtool.obj's $E65 / $E70): call this file's $E, then a tail jump to another of its $E
+            t = rel32(code, i, va)
+            lines.append(f"LO_FN(LoVoid_t, 0x{t:08x})();    // {'call' if b == 0xE8 else 'jmp'}: {inv[t]['demangled']}")
+            types.add("LoVoid_t")
+            eax, ecxv, byte_regs = None, None, {}
+            i += 5
+            if b == 0xE9:
+                break
+        elif b == 0xE8 and rel32(code, i, va) == ATEXIT and len(pushes) == 1 and ecx is None \
+                and code[i + 5:i + 8] == b"\x83\xC4\x04":
+            # U5 (modtool.obj's $E64 / $E69): push F ; call atexit ; add esp, 4 -- a static's destructor, at exit
+            fr = inv.get(pushes[0])
+            what = fr["demangled"] if fr else "?"
+            lines.append(f"LO_FN(LoAtexit_t, 0x{ATEXIT:08x})(0x{pushes[0]:08x}u);    // atexit({what})")
+            types.add("LoAtexit_t")
+            pushes, eax, ecxv, byte_regs = [], None, None, {}
+            i += 8
         elif b == 0xE8:                                        # call F: a static's constructor
             f = rel32(code, i, va)
             fr = inv.get(f)
@@ -571,6 +607,9 @@ typedef void*(__fastcall* LoCtor2_t)(void*, LoEdx, uint32_t, uint32_t);
 static void fp_lo_static_init(Footprint& f) {{ f.replay_only = "a static initialiser (runs once, from the CRT's _initterm)"; }}
 """
 
+# typedefs a header doesn't carry, added after it only in a file that uses them (U5)
+EXTRA_TYPEDEFS = {"LoAtexit_t": "typedef int(__cdecl* LoAtexit_t)(uint32_t);    // the CRT's atexit, by address"}
+
 STAGE_HEADER = """\
 // {target} -- generated by tools/gen_leftovers.py --lib {lib} -- don't edit
 //
@@ -655,6 +694,7 @@ def main() -> int:
     out, refused, counts = [], [], {}
     used_ids: set[str] = set()
     names: set[str] = set()
+    extra_types: set[str] = set()
     for r in sorted(targets, key=lambda r: int(r["va"], 16)):
         va, size, obj = int(r["va"], 16), int(r["size"]), r["object"]
         oname = objname(r)
@@ -675,7 +715,8 @@ def main() -> int:
                         f"static void fp_{rid}(Footprint& f) {{ f.pure = true; }}",
                         f"PORT_FN(0x{va:08x}, \"{name}\", {rid}, fp_{rid})"]
             elif dem.startswith("$E"):
-                lines, _types = parse_e(img, inv, va, size, obj)
+                lines, etypes = parse_e(img, inv, va, size, obj)
+                extra_types |= etypes & set(EXTRA_TYPEDEFS)
                 shape = "$E"
                 name = f"{dem}({oname})"
                 if name in names or name in names_taken:
@@ -744,7 +785,8 @@ def main() -> int:
         print(f"{len(refused)} functions fit no known shape: nothing written (hand-write them in {hand})")
         return 1
 
-    order = ["$E ret", "$E jmp", "$E jmp (constructor)", "$E stores", "$E constructor", "$E array constructor", "$E mixed", "ret", "ret_n", "ret_al",
+    order = ["$E ret", "$E jmp", "$E jmp (constructor)", "$E stores", "$E constructor", "$E array constructor", "$E mixed",
+             "$E call + jmp", "$E atexit", "ret", "ret_n", "ret_al",
              "ret_ax", "ret_this", "ret_member", "thunk ret", "dtor_call", "dtor_inline"]
     ctext = ", ".join(f"{k} {counts[k]}" for k in order if k in counts) + f"; {sum(counts.values())} in all"
     if stage:
@@ -752,6 +794,7 @@ def main() -> int:
         text = [STAGE_HEADER.format(target=target, lib=stage, what=what, hand=hand, harness=harness, counts=ctext)]
     else:
         text = [HEADER.format(counts=ctext)]
+    text += [EXTRA_TYPEDEFS[k] for k in sorted(extra_types)]   # only where used: the other files stay as they were
     cur = None
     for va, obj, code in out:
         if obj != cur:
@@ -769,6 +812,10 @@ def classify_e(lines: list[str]) -> str:
     """The $E's shape, for the counts."""
     if not lines:
         return "$E ret"
+    if any("// atexit(" in x for x in lines):
+        return "$E atexit"
+    if any("// call: " in x for x in lines):
+        return "$E call + jmp"
     if len(lines) == 1 and "// jmp" in lines[0]:
         return "$E jmp (constructor)" if "LoCtor0_t" in lines[0] else "$E jmp"
     if any(x.startswith("for ") for x in lines):
