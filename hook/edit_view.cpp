@@ -410,9 +410,10 @@ static void __fastcall MV_MouseDown_n(ModelViewer* self, Edx, int32_t x, int32_t
         float inv[9];                                    // E-0x78 (mode 2: u at E-0x78)
         float m[9];                                      // E-0x54 (mode 1, 2, 3: a vertex, a triangle)
         float tri[3];                                    // E-0x30 (mode 2: the texture triangle's triangle; mode 4: the triangle)
-#ifdef VP_GCC
-        int32_t tri_flags;                               // E-0x24: mode 4's ModBuilderGetTriangle writes the triangle's 4th
-#endif                                                   // dword here (GCC put the saved ebx there; MSVC's frame has room)
+        int32_t tri_flags;                               // E-0x24: the triangle is 4 dwords in the original's frame (three
+                                                         // vertices and its flags): mode 4's ModBuilderGetTriangle writes
+                                                         // all four (without this the 4th fell past the local -- by luck on
+                                                         // a free slot under MSVC, on the saved ebx under GCC)
     } L;
     volatile int32_t ta, tb, tc, pvtx;                   // E-0xf0, E-0xcc, E-0xd8; E-0xb4
     int32_t* const tri4 = (int32_t*)L.tri;
