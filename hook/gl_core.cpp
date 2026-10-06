@@ -508,10 +508,25 @@ void clip_window(const D3DVIEWPORT2& vp, float out[4]) {
     out[0] = vp.dvClipX * k, out[1] = vp.dvClipY, out[2] = vp.dvClipWidth * k, out[3] = vp.dvClipHeight;
 }
 
+// a session replay drawn at the recording's size where the window's drawable (*ww x *wh) is another: true. Asked of the
+// session each time (never kept in the renderer's state, which the shadow checks save and compare).
+bool replay_scaled(int* ww, int* wh) {
+    int rw, rh;
+    if (!session_render_size(&rw, &rh)) return false;
+    *ww = 0, *wh = 0;
+    glr::GetDrawableSize(platform_window(), ww, wh);
+    return *ww > 0 && *wh > 0 && (*ww != st.rt_w || *wh != st.rt_h);
+}
+
 void make_target() {                             // the render target at the window's size
     int ww = 0, wh = 0;
     glr::GetDrawableSize(platform_window(), &ww, &wh);
     if (ww <= 0 || wh <= 0) ww = st.w, wh = st.h;
+    // a session replay draws at the recording's size, whatever the window is (shown scaled): the 2D page's 3D read-back
+    // is then the recording's (session_render_size; equal sizes -- every replay on the machine that recorded -- change
+    // nothing)
+    int rw, rh;
+    if (session_render_size(&rw, &rh)) ww = rw, wh = rh;
     touch_state();
     st.scale = (float)wh / st.h;
     if (st.w * st.scale > ww) st.scale = (float)ww / st.w;   // a window narrower than 4:3: fit the width
@@ -580,6 +595,7 @@ void set_mode(int w, int h) {
     pg.under.assign((size_t)w * h, 0);
     pg.overlay.assign((size_t)w * h, 0);
     pg.drawn3d.assign((size_t)w * h, 0);
+    pg.gpu.assign((size_t)w * h, 0);
     if (!in.ready) return;
     if (st.small_fbo) glr::DeleteFramebuffers(1, &st.small_fbo), glr::DeleteTextures(1, &st.small_color);
     glr::GenTextures(1, &st.small_color);
@@ -600,7 +616,14 @@ namespace {
 // gl_api.SwapWindow's live function once the DXGI swap chain is up (gl_dxgi.h): glr::SwapWindow stays the recorded
 // point, so the call stream a check compares is the same either way, and a check's rewrite pass (no live calls) and
 // the harness's fakes never get here. The render target as it stands: present() and repaint() swap before make_target.
-void swap_live(SDL_Window* win) { dxgi::present(win, st.fbo, st.rt_w, st.rt_h); }
+void swap_live(SDL_Window* win) {
+    int ww, wh;
+    if (replay_scaled(&ww, &wh)) {               // a replay drawn at another size: present scaled it into the window,
+        SDL_GL_SwapWindow(win);                  // the plain swap
+        return;
+    }
+    dxgi::present(win, st.fbo, st.rt_w, st.rt_h);
+}
 }  // namespace
 
 bool start() {
@@ -828,6 +851,17 @@ void capture_install(const char* ini) {
     g_capture_ms = (uint32_t)vpos_GetPrivateProfileIntA("debug", "capture", 0, ini) * 1000u;
 }
 
+// the render target into the window (bound as the draw framebuffer): 1:1 -- the target is the window's size -- or, in a
+// session replay drawn at the recording's size, scaled to the window. The target's row 0 is the top of the picture; the
+// window's is the bottom.
+void blit_to_window() {
+    int ww, wh;
+    if (!replay_scaled(&ww, &wh))
+        glr::BlitFramebuffer(0, 0, st.rt_w, st.rt_h, 0, st.rt_h, st.rt_w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    else
+        glr::BlitFramebuffer(0, 0, st.rt_w, st.rt_h, 0, wh, ww, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+}
+
 void present() {
     if (g_session_mode != SESSION_OFF) session_frame();   // a frame ends (the session recorder)
     if (!on_gl_thread()) return;
@@ -836,10 +870,17 @@ void present() {
     capture_frame();
     glr::Disable(GL_SCISSOR_TEST);
     // the target's row 0 is the top of the picture; the window's is the bottom
-    glr::BlitFramebuffer(0, 0, st.rt_w, st.rt_h, 0, st.rt_h, st.rt_w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    blit_to_window();
     glr::SwapWindow(platform_window());
     int x0 = (int)floorf(st.ox + 0.5f), x1 = (int)floorf(st.ox + st.w * st.scale + 0.5f);
-    glr::SetView(x0, 0, x1 - x0, (int)floorf(st.h * st.scale + 0.5f), st.w, st.h);   // for the mouse
+    int vw, vh;
+    if (!replay_scaled(&vw, &vh)) {
+        glr::SetView(x0, 0, x1 - x0, (int)floorf(st.h * st.scale + 0.5f), st.w, st.h);   // for the mouse
+    } else {                                     // (a replay drawn at another size: the picture in window pixels)
+        const float kx = (float)vw / st.rt_w, ky = (float)vh / st.rt_h;
+        glr::SetView((int)floorf(x0 * kx + 0.5f), 0, (int)floorf((x1 - x0) * kx + 0.5f),
+                     (int)floorf(st.h * st.scale * ky + 0.5f), st.w, st.h);
+    }
     // the sides only get drawn by a full-width 3D view; anything else there would be stale
     glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
     glr::Enable(GL_SCISSOR_TEST);
@@ -863,7 +904,7 @@ void repaint() {
     glr::BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glr::BindFramebuffer(GL_READ_FRAMEBUFFER, st.fbo);
     glr::Disable(GL_SCISSOR_TEST);               // (every draw and clear sets its own scissor)
-    glr::BlitFramebuffer(0, 0, st.rt_w, st.rt_h, 0, st.rt_h, st.rt_w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    blit_to_window();
     glr::SwapWindow(platform_window());
     glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
 }
@@ -974,7 +1015,14 @@ HRESULT lock(Surface* s, LPDDSURFACEDESC d) {
 
 HRESULT unlock(Surface* s) {
     if (s->is_back && st.page_locked) {
-        if (g_session_frames) session_gfx_page(pg.page.data(), st.w, st.h);
+        if (g_session_frames) {
+            const size_t n = (size_t)st.w * st.h;
+            const bool have = pg.gpu.size() == n && pg.under.size() == n && pg.page.size() == n;
+            if (have)                            // what the game's 2D changed is its own (drawn opaque over the 3D)
+                for (size_t i = 0; i < n; i++)
+                    if (pg.page[i] != pg.under[i]) pg.gpu[i] = 0;
+            session_gfx_page(pg.page.data(), st.w, st.h, have ? pg.gpu.data() : 0);
+        }
         touch_state();
         st.page_locked = false;
         draw_page();
@@ -1246,6 +1294,13 @@ void clear(Viewport* v, DWORD n, const D3DRECT* rects, DWORD flags) {
         glr::ClearColor(c.r, c.g, c.b, 1.0f);
     }
     if (flags & D3DCLEAR_ZBUFFER) bits |= GL_DEPTH_BUFFER_BIT, glr::ClearDepth(1.0);
+    if ((flags & D3DCLEAR_TARGET) && pg.gpu.size() == (size_t)st.w * st.h)   // a cleared colour is exact on any GPU
+        for (DWORD i = 0; i < n; i++) {
+            const int x0 = rects[i].x1 < 0 ? 0 : (int)rects[i].x1, y0 = rects[i].y1 < 0 ? 0 : (int)rects[i].y1;
+            const int x1 = rects[i].x2 > st.w ? st.w : (int)rects[i].x2, y1 = rects[i].y2 > st.h ? st.h : (int)rects[i].y2;
+            for (int y = y0; y < y1; y++)
+                if (x1 > x0) memset(&pg.gpu[(size_t)y * st.w + x0], 0, (size_t)(x1 - x0));
+        }
     for (DWORD i = 0; i < n; i++) {
         Rect r = map_rect(rects[i].x1, rects[i].y1, rects[i].x2 - rects[i].x1, rects[i].y2 - rects[i].y1);
         glr::Scissor(r.x, r.y, r.w, r.h);
@@ -1424,7 +1479,10 @@ void mark_drawn3d(bool tl, const void* verts, DWORD nverts) {
     const int ix0 = x0 < 0 ? 0 : (int)x0, iy0 = y0 < 0 ? 0 : (int)y0;
     const int ix1 = x1 > st.w ? st.w : (int)ceilf(x1), iy1 = y1 > st.h ? st.h : (int)ceilf(y1);
     for (int y = iy0; y < iy1; y++)
-        if (ix1 > ix0) memset(&pg.drawn3d[(size_t)y * st.w + ix0], 1, (size_t)(ix1 - ix0));
+        if (ix1 > ix0) {
+            memset(&pg.drawn3d[(size_t)y * st.w + ix0], 1, (size_t)(ix1 - ix0));
+            if (pg.gpu.size() == pg.drawn3d.size()) memset(&pg.gpu[(size_t)y * st.w + ix0], 1, (size_t)(ix1 - ix0));
+        }
 }
 }  // namespace
 

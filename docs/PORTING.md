@@ -169,6 +169,14 @@ for a check on the main thread, where the physics can tick between the two passe
    out is `VP_ASM_CALLS`. Known GCC differences (no other compiler lays out frames like MSVC): four rewrites that
    faithfully read uninitialised stack or print a local's address -- world_menu_car, world_menu_options,
    world_net_core, world_krn_file report them.
+8. **Native Linux:** `tools/build_linux.sh` (in WSL Ubuntu: gcc/g++-multilib, libsdl2-dev:i386, Mesa i386) builds
+   `out-linux/viperport`, one 32-bit ELF -- loader (loader/viperport_linux.cpp) + port + the Win32 stand-ins
+   (hook/w32_*.cpp, which the GCC standalone uses on Windows too) -- that runs the user's v1.0 race.exe.
+   `python tools/corpus.py --linux` replays the corpus' standalone route with it in WSL (WSLg). A replay draws at the
+   recording's window size whatever the window is; across GPUs (`[session] cross_gpu=1`, which --linux sets) the 2D
+   page's tiles holding GPU-rasterised 3D aren't compared -- another rasteriser draws those pixels differently from
+   identical draw calls -- while the surfaces, the 3D state, every draw with its vertices, the races and the sends are
+   compared exactly. A session that can't be compared across GPUs says why in tools/corpus.json (`cross_gpu`).
 
 ## Fixes
 

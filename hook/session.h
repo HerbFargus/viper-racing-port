@@ -12,6 +12,10 @@ extern volatile int g_session_mode;
 extern bool g_session_frames;                  // hashing the frames (record or play, on the OpenGL renderer)
 
 void session_install(const char* ini);         // after port_install: reads [session], hooks what it needs
+// a replay's render size: true and the recording's window size (its drawable, as recorded) while a session replays and
+// the recording has one -- the renderer draws at that size, whatever the window is, so the 2D page's 3D read-back is
+// the recording's (gl_core.cpp make_target)
+bool session_render_size(int* w, int* h);
 void session_report();                         // the exit log (and a recording's end)
 
 inline bool session_recording() { return g_session_mode == SESSION_RECORD; }
@@ -80,7 +84,9 @@ enum : uint8_t {
 };
 void session_gfx(uint8_t kind, const void* a, size_t na, const void* b = 0, size_t nb = 0, const void* c = 0, size_t nc = 0);
 void session_gfx_state(uint32_t what, const void* p, size_t n);
-void session_gfx_page(const uint16_t* page, int w, int h);
+// the 2D page at Unlock; drawn3d (w x h, may be null): where the page holds the GPU's 3D (gl_core.cpp's pg.gpu) -- a
+// cross-GPU replay ([session] cross_gpu=1) leaves those tiles out of the comparison
+void session_gfx_page(const uint16_t* page, int w, int h, const uint8_t* drawn3d = 0);
 void session_frame();
 uint64_t session_hash(const void* p, size_t n, uint64_t h = 1469598103934665603ull);
 

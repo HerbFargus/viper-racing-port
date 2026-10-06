@@ -130,6 +130,14 @@ SDL_Window* platform_window();
 
 volatile int g_session_mode = SESSION_OFF;
 bool g_session_frames;
+// [session] cross_gpu=1 (a replay on another GPU -- Linux's Mesa against the recording's NVIDIA): the 2D page holds the
+// GPU's own 3D picture read back under the 2D, which another rasteriser draws differently from identical draw calls.
+// Such a replay compares every frame as usual -- the surfaces, the 3D state, the 3D work (every draw with its
+// vertices), the network sends, the races -- and the 2D page tile by tile, leaving out the tiles where 3D was drawn
+// that frame; the page events' hashes (which hold those pixels) are compared by kind and order only.
+bool g_cross_gpu;
+uint16_t g_tile3d;                               // this frame: the page tiles with 3D drawn in them (bit = tile)
+unsigned long g_tiles_skipped;                   // cross_gpu: tile comparisons left out, over the replay
 
 namespace {
 
@@ -1527,6 +1535,7 @@ Acc g_acc;
 
 void acc_reset() {
     memset(&g_acc.f, 0, sizeof g_acc.f);
+    g_tile3d = 0;
     g_acc.pending = 0;
     g_acc.ev.clear();
     for (int i = 0; i < SP_N; i++) g_acc.f.part[i] = 1469598103934665603ull;
@@ -1610,9 +1619,24 @@ void compare_frame() {
     g_compared++;
     if (g_acc.f.flags & F_LOCKSTEP) g_race_compared++;
     const TraceFrame& f = g_acc.f;
-    bool same = r->nevents == f.nevents && !memcmp(r->part, f.part, sizeof f.part) && !memcmp(r->count, f.count, sizeof f.count) &&
-                !memcmp(r->tile, f.tile, sizeof f.tile);
-    if (same && r->nstored == f.nstored && f.nstored && memcmp(rev, g_acc.ev.data(), f.nstored * 4)) same = false;
+    bool same;
+    if (!g_cross_gpu) {
+        same = r->nevents == f.nevents && !memcmp(r->part, f.part, sizeof f.part) && !memcmp(r->count, f.count, sizeof f.count) &&
+               !memcmp(r->tile, f.tile, sizeof f.tile);
+        if (same && r->nstored == f.nstored && f.nstored && memcmp(rev, g_acc.ev.data(), f.nstored * 4)) same = false;
+    } else {                                     // (see g_cross_gpu)
+        same = r->nevents == f.nevents && r->nstored == f.nstored && !memcmp(r->count, f.count, sizeof f.count);
+        for (int p = 0; p < SP_N && same; p++)
+            if (p != SP_PAGE && r->part[p] != f.part[p]) same = false;
+        for (int i = 0; i < 16 && same; i++) {
+            if (g_tile3d & (1u << i)) { g_tiles_skipped++; continue; }
+            if (r->tile[i] != f.tile[i]) same = false;
+        }
+        for (uint32_t e = 0; e < f.nstored && same; e++) {
+            const uint32_t a = rev[e], b = g_acc.ev[e];
+            if ((a >> 28) != (b >> 28) || ((a >> 28) != SG_PAGE && a != b)) same = false;
+        }
+    }
     if (same) return;
     g_differ++;
     if (g_differ > 6) return;
@@ -1639,12 +1663,11 @@ void first_present() {
     g_win_w = ww, g_win_h = wh;
     if (g_session_mode == SESSION_PLAY) {
         SDL_GL_SetSwapInterval(0);                                    // as fast as the fed clock allows
-        int rec[2] = {0, 0};
-        for (const Rec& r : g_recs)
-            if (r.kind == K_INFO && r.len == sizeof rec) { memcpy(rec, payload(r), sizeof rec); break; }
-        if (rec[0] && (rec[0] != ww || rec[1] != wh))
-            logf("session: the window is %dx%d, the recording's was %dx%d -- the 2D page holds the 3D read back at the window's"
-                 " size, so frames with 3D under 2D will differ: replay at the recording's size", ww, wh, rec[0], rec[1]);
+        int rw = 0, rh = 0;
+        if (session_render_size(&rw, &rh) && (rw != ww || rh != wh))
+            logf("session: the window is %dx%d, the recording's was %dx%d -- drawn at the recording's size and shown scaled,"
+                 " so the 2D page's 3D read-back is the recording's", ww, wh, rw, rh);
+        if (rw) g_win_w = rw, g_win_h = rh;                           // (what the frames are drawn at)
     }
 #endif
     if (g_session_mode == SESSION_RECORD) {
@@ -1654,6 +1677,17 @@ void first_present() {
 }
 
 }  // namespace
+
+bool session_render_size(int* w, int* h) {
+    *w = *h = 0;
+    if (g_session_mode != SESSION_PLAY && g_session_mode != SESSION_ENDED) return false;
+    int rec[2] = {0, 0};
+    for (const Rec& r : g_recs)
+        if (r.kind == K_INFO && r.len == sizeof rec) { memcpy(rec, payload(r), sizeof rec); break; }
+    if (rec[0] <= 0 || rec[1] <= 0) return false;
+    *w = rec[0], *h = rec[1];
+    return true;
+}
 
 // ---- the frame hash, from the renderer (gl_core.cpp) ---------------------------------------------------------------------------
 uint64_t session_hash(const void* p, size_t n, uint64_t h) {
@@ -1685,8 +1719,14 @@ void session_gfx_state(uint32_t what, const void* p, size_t n) {
     g_acc.pending = mix(g_acc.pending, h);
 }
 
-void session_gfx_page(const uint16_t* page, int w, int h) {
+void session_gfx_page(const uint16_t* page, int w, int h, const uint8_t* drawn3d) {
     if (!gfx_here() || w <= 0 || h <= 0) return;
+    if (drawn3d)
+        for (int y = 0; y < h; y++)
+            for (int c = 0; c < 4; c++) {
+                const int x0 = c * w / 4, x1 = (c + 1) * w / 4;
+                if (memchr(drawn3d + (size_t)y * w + x0, 1, (size_t)(x1 - x0))) g_tile3d |= (uint16_t)(1u << ((y * 4 / h) * 4 + c));
+            }
     uint64_t t[16];
     for (int i = 0; i < 16; i++) t[i] = 1469598103934665603ull;
     for (int y = 0; y < h; y++) {
@@ -1971,6 +2011,7 @@ void session_install_mode(const char* ini) {
     char play[128], label[64];
     vpos_GetPrivateProfileStringA("session", "play", "", play, sizeof play, ini);
     vpos_GetPrivateProfileStringA("session", "label", "", label, sizeof label, ini);
+    g_cross_gpu = play[0] && vpos_GetPrivateProfileIntA("session", "cross_gpu", 0, ini) != 0;
     if (!record && !play[0]) return;
     g_main = vpos_GetCurrentThreadId();
     vpos_InitializeCriticalSection(&g_put_cs);
@@ -2059,6 +2100,8 @@ void session_install_mode(const char* ini) {
         path[sizeof path - 1] = 0;
         if (g_session_frames) g_trace = fopen(path, "wb");
         g_session_mode = SESSION_PLAY;
+        if (g_cross_gpu)
+            logf("session: cross-GPU replay ([session] cross_gpu=1): the 2D page's tiles where 3D is drawn aren't compared");
         logf("session: replaying %s (%u input records, %u frames) as %s -> %s -- real input is ignored while it plays", g_dir,
              (unsigned)g_recs.size(), (unsigned)g_ref_at.size(), g_run, g_trace ? path : "(no trace)");
     } else {
@@ -2125,6 +2168,9 @@ void session_report() {
         else
             logf("exit: session: %s: parted at frame %u (%s); %u of %u frames compared differ", g_run, g_first_part,
                  g_first_part_what, g_differ, g_compared);
+        if (g_cross_gpu)
+            logf("exit: session: cross-GPU replay ([session] cross_gpu): %lu page tiles with 3D drawn in them left out of the"
+                 " comparison; everything else compared", g_tiles_skipped);
         logf("exit: session: fed %lu Win32Idle calls (%lu input events); %lu reads fell back on the last value or the live one, "
              "%lu recorded reads were never taken%s", g_idles, g_events, g_fallbacks, g_left_over,
              g_redirect_ok ? "" : "; the user directory was NOT redirected");

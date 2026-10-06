@@ -94,14 +94,15 @@ def ini_set(text, section, key, value):
     return "\n".join(lines) + "\n"
 
 
-def ini_for_run(text, play, label, default, extra=None):
+def ini_for_run(text, play, label, default, extra=None, cross_gpu=False):
     for sec, keys in (extra or {}).items():
         for key, val in keys.items():
             text = ini_set(text, sec, key, str(val))
     if "two_copies" not in (extra or {}).get("test", {}):
         text = ini_set(text, "test", "two_copies", "0")
     for sec, key, val in (("session", "record", "0"), ("session", "play", play), ("session", "label", label),
-                          ("port", "default", default), ("replay", "record", "0")):
+                          ("port", "default", default), ("replay", "record", "0"),
+                          ("session", "cross_gpu", "1" if cross_gpu else "0")):
         text = ini_set(text, sec, key, val)
     return text
 
@@ -117,7 +118,7 @@ R_FED = re.compile(r"exit: session: fed (\d+) Win32Idle calls \((\d+) input even
 R_RACE_OK = re.compile(r"replay: (.*?): (\d+) ticks, IDENTICAL to the recording over all (\d+) ticks compared(.*)")
 R_RACE_BAD = re.compile(r"replay: (.*?): (\d+) ticks; first diverged at tick (\d+), (\d+) ticks differ")
 R_SENDS = re.compile(r"exit: session: network: (\d+) sends compared, (\d+) differ from the recording's")
-R_WINDOW = re.compile(r"session: the window is (\d+)x(\d+), the recording's was (\d+)x(\d+)")
+R_WINDOW = re.compile(r"session: the window is (\d+)x(\d+), the recording's was (\d+)x(\d+)(?!\d)(?! -- drawn at the recording's size)")
 R_ORIGINAL = re.compile(r"standalone: ORIGINAL CODE REACHED at (.*)")
 R_ENDED = re.compile(r"session: (.*) -- the player has control from here")
 R_LOCKSTEP = re.compile(r"exit: session: (\d+) races, (\d+) of them in lockstep \((\d+) dropped it\)")
@@ -326,7 +327,9 @@ def run_one(install, entry, route, label, timeout, grace, log_tail, linux=None):
     with open(ini_path, encoding="latin-1") as f:
         base = f.read()
     with open(ini_path, "w", encoding="latin-1", newline="\r\n") as f:
-        f.write(ini_for_run(base, session, label, "original" if route == "original" else "new", entry.get("ini")))
+        # (--linux: another GPU than the recording's -- [session] cross_gpu leaves the page tiles with 3D out)
+        f.write(ini_for_run(base, session, label, "original" if route == "original" else "new", entry.get("ini"),
+                            cross_gpu=bool(linux)))
     log_path = os.path.join(install, "viperport.log")
     started = time.time()
     run = LinuxRun(linux["distro"], linux["exe"], os.path.join(install, exe), install) if linux else None
@@ -506,6 +509,9 @@ def main():
             continue
         if not os.path.isfile(os.path.join(session_dir(install, e), "session.vps")):
             print("skip %s: %s isn't in the install" % (e["name"], e["session"]))
+            continue
+        if linux and e.get("cross_gpu") is False:                 # (corpus.json says why)
+            print("skip %s on Linux: %s" % (e["name"], e.get("cross_gpu_why", "not comparable across GPUs")))
             continue
         for r in e["routes"]:
             if r in want_routes:

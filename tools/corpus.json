@@ -1,5 +1,5 @@
 {
-  "about": "The regression corpus (tools/corpus.py): recorded sessions in the test install's sessions\\ (and sessions-2\\), by name only. exe = the race.exe it was recorded on (beside the port's dinput.dll). ini = extra viperport.ini settings for its replays. routes = how it must replay IDENTICAL: dll (rewrites), original (MGI's code; never for a session that visits Options), standalone (viperport.exe --race exe). provisional = recorded before the corpus existed, kept for what the fresh set lacks (the stock race.exe, career saves).",
+  "about": "The regression corpus (tools/corpus.py): recorded sessions in the test install's sessions\\ (and sessions-2\\), by name only. exe = the race.exe it was recorded on (beside the port's dinput.dll). ini = extra viperport.ini settings for its replays. cross_gpu false = left out of --linux (cross_gpu_why). routes = how it must replay IDENTICAL: dll (rewrites), original (MGI's code; never for a session that visits Options), standalone (viperport.exe --race exe). provisional = recorded before the corpus existed, kept for what the fresh set lacks (the stock race.exe, career saves).",
   "sessions": [
     {"name": "standin-live", "session": "20261006-074010", "exe": "race.exe", "routes": ["dll", "original", "standalone"],
      "what": "recorded LIVE on the GCC standalone with the Win32 stand-ins (R2a.1: clocks, scans through them); menus, a race"},
@@ -18,7 +18,9 @@
     {"name": "lan-2", "session": "sessions-2/20261005-101954", "exe": "race.exe", "routes": ["dll", "original", "standalone"],
      "ini": {"test": {"two_copies": 1}}, "what": "fresh set 4: the same race, copy 2 (client), replayed alone"},
     {"name": "sp-stock", "session": "20261005-030122", "exe": "race_stock.exe", "routes": ["dll", "original", "standalone"],
-     "provisional": true, "what": "kept: the only session on the stock exe; single-player race (S1 check; DPI-virtualised 1536x864: race_stock.exe has no HIGHDPIAWARE flag)"},
+     "provisional": true, "cross_gpu": false,
+     "cross_gpu_why": "recorded DPI-virtualised at 1536x864: the 2D page round-trips the GPU at a 1.8x scale, which another GPU filters differently (on Linux: surfaces, 3D state, 3D work, events and the race all identical; only page pixels differ)",
+     "what": "kept: the only session on the stock exe; single-player race (S1 check; DPI-virtualised 1536x864: race_stock.exe has no HIGHDPIAWARE flag)"},
     {"name": "libc-career", "session": "20261004-165311", "exe": "race.exe", "routes": ["dll", "original", "standalone"],
      "provisional": true, "what": "kept: the only career save; LIBC check: menus, career + paint kit saves, 2 races"}
   ]
