@@ -324,8 +324,55 @@ LPSTR WINAPI race_GetCommandLineA() { return (LPSTR)g_race_cmdline.c_str(); }
 // race.exe's DINPUT import, until the port DLL is loaded and its own export takes the slot
 HRESULT WINAPI dinput_not_yet(HINSTANCE, DWORD, void**, void*) { return E_FAIL; }
 
+// ---- VP_TRACE_IMPORTS=1: which of race.exe's imports the game calls (relink stage R2a.0) -----------------------------------
+// Each import slot gets a counting stub -- `lock inc dword [count]; jmp dword [real]`, no register or stack touched (only
+// the flags, which no call passes) -- and ExitProcess writes the counts, appended, to import-trace.txt beside viperport.exe.
+// (The session recorder patches some slots later; its hooks call on through the stub, so those calls still count.)
+struct TraceSlot { volatile LONG count; FARPROC real; char what[64]; };
+TraceSlot* g_trace;
+int g_trace_n;
+typedef VOID(WINAPI* ExitProcess_t)(UINT);
+ExitProcess_t g_trace_exit;
+void trace_write() {
+    if (FILE* f = fopen((g_self_dir + "import-trace.txt").c_str(), "a")) {
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        fprintf(f, "== %04d-%02d-%02d %02d:%02d:%02d %s\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, GetCommandLineA());
+        for (int i = 0; i < g_trace_n; i++) fprintf(f, "%10ld  %s\n", (long)g_trace[i].count, g_trace[i].what);
+        fclose(f);
+    }
+}
+VOID WINAPI trace_ExitProcess(UINT code) {
+    trace_write();
+    g_trace_exit(code);
+}
+FARPROC trace_stub(const char* what, FARPROC real) {
+    static uint8_t* code;
+    static int used;
+    if (!g_trace) {
+        g_trace = (TraceSlot*)VirtualAlloc(0, 512 * sizeof(TraceSlot), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        code = (uint8_t*)VirtualAlloc(0, 512 * 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!g_trace || !code) return real;
+    }
+    if (g_trace_n >= 512) return real;
+    TraceSlot* s = &g_trace[g_trace_n++];
+    s->real = real;
+    lstrcpynA(s->what, what, sizeof s->what);
+    if (!_stricmp(what, "KERNEL32.dll!ExitProcess")) {
+        g_trace_exit = (ExitProcess_t)real;
+        s->real = (FARPROC)&trace_ExitProcess;
+    }
+    uint8_t* p = code + 16 * used++;
+    p[0] = 0xF0; p[1] = 0xFF; p[2] = 0x05;                         // lock inc dword ptr [&s->count]
+    *(uint32_t*)(p + 3) = (uint32_t)(uintptr_t)&s->count;
+    p[7] = 0xFF; p[8] = 0x25;                                      // jmp dword ptr [&s->real]
+    *(uint32_t*)(p + 9) = (uint32_t)(uintptr_t)&s->real;
+    return (FARPROC)p;
+}
+
 // every import into its IAT slot; DINPUT.dll's -> dinput_not_yet for now (the slots it names, returned)
 int resolve_imports(Image& im, std::vector<uint32_t*>& dinput_slots) {
+    const bool trace = GetEnvironmentVariableA("VP_TRACE_IMPORTS", 0, 0) != 0;
     const IMAGE_DATA_DIRECTORY d = im.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (!d.VirtualAddress) return 0;
     int n = 0;
@@ -364,6 +411,7 @@ int resolve_imports(Image& im, std::vector<uint32_t*>& dinput_slots) {
                 f = (FARPROC)&race_GetModuleFileNameA;
                 g_gmfn_slot = (void**)&iat->u1.Function;
             }
+            if (trace) f = trace_stub(what, f);
             iat->u1.Function = (DWORD)(uintptr_t)f;
         }
     }
