@@ -1,0 +1,2 @@
+# the Linux build script must keep LF line ends on a Windows checkout (core.autocrlf)
+*.sh text eol=lf

@@ -733,13 +733,13 @@ static int32_t __cdecl c_crtLCMapStringA(uint32_t locale, uint32_t flags, const 
     if (use == 2) return lcmapA(locale, flags, src, cch_src, dst, cch_dst);
     G32(CRT_AWMAP_FUSE_VA) = use;
     if (use != 1) return use;
-    wchar_t* inw = 0;
-    wchar_t* outw = 0;
+    WCHAR* inw = 0;                                 // (WCHAR: wchar_t on Windows, 16-bit on Linux)
+    WCHAR* outw = 0;
     int32_t ret;
     if (!code_page) code_page = crt_lc_codepage;
     const int32_t insize = kMultiByteToWideChar(code_page, 9, src, cch_src, 0, 0);
     if (!insize) return 0;
-    inw = gcall<wchar_t*>(F_malloc, (uint32_t)insize * 2);
+    inw = gcall<WCHAR*>(F_malloc, (uint32_t)insize * 2);
     if (!inw) return 0;
     if (!kMultiByteToWideChar(code_page, 1, src, cch_src, inw, insize)) goto fail;
     ret = kLCMapStringW(locale, flags, inw, insize, 0, 0);
@@ -750,7 +750,7 @@ static int32_t __cdecl c_crtLCMapStringA(uint32_t locale, uint32_t flags, const 
             if (!kLCMapStringW(locale, flags, inw, insize, (LPWSTR)dst, cch_dst)) goto fail;
         }
     } else {
-        outw = gcall<wchar_t*>(F_malloc, (uint32_t)ret * 2);
+        outw = gcall<WCHAR*>(F_malloc, (uint32_t)ret * 2);
         if (!outw) goto fail;
         if (!kLCMapStringW(locale, flags, inw, insize, outw, ret)) goto fail;
         if (!cch_dst) ret = kWideCharToMultiByte(code_page, 0x220, outw, ret, 0, 0, 0, 0);
@@ -792,11 +792,11 @@ static int32_t __cdecl c_crtGetStringTypeA(uint32_t info_type, const char* src, 
     G32(CRT_AWSTR_FUSE_VA) = use;
     if (use != 1) return use;
     int32_t ret = 0;
-    wchar_t* w = 0;
+    WCHAR* w = 0;
     if (!code_page) code_page = crt_lc_codepage;
     const int32_t size = kMultiByteToWideChar(code_page, 9, src, cch_src, 0, 0);
     if (size) {
-        w = gcall<wchar_t*>(F_calloc, 2u, (uint32_t)size);
+        w = gcall<WCHAR*>(F_calloc, 2u, (uint32_t)size);
         if (w) {
             const int32_t r1 = kMultiByteToWideChar(code_page, 1, src, cch_src, w, size);
             if (r1) ret = kGetStringTypeW(info_type, w, r1, (LPWORD)types);

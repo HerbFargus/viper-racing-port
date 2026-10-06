@@ -250,7 +250,11 @@ unsigned char __cdecl sdl_create_window(void* instance) {
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
     // the game's own window class name, so start_unique_instance's FindWindow still finds a running copy
     const char* cls = *(const char**)G.class_name;
+#ifdef _WIN32
     SDL_RegisterApp(cls ? cls : "Viper Racing Window", CS_HREDRAW | CS_VREDRAW, instance);
+#else
+    (void)cls;
+#endif
     // keep the game DPI-unaware, as it always was: DirectDraw's fullscreen and the mouse coordinates are
     // built on it (stage 2, with our own renderer, is where the game learns real pixels)
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "unaware");
@@ -259,7 +263,9 @@ unsigned char __cdecl sdl_create_window(void* instance) {
         logf("SDL: can't start: %s", SDL_GetError());
         return 0;
     }
+#ifdef _WIN32
     SDL_SetWindowsMessageHook(raw_message, 0);
+#endif
     const char* title = *(const char**)G.title;
     int w = vpos_GetSystemMetrics(SM_CXSCREEN), h = vpos_GetSystemMetrics(SM_CYSCREEN);
     if (vp_two_copies()) {                                       // [test] two_copies: a window on its half
@@ -294,7 +300,7 @@ unsigned char __cdecl sdl_create_window(void* instance) {
     // back from SDL_WINDOWEVENT_FOCUS_LOST / FOCUS_GAINED in handle() (what game_wndproc does on WM_ACTIVATEAPP);
     // SDL_SetWindowsMessageHook and SDL_RegisterApp above are Windows-only (the game's message hooks get nothing);
     // the icon from race.exe's resource 1 through SDL_SetWindowIcon
-#error "R2b: the SDL window's Windows side (HWND, activation, message hook, icon) -- see the comment above"
+    vp_r2b_todo("platform.cpp sdl_create_window: the game's HWND, activation, icon (agent D)");
 #endif
     *(HWND*)G.hwnd = g_hwnd;
     SDL_ShowCursor(SDL_DISABLE);                                 // the game draws its own
@@ -330,7 +336,7 @@ void mouse_event(int type, int x, int y, int buttons) {
 }
 
 void queue_text(const char* utf8) {                              // typed text: the game's character set is ANSI
-    wchar_t wide[32];
+    WCHAR wide[32];                                              // (16-bit: wchar_t on Windows)
     int n = vpos_MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, 32);
     char ansi[64];
     int m = n > 0 ? vpos_WideCharToMultiByte(CP_ACP, 0, wide, -1, ansi, sizeof ansi, 0, 0) : 0;

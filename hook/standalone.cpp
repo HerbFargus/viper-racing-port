@@ -443,7 +443,9 @@ int run(const VpStandaloneArgs* args) {
         // GetModuleHandle(NULL), which must be a module Windows knows. No window is opened.
         {
             SDL_SetMainReady();
+#ifdef _WIN32
             SDL_RegisterApp((char*)"viperport check", CS_HREDRAW | CS_VREDRAW, (void*)(uintptr_t)0x400000);
+#endif
             const Uint32 sub = SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC;
             if (SDL_InitSubSystem(sub) != 0) {
                 fail("SDL doesn't start as the game starts it: %s (GetModuleHandle(NULL) = %p)", SDL_GetError(),
@@ -452,7 +454,9 @@ int run(const VpStandaloneArgs* args) {
                 say("SDL starts as the game starts it (video, events, joysticks, haptics: %d joysticks)", SDL_NumJoysticks());
                 SDL_QuitSubSystem(sub);
             }
+#ifdef _WIN32
             SDL_UnregisterApp();
+#endif
         }
         // SEH: a handler in the mapping (see seh_probe_raise)
         {

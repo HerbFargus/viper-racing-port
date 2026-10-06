@@ -13,3 +13,4 @@ test/build/
 loader/build/
 hook/build-gcc/
 loader/build-gcc/
+out-linux/

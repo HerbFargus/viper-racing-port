@@ -92,7 +92,8 @@ static void decide_copy(const char* ini) {
     }
     g_copy_note = "two_copies: two copies already run; this start is the game's own (its single-instance check decides)";
 #else
-#error "R2b: [test] two_copies' two slots -- e.g. flock() on two lock files in the temp folder, held for the process's life"
+    // R2b: [test] two_copies' two slots -- e.g. flock() on two lock files in the temp folder, held for the process's life
+    vp_r2b_todo("viperport.cpp decide_copy: two_copies' slots as lock files (agent D)");
 #endif
 }
 

@@ -82,7 +82,12 @@ const char* const k_missing[M_N] = {"GetCurrentThreadId", "GetLastError", "Suspe
     "FindFirstFileA/FindNextFileA/FindClose", "GetLocalTime", "MultiByteToWideChar", "WideCharToMultiByte",
     "GetSystemMetrics", "GetForegroundWindow", "ClipCursor", "LoadIconA"};
 std::atomic<unsigned long> g_missing[M_N];
+#ifdef _WIN32
 inline void missing(Missing m) { g_missing[m]++; }
+#else
+// (Linux: every stand-in is linked in, and there is no Windows to fall back on)
+[[noreturn]] inline void missing(Missing m) { vp_r2b_todo(k_missing[m]); }
+#endif
 
 inline uint32_t h32(HANDLE h) { return (uint32_t)(uintptr_t)h; }
 inline bool is_w32(HANDLE h) { return w32::get(h32(h)) != nullptr; }
@@ -118,7 +123,8 @@ FILE* open_read(const char* path) {
 #ifdef _WIN32
     return fopen(path, "rb");
 #else
-#error "R2b: open the Windows path through the path layer (w32_path.h: backslashes, any case, the install as the root)"
+    // R2b: open the Windows path through the path layer (w32_path.h: backslashes, any case, the install as the root)
+    vp_r2b_todo("vp_os.cpp open_read: the path layer (agent B)");
 #endif
 }
 
@@ -272,6 +278,8 @@ DWORD wait(HANDLE h, DWORD ms) {
 #endif
 #ifdef _WIN32
     return ::WaitForSingleObject(h, ms);
+#else
+    vp_r2b_todo("vp_os.cpp wait: no stand-in (Linux: unreachable)");
 #endif
 }
 BOOL close_handle(HANDLE h) {
@@ -331,6 +339,8 @@ BOOL set_event(HANDLE h) {
     }
 #ifdef _WIN32
     return ::SetEvent(h);
+#else
+    vp_r2b_todo("vp_os.cpp set_event: no stand-in (Linux: unreachable)");
 #endif
 }
 
@@ -394,6 +404,8 @@ BOOL find_next(HANDLE h, WIN32_FIND_DATAA* fd) {
 #endif
 #ifdef _WIN32
     return ::FindNextFileA(h, fd);
+#else
+    vp_r2b_todo("vp_os.cpp find_next: no stand-in (Linux: unreachable)");
 #endif
 }
 BOOL find_close(HANDLE h) {
@@ -402,6 +414,8 @@ BOOL find_close(HANDLE h) {
 #endif
 #ifdef _WIN32
     return ::FindClose(h);
+#else
+    vp_r2b_todo("vp_os.cpp find_close: no stand-in (Linux: unreachable)");
 #endif
 }
 
@@ -426,7 +440,10 @@ DWORD file_attributes(const char* path) {
     const bool dir = r == 0 && (st.st_mode & _S_IFDIR);
     const bool ro = r == 0 && !(st.st_mode & _S_IWRITE);
 #else
-#error "R2b: stat() the path resolved through the path layer (w32_path.h)"
+    // R2b: stat() the path resolved through the path layer (w32_path.h)
+    vp_r2b_todo("vp_os.cpp file_attributes: stat() through the path layer (agent B)");
+    const int r = -1;
+    const bool dir = false, ro = false;
 #endif
     if (r == 0 && (dir || !want_dir)) {
         return dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE | (ro ? FILE_ATTRIBUTE_READONLY : 0);
@@ -438,8 +455,12 @@ DWORD file_attributes(const char* path) {
     const size_t cut = p.find_last_of("\\/");
     bool parent = true;
     if (cut != std::string::npos && cut > 0 && !(cut == 2 && p[1] == ':')) {
+#ifdef _WIN32
         struct _stat ps;
         parent = _stat(p.substr(0, cut).c_str(), &ps) == 0 && (ps.st_mode & _S_IFDIR);
+#else
+        vp_r2b_todo("vp_os.cpp file_attributes: the parent folder through the path layer (agent B)");
+#endif
     }
     vpos::set_last_error(parent ? w32::ERR_FILE_NOT_FOUND : w32::ERR_PATH_NOT_FOUND);
     return INVALID_FILE_ATTRIBUTES;

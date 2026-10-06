@@ -71,5 +71,7 @@ __attribute__((naked)) void W32K_CALL w32_RtlUnwind(void*, void*, void*, void*) 
 #endif
 
 #else
-#error "R2b: SEH on Linux -- a TIB per thread behind fs, signals -> EXCEPTION_RECORD/CONTEXT, an fs:[0] chain dispatcher, RaiseException/RtlUnwind/UnhandledExceptionFilter on it (see the notes above)"
+// R2b (agent C): SEH on Linux -- a TIB per thread behind fs, signals -> EXCEPTION_RECORD/CONTEXT, an fs:[0] chain
+// dispatcher, RaiseException/RtlUnwind/UnhandledExceptionFilter on it (see the notes above). Until then the four
+// stand-ins are stubs in hook/linux_todo.cpp.
 #endif

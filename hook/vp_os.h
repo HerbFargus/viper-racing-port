@@ -50,7 +50,7 @@ unsigned long thread_id() VP_OS_WEAK;
 #ifdef _WIN32
 #include <windows.h>
 #else
-#error "R2b: vp_os.h names Win32 types (DWORD, HANDLE, BOOL, SYSTEMTIME, WIN32_FIND_DATAA, CRITICAL_SECTION, RECT, HWND, MEMORY_BASIC_INFORMATION, EXCEPTION_POINTERS) -- a w32 types header for Linux"
+#include <windows.h>     // R2b: the Linux build's is hook/linux_inc/windows.h -> win32_compat.h (Windows' types and layouts)
 #endif
 // the stand-ins are race.exe's imports (vp_standalone(), GCC): the S kind goes through them from here (viperport.cpp)
 void vp_os_init(bool stand_ins) VP_OS_WEAK;
@@ -322,7 +322,17 @@ inline DWORD vpos_GetModuleFileNameA(HMODULE m, LPSTR out, DWORD n) { return ::G
 // GetModuleHandleA(0) -- race.exe's base, 0x400000 (the ELF loader maps it there); GetModuleFileNameA -- the
 // executable's path (/proc/self/exe) for both 0 and the port's own module (one ELF), in Windows form (backslashes)
 // through the path layer (w32_path.h).
-#error "R2b: the OS kind of vp_os.h (see the comment above)"
+// The Linux definitions are agent B's (vp_os.cpp; vpos_AddVectoredExceptionHandler agent C's, w32_seh.cpp); until
+// they exist each is a stub in hook/linux_todo.cpp.
+DWORD vpos_GetTickCount();
+BOOL vpos_VirtualProtect(LPVOID p, SIZE_T n, DWORD prot, PDWORD old);
+SIZE_T vpos_VirtualQuery(LPCVOID p, MEMORY_BASIC_INFORMATION* m, SIZE_T n);
+LPVOID vpos_VirtualAlloc(LPVOID p, SIZE_T n, DWORD type, DWORD prot);
+inline void vpos_flush_code(const void*, SIZE_T) {}      // x86: instruction fetch sees the stores
+BOOL vpos_IsBadReadPtr(const void* p, UINT_PTR n);
+PVOID vpos_AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER h);
+HMODULE vpos_GetModuleHandleA(LPCSTR name);
+DWORD vpos_GetModuleFileNameA(HMODULE m, LPSTR out, DWORD n);
 #endif
 
 // ---- plain C (Windows' semantics) ------------------------------------------------------------------------------------------
