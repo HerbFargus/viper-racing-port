@@ -73,6 +73,25 @@ typedef int Edx;                                    // the unused edx of a __thi
 // ---- the inlined string operations, as the original's instructions -------------------------------------------------
 // strcpy: repne scasb (the length, NUL included), then rep movsd, rep movsb: forward
 static __forceinline void gxt_strcpy(char* dst, const char* src) {
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %[src]\n\t"
+                     "mov ecx, 0xffffffff\n\t"
+                     "sub eax, eax\n\t"
+                     "repne scasb\n\t"
+                     "not ecx\n\t"
+                     "sub edi, ecx\n\t"
+                     "mov eax, ecx\n\t"
+                     "shr ecx, 2\n\t"
+                     "mov esi, edi\n\t"
+                     "mov edi, %[dst]\n\t"
+                     "rep movsd\n\t"
+                     "mov ecx, eax\n\t"
+                     "and ecx, 3\n\t"
+                     "rep movsb"
+                     :
+                     : [dst] "m"(dst), [src] "m"(src)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "esi", "edi", "cc", "memory");
+#else
     __asm { mov edi, src
             mov ecx, 0xffffffff
             sub eax, eax
@@ -87,6 +106,7 @@ static __forceinline void gxt_strcpy(char* dst, const char* src) {
             mov ecx, eax
             and ecx, 3
             rep movsb }
+#endif
 }
 // strcat of a literal the compiler knew: the destination's end (repne scasb; dec edi), then the literal's bytes, NUL
 // included
@@ -101,6 +121,23 @@ static __forceinline int32_t gxt_ftol_mul(int32_t n, const float* u) {
     int32_t lo;
     uint16_t cw, chop;
     int64_t q;
+#ifdef VP_GCC
+    __asm__ volatile("fild %[n]\n\t"
+                     "mov eax, %[u]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fnstcw %[cw]\n\t"
+                     "mov ax, %[cw]\n\t"
+                     "or ah, 0x0c\n\t"
+                     "mov %[chop], ax\n\t"
+                     "fldcw %[chop]\n\t"
+                     "fistp %[q]\n\t"
+                     "fldcw %[cw]\n\t"
+                     "fstp st(0)"
+                     : [cw] "=m"(cw), [chop] "=m"(chop), [q] "=m"(q)
+                     : [n] "m"(n), [u] "m"(u)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { fild n
             mov eax, u
             fld dword ptr [eax]
@@ -113,6 +150,7 @@ static __forceinline int32_t gxt_ftol_mul(int32_t n, const float* u) {
             fistp qword ptr q
             fldcw cw
             fstp st(0) }
+#endif
     lo = (int32_t)q;
     return lo;
 }

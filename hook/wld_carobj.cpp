@@ -68,10 +68,20 @@ static __forceinline float asf(uint32_t u) { float f; memcpy(&f, &u, 4); return 
 // fld dword; fchs; (fst) dword -- through the FPU, as the original does (a signalling NaN comes out quiet)
 static __forceinline float fpu_neg(const uint32_t* p) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[p]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fchs\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [p] "m"(p)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { mov eax, p
             fld dword ptr [eax]
             fchs
             fstp r }
+#endif
     return r;
 }
 

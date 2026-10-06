@@ -46,6 +46,9 @@
 #include <vector>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
 #include "../hook/port.h"
 
@@ -586,31 +589,72 @@ static int fault_filter(EXCEPTION_POINTERS* e) {
     g_fault_code = e->ExceptionRecord->ExceptionCode;
     g_fault_at = (uint32_t)(uintptr_t)e->ExceptionRecord->ExceptionAddress;
     // an unmasked x87 exception is still pending: the handler's first `wait` would raise it again
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     return EXCEPTION_EXECUTE_HANDLER;
 }
 template <typename Run> static int guarded(Run& run, uint64_t* ret) {
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { *ret = run(); }, fault_filter)) {
+        return g_fault_code == PANIC_CODE ? 1 : 2;
+    }
+    return 0;
+#else
     __try {
         *ret = run();
         return 0;
     } __except (fault_filter(GetExceptionInformation())) {
         return g_fault_code == PANIC_CODE ? 1 : 2;
     }
+#endif
 }
 static void fpu_mode(unsigned pc, bool unmask) {
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _clearfp();
     _controlfp_s(&cw, pc, _MCW_PC);
     if (unmask) _controlfp_s(&cw, _EM_INEXACT | _EM_UNDERFLOW | _EM_INVALID | _EM_DENORMAL, _MCW_EM);
 }
 static void fpu_reset() {
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _clearfp();
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
 }
+#if defined(__GNUC__) && !defined(__clang__)
+// (GCC: declared here, before check() -- GCC binds a template's non-dependent names where the template is defined)
+static volatile long g_check_serial;
+static volatile const char* g_check_name = "";
+#define COVS(X) X(key_full) X(key_dropped_disabled) X(key_meta) X(key_corrupt) X(mouse_full) X(mouse_coalesced)     \
+    X(pool_exhausted) X(pool_panic) X(pool_zero_count) X(dpool_overalloc) X(node_grab_fail) X(node_release_fail)      \
+    X(stream_overflow) X(stream_getstring_over_max) X(stream_getstring_uninit) X(table_sorted) X(table_sort_changed)  \
+    X(table_find_present_missed) X(table_found) X(b64_roundtrip_ok) X(b64_bad) X(b64_over_max) X(slerp_negated_a)     \
+    X(slerp_small_sin) X(slerp_div0) X(bag_full) X(clip_get) X(clip_put) X(joy_stop) X(joy_fail) X(random_out_of_range)
+enum {
+#define X(n) C_##n,
+    COVS(X)
+#undef X
+    NCOV
+};
+static const char* const k_cov_names[] = {
+#define X(n) #n,
+    COVS(X)
+#undef X
+};
+static long g_cov[NCOV];
+#endif
 template <typename Run, typename Fp> static void check(const char* fname, Run run, Fp footprint) {
     std::string name = fname;
     if (g_chain) name += " [chain]";
@@ -751,6 +795,9 @@ template <typename Run, typename Fp> static void check(const char* fname, Run ru
 #define CB0(FN) do { save(g_saved); g_chain = false; CHECK0(FN); load(g_saved); g_chain = true; CHECK0(FN); g_chain = false; } while (0)
 
 // ---- coverage and evidence --------------------------------------------------------------------------------------------
+#if defined(__GNUC__) && !defined(__clang__)
+// (GCC: declared above check())
+#else
 #define COVS(X) X(key_full) X(key_dropped_disabled) X(key_meta) X(key_corrupt) X(mouse_full) X(mouse_coalesced)     \
     X(pool_exhausted) X(pool_panic) X(pool_zero_count) X(dpool_overalloc) X(node_grab_fail) X(node_release_fail)      \
     X(stream_overflow) X(stream_getstring_over_max) X(stream_getstring_uninit) X(table_sorted) X(table_sort_changed)  \
@@ -768,6 +815,7 @@ static const char* const k_cov_names[] = {
 #undef X
 };
 static long g_cov[NCOV];
+#endif
 
 // =====================================================================================================================
 // the episodes
@@ -1500,8 +1548,12 @@ static void run_episode() {
 
 // the watchdog: a check that runs for more than a minute (an original looping forever, e.g. over a cyclic list)
 // is reported and the harness ends itself
+#if defined(__GNUC__) && !defined(__clang__)
+// (GCC: declared above check())
+#else
 static volatile long g_check_serial;
 static volatile const char* g_check_name = "";
+#endif
 static DWORD WINAPI watchdog(void*) {
     long last = -1, same = 0;
     for (;;) {
@@ -1528,7 +1580,11 @@ static LONG WINAPI unhandled(EXCEPTION_POINTERS* e) {
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     _set_error_mode(_OUT_TO_STDERR);
+#if defined(__GNUC__) && !defined(__clang__) && !defined(_UCRT)
+    // (mingw on msvcrt.dll: no _set_abort_behavior there -- and its abort() never calls Windows Error Reporting)
+#else
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
     if (!GetEnvironmentVariableA("VP_K3_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
     SetUnhandledExceptionFilter(unhandled);

@@ -41,6 +41,9 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
 #define VP_TEST_FIXES           // (the flag the other harnesses use)
 #endif
@@ -489,6 +492,14 @@ static int crash_filter(EXCEPTION_POINTERS* e, bool orig) {
            e->ExceptionRecord->ExceptionCode, e->ExceptionRecord->ExceptionAddress);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+template <typename Run> static uint64_t guarded(Run& run, bool orig) {
+    uint64_t r = 0;
+    if (vp_try([&] { r = run(orig); }, [&](EXCEPTION_POINTERS* e) { return crash_filter(e, orig); }))
+        return 0xdeaddeaddeaddeadull;
+    return r;
+}
+#else
 template <typename Run> static uint64_t guarded(Run& run, bool orig) {
     __try {
         return run(orig);
@@ -496,6 +507,7 @@ template <typename Run> static uint64_t guarded(Run& run, bool orig) {
         return 0xdeaddeaddeaddeadull;
     }
 }
+#endif
 
 template <typename Run, typename Fp> static void check(const char* name, Run run, Fp footprint) {
     Stat& st = stat(name);
@@ -730,8 +742,13 @@ static bool logged_str(uint32_t tag, const char* expect) {
 }
 static void rewrite_pass() { g_pass = 1; g_nlog[1] = 0; g_script = rnd() | 1; g_heap_next = g_heap_mark; }
 template <typename F> static bool no_fault(F f) {
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { f(); })) { return false; }
+    return true;
+#else
     __try { f(); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return true;
+#endif
 }
 typedef RecordMgr*(__fastcall* OrigMgrCtor_t)(RecordMgr*, Edx, const char*);
 typedef void(__cdecl* Void0_t)(void);

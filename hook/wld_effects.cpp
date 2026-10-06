@@ -101,10 +101,20 @@ static __forceinline void cp12(void* d, const void* s) {       // three integer 
 // fld dword; fchs; fstp dword -- through the FPU, as the original does
 static __forceinline float fpu_neg(const float* p) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[p]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fchs\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [p] "m"(p)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { mov eax, p
             fld dword ptr [eax]
             fchs
             fstp r }
+#endif
     return r;
 }
 
@@ -952,17 +962,29 @@ PORT_FN(0x00468f90, "SkidMark::SkidMark", SkidMark_ctor, fp_nothing)
 // BuddyObject::IsVisible (0x468e70) / GetZ (0x468e80): tail calls to the buddy's own (whatever it leaves in al /
 // ST0 is the result: jumped to, exactly as the original)
 static __declspec(naked) uint8_t __fastcall BuddyObject_IsVisible(void*, Edx) {
+#ifdef VP_GCC
+    __asm__ volatile("mov ecx, dword ptr [ecx + 4]\n\t"
+                     "mov eax, dword ptr [ecx]\n\t"
+                     "jmp dword ptr [eax + 0xc]" : :);
+#else
     __asm { mov ecx, dword ptr [ecx + 4]
             mov eax, dword ptr [ecx]
             jmp dword ptr [eax + 0xc] }
+#endif
 }
 static void fp_buddy(Footprint&, void*, Edx) {}
 PORT_FN(0x00468e70, "BuddyObject::IsVisible", BuddyObject_IsVisible, fp_buddy)
 
 static __declspec(naked) double __fastcall BuddyObject_GetZ(void*, Edx) {
+#ifdef VP_GCC
+    __asm__ volatile("mov ecx, dword ptr [ecx + 4]\n\t"
+                     "mov eax, dword ptr [ecx]\n\t"
+                     "jmp dword ptr [eax + 0x20]" : :);
+#else
     __asm { mov ecx, dword ptr [ecx + 4]
             mov eax, dword ptr [ecx]
             jmp dword ptr [eax + 0x20] }
+#endif
 }
 PORT_FN(0x00468e80, "BuddyObject::GetZ", BuddyObject_GetZ, fp_buddy)
 

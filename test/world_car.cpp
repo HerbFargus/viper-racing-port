@@ -36,6 +36,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #include "../hook/port.h"
 #undef PORT_FN_BUILDS
@@ -709,8 +712,13 @@ static int run_guarded(Kind k, bool rewrite, uint64_t* ret) {
     unsigned cw;
     _clearfp();
     _controlfp_s(&cw, _PC_24, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { *ret = call_kind(k, rewrite); }, fault_filter)) { return 1; }
+    return 0;
+#else
     __try { *ret = call_kind(k, rewrite); } __except (fault_filter(GetExceptionInformation())) { return 1; }
     return 0;
+#endif
 }
 
 // the rewrite's footprint for the world's call

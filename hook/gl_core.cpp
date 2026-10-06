@@ -10,6 +10,9 @@
 #include "session.h"
 #include "fix_paths.h"
 #include "gl_dxgi.h"
+#ifdef VP_GCC
+#include <stdio.h>                                   // _snprintf, FILE (MSVC's own headers bring them in)
+#endif
 
 SDL_Window* platform_window();
 
@@ -277,8 +280,13 @@ struct Check {
     std::vector<Entry> e;
     std::unordered_map<Obj*, size_t> at;
 };
+#ifdef VP_GCC
+__thread Check* t_chk;
+__thread std::set<Obj*>* t_deleted;    // while a check's end deletes: what's already gone
+#else
 __declspec(thread) Check* t_chk;
 __declspec(thread) std::set<Obj*>* t_deleted;    // while a check's end deletes: what's already gone
+#endif
 
 int check_phase() {
     if (!t_chk || !t_chk->active) return 0;

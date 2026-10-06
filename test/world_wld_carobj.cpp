@@ -40,6 +40,9 @@
 #include <string.h>
 #include <vector>
 #include <string>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
 #include "../hook/port.h"
@@ -537,8 +540,12 @@ static void build_car(int i, bool ghost) {
     memset(car(i), 0xcd, CAR_STRIDE);
     unsigned cw;
     _controlfp_s(&cw, _PC_24, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { ((CarCtorT)(ghost ? 0x0046cd20 : 0x00469e00))(car(i), 0, pd, g_arena + A_CLE); })) { g_setup_faults++; }
+#else
     __try { ((CarCtorT)(ghost ? 0x0046cd20 : 0x00469e00))(car(i), 0, pd, g_arena + A_CLE); }
     __except (EXCEPTION_EXECUTE_HANDLER) { g_setup_faults++; }
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     g_script.lod_rows = rows;
 }
@@ -735,7 +742,11 @@ static int run_guarded(Kind k, bool rw, uint64_t* ret) {
     _clearfp();
     _controlfp_s(&cw, g_pc, _MCW_PC);
     int fault = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { *ret = call_kind(k); }, fault_filter)) { fault = 1; }
+#else
     __try { *ret = call_kind(k); } __except (fault_filter(GetExceptionInformation())) { fault = 1; }
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     rewrites_on(false);
     return fault;
@@ -894,14 +905,22 @@ static void prepare_graf(Kind k) {
     fresh_graf();
     unsigned cw;
     _controlfp_s(&cw, _PC_24, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+#else
     __try {
+#endif
         // a graf the caller won't relocate is one already relocated (unrelocated offsets as pointers would write at
         // random low addresses -- this process's stack among them)
         const bool pre = (k == K_GRAFLOAD && g_script.first && !g_script.reloc) || (k == K_FIXGRAF && !(uint8_t)g_args.i);
         if (pre || k == K_FIXOBJS || k == K_CLEANUP || k == K_GRAFUNLOAD) ((VPP_t)0x0046e160)(g_graf, g_graf);
         if (k == K_CLEANUP || k == K_GRAFUNLOAD) ((VPB_t)0x0046e1a0)(g_graf, (uint8_t)chance(50));
         if (k == K_GRAFUNLOAD) { puti((void*)0x0055997c, (int32_t)(uintptr_t)g_graf); puti((void*)0x00559978, (int32_t)(uintptr_t)(g_arena + A_NAME)); }
+#if defined(__GNUC__) && !defined(__clang__)
+    })) { printf("  (setup: the graf's preparation faulted)\n"); }
+#else
     } __except (EXCEPTION_EXECUTE_HANDLER) { printf("  (setup: the graf's preparation faulted)\n"); }
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
 }
 
@@ -922,7 +941,11 @@ static const char* where(uint32_t a, char* buf) {
 // ---- main ----------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+#if defined(__GNUC__) && !defined(__clang__) && !defined(_UCRT)
+    // (mingw on msvcrt.dll: no _set_abort_behavior there -- and its abort() never calls Windows Error Reporting)
+#else
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
     SetUnhandledExceptionFilter(unhandled);
     setvbuf(stdout, 0, _IONBF, 0);
@@ -1004,7 +1027,11 @@ int main(int argc, char** argv) {
                     random_message(g_arena + A_MSG, cobj(g_args.car));
                     unsigned cw;
                     _controlfp_s(&cw, _PC_24, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+                    if (vp_try([&] { ((TP_t)0x0046bce0)(cobj(g_args.car), 0, g_arena + A_MSG); })) {}
+#else
                     __try { ((TP_t)0x0046bce0)(cobj(g_args.car), 0, g_arena + A_MSG); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
                     _controlfp_s(&cw, _PC_53, _MCW_PC);
                     stir_car(cobj(g_args.car));
                 }

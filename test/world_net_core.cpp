@@ -71,6 +71,9 @@
 #else
 #define NET_FIXES 1
 #endif
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #include "../hook/port.h"
 
 // ---- the registry -----------------------------------------------------------------------------------------------------------
@@ -263,10 +266,18 @@ static uint32_t fnv(const void* p, size_t n) {
     return h;
 }
 static void L_bytes(const void* p, uint32_t n) {
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { L(n); __asm__ volatile("" ::: "memory"); L(fnv(p, n)); })) { L('BADP'); }
+#else
     __try { L(n); L(fnv(p, n)); } __except (EXCEPTION_EXECUTE_HANDLER) { L('BADP'); }
+#endif
 }
 static void L_str(const char* s) {
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { const size_t n = strnlen(s, 4096); L((uint32_t)n); __asm__ volatile("" ::: "memory"); L(fnv(s, n)); })) { L('BADS'); }
+#else
     __try { const size_t n = strnlen(s, 4096); L((uint32_t)n); L(fnv(s, n)); } __except (EXCEPTION_EXECUTE_HANDLER) { L('BADS'); }
+#endif
 }
 // a pointer argument: its address if it's in the arena or the game (the same in both passes), else what it points at
 static void L_ptr(uint32_t w, uint32_t n) {
@@ -279,6 +290,20 @@ static void L_ptr(uint32_t w, uint32_t n) {
 static void L_fmt(const char* fmt, const uint32_t* a) {
     L((uint32_t)(uintptr_t)fmt);
     int k = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {                                        // (the barrier: the log words so far in memory before *p)
+        for (const char* p = fmt; ({ __asm__ volatile("" ::: "memory"); *p; }) && k < 8; p++) {
+            if (*p != '%') continue;
+            p++;
+            if (*p == '%') continue;
+            while (*p && strchr("-+ #0123456789.lh", *p)) p++;
+            if (!*p) break;
+            if (*p == 's') L_str((const char*)(uintptr_t)a[k]);
+            else L(a[k]);
+            k++;
+        }
+    })) { L('BADF'); }
+#else
     __try {
         for (const char* p = fmt; *p && k < 8; p++) {
             if (*p != '%') continue;
@@ -291,6 +316,7 @@ static void L_fmt(const char* fmt, const uint32_t* a) {
             k++;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { L('BADF'); }
+#endif
 }
 static void __cdecl stub_LogReport(const char* fmt, ...) { L('LREP'); L_fmt(fmt, (const uint32_t*)(&fmt + 1)); }
 static void __cdecl stub_LogPanic(const char* fmt, ...) { L('LPAN'); L_fmt(fmt, (const uint32_t*)(&fmt + 1)); }
@@ -357,7 +383,11 @@ static void __fastcall so_Send(void*, int, const uint8_t* pkt, int len, const ui
     L('SEND'); L((uint32_t)len);
     uint8_t m[0x400];
     const int n = len > 0 && len < 0x400 ? len : 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { memcpy(m, pkt, n); })) { L('BADP'); return; }
+#else
     __try { memcpy(m, pkt, n); } __except (EXCEPTION_EXECUTE_HANDLER) { L('BADP'); return; }
+#endif
     mask_session_packet(m, n);
     L_bytes(m, (uint32_t)n);
     L_bytes(addr, 12);
@@ -404,6 +434,50 @@ static void* g_sock_vt[16] = {(void*)so_dtor, (void*)so_Send, (void*)so_Recv, (v
 static uint32_t g_c_fn, g_c_ecx, g_c_edx, g_c_n, g_c_args[16];
 static uint32_t g_r_eax, g_r_edx, g_r_ebx, g_r_esi, g_r_edi, g_r_ebp, g_r_esp, g_c_top, g_save_esp;
 static uint16_t g_r_sw;
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((naked)) static void raw_call() {
+    __asm__ volatile(
+        "push ebx\n\t"
+        "push esi\n\t"
+        "push edi\n\t"
+        "push ebp\n\t"
+        "mov dword ptr [%P[save_esp]], esp\n\t"
+        "mov ecx, dword ptr [%P[c_n]]\n"
+        "1:\n\t"                                          // pushloop
+        "test ecx, ecx\n\t"
+        "jz 2f\n\t"
+        "dec ecx\n\t"
+        "push dword ptr [%P[c_args] + ecx * 4]\n\t"
+        "jmp 1b\n"
+        "2:\n\t"                                          // pushed
+        "mov dword ptr [%P[c_top]], esp\n\t"
+        "mov ebx, 0x0b0b0b0b\n\t"
+        "mov esi, 0x05050505\n\t"
+        "mov edi, 0x0d0d0d0d\n\t"
+        "mov ebp, 0x0e0e0e0e\n\t"
+        "mov ecx, dword ptr [%P[c_ecx]]\n\t"
+        "mov edx, dword ptr [%P[c_edx]]\n\t"
+        "call dword ptr [%P[c_fn]]\n\t"
+        "mov dword ptr [%P[r_eax]], eax\n\t"
+        "mov dword ptr [%P[r_edx]], edx\n\t"
+        "mov dword ptr [%P[r_ebx]], ebx\n\t"
+        "mov dword ptr [%P[r_esi]], esi\n\t"
+        "mov dword ptr [%P[r_edi]], edi\n\t"
+        "mov dword ptr [%P[r_ebp]], ebp\n\t"
+        "mov dword ptr [%P[r_esp]], esp\n\t"
+        "fnstsw word ptr [%P[r_sw]]\n\t"
+        "mov esp, dword ptr [%P[save_esp]]\n\t"
+        "pop ebp\n\t"
+        "pop edi\n\t"
+        "pop esi\n\t"
+        "pop ebx\n\t"
+        "ret"
+        :: [save_esp] "i"(&g_save_esp), [c_n] "i"(&g_c_n), [c_args] "i"(g_c_args), [c_top] "i"(&g_c_top),
+           [c_ecx] "i"(&g_c_ecx), [c_edx] "i"(&g_c_edx), [c_fn] "i"(&g_c_fn), [r_eax] "i"(&g_r_eax), [r_edx] "i"(&g_r_edx),
+           [r_ebx] "i"(&g_r_ebx), [r_esi] "i"(&g_r_esi), [r_edi] "i"(&g_r_edi), [r_ebp] "i"(&g_r_ebp), [r_esp] "i"(&g_r_esp),
+           [r_sw] "i"(&g_r_sw));
+}
+#else
 __declspec(naked) static void raw_call() {
     __asm {
         push ebx
@@ -443,7 +517,26 @@ __declspec(naked) static void raw_call() {
         ret
     }
 }
+#endif
 // the stack the call will use, filled with one pattern (world_root_race.cpp's): frame garbage the same in both passes
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((naked)) static void fill_stack() {
+    __asm__ volatile(
+        "push edi\n\t"
+        "push ecx\n\t"
+        "push eax\n\t"
+        "lea edi, [esp - 4]\n\t"
+        "mov ecx, 0xc000\n\t"
+        "mov eax, 0xa5a5a5a5\n\t"
+        "std\n\t"
+        "rep stosd\n\t"
+        "cld\n\t"
+        "pop eax\n\t"
+        "pop ecx\n\t"
+        "pop edi\n\t"
+        "ret");
+}
+#else
 __declspec(naked) static void fill_stack() {
     __asm {
         push edi
@@ -461,6 +554,7 @@ __declspec(naked) static void fill_stack() {
         ret
     }
 }
+#endif
 struct Result { int fault; uint32_t code, eip, ret, pops, regs[4], top; };
 static uint32_t g_fault_code, g_fault_eip;
 static int fault_filter(EXCEPTION_POINTERS* e) {
@@ -483,6 +577,14 @@ __declspec(noinline) static Result run(const Ent& f, bool rewrite, const uint32_
     g_c_n = (uint32_t)f.nstack;
     for (int i = 0; i < f.nstack && i < 16; i++) g_c_args[i] = stack[i];
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+    _controlfp_s(&cw, _MCW_EM, _MCW_EM);
+    _controlfp_s(&cw, g_pc, _MCW_PC);
+    fill_stack();
+    if (vp_try([&] { raw_call(); }, fault_filter)) { r.fault = 1; r.code = g_fault_code; r.eip = g_fault_eip; }
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, g_pc, _MCW_PC);
@@ -491,6 +593,7 @@ __declspec(noinline) static Result run(const Ent& f, bool rewrite, const uint32_
         raw_call();
     } __except (fault_filter(GetExceptionInformation())) { r.fault = 1; r.code = g_fault_code; r.eip = g_fault_eip; }
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     if (!r.fault) {

@@ -43,6 +43,9 @@
 // the rewrite (a scripted run of TextureGet / TextureSelect with names of 15..30 characters).
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
+#if defined(__GNUC__) && !defined(__clang__)
+#define _WIN32_WINNT 0x0A00               // (mingw: GetCurrentThreadStackLimits)
+#endif
 #include <windows.h>
 #include <float.h>
 #include <math.h>
@@ -54,6 +57,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
@@ -83,6 +89,32 @@ struct Reg {
         : at(a), name(n), fn(f), orig(o), neu(nw), fp(p), nargs(na), next(head()) { head() = this; }
 };
 template <typename F> struct Gen;
+#if defined(__GNUC__) && !defined(__clang__)
+// (GCC drops a __stdcall / __fastcall from a non-type template parameter's type `Fn`, so a rewrite with one doesn't
+// convert to it: neu takes NEW as `auto`, which keeps its own type, = Fn; run's Fn parameter keeps the convention.
+// orig hides the original's address from the optimizer: GCC 16.2 -O2 turns run inlined with a constant address and
+// five or more arguments into __builtin_unreachable -- a ud2 -- create_texture_surface's orig among them)
+#define GEN_CC(CC)                                                                                                     \
+    template <typename R, typename... A> struct Gen<R(CC*)(A...)> {                                                  \
+        typedef R(CC* Fn)(A...);                                                                                      \
+        template <size_t... I> static uint64_t run(Fn f, const uint32_t* a, std::index_sequence<I...>) {              \
+            if constexpr (std::is_void_v<R>) { f(conv<A>(a[I])...); return 0; }                                      \
+            else return ret64(f(conv<A>(a[I])...));                                                                   \
+        }                                                                                                             \
+        template <uint32_t AT> static uint64_t orig(const uint32_t* a) {                                              \
+            Fn f = (Fn)(uintptr_t)AT;                                                                                 \
+            __asm__("" : "+r"(f));                                                                                    \
+            return run(f, a, std::index_sequence_for<A...>{});                                                        \
+        }                                                                                                             \
+        template <auto NEW> static uint64_t neu(const uint32_t* a) { return run(NEW, a, std::index_sequence_for<A...>{}); } \
+        template <void (*FP)(Footprint&, A...), size_t... I>                                                          \
+        static void fpI(Footprint& f, const uint32_t* a, std::index_sequence<I...>) { FP(f, conv<A>(a[I])...); }      \
+        template <void (*FP)(Footprint&, A...)> static void fp(Footprint& f, const uint32_t* a) {                     \
+            fpI<FP>(f, a, std::index_sequence_for<A...>{});                                                           \
+        }                                                                                                             \
+        static const int nargs = (int)sizeof...(A);                                                                   \
+    };
+#else
 #define GEN_CC(CC)                                                                                                     \
     template <typename R, typename... A> struct Gen<R(CC*)(A...)> {                                                  \
         typedef R(CC* Fn)(A...);                                                                                      \
@@ -101,6 +133,7 @@ template <typename F> struct Gen;
         }                                                                                                             \
         static const int nargs = (int)sizeof...(A);                                                                   \
     };
+#endif
 GEN_CC(__cdecl)
 GEN_CC(__fastcall)
 GEN_CC(__stdcall)
@@ -243,7 +276,15 @@ static void lg(uint32_t w) { if (g_log.n < LOG_MAX) g_log.w[g_log.n] = w; g_log.
 static void lg_str(const char* s, int max = 256) {
     char buf[260];
     int n = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {                                  // (n and buf as they stand at a fault, as MSVC keeps them)
+        volatile int& vn = n;
+        volatile char* vb = buf;
+        while (vn < max && s[vn]) { vb[vn] = s[vn]; vn++; }
+    })) { lg(0xbadbad); }
+#else
     __try { while (n < max && s[n]) { buf[n] = s[n]; n++; } } __except (EXCEPTION_EXECUTE_HANDLER) { lg(0xbadbad); }
+#endif
     lg((uint32_t)n);
     for (int i = 0; i < n; i += 4) { uint32_t w = 0; memcpy(&w, buf + i, n - i < 4 ? n - i : 4); lg(w); }
 }
@@ -726,28 +767,60 @@ struct SetupOp { char* name; int key; bool create; int size; bool again, select;
 static bool run_setup(const SetupOp* ops, int n, bool forget, bool deres, int conserve, int base, bool grab) {
     unsigned cw;
     bool ok = true;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _PC_24, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+#else
     __try {
+#endif
         ((TB_t)0x00459f80)(0, 0, 0);                        // TextureBegin
         for (int k = 0; k < n; k++) {
+#if defined(__GNUC__) && !defined(__clang__)
+            if (vp_try([&] {
+#else
             __try {
+#endif
                 int id;
                 if (ops[k].create) id = ((TC_t)0x0045a170)(ops[k].name, ops[k].key, ops[k].size);   // TextureCreate
                 else id = ((TG_t)0x0045a0c0)(ops[k].name, ops[k].key);                                // TextureGet
                 if (ops[k].again) ((TG_t)0x0045a0c0)(ops[k].name, ops[k].key);                        // a second reference
                 if (ops[k].select && id != -1) ((TS_t)0x0045a4e0)(id);                                // TextureSelect
+#if defined(__GNUC__) && !defined(__clang__)
+            })) {}
+#else
             } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
         }
+#if defined(__GNUC__) && !defined(__clang__)
+        if (vp_try([&] {
+#else
         __try {
+#endif
             if (forget) ((TI_t)0x0045a110)(random_id());                 // TextureForget
             if (deres) G8(X_DERES) = 1;
             if (conserve >= 0) GI(X_CONSERVE) = conserve;
             if (base >= 0) GI(X_CONSERVE_BASE) = base;
             if (grab) ((TGR_t)0x0045a300)(random_id(), AR(A_ARGS + 0x100));   // a grab left pending
+#if defined(__GNUC__) && !defined(__clang__)
+        })) {}
+#else
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+    }, fault_filter)) { ok = false; }
+#else
     } __except (fault_filter(GetExceptionInformation())) { ok = false; }
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     return ok;
 }
@@ -848,8 +921,13 @@ static const TexRes* random_tt_res() { return g_tex.empty() ? 0 : &g_tex[rnd() %
 
 static void grab_first() {
     const int id = random_id();
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { ((TGR_t)0x0045a300)(id, AR(A_ARGS + 0x100)); })) {}
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __try { ((TGR_t)0x0045a300)(id, AR(A_ARGS + 0x100)); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     __asm fninit
+#endif
 }
 static uint32_t vr_rnd() { return rnd(); }
 static void gen_args(Reg* r) {
@@ -1089,18 +1167,33 @@ static bool g_unmask;
 static int run_guarded(Reg* r, bool rw, bool chain, uint64_t* ret) {
     g_log.n = 0;
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, g_pc, _MCW_PC);
     if (g_unmask) _controlfp_s(&cw, _MCW_EM & ~(_EM_OVERFLOW | _EM_ZERODIVIDE), _MCW_EM);
     if (rw && chain) chain_on();
     int fault = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+        *ret = rw ? r->neu(g_args) : r->orig(g_args);
+        __asm__ volatile("fwait" ::: VP_X87_CLOBBERS, "memory");
+    }, fault_filter)) { fault = 1; }
+#else
     __try {
         *ret = rw ? r->neu(g_args) : r->orig(g_args);
         __asm fwait
     } __except (fault_filter(GetExceptionInformation())) { fault = 1; }
+#endif
     if (rw && chain) chain_off();
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     return fault ? (g_fault_code == PANIC_CODE ? 2 : g_fault_code == EXIT_CODE ? 3 : g_fault_code == ODD_CODE ? 4 : 1) : 0;
@@ -1110,11 +1203,19 @@ static std::vector<std::pair<uint32_t, int>> g_panics;
 static int g_cov[16];
 static const char* panic_text(uint32_t a, char* buf) {
     strcpy(buf, "?");
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { strncpy(buf, (const char*)(uintptr_t)a, 44); buf[44] = 0; })) {}
+#else
     __try { strncpy(buf, (const char*)(uintptr_t)a, 44); buf[44] = 0; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
     return buf;
 }
 static bool safe_fp(Reg* r, Footprint& fp) {
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { r->fp(fp, g_args); })) { return false; }
+#else
     __try { r->fp(fp, g_args); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#endif
     return true;
 }
 
@@ -1157,7 +1258,11 @@ static const char* where(const void* p, char* buf) {
 static bool sys_null(int id) {
     if (id == -1) return false;
     bool r = false;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { r = entry(id)->sys == 0; })) { r = false; }
+#else
     __try { r = entry(id)->sys == 0; } __except (EXCEPTION_EXECUTE_HANDLER) { r = false; }
+#endif
     return r;
 }
 static bool fix_case(const Reg* r) {
@@ -1200,10 +1305,22 @@ static void expect(bool ok, const char* what, int len) {
 template <typename F> static int guarded(F f) {                  // 0, or the exception (LogPanic's included)
     unsigned cw;
     int r = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _PC_24, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { f(); }, fault_filter)) { r = (int)g_fault_code; }
+#else
     __try { f(); } __except (fault_filter(GetExceptionInformation())) { r = (int)g_fault_code; }
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     return r;
 }
@@ -1375,9 +1492,31 @@ static void fix_null_sys(bool m1) {
 struct DemoOut { int id1 = -9, id2 = -9, id3 = -9, sel = -9; uint32_t key = 0, loaded = 0, sys = 0, vid = 0; const char* fault = ""; };
 static void demo_run(int pass, char* p, DemoOut& o) {
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _PC_24, _MCW_PC);
     if (pass) chain_on();                               // the rewrite: every function of the group rewritten
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+        volatile DemoOut& vo = o;                       // (o as it stands at a fault, as MSVC keeps it: fault names the call)
+        ((TB_t)0x00459f80)(0, 0, 0);
+        TG_t get = (TG_t)0x0045a0c0;
+        TS_t select = (TS_t)0x0045a4e0;
+        vo.id1 = get(p, 0x21);
+        vo.key = (uint32_t)entry(vo.id1)->key;
+        vo.loaded = entry(vo.id1)->loaded;
+        vo.sys = (uint32_t)(uintptr_t)entry(vo.id1)->sys;
+        vo.vid = (uint32_t)(uintptr_t)entry(vo.id1)->vid;
+        vo.id2 = get(p, 0x21);
+        vo.id3 = get(p, 0);
+        vo.fault = "TextureSelect";
+        vo.sel = select(vo.id1);
+        vo.fault = "";
+    }, fault_filter)) {}
+#else
     __try {
         ((TB_t)0x00459f80)(0, 0, 0);
         TG_t get = (TG_t)0x0045a0c0;
@@ -1393,8 +1532,13 @@ static void demo_run(int pass, char* p, DemoOut& o) {
         o.sel = select(o.id1);
         o.fault = "";
     } __except (fault_filter(GetExceptionInformation())) {}
+#endif
     if (pass) chain_off();
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
 }
 static void name_bug_demo() {

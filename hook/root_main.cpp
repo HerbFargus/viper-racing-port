@@ -361,6 +361,91 @@ static void __cdecl convert_frame_in_c(RbFrame* dst, const RbCompactFrame* src) 
     volatile float* p8 = &t8;
     volatile float* pc = &tc;
     volatile float* p10 = &t10;
+#ifdef VP_GCC
+    __asm__ volatile("mov edx, %[dst]\n\t"
+                     "mov esi, %[src]\n\t"
+                     "mov eax, %[pa]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fdivr %[k_one]\n\t"
+                     "fld dword ptr [esi + 0xc]\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fld dword ptr [esi + 0x10]\n\t"
+                     "fmul st, st(2)\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul dword ptr [esi + 0x14]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fsin\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fcos\n\t"
+                     "fld %[k_one]\n\t"
+                     "fsub st, st(1)\n\t"
+                     "fld st(4)\n\t"
+                     "fmul st, st(5)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [edx]\n\t"
+                     "fld st(4)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "mov eax, %[p4]\n\t"
+                     "fst dword ptr [eax]\n\t"
+                     "fmul st, st(6)\n\t"
+                     "mov ecx, %[pc]\n\t"
+                     "fstp dword ptr [ecx]\n\t"
+                     "fld st(2)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "mov ecx, %[p8]\n\t"
+                     "fst dword ptr [ecx]\n\t"
+                     "mov ecx, %[pc]\n\t"
+                     "fadd dword ptr [ecx]\n\t"
+                     "fstp dword ptr [edx + 4]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fmul st, st(4)\n\t"
+                     "mov ecx, %[p10]\n\t"
+                     "fstp dword ptr [ecx]\n\t"
+                     "fld st(2)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fst dword ptr [eax]\n\t"
+                     "fsubr dword ptr [ecx]\n\t"
+                     "fstp dword ptr [edx + 8]\n\t"
+                     "mov ecx, %[pc]\n\t"
+                     "fld dword ptr [ecx]\n\t"
+                     "mov ecx, %[p8]\n\t"
+                     "fsub dword ptr [ecx]\n\t"
+                     "fstp dword ptr [edx + 0xc]\n\t"
+                     "fld st(5)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [edx + 0x10]\n\t"
+                     "fld st(0)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fstp dword ptr [ecx]\n\t"
+                     "fxch st(4)\n\t"
+                     "fmul st, st(2)\n\t"
+                     "fld dword ptr [ecx]\n\t"
+                     "fadd st, st(1)\n\t"
+                     "fstp dword ptr [edx + 0x14]\n\t"
+                     "mov ecx, %[p10]\n\t"
+                     "fld dword ptr [ecx]\n\t"
+                     "fadd dword ptr [eax]\n\t"
+                     "fstp dword ptr [edx + 0x18]\n\t"
+                     "mov ecx, %[p8]\n\t"
+                     "fsubr dword ptr [ecx]\n\t"
+                     "fstp dword ptr [edx + 0x1c]\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul st, st(0)\n\t"
+                     "fmul st, st(3)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [edx + 0x20]\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)"
+                     :
+                     : [dst] "m"(dst), [src] "m"(src), [pa] "m"(pa), [k_one] "m"(k_one), [p4] "m"(p4), [pc] "m"(pc), [p8] "m"(p8), [p10] "m"(p10)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "esi", "cc", "memory");
+#else
     __asm {
         mov  edx, dst
         mov  esi, src
@@ -443,6 +528,7 @@ static void __cdecl convert_frame_in_c(RbFrame* dst, const RbCompactFrame* src) 
         fstp st(0)
         fstp st(0)
     }
+#endif
 }
 static void fp_convert_frame_in(Footprint& f, RbFrame* out, const RbCompactFrame*) {
     f.pure = true;
@@ -925,6 +1011,23 @@ PORT_FN(0x00402920, "copy_blimp_to_clipboard", copy_blimp_to_clipboard_c, fp_cop
 static const float k_eps = 1.1920928955078125e-07f;                  // 0x34000000
 static VP_ASM_CALLS_INLINE bool acos_sin(const volatile float* w, volatile float* ha, volatile float* sn) {
     uint16_t sw;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[w]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "mov eax, 0x004cf07c\n\t"
+                     "call eax\n\t"
+                     "mov ecx, %[ha]\n\t"
+                     "fst dword ptr [ecx]\n\t"
+                     "fsin\n\t"
+                     "mov ecx, %[sn]\n\t"
+                     "fst dword ptr [ecx]\n\t"
+                     "fabs\n\t"
+                     "fcomp %[k_eps]\n\t"
+                     "fnstsw %[sw]"
+                     : [sw] "=m"(sw)
+                     : [w] "m"(w), [ha] "m"(ha), [sn] "m"(sn), [k_eps] "m"(k_eps)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         mov  eax, w
         fld  dword ptr [eax]
@@ -939,6 +1042,7 @@ static VP_ASM_CALLS_INLINE bool acos_sin(const volatile float* w, volatile float
         fcomp k_eps
         fnstsw sw
     }
+#endif
     return (sw & 0x4100) != 0;                                      // test ah, 0x41: |sin| <= eps, or unordered
 }
 static void __cdecl convert_frame_out_c(RbCompactFrame* out, const RbFrame* in) {

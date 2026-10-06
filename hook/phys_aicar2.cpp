@@ -55,8 +55,16 @@ static __forceinline float Fb(uint32_t u) { float f; memcpy(&f, &u, 4); return f
 // a float copied through the FPU (fld; fst): the same value, but a signalling NaN comes out quiet
 static __declspec(noinline) float fpu_copy(float x) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[x]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld x
             fstp r }
+#endif
     return r;
 }
 
@@ -508,6 +516,20 @@ static __forceinline uint8_t* race_record(const AICar* self) {
 // fmod(a, b) through the CRT's __CIfmod in race.exe (0x4cf36a): a in ST1, b in ST0; the result stored as a float
 VP_ASM_CALLS static float cifmod_f(double a, float b) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[a]\n\t"
+                     "fld %[b]\n\t"
+                     "push ecx\n\t"
+                     "push edx\n\t"
+                     "mov eax, 0x4cf36a\n\t"
+                     "call eax\n\t"
+                     "pop edx\n\t"
+                     "pop ecx\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [a] "m"(a), [b] "m"(b)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         push ecx
         push edx
@@ -519,6 +541,7 @@ VP_ASM_CALLS static float cifmod_f(double a, float b) {
         pop ecx
         fstp r
     }
+#endif
     return r;
 }
 
@@ -527,23 +550,46 @@ VP_ASM_CALLS static float cifmod_f(double a, float b) {
 // unreachable (the steering is clamped to +-1, max_steer_angle < 1 rad).
 static __forceinline double yaw_tan_ratio(double steer, double wheelbase) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[steer]\n\t"
+                     "fptan\n\t"
+                     "fstp st(0)\n\t"
+                     "fld %[wheelbase]\n\t"
+                     "fdivp st(1), st(0)\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [steer] "m"(steer), [wheelbase] "m"(wheelbase)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld steer
             fptan
             fstp st(0)
             fld wheelbase
             fdivp st(1), st(0)
             fstp r }
+#endif
     return r;
 }
 
 // fpatan (atan2(y, x), a full 64-bit mantissa) divided by a float in the same asm block (the quotient is rounded)
 static __forceinline double atan2_div(double y, double x, float m) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[y]\n\t"
+                     "fld %[x]\n\t"
+                     "fpatan\n\t"
+                     "fdiv %[m]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [y] "m"(y), [x] "m"(x), [m] "m"(m)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld y
             fld x
             fpatan
             fdiv m
             fstp r }
+#endif
     return r;
 }
 
@@ -771,6 +817,10 @@ static void __fastcall AICar_init_rt_lat(AICar* self, Edx) {
     float w;                                            // [+8] the corridor's width at the centre-line bead
     if (ILSeg* s = cl->bead_seg) COPY4(w, s->corridor_half_width);
     else SET4(w, 0x41a00000u);                          // 20 m
+#ifdef VP_GCC
+    __asm__("" : "+m"(w));      // (w opaque: GCC would fold (20 - 1.905) * 0.5 at compile time, where the original's
+                                // fsub rounds it to the thread's precision -- 24 bits on the physics thread)
+#endif
     const float half = (float)(D(w) * 0.5f);            // [+0x10]
     const double n = (D(w) - k_car_width) * 0.5f;
     COPY4(self->track_half_width, half);
@@ -1358,7 +1408,12 @@ static void __fastcall AICar_lonslam(AICar* self, Edx, float* brake) {
         const float t = (float)-q;                      // [+0]
         if (!far_off) return;
         if (I(t) <= 0) return;
+#ifdef VP_GCC
+        const double k = (D(2.5f) - t) * (float)0.4f;   // (GCC reads a bare 0.4f as the long double 0.4L: the cast
+                                                        //  gives the float the original multiplies by)
+#else
         const double k = (D(2.5f) - t) * 0.4f;
+#endif
         float kf = (float)k;
         if (!(k >= 0.0f)) SET4(kf, 0);                  // test ah,1
         else if (I(kf) > 0x3f800000) SET4(kf, 0x3f800000u);

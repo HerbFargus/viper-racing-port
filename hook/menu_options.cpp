@@ -264,6 +264,25 @@ static int32_t ctc_cos_term(const volatile float* t) {
     int64_t q;
     uint16_t cw, chop;
     const volatile float* tp = t;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[tp]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fcos\n\t"
+                     "mov eax, 0x004de494\n\t"
+                     "fmul dword ptr [eax]\n\t"
+                     "mov eax, 0x004de488\n\t"
+                     "fsub dword ptr [eax]\n\t"
+                     "fnstcw %[cw]\n\t"
+                     "mov ax, %[cw]\n\t"
+                     "or ah, 0x0c\n\t"
+                     "mov %[chop], ax\n\t"
+                     "fldcw %[chop]\n\t"
+                     "fistp %[q]\n\t"
+                     "fldcw %[cw]"
+                     : [cw] "=m"(cw), [chop] "=m"(chop), [q] "=m"(q)
+                     : [tp] "m"(tp)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm {
         mov eax, tp
         fld dword ptr [eax]
@@ -280,12 +299,32 @@ static int32_t ctc_cos_term(const volatile float* t) {
         fistp qword ptr q
         fldcw cw
     }
+#endif
     return (int32_t)q;
 }
 static int32_t ctc_sin_term(const volatile float* t) {
     int64_t q;
     uint16_t cw, chop;
     const volatile float* tp = t;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[tp]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fsin\n\t"
+                     "mov eax, 0x004de498\n\t"
+                     "fmul dword ptr [eax]\n\t"
+                     "mov eax, 0x004de49c\n\t"
+                     "fadd dword ptr [eax]\n\t"
+                     "fnstcw %[cw]\n\t"
+                     "mov ax, %[cw]\n\t"
+                     "or ah, 0x0c\n\t"
+                     "mov %[chop], ax\n\t"
+                     "fldcw %[chop]\n\t"
+                     "fistp %[q]\n\t"
+                     "fldcw %[cw]"
+                     : [cw] "=m"(cw), [chop] "=m"(chop), [q] "=m"(q)
+                     : [tp] "m"(tp)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm {
         mov eax, tp
         fld dword ptr [eax]
@@ -302,6 +341,7 @@ static int32_t ctc_sin_term(const volatile float* t) {
         fistp qword ptr q
         fldcw cw
     }
+#endif
     return (int32_t)q;
 }
 // the panel: the wheel (its stamp, the ball at an angle of steer * 1.309 rad), three bars (throttle, brake, clutch)

@@ -96,9 +96,18 @@ typedef void(__cdecl* Sprintf_)(char*, const char*, ...);
 // a function returning a float in st0, stored as a float (`call; fstp dword`)
 static VP_ASM_CALLS_INLINE float call_f(uint32_t fn) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[fn]\n\t"
+                     "call eax\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [fn] "m"(fn)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm { mov eax, fn
             call eax
             fstp dword ptr [r] }
+#endif
     return r;
 }
 // "<track>.trk": strcpy, then the literal's five bytes (a dword and a byte) at the end
@@ -954,6 +963,29 @@ static const uint32_t k_2pi = 0x40c90fdb, k_pi = 0x40490fdb, k_inv2pi = 0x3e22f9
 VP_ASM_CALLS static void jog_angle(int32_t my_dy, int32_t my_dx, float* out, uint16_t* sw) {
     float a;
     uint16_t s;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, 0x0042bc80\n\t"
+                     "call eax\n\t"
+                     "fdiv %[k_5]\n\t"
+                     "fild %[my_dy]\n\t"
+                     "fild %[my_dx]\n\t"
+                     "fpatan\n\t"
+                     "fld %[k_1d]\n\t"
+                     "fxch st(2)\n\t"
+                     "fxch st(1)\n\t"
+                     "fxch st(2)\n\t"
+                     "mov eax, 0x004cf36a\n\t"
+                     "call eax\n\t"
+                     "fmul %[k_2pi]\n\t"
+                     "fsubp st(1), st\n\t"
+                     "fcom %[k_pi]\n\t"
+                     "fstp %[a]\n\t"
+                     "fnstsw ax\n\t"
+                     "mov %[s], ax"
+                     : [a] "=m"(a), [s] "=m"(s)
+                     : [k_5] "m"(k_5), [my_dy] "m"(my_dy), [my_dx] "m"(my_dx), [k_1d] "m"(k_1d), [k_2pi] "m"(k_2pi), [k_pi] "m"(k_pi)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         mov eax, 0x0042bc80
         call eax
@@ -974,6 +1006,7 @@ VP_ASM_CALLS static void jog_angle(int32_t my_dy, int32_t my_dx, float* out, uin
         fnstsw ax
         mov s, ax
     }
+#endif
     *out = a;
     *sw = s;
 }
@@ -1006,6 +1039,23 @@ PORT_FN(0x00409510, "JogControl::Callback", JogControl_Callback_n, fp_jog_cb)
 // Draw: the wheel, and the detent on its rim, turned by the time
 VP_ASM_CALLS static void jog_cos_sin(float* c, float* s) {
     float v_c, v_s;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, 0x0042bc80\n\t"
+                     "call eax\n\t"
+                     "fdiv %[k_5]\n\t"
+                     "fld %[k_1d]\n\t"
+                     "mov eax, 0x004cf36a\n\t"
+                     "call eax\n\t"
+                     "fmul %[k_2pi]\n\t"
+                     "fld st(0)\n\t"
+                     "fcos\n\t"
+                     "fstp %[v_c]\n\t"
+                     "fsin\n\t"
+                     "fstp %[v_s]"
+                     : [v_c] "=m"(v_c), [v_s] "=m"(v_s)
+                     : [k_5] "m"(k_5), [k_1d] "m"(k_1d), [k_2pi] "m"(k_2pi)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         mov eax, 0x0042bc80
         call eax
@@ -1020,6 +1070,7 @@ VP_ASM_CALLS static void jog_cos_sin(float* c, float* s) {
         fsin
         fstp dword ptr [v_s]
     }
+#endif
     *c = v_c;
     *s = v_s;
 }

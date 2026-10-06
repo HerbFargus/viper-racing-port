@@ -58,6 +58,9 @@
 // faults exactly when the check says it reads one). Without it (VP_FAITHFUL) every rewrite must match its original bit
 // for bit.
 #define _CRT_SECURE_NO_WARNINGS
+#if defined(__GNUC__) && !defined(__clang__)
+#define _WIN32_WINNT 0x0A00               // (mingw: GetCurrentThreadStackLimits)
+#endif
 #include <windows.h>
 #include <float.h>
 #include <math.h>
@@ -75,6 +78,9 @@
 #define ROOT_FIXES 0
 #else
 #define ROOT_FIXES 1
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
 #endif
 #include "../hook/port.h"
 
@@ -583,6 +589,51 @@ static uint32_t g_c_fn, g_c_ecx, g_c_edx, g_c_n, g_c_args[64];
 static uint32_t g_r_eax, g_r_edx, g_r_ebx, g_r_esi, g_r_edi, g_r_ebp, g_r_esp, g_c_top, g_save_esp;
 static uint16_t g_r_sw;
 static double g_r_st0;
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((naked)) static void raw_call() {
+    __asm__ volatile(
+        "push ebx\n\t"
+        "push esi\n\t"
+        "push edi\n\t"
+        "push ebp\n\t"
+        "mov dword ptr [%P[save_esp]], esp\n\t"
+        "mov ecx, dword ptr [%P[c_n]]\n"
+        "1:\n\t"                                          // pushloop
+        "test ecx, ecx\n\t"
+        "jz 2f\n\t"
+        "dec ecx\n\t"
+        "push dword ptr [%P[c_args] + ecx * 4]\n\t"
+        "jmp 1b\n"
+        "2:\n\t"                                          // pushed
+        "mov dword ptr [%P[c_top]], esp\n\t"
+        "mov ebx, 0x0b0b0b0b\n\t"
+        "mov esi, 0x05050505\n\t"
+        "mov edi, 0x0d0d0d0d\n\t"
+        "mov ebp, 0x0e0e0e0e\n\t"
+        "mov ecx, dword ptr [%P[c_ecx]]\n\t"
+        "mov edx, dword ptr [%P[c_edx]]\n\t"
+        "call dword ptr [%P[c_fn]]\n\t"
+        "mov dword ptr [%P[r_eax]], eax\n\t"
+        "mov dword ptr [%P[r_edx]], edx\n\t"
+        "mov dword ptr [%P[r_ebx]], ebx\n\t"
+        "mov dword ptr [%P[r_esi]], esi\n\t"
+        "mov dword ptr [%P[r_edi]], edi\n\t"
+        "mov dword ptr [%P[r_ebp]], ebp\n\t"
+        "mov dword ptr [%P[r_esp]], esp\n\t"
+        "fnstsw word ptr [%P[r_sw]]\n\t"
+        "fst qword ptr [%P[r_st0]]\n\t"
+        "mov esp, dword ptr [%P[save_esp]]\n\t"
+        "pop ebp\n\t"
+        "pop edi\n\t"
+        "pop esi\n\t"
+        "pop ebx\n\t"
+        "ret"
+        :: [save_esp] "i"(&g_save_esp), [c_n] "i"(&g_c_n), [c_args] "i"(g_c_args), [c_top] "i"(&g_c_top),
+           [c_ecx] "i"(&g_c_ecx), [c_edx] "i"(&g_c_edx), [c_fn] "i"(&g_c_fn), [r_eax] "i"(&g_r_eax), [r_edx] "i"(&g_r_edx),
+           [r_ebx] "i"(&g_r_ebx), [r_esi] "i"(&g_r_esi), [r_edi] "i"(&g_r_edi), [r_ebp] "i"(&g_r_ebp), [r_esp] "i"(&g_r_esp),
+           [r_sw] "i"(&g_r_sw), [r_st0] "i"(&g_r_st0));
+}
+#else
 __declspec(naked) static void raw_call() {
     __asm {
         push ebx
@@ -623,6 +674,7 @@ __declspec(naked) static void raw_call() {
         ret
     }
 }
+#endif
 struct Result { int fault; uint32_t code, eip, ret, pops, regs[4], top; double st0; };
 static uint32_t g_fault_code, g_fault_eip;
 static int fault_filter(EXCEPTION_POINTERS* e) {
@@ -633,6 +685,24 @@ static int fault_filter(EXCEPTION_POINTERS* e) {
     g_fault_code = e->ExceptionRecord->ExceptionCode;
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((naked)) static void fill_stack() {
+    __asm__ volatile(
+        "push edi\n\t"
+        "push ecx\n\t"
+        "push eax\n\t"
+        "lea edi, [esp - 4]\n\t"
+        "mov ecx, 0xc000\n\t"
+        "mov eax, 0xcdcdcdcd\n\t"
+        "std\n\t"
+        "rep stosd\n\t"
+        "cld\n\t"
+        "pop eax\n\t"
+        "pop ecx\n\t"
+        "pop edi\n\t"
+        "ret");
+}
+#else
 __declspec(naked) static void fill_stack() {
     __asm {
         push edi
@@ -650,6 +720,7 @@ __declspec(naked) static void fill_stack() {
         ret
     }
 }
+#endif
 static unsigned g_pc;
 __declspec(noinline) static Result run(const Ent& f, bool rewrite, const uint32_t* words) {
     Result r = {};
@@ -661,6 +732,14 @@ __declspec(noinline) static Result run(const Ent& f, bool rewrite, const uint32_
     g_c_n = (uint32_t)f.nstack;
     for (int i = 0; i < f.nstack && i < 64; i++) g_c_args[i] = stack[i];
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+    _controlfp_s(&cw, _MCW_EM, _MCW_EM);
+    _controlfp_s(&cw, g_pc, _MCW_PC);
+    fill_stack();
+    if (vp_try([&] { raw_call(); }, fault_filter)) { r.fault = 1; r.code = g_fault_code; r.eip = g_fault_eip; }
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, g_pc, _MCW_PC);
@@ -669,6 +748,7 @@ __declspec(noinline) static Result run(const Ent& f, bool rewrite, const uint32_
         raw_call();
     } __except (fault_filter(GetExceptionInformation())) { r.fault = 1; r.code = g_fault_code; r.eip = g_fault_eip; }
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     if (!r.fault) {
@@ -1078,11 +1158,19 @@ static uint8_t* g_noaccess;
 static bool game_reads_args(const char* fmt) {
     static char out[0x2000];
     typedef int(__cdecl * VSprintf_t)(char*, const char*, void*);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { ((VSprintf_t)(uintptr_t)0x004cf7c0)(out, fmt, g_noaccess); },
+               [](EXCEPTION_POINTERS* e) { return e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ?
+                                                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH; })) {
+        return true;
+    }
+#else
     __try {
         ((VSprintf_t)(uintptr_t)0x004cf7c0)(out, fmt, g_noaccess);
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         return true;
     }
+#endif
     return false;
 }
 
@@ -1169,6 +1257,18 @@ int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
+#if defined(__GNUC__) && !defined(__clang__)
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* e) __attribute__((stdcall)) -> LONG {   // (GCC: a WINAPI lambda)
+        printf("the test itself crashed: %08lx at %08lx (esp %08lx)\n", e->ExceptionRecord->ExceptionCode,
+               (unsigned long)e->ContextRecord->Eip, (unsigned long)e->ContextRecord->Esp);
+        const uint32_t* sp = (const uint32_t*)(uintptr_t)e->ContextRecord->Esp;
+        for (int i = 0; i < 24; i++) printf(" %08x", sp[i]);
+        printf("\n esi %08lx edi %08lx ecx %08lx\n", (unsigned long)e->ContextRecord->Esi, (unsigned long)e->ContextRecord->Edi,
+               (unsigned long)e->ContextRecord->Ecx);
+        fflush(stdout);
+        ExitProcess(5);
+    });
+#else
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* e) -> LONG {
         printf("the test itself crashed: %08lx at %08lx (esp %08lx)\n", e->ExceptionRecord->ExceptionCode,
                (unsigned long)e->ContextRecord->Eip, (unsigned long)e->ContextRecord->Esp);
@@ -1179,6 +1279,7 @@ int main(int argc, char** argv) {
         fflush(stdout);
         ExitProcess(5);
     });
+#endif
     const int rounds = argc > 1 ? atoi(argv[1]) : 24;
     if (argc > 2) g_rng = ((uint32_t)strtoul(argv[2], 0, 0) * 2654435761u) | 1;
     const bool trace = GetEnvironmentVariableA("VP_TRACE", 0, 0) != 0;

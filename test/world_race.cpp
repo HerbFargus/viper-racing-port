@@ -30,6 +30,9 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #include "../hook/port.h"
 
 // the rewrites, compiled in: each PORT_FN just names the original's address and the footprint function
@@ -497,14 +500,22 @@ template <typename Run, typename Fp> static void check(const char* name, Run run
     g_pass = 0; g_nlog[0] = 0; g_si = 0;
     uint64_t ro = 0, rn = 0;
     int fo = 0, fn = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { ro = run(true); })) { fo = 1; }
+#else
     __try { ro = run(true); } __except (EXCEPTION_EXECUTE_HANDLER) { fo = 1; }
+#endif
     save(g_after);
     if (memcmp(g_after.arena, g_start.arena, ARENA_SIZE) || memcmp(g_after.globals, g_start.globals, GLOBALS_BYTES)) st.changed++;
     load(g_start);
     g_pass = 1; g_nlog[1] = 0; g_si = 0;
     _clearfp();
     _controlfp_s(&cw, _PC_24, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { rn = run(false); })) { fn = 1; }
+#else
     __try { rn = run(false); } __except (EXCEPTION_EXECUTE_HANDLER) { fn = 1; }
+#endif
     if (fo || fn) {
         st.faults++;
         if (fo != fn && st.fails++ < 4) printf("MISMATCH %s (world %d, %s): original %s, rewrite %s\n", name, g_world, g_phase,

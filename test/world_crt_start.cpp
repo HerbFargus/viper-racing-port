@@ -98,6 +98,11 @@
 #define VP_FAITHFUL
 #define VP_CRT_HARNESS              // _WinMainCRTStartup's rewrite doesn't install the islands itself
 #include "../hook/port.h"
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                 // vp_guard: the GCC build's __try / __except
+#include <malloc.h>                 // _resetstkoflw
+#include <math.h>                   // ldexp (MSVC's headers bring it in)
+#endif
 
 struct ChainReg {
     uint32_t at; void* fn; const char* name; ChainReg* next;
@@ -144,6 +149,9 @@ static uint32_t fnv(const void* p, size_t n, uint32_t h = 2166136261u) {
 }
 static uint32_t hs(const char* s) { return s ? fnv(s, strlen(s)) : 0xdead; }
 static uint32_t P(const void* p) { return (uint32_t)(uintptr_t)p; }
+#if defined(__GNUC__) && !defined(__clang__)
+template <class F> static uint32_t P(F* f) { return (uint32_t)(uintptr_t)f; }   // (a function pointer: MSVC converts)
+#endif
 #define G32(va) CRT_G(uint32_t, va)
 #define G8(va) CRT_G(uint8_t, va)
 
@@ -713,7 +721,17 @@ static uint32_t __cdecl misc_c(uint32_t id, uint32_t a1, uint32_t a2) {
         if (a1 != 8) a2 = 0;                           // only SIGFPE's handler is passed a second argument (_fpecode)
         EXCEPTION_POINTERS* ep = (EXCEPTION_POINTERS*)(uintptr_t)G32(CRT_PXCPTINFOPTRS_VA);
         uint32_t code = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+        struct ReadCode { EXCEPTION_POINTERS* ep; uint32_t code; } rc = {ep, 0};
+        if (vp_guard([](void* a) {
+                ReadCode* r = (ReadCode*)a;
+                r->code = r->ep ? r->ep->ExceptionRecord->ExceptionCode : 0;
+            }, &rc))
+            rc.code = 0xbad;
+        code = rc.code;
+#else
         __try { code = ep ? ep->ExceptionRecord->ExceptionCode : 0; } __except (EXCEPTION_EXECUTE_HANDLER) { code = 0xbad; }
+#endif
         lg(E_Signal, id, a1, a2, G32(CRT_FPECODE_VA), code, fnv((void*)(uintptr_t)CRT_XCPTACTTAB_VA, 120));
         if (g_fk.sig_fix && ep && code == EXCEPTION_ACCESS_VIOLATION) ep->ContextRecord->Esi = P(g_valid);
         if (id == 6) G32(CRT_XCPTACTTAB_VA + 8) = (uint32_t)(5 + id);   // a handler that re-arms an entry
@@ -764,6 +782,112 @@ static CallIn g_ci;
 static CallOut g_co;
 static uint32_t g_saved_esp, g_saved_fs0;
 static __declspec(naked) void call_thunk() {
+#if defined(__GNUC__) && !defined(__clang__)
+    // (two statements, split at the call: one would need more than GCC's 30 operands)
+    __asm__ volatile(
+        "pushad\n\t"
+        "mov dword ptr [%c0], esp\n\t"
+        "mov eax, dword ptr fs:[0]\n\t"
+        "mov dword ptr [%c1], eax\n\t"
+        "mov edi, esp\n\t"
+        "sub edi, 4\n\t"
+        "mov ecx, 0x8000\n\t"
+        "mov eax, dword ptr [%c2]\n\t"
+        "std\n\t"
+        "rep stosd\n\t"
+        "cld\n\t"
+        "fninit\n\t"
+        "fldcw word ptr [%c3]\n\t"
+        "test dword ptr [%c4], 1\n\t"
+        "jz pf2%=\n\t"
+        "fld1\n\t"
+        "fldz\n\t"
+        "fdivp st(1), st\n\t"
+        "fstp st(0)\n"
+        "pf2%=:\n\t"
+        "test dword ptr [%c4], 2\n\t"
+        "jz pf4%=\n\t"
+        "fld1\n\t"
+        "fchs\n\t"
+        "fsqrt\n\t"
+        "fstp st(0)\n"
+        "pf4%=:\n\t"
+        "test dword ptr [%c4], 4\n\t"
+        "jz pf_done%=\n\t"
+        "fld1\n\t"
+        "fld1\n\t"
+        "fadd st(0), st(0)\n\t"
+        "fld1\n\t"
+        "faddp st(1), st\n\t"
+        "fld1\n\t"
+        "fdivrp st(1), st\n\t"
+        "fstp st(0)\n"
+        "pf_done%=:\n\t"
+        "mov ecx, dword ptr [%c5]\n"
+        "ld%=:\n\t"
+        "test ecx, ecx\n\t"
+        "jz ld_done%=\n\t"
+        "dec ecx\n\t"
+        "lea eax, [ecx + ecx * 4]\n\t"
+        "lea edx, [%c6]\n\t"
+        "fld tbyte ptr [edx + eax * 2]\n\t"
+        "jmp ld%=\n"
+        "ld_done%=:\n\t"
+        "mov ecx, dword ptr [%c7]\n"
+        "pa%=:\n\t"
+        "test ecx, ecx\n\t"
+        "jz pa_done%=\n\t"
+        "dec ecx\n\t"
+        "lea eax, [%c8]\n\t"
+        "push dword ptr [eax + ecx * 4]\n\t"
+        "jmp pa%=\n"
+        "pa_done%=:\n\t"
+        "mov eax, dword ptr [%c9]\n\t"
+        "test eax, eax\n\t"
+        "jz no_fs%=\n\t"
+        "mov dword ptr fs:[0], eax\n"
+        "no_fs%=:\n\t"
+        "mov dword ptr [%c10], esp\n\t"
+        "mov eax, dword ptr [%c11]\n\t"
+        "mov ecx, dword ptr [%c12]\n\t"
+        "mov edx, dword ptr [%c13]\n\t"
+        "mov ebx, dword ptr [%c14]\n\t"
+        "mov esi, dword ptr [%c15]\n\t"
+        "mov edi, dword ptr [%c16]\n\t"
+        "cmp dword ptr [%c17], 0\n\t"
+        "je keep_ebp%=\n\t"
+        "mov ebp, dword ptr [%c18]\n"
+        "keep_ebp%=:\n\t"
+        "call dword ptr [%c19]"
+        : : "i"(&g_saved_esp), "i"(&g_saved_fs0), "i"(&g_ci.fill), "i"(&g_ci.cw), "i"(&g_ci.preflags),
+            "i"(&g_ci.nst), "i"(&g_ci.st), "i"(&g_ci.nargs), "i"(&g_ci.args), "i"(&g_ci.fs0), "i"(&g_co.esp_before),
+            "i"(&g_ci.eax), "i"(&g_ci.ecx), "i"(&g_ci.edx), "i"(&g_ci.ebx), "i"(&g_ci.esi), "i"(&g_ci.edi),
+            "i"(&g_ci.set_ebp), "i"(&g_ci.ebp), "i"(&g_ci.fn));
+    __asm__ volatile(
+        "mov dword ptr [%c0], eax\n\t"
+        "mov dword ptr [%c1], ecx\n\t"
+        "mov dword ptr [%c2], edx\n\t"
+        "mov dword ptr [%c3], ebx\n\t"
+        "mov dword ptr [%c4], esi\n\t"
+        "mov dword ptr [%c5], edi\n\t"
+        "mov dword ptr [%c6], ebp\n\t"
+        "pushfd\n\t"
+        "pop dword ptr [%c7]\n\t"
+        "mov dword ptr [%c8], esp\n\t"
+        "mov eax, dword ptr fs:[0]\n\t"
+        "mov dword ptr [%c9], eax\n\t"
+        "fnsave [%c10]\n\t"
+        "mov dword ptr [%c11], 0\n\t"
+        "cld\n\t"
+        "mov esp, dword ptr [%c12]\n\t"
+        "mov eax, dword ptr [%c13]\n\t"
+        "mov dword ptr fs:[0], eax\n\t"
+        "popad\n\t"
+        "ret"
+        : : "i"(&g_co.eax), "i"(&g_co.ecx), "i"(&g_co.edx), "i"(&g_co.ebx), "i"(&g_co.esi), "i"(&g_co.edi),
+            "i"(&g_co.ebp), "i"(&g_co.efl), "i"(&g_co.esp_after), "i"(&g_co.fs0_after), "i"(&g_co.save),
+            "i"(&g_co.exited), "i"(&g_saved_esp), "i"(&g_saved_fs0));
+#else
     __asm {
         pushad
         mov g_saved_esp, esp
@@ -860,10 +984,26 @@ static __declspec(naked) void call_thunk() {
         popad
         ret
     }
+#endif
 }
 // ExitProcess (and the event limit): end the pass, back to the thunk's caller
 static uint32_t g_bail_code;
 static __declspec(naked) void bail_back() {
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile(
+        "fnsave [%c0]\n\t"
+        "mov dword ptr [%c1], 1\n\t"
+        "mov eax, dword ptr [%c2]\n\t"
+        "mov dword ptr [%c3], eax\n\t"
+        "cld\n\t"
+        "mov esp, dword ptr [%c4]\n\t"
+        "mov eax, dword ptr [%c5]\n\t"
+        "mov dword ptr fs:[0], eax\n\t"
+        "popad\n\t"
+        "ret"
+        : : "i"(&g_co.save), "i"(&g_co.exited), "i"(&g_bail_code), "i"(&g_co.exit_code), "i"(&g_saved_esp),
+            "i"(&g_saved_fs0));
+#else
     __asm {
         fnsave g_co.save
         mov g_co.exited, 1
@@ -876,6 +1016,7 @@ static __declspec(naked) void bail_back() {
         popad
         ret
     }
+#endif
 }
 static bool g_in_call;
 static void bail_exit(uint32_t code) {
@@ -892,6 +1033,15 @@ static void bail_abort() {
     bail_back();
 }
 static __declspec(noinline) uint32_t run_guarded() {
+#if defined(__GNUC__) && !defined(__clang__)
+    const uint32_t code = vp_guard([](void*) { call_thunk(); }, nullptr);
+    if (code) {
+        __writefsdword(0, g_saved_fs0);        // the SEH chain as __except's unwind leaves it (the thunk's may not be)
+        if (code == EXCEPTION_STACK_OVERFLOW) _resetstkoflw();
+        return code;
+    }
+    return 0;
+#else
     __try {
         call_thunk();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -900,6 +1050,7 @@ static __declspec(noinline) uint32_t run_guarded() {
         return code;
     }
     return 0;
+#endif
 }
 // what a run records
 enum { R_EAX = 1, R_EDX = 2, R_ECX = 4, R_REGS = 8, R_FLAGS = 16, R_X87 = 32, R_ESP = 64, R_CW = 128 };
@@ -927,7 +1078,11 @@ static void run(uint32_t fn, unsigned what) {
     g_fault = f;
     unsigned int cw;
     _clearfp();
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" : : : VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _CW_DEFAULT, 0xffffffff);
     out(f, "fault");
     out(g_co.exited, "exited");
@@ -1231,11 +1386,18 @@ static void rand_ext(uint8_t out[10]) {
         const uint64_t u = rand_double();
         double d = bitsd(u);
         uint8_t* o = out;
+#if defined(__GNUC__) && !defined(__clang__)
+        __asm__ volatile("fld %0\n\t"
+                         "mov eax, %1\n\t"
+                         "fstp tbyte ptr [eax]"
+                         : : "m"(d), "m"(o) : VP_X87_CLOBBERS, "eax", "memory");
+#else
         __asm {
             fld qword ptr d
             mov eax, o
             fstp tbyte ptr [eax]
         }
+#endif
         if ((u & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (u & 0xfffffffffffffull) && chance(50)) {
             out[7] &= 0xbf;                                                                // signalling again
             out[0] |= 1;
@@ -1294,11 +1456,18 @@ static int __stdcall wm_c(uint32_t hinst, uint32_t prev, const char* cmd, int sh
     return (int)g_fk.winmain_ret;
 }
 static __declspec(naked) void wm_entry() {
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("mov dword ptr [%c0], ebp\n\t"
+                     "mov dword ptr [%c1], esp\n\t"
+                     "jmp %P2"
+                     : : "i"(&g_wm_ebp), "i"(&g_wm_esp), "i"(&wm_c));
+#else
     __asm {
         mov g_wm_ebp, ebp
         mov g_wm_esp, esp
         jmp wm_c
     }
+#endif
 }
 
 // ---- the world's random parts ------------------------------------------------------------------------------------------

@@ -41,11 +41,19 @@ enum Id : uint16_t {
     I_GetDrawableSize, I_SetView,
 };
 
+#ifdef VP_GCC
+__thread int t_direct;                       // inside glr::Direct: the start-up's calls
+#else
 __declspec(thread) int t_direct;                       // inside glr::Direct: the start-up's calls
+#endif
 
 // what the calls hand back, queued by the original's pass for the rewrite's (per check, per thread)
 struct Feed { unsigned check = ~0u; int ph = 0; std::vector<uint8_t> q; size_t at = 0; };
+#ifdef VP_GCC
+__thread Feed* t_feed;
+#else
 __declspec(thread) Feed* t_feed;
+#endif
 
 int phase() {
     if (t_direct) return 0;

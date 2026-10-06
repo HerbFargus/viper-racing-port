@@ -26,6 +26,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
 #define VP_TEST_FIXES
 #endif
@@ -210,6 +213,16 @@ static int run(bool orig) {
     _controlfp_s(&cw, _PC_24, _MCW_PC);
     if (g_physics_masks) _controlfp_s(&cw, _EM_INVALID | _EM_UNDERFLOW | _EM_INEXACT | _EM_DENORMAL, _MCW_EM);
     int fault = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+            void* v = W.vol;
+            if (orig) ((void(__fastcall*)(void*, int))(uintptr_t)(g_cube ? 0x00432980 : 0x004324d0))(v, 0);
+            else if (g_cube) CubeVolume_CollideGround((CubeVolume*)v, 0);
+            else SphereVolume_CollideGround((SphereVolume*)v, 0);
+            volatile float z = 1.0f;
+            z = z + 0.0f;                                           // a pending x87 exception is raised here
+        }, filt)) { fault = 1; _fpreset(); }
+#else
     __try {
         void* v = W.vol;
         if (orig) ((void(__fastcall*)(void*, int))(uintptr_t)(g_cube ? 0x00432980 : 0x004324d0))(v, 0);
@@ -218,6 +231,7 @@ static int run(bool orig) {
         volatile float z = 1.0f;
         z = z + 0.0f;                                               // a pending x87 exception is raised here
     } __except (filt(GetExceptionInformation())) { fault = 1; _fpreset(); }
+#endif
     _controlfp_s(&cw, _CW_DEFAULT, 0xffffffff);
     _clearfp();
     return fault;

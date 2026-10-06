@@ -46,6 +46,9 @@
 #include <vector>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                                 // the original's behaviour, bit for bit (the fixes: /DFIX_TESTS)
 #endif
@@ -755,6 +758,15 @@ static int crash_filter(EXCEPTION_POINTERS* e, bool orig) {
            e->ExceptionRecord->ExceptionCode, e->ExceptionRecord->ExceptionAddress);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+template <typename Run> static uint64_t guarded(Run& run, bool orig) {
+    uint64_t r = 0;
+    if (vp_try([&] { r = run(orig); }, [&](EXCEPTION_POINTERS* e) { return crash_filter(e, orig); })) {
+        return 0xdeaddeaddeaddeadull;
+    }
+    return r;
+}
+#else
 template <typename Run> static uint64_t guarded(Run& run, bool orig) {
     __try {
         return run(orig);
@@ -762,6 +774,7 @@ template <typename Run> static uint64_t guarded(Run& run, bool orig) {
         return 0xdeaddeaddeaddeadull;
     }
 }
+#endif
 static void reset_pass(uint32_t seed, int pass) {
     g_script = seed;
     g_heap_next = 0;
@@ -784,14 +797,22 @@ template <typename Run, typename Fp> static void check(const char* name, Run run
     g_running = name;
     uint64_t ro = expect_crash ? 0 : guarded(run, true);
     if (expect_crash) {
+#if defined(__GNUC__) && !defined(__clang__)
+        if (vp_try([&] { ro = run(true); })) { ro = 0xdeaddeaddeaddeadull; }
+#else
         __try { ro = run(true); } __except (EXCEPTION_EXECUTE_HANDLER) { ro = 0xdeaddeaddeaddeadull; }
+#endif
     }
     snapshot(g_after);
     restore(g_start);
     reset_pass(seed, 1);
     uint64_t rn = 0;
     if (expect_crash) {
+#if defined(__GNUC__) && !defined(__clang__)
+        if (vp_try([&] { rn = run(false); })) { rn = 0xdeaddeaddeaddeadull; }
+#else
         __try { rn = run(false); } __except (EXCEPTION_EXECUTE_HANDLER) { rn = 0xdeaddeaddeaddeadull; }
+#endif
     } else {
         rn = guarded(run, false);
     }
@@ -1088,7 +1109,11 @@ static void run_fix_tests() {
         reset_pass(seed, 0);
         g_mustloads = g_aicarsetups = 0;
         uint8_t ro = 0xee;
+#if defined(__GNUC__) && !defined(__clang__)
+        if (vp_try([&] { ro = GameBeginSingle_orig(w); })) { ro = 0xee; }
+#else
         __try { ro = GameBeginSingle_orig(w); } __except (EXCEPTION_EXECUTE_HANDLER) { ro = 0xee; }
+#endif
         if (ro != 1) { restore(g_start); continue; }          // the menu was left: nothing set up
         if (c == L_SOME_NOTES || c == L_ALL_NOTES) {          // the notes of the drivers of the track and strength chosen
             g_quiet = true;
@@ -1124,7 +1149,11 @@ static void run_fix_tests() {
         g_mustloads = g_aicarsetups = 0;
         const int allocs_before = g_host_allocs;
         uint8_t rn = 0xee;
+#if defined(__GNUC__) && !defined(__clang__)
+        if (vp_try([&] { rn = GameBeginSingle(w); })) { rn = 0xee; }
+#else
         __try { rn = GameBeginSingle(w); } __except (EXCEPTION_EXECUTE_HANDLER) { rn = 0xee; }
+#endif
         hook_loadrace(false);
         FIXCHECK(rn == 1, "case %s: the fixed GameBeginSingle returned %d", k_case_names[c], rn);
         FIXCHECK(g_host_allocs == allocs_before, "case %s: the line check leaked %d allocations", k_case_names[c], g_host_allocs - allocs_before);

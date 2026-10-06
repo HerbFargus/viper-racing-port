@@ -33,18 +33,37 @@ static inline float fbits(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 // fld dword; fchs; fstp dword -- through the FPU (a signalling NaN comes out quiet), as the original does
 static __forceinline float fpu_neg(const float* p) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[p]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fchs\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [p] "m"(p)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { mov eax, p
             fld dword ptr [eax]
             fchs
             fstp r }
+#endif
     return r;
 }
 // fld dword; fstp dword -- a copy through the FPU
 static __forceinline float fpu_copy(const float* p) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[p]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [p] "m"(p)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { mov eax, p
             fld dword ptr [eax]
             fstp r }
+#endif
     return r;
 }
 

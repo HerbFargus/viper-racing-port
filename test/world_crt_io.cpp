@@ -66,6 +66,9 @@
 #include <functional>
 #define VP_FAITHFUL
 #include "../hook/port.h"
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                 // vp_guard: the GCC build's __try / __except
+#endif
 
 struct ChainReg {
     uint32_t at; void* fn; const char* name; ChainReg* next;
@@ -565,12 +568,16 @@ static void __cdecl fatal_amsg(int code) {
 
 // ---- fault guard ---------------------------------------------------------------------------------------------------------
 template <typename F> static __declspec(noinline) DWORD guarded(F&& f) {
+#if defined(__GNUC__) && !defined(__clang__)
+    return vp_guard([](void* p) { (*(F*)p)(); }, (void*)&f);
+#else
     __try {
         f();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
     }
     return 0;
+#endif
 }
 
 // ---- the state every pass starts from -------------------------------------------------------------------------------------
@@ -671,6 +678,67 @@ static FpuOut g_fout;
 static uint32_t g_ftarget, g_fsaved_esp, g_fesp_before, g_fesp_after, g_fr[4];
 static const uint8_t k_zero10[10] = {};
 static __declspec(naked) void fpu_thunk() {
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile(
+        "pushad\n\t"
+        "mov dword ptr [%c0], esp\n\t"
+        "sub esp, 0x800\n\t"
+        "mov edi, esp\n\t"
+        "xor eax, eax\n\t"
+        "mov ecx, 0x200\n\t"
+        "cld\n\t"
+        "rep stosd\n\t"
+        "add esp, 0x800\n\t"
+        "finit\n\t"
+        "fldz\n\t"
+        "fldz\n\t"
+        "fldz\n\t"
+        "fldz\n\t"
+        "fldz\n\t"
+        "fldz\n\t"
+        "fldz\n\t"
+        "fldz\n\t"
+        "finit\n\t"
+        "fldcw word ptr [%c1]\n\t"
+        "mov ecx, dword ptr [%c2]\n"
+        "ld%=:\n\t"
+        "test ecx, ecx\n\t"
+        "jz loaded%=\n\t"
+        "dec ecx\n\t"
+        "lea eax, [ecx + ecx * 4]\n\t"
+        "fld tbyte ptr [%c3 + eax * 2]\n\t"
+        "jmp ld%=\n"
+        "loaded%=:\n\t"
+        "mov ecx, dword ptr [%c4]\n\t"
+        "cmp ecx, 2\n\t"
+        "jne one%=\n\t"
+        "push dword ptr [%c5 + 4]\n\t"
+        "push dword ptr [%c5]\n\t"
+        "jmp go%=\n"
+        "one%=:\n\t"
+        "cmp ecx, 1\n\t"
+        "jne go%=\n\t"
+        "push dword ptr [%c5]\n"
+        "go%=:\n\t"
+        "mov dword ptr [%c6], esp\n\t"
+        "mov eax, dword ptr [%c7]\n\t"
+        "mov ecx, 0x11111111\n\t"
+        "mov edx, 0x22222222\n\t"
+        "mov ebx, 0x33333333\n\t"
+        "call dword ptr [%c8]\n\t"
+        "mov dword ptr [%c9], esp\n\t"
+        "mov dword ptr [%c10], eax\n\t"
+        "mov dword ptr [%c10 + 4], ecx\n\t"
+        "mov dword ptr [%c10 + 8], edx\n\t"
+        "mov dword ptr [%c10 + 12], ebx\n\t"
+        "fnsave [%c11]\n\t"
+        "mov esp, dword ptr [%c0]\n\t"
+        "popad\n\t"
+        "ret"
+        : : "i"(&g_fsaved_esp), "i"(&g_fin.cw), "i"(&g_fin.depth), "i"(&g_fin.reg), "i"(&g_fin.nargs),
+            "i"(&g_fin.arg), "i"(&g_fesp_before), "i"(&g_fin.eax), "i"(&g_ftarget), "i"(&g_fesp_after), "i"(&g_fr),
+            "i"(&g_fout.save));
+#else
     __asm {
         pushad
         mov g_fsaved_esp, esp
@@ -728,14 +796,19 @@ static __declspec(naked) void fpu_thunk() {
         popad
         ret
     }
+#endif
 }
 static __declspec(noinline) DWORD run_fpu_guarded() {
+#if defined(__GNUC__) && !defined(__clang__)
+    return vp_guard([](void*) { fpu_thunk(); }, nullptr);
+#else
     __try {
         fpu_thunk();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
     }
     return 0;
+#endif
 }
 static void run_fpu(uint32_t target, FpuOut& out) {
     g_ftarget = target;
@@ -743,7 +816,11 @@ static void run_fpu(uint32_t target, FpuOut& out) {
     const DWORD f = run_fpu_guarded();
     unsigned int cw;
     _clearfp();
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" : : : VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _CW_DEFAULT, 0xffffffff);
     g_fout.fault = f;
     if (!f) {

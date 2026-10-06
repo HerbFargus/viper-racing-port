@@ -51,6 +51,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #ifndef VP_SND_FIXES                // (built with /DVP_SND_FIXES: the fixes on, and tested -- see main)
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
@@ -992,16 +995,31 @@ static int run_guarded(Kind k, bool rw, uint64_t* ret) {
     g_task = g_world_task;
     g_in_tick = false;
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, g_pc, _MCW_PC);
     if (g_unmask) _controlfp_s(&cw, _MCW_EM & ~(_EM_OVERFLOW | _EM_ZERODIVIDE), _MCW_EM);
     int fault = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+        *ret = call_kind(k, rw);
+        __asm__ volatile("fwait" ::: VP_X87_CLOBBERS, "memory");
+    }, fault_filter)) { fault = 1; }
+#else
     __try {
         *ret = call_kind(k, rw);
         __asm fwait
     } __except (fault_filter(GetExceptionInformation())) { fault = 1; }
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     return fault;
@@ -1025,17 +1043,32 @@ static int guarded(void (*fn)(), bool unmask, int32_t task) {
     g_task = task;
     g_in_tick = false;
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_24, _MCW_PC);                              // (the BG thread's precision)
     if (unmask) _controlfp_s(&cw, _MCW_EM & ~(_EM_OVERFLOW | _EM_ZERODIVIDE), _MCW_EM);
     int fault = 0;
     g_t_fault = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+        fn();
+        __asm__ volatile("fwait" ::: VP_X87_CLOBBERS, "memory");
+    }, fault_filter)) { fault = 1; g_t_fault = g_fault_code; }
+#else
     __try {
         fn();
         __asm fwait
     } __except (fault_filter(GetExceptionInformation())) { fault = 1; g_t_fault = g_fault_code; }
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     return fault;
@@ -1513,11 +1546,19 @@ int main(int argc, char** argv) {
         g_unmask = chance(30);
         if (g_unmask) unmasked_runs++;
         if (trace) printf("world %d: %s\n", it, kind_names[kind]);
+#if defined(__GNUC__) && !defined(__clang__)
+        if (vp_try([&] { footprint_of(kind, fp); })) {
+            printf("  FOOTPRINT world %d (%s): the footprint function faulted\n", it, kind_names[kind]);
+            fp_bad++;
+            continue;
+        }
+#else
         __try { footprint_of(kind, fp); } __except (EXCEPTION_EXECUTE_HANDLER) {
             printf("  FOOTPRINT world %d (%s): the footprint function faulted\n", it, kind_names[kind]);
             fp_bad++;
             continue;
         }
+#endif
         if (fp.replay_only) replay_only++;
         memcpy(g_arena_snap, g_arena, ARENA_BYTES);
         memcpy(g_data_snap, DATA, DATA_BYTES);

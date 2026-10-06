@@ -27,8 +27,16 @@ static __forceinline uint32_t bits(float x) { uint32_t u; memcpy(&u, &x, 4); ret
 // fld / fstp dword: a value the original copies through the FPU (the clamps in collide_sphere_box)
 static __forceinline float x87_float(double x) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[x]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld x
             fstp r }
+#endif
     return r;
 }
 

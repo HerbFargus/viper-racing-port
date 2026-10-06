@@ -71,6 +71,9 @@
 // goes wrong there. (A name typed to the save dialog's limit is compared with the original outright: its frame holds
 // the field's 64 bytes.) Without it (VP_FAITHFUL) every rewrite must match its original bit for bit.
 #define _CRT_SECURE_NO_WARNINGS
+#if defined(__GNUC__) && !defined(__clang__)
+#define _WIN32_WINNT 0x0A00               // (mingw: GetCurrentThreadStackLimits)
+#endif
 #include <windows.h>
 #include <float.h>
 #include <math.h>
@@ -82,6 +85,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #ifndef VP_MENU_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
@@ -604,6 +610,52 @@ static uint32_t g_c_fn, g_c_ecx, g_c_edx, g_c_n, g_c_args[64];
 static uint32_t g_r_eax, g_r_edx, g_r_ebx, g_r_esi, g_r_edi, g_r_ebp, g_r_esp, g_c_top, g_save_esp;
 static uint16_t g_r_sw;
 static double g_r_st0;
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((naked)) static void raw_call() {
+    __asm__ volatile(
+        "push ebx\n\t"
+        "push esi\n\t"
+        "push edi\n\t"
+        "push ebp\n\t"
+        "mov dword ptr [%P[save_esp]], esp\n\t"
+        "sub esp, 0x200\n\t"  // the callee's frame well inside what fill_stack filled
+        "mov ecx, dword ptr [%P[c_n]]\n"
+        "1:\n\t"
+        "test ecx, ecx\n\t"
+        "jz 2f\n\t"
+        "dec ecx\n\t"
+        "push dword ptr [%P[c_args] + ecx * 4]\n\t"
+        "jmp 1b\n"
+        "2:\n\t"
+        "mov dword ptr [%P[c_top]], esp\n\t"
+        "mov ebx, 0x0b0b0b0b\n\t"
+        "mov esi, 0x05050505\n\t"
+        "mov edi, 0x0d0d0d0d\n\t"
+        "mov ebp, 0x0e0e0e0e\n\t"
+        "mov ecx, dword ptr [%P[c_ecx]]\n\t"
+        "mov edx, dword ptr [%P[c_edx]]\n\t"
+        "call dword ptr [%P[c_fn]]\n\t"
+        "mov dword ptr [%P[r_eax]], eax\n\t"
+        "mov dword ptr [%P[r_edx]], edx\n\t"
+        "mov dword ptr [%P[r_ebx]], ebx\n\t"
+        "mov dword ptr [%P[r_esi]], esi\n\t"
+        "mov dword ptr [%P[r_edi]], edi\n\t"
+        "mov dword ptr [%P[r_ebp]], ebp\n\t"
+        "mov dword ptr [%P[r_esp]], esp\n\t"
+        "fnstsw word ptr [%P[r_sw]]\n\t"
+        "fst qword ptr [%P[r_st0]]\n\t"
+        "mov esp, dword ptr [%P[save_esp]]\n\t"
+        "pop ebp\n\t"
+        "pop edi\n\t"
+        "pop esi\n\t"
+        "pop ebx\n\t"
+        "ret"
+        :: [save_esp] "i"(&g_save_esp), [c_n] "i"(&g_c_n), [c_args] "i"(g_c_args), [c_top] "i"(&g_c_top), [c_ecx] "i"(&g_c_ecx),
+           [c_edx] "i"(&g_c_edx), [c_fn] "i"(&g_c_fn), [r_eax] "i"(&g_r_eax), [r_edx] "i"(&g_r_edx), [r_ebx] "i"(&g_r_ebx),
+           [r_esi] "i"(&g_r_esi), [r_edi] "i"(&g_r_edi), [r_ebp] "i"(&g_r_ebp), [r_esp] "i"(&g_r_esp), [r_sw] "i"(&g_r_sw),
+           [r_st0] "i"(&g_r_st0));
+}
+#else
 __declspec(naked) static void raw_call() {
     __asm {
         push ebx
@@ -645,6 +697,7 @@ __declspec(naked) static void raw_call() {
         ret
     }
 }
+#endif
 struct Result { int fault; uint32_t code, eip, ret, pops, regs[4], top; double st0; };
 static uint32_t g_fault_code, g_fault_eip;
 static int fault_filter(EXCEPTION_POINTERS* e) {
@@ -695,6 +748,23 @@ __declspec(noinline) static Result run(const Ent& f, bool rewrite, const uint32_
     g_c_n = (uint32_t)f.nstack;
     for (int i = 0; i < f.nstack && i < 64; i++) g_c_args[i] = stack[i];
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+    _controlfp_s(&cw, _MCW_EM, _MCW_EM);
+    _controlfp_s(&cw, g_pc, _MCW_PC);
+    if (g_unmask) _controlfp_s(&cw, 0, g_unmask);
+    fill_stack();                                         // (after the _controlfp_s calls, whose frames it would leave behind)
+    if (vp_try([&] {
+        g_wd_deadline = GetTickCount() + 2000;
+        g_wd_armed = 1;
+        raw_call();
+        g_wd_armed = 0;
+    }, fault_filter)) {
+        g_wd_armed = 0;
+        r.fault = 1; r.code = g_fault_code; r.eip = g_fault_code == 0xe0000d06u ? g_hang_eip : g_fault_eip;
+    }
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, g_pc, _MCW_PC);
@@ -710,6 +780,7 @@ __declspec(noinline) static Result run(const Ent& f, bool rewrite, const uint32_
         r.fault = 1; r.code = g_fault_code; r.eip = g_fault_code == 0xe0000d06u ? g_hang_eip : g_fault_eip;
     }
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     if (!r.fault) {

@@ -137,21 +137,42 @@ static __forceinline int setup_changed() {
 static __forceinline float sin_deg_f(float x) {
     float r;
     static const uint32_t k = 0x3c8efa35u;               // 0.017453292f
+#ifdef VP_GCC
+    __asm__ volatile("fld %[x]\n\t"
+                     "fmul %[k]\n\t"
+                     "fsin\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x), [k] "m"(k)
+                     : VP_X87_CLOBBERS);
+#else
     __asm { fld x
             fmul dword ptr k
             fsin
             fstp r }
+#endif
     return r;
 }
 // tan(x * pi/180) as fptan gives it (the 1.0 it pushes popped), stored to a float
 static __forceinline float tan_deg_f(float x) {
     float r;
     static const uint32_t k = 0x3c8efa35u;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[x]\n\t"
+                     "fmul %[k]\n\t"
+                     "fptan\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x), [k] "m"(k)
+                     : VP_X87_CLOBBERS);
+#else
     __asm { fld x
             fmul dword ptr k
             fptan
             fstp st(0)
             fstp r }
+#endif
     return r;
 }
 // the tire graph's point: the lateral force at a slip angle (degrees), for a load and a camber
@@ -1171,33 +1192,67 @@ static __forceinline double sin_store_mul(volatile float* a, double k) {
     const float x = *a;
     float s;
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[x]\n\t"
+                     "fsin\n\t"
+                     "fst %[s]\n\t"
+                     "fmul %[k]\n\t"
+                     "fstp %[r]"
+                     : [s] "=m"(s), [r] "=m"(r)
+                     : [x] "m"(x), [k] "m"(k)
+                     : VP_X87_CLOBBERS);
+#else
     __asm { fld x
             fsin
             fst s
             fmul k
             fstp r }
+#endif
     *a = s;
     return r;
 }
 // fild n; fld a; fcos; fmul st(1) -> cos(a) * n (the n left in st(1): the caller's next fsin uses it too)
 static __forceinline double cos_mul_i(float a, int32_t n) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fild %[n]\n\t"
+                     "fld %[a]\n\t"
+                     "fcos\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fstp %[r]\n\t"
+                     "fstp st(0)"
+                     : [r] "=m"(r)
+                     : [n] "m"(n), [a] "m"(a)
+                     : VP_X87_CLOBBERS);
+#else
     __asm { fild n
             fld a
             fcos
             fmul st, st(1)
             fstp r
             fstp st(0) }
+#endif
     return r;
 }
 // fld a; fsin; fmulp st(1) with the n from fild, the product stored (fst) and returned
 static __forceinline double sin_mul_i(float a, int32_t n) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fild %[n]\n\t"
+                     "fld %[a]\n\t"
+                     "fsin\n\t"
+                     "fmulp st(1), st\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [n] "m"(n), [a] "m"(a)
+                     : VP_X87_CLOBBERS);
+#else
     __asm { fild n
             fld a
             fsin
             fmulp st(1), st
             fstp r }
+#endif
     return r;
 }
 

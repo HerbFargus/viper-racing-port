@@ -363,11 +363,22 @@ PORT_FN(0x004134d0, "prof_stop", prof_stop_rw, fp_prof_stop)
 // idiv: faults on 0 and on a quotient past 32 bits, as the original
 static int __cdecl li_div_rw(LARGE_INTEGER* a, int d) {
     int r;
+#ifdef VP_GCC
+    __asm__ volatile("mov ecx, %[a]\n\t"
+                     "mov eax, [ecx]\n\t"
+                     "mov edx, [ecx + 4]\n\t"
+                     "idiv %[d]\n\t"
+                     "mov %[r], eax"
+                     : [r] "=m"(r)
+                     : [a] "m"(a), [d] "m"(d)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm { mov ecx, a
             mov eax, [ecx]
             mov edx, [ecx + 4]
             idiv d
             mov r, eax }
+#endif
     return r;
 }
 // not fuzzed (a random divisor faults): checked by the harness; writes nothing
@@ -411,6 +422,30 @@ static __declspec(noinline) int32_t tsc_rate(uint32_t over, uint32_t freq, uint3
     uint32_t q[2] = {0, 0};
     uint16_t cw, chop;
     int64_t r;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[over]\n\t"
+                     "mov %[q0], eax\n\t"
+                     "fild %[q]\n\t"
+                     "mov eax, %[freq]\n\t"
+                     "mov %[q0], eax\n\t"
+                     "fild %[q]\n\t"
+                     "fdivp st(1), st\n\t"
+                     "fadd %[one]\n\t"
+                     "mov eax, %[delta]\n\t"
+                     "mov %[q0], eax\n\t"
+                     "fild %[q]\n\t"
+                     "fdivrp st(1), st\n\t"
+                     "fnstcw %[cw]\n\t"
+                     "mov ax, %[cw]\n\t"
+                     "or ah, 0x0c\n\t"
+                     "mov %[chop], ax\n\t"
+                     "fldcw %[chop]\n\t"
+                     "fistp %[r]\n\t"
+                     "fldcw %[cw]"
+                     : [q] "+m"(q), [q0] "+m"(q[0]), [cw] "=m"(cw), [chop] "=m"(chop), [r] "=m"(r)
+                     : [over] "m"(over), [freq] "m"(freq), [delta] "m"(delta), [one] "m"(one)
+                     : VP_X87_CLOBBERS, "eax", "cc");
+#else
     __asm { mov eax, over
             mov q, eax
             fild qword ptr q
@@ -430,6 +465,7 @@ static __declspec(noinline) int32_t tsc_rate(uint32_t over, uint32_t freq, uint3
             fldcw chop
             fistp qword ptr r
             fldcw cw }
+#endif
     return (int32_t)r;
 }
 
@@ -514,19 +550,38 @@ static __forceinline double prof_pct(uint32_t ms, const float* total) {
     static const uint32_t k100 = 0x42c80000;         // 100.0f (0x4db450)
     uint32_t q[2] = {ms, 0};
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fild %[q]\n\t"
+                     "fmul %[k100]\n\t"
+                     "mov eax, %[total]\n\t"
+                     "fdiv dword ptr [eax]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [q] "m"(q), [k100] "m"(k100), [total] "m"(total)
+                     : VP_X87_CLOBBERS, "eax", "memory");
+#else
     __asm { fild qword ptr q
             fmul dword ptr k100
             mov eax, total
             fdiv dword ptr [eax]
             fstp r }
+#endif
     return r;
 }
 // fild qword (the total, zero-extended); fstp dword
 static __forceinline float u32_to_float(uint32_t v) {
     uint32_t q[2] = {v, 0};
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("fild %[q]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [q] "m"(q)
+                     : VP_X87_CLOBBERS);
+#else
     __asm { fild qword ptr q
             fstp r }
+#endif
     return r;
 }
 // ticks -> ms, as the report inlines it: hi * (ms per 2^32 ticks) + lo / ticks per ms (div: faults when 0)
@@ -753,6 +808,27 @@ HARNESS_ONLY_FN(0x004188ad, "rdtsc", rdtsc_rw, fp_reads_tsc)
 // can EFLAGS.ID (bit 21) be toggled? (restores the flags)
 static int __cdecl isCpuidSupported_rw() {
     int r;
+#ifdef VP_GCC
+    __asm__ volatile("pushfd\n\t"
+                     "pushfd\n\t"
+                     "pop eax\n\t"
+                     "mov ecx, eax\n\t"
+                     "xor eax, 0x200000\n\t"
+                     "push eax\n\t"
+                     "popfd\n\t"
+                     "pushfd\n\t"
+                     "pop eax\n\t"
+                     "popfd\n\t"
+                     "xor edx, edx\n\t"
+                     "cmp ecx, eax\n\t"
+                     "je same%=\n\t"
+                     "inc edx\n"
+                     "same%=:\n\t"
+                     "mov %[r], edx"
+                     : [r] "=m"(r)
+                     :
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc");
+#else
     __asm { pushfd
             pushfd
             pop eax
@@ -769,6 +845,7 @@ static int __cdecl isCpuidSupported_rw() {
             inc edx
           same:
             mov r, edx }
+#endif
     return r;
 }
 PORT_FN(0x004188b0, "isCpuidSupported", isCpuidSupported_rw, fp_pure0)

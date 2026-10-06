@@ -62,6 +62,9 @@
 #include <utility>
 #include <vector>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                      // the original's behaviour, bit for bit (the fixes: /DFIX_TESTS)
 #endif
@@ -85,6 +88,26 @@ template <typename T> static T cv(uint32_t v) {
     else return (T)v;
 }
 template <typename F> struct Inv;
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC drops a calling convention from the type of a non-type template parameter (`Fn NEW` would become a __cdecl
+// pointer that a __stdcall/__fastcall rewrite doesn't convert to): take NEW as `auto` (it keeps its own type, = Fn)
+#define INV_CC(CC)                                                                                                     \
+    template <typename R, typename... Args> struct Inv<R(CC*)(Args...)> {                                             \
+        typedef R(CC* Fn)(Args...);                                                                                    \
+        enum { N = sizeof...(Args) };                                                                                  \
+        template <auto NEW, void (*FP)(Footprint&, Args...), size_t... I>                                              \
+        static uint64_t go(int rw, uint32_t at, const uint32_t* a, Footprint* f, std::index_sequence<I...>) {          \
+            if (f) { FP(*f, cv<Args>(a[I])...); return 0; }                                                            \
+            Fn fn = rw ? NEW : (Fn)(uintptr_t)at;                                                                      \
+            if constexpr (std::is_void_v<R>) { fn(cv<Args>(a[I])...); return 0; }                                     \
+            else { R r = fn(cv<Args>(a[I])...); uint64_t u = 0; memcpy(&u, &r, sizeof r); return u; }                  \
+        }                                                                                                              \
+        template <auto NEW, void (*FP)(Footprint&, Args...)>                                                           \
+        static uint64_t run(int rw, uint32_t at, const uint32_t* a, Footprint* f) {                                    \
+            return go<NEW, FP>(rw, at, a, f, std::index_sequence_for<Args...>{});                                      \
+        }                                                                                                              \
+    };
+#else
 #define INV_CC(CC)                                                                                                     \
     template <typename R, typename... Args> struct Inv<R(CC*)(Args...)> {                                             \
         typedef R(CC* Fn)(Args...);                                                                                    \
@@ -101,6 +124,7 @@ template <typename F> struct Inv;
             return go<NEW, FP>(rw, at, a, f, std::index_sequence_for<Args...>{});                                      \
         }                                                                                                              \
     };
+#endif
 INV_CC(__cdecl)
 INV_CC(__fastcall)
 INV_CC(__stdcall)
@@ -296,6 +320,44 @@ enum { LOG_CAP = 1 << 20 };
 static void lg(uint32_t v) {
     if (g_log[g_pass].size() < LOG_CAP) g_log[g_pass].push_back(v);
 }
+#if defined(__GNUC__) && !defined(__clang__)
+static uint32_t safe_hash(const void* p, uint32_t n) {
+    if (!p) return 0xdeadbeef;
+    uint32_t r = 0;
+    if (vp_try([&] { r = fnv(p, n); })) return 0xbadbad;
+    return r;
+}
+static uint32_t safe_hash_str(const char* s, int max = 512) {
+    if (!s) return 0xdeadbeef;
+    uint32_t h = 2166136261u;
+    if (vp_try([&] {
+            volatile uint32_t& vh = h;                   // its value at a fault stays in memory
+            for (int i = 0; i < max && s[i]; i++) vh = (vh ^ (uint8_t)s[i]) * 16777619u;
+        })) { h ^= 0xbadbad; }
+    return h;
+}
+static void lg_fmt(const char* fmt, va_list ap) {
+    lg(aoff(fmt));
+    lg(safe_hash_str(fmt));
+    if (vp_try([&] {
+            for (const char* p = fmt; *p; p++) {
+                if (*p != '%') continue;
+                p++;
+                while (*p && strchr("-+ #0123456789.lh", *p)) p++;
+                if (!*p) break;
+                if (*p == '%') continue;
+                if (*p == 's') lg(safe_hash_str(va_arg(ap, const char*)));
+                else if (*p == 'f' || *p == 'g' || *p == 'e') {
+                    double d = va_arg(ap, double);
+                    uint32_t u[2];
+                    memcpy(u, &d, 8);
+                    lg(u[0]);
+                    lg(u[1]);
+                } else lg(va_arg(ap, uint32_t));
+            }
+        })) { lg(0xbadf0); }
+}
+#else
 static uint32_t safe_hash(const void* p, uint32_t n) {
     if (!p) return 0xdeadbeef;
     __try {
@@ -331,6 +393,7 @@ static void lg_fmt(const char* fmt, va_list ap) {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { lg(0xbadf0); }
 }
+#endif
 enum : uint32_t {
     K_REPORT = 0x4b000001, K_PANIC, K_ALLOC, K_FREE, K_IDLE, K_TIME, K_WINDOW, K_CANVAS, K_TFLUSH, K_TSELECT, K_TALPHA,
     K_EXIT, K_DDCREATE, K_DDENUM, K_DDENUM_CB, K_MODES_CB, K_TEXFMT_CB, K_CB_RET, K_BADSLOT,
@@ -1043,6 +1106,21 @@ static int fault_filter(EXCEPTION_POINTERS* e) {
     g_fault_at = (uint32_t)(uintptr_t)e->ExceptionRecord->ExceptionAddress;
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+static int guarded(Reg* r, int rw, const uint32_t* a, uint64_t* ret) {
+    if (vp_try([&] { *ret = r->run(rw, r->at, a, 0); }, fault_filter)) {
+        _fpreset();
+        if (g_fault_code == PANIC_CODE) return 1;
+        if (g_fault_code == EXIT_CODE) return 3;
+        return 2;
+    }
+    return 0;
+}
+static int guarded_fp(Reg* r, const uint32_t* a, Footprint* f) {
+    if (vp_try([&] { r->run(0, r->at, a, f); })) { return 1; }
+    return 0;
+}
+#else
 static int guarded(Reg* r, int rw, const uint32_t* a, uint64_t* ret) {
     __try {
         *ret = r->run(rw, r->at, a, 0);
@@ -1062,6 +1140,7 @@ static int guarded_fp(Reg* r, const uint32_t* a, Footprint* f) {
         return 1;
     }
 }
+#endif
 
 struct Stat { std::string name; long n, bad, faults, panics, exits, ronly, fpbad, fpfault, fault_state; };
 static std::vector<Stat> g_stats;
@@ -1274,6 +1353,11 @@ static uint64_t ck(uint32_t at, std::initializer_list<uint32_t> args) {
 // ---- the world: the wrappers the statics point at, and buffers for arguments --------------------------------------------
 static uint32_t g_world_top;
 static uint32_t U(const void* p) { return (uint32_t)(uintptr_t)p; }
+#if defined(__GNUC__) && !defined(__clang__)
+// (MSVC converts a function pointer to const void* implicitly; GCC doesn't)
+template <typename F, typename = std::enable_if_t<std::is_function_v<std::remove_pointer_t<F>>>>
+static uint32_t U(F p) { return (uint32_t)(uintptr_t)p; }
+#endif
 static uint8_t* wbuf(uint32_t n, int fill = -1) {       // a buffer in the world (random, or a fill byte)
     n = (n + 15) & ~15u;
     if (g_world_top + n > WORLD_SIZE) g_world_top = 0x10000;

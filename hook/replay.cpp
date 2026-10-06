@@ -42,6 +42,9 @@
 #include "viperport.h"
 #include "port.h"
 #include "session.h"
+#ifdef VP_GCC
+#define _ReturnAddress() __builtin_return_address(0)    // (mingw declares the MSVC intrinsic but has no body for it)
+#endif
 
 // ---- the game's globals ----------------------------------------------------------------------------------
 static void*** const PHOBS = (void***)0x00520bb4;     // PhobRoot** phobs

@@ -29,6 +29,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 // the rewrite, compiled into this program: PORT_FN only records its function
 #define VP_FAITHFUL                 // the rewrite exactly as the original, bugs included (docs/PORTING.md, "Fixes")
@@ -415,8 +418,13 @@ static int run_guarded(Update_t fn) {
     unsigned cw;
     _clearfp();
     _controlfp_s(&cw, _PC_24, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { fn(g_w, 0, g_car); })) { return 1; }
+    return 0;
+#else
     __try { fn(g_w, 0, g_car); } __except (EXCEPTION_EXECUTE_HANDLER) { return 1; }
     return 0;
+#endif
 }
 
 // a name for a byte of the car

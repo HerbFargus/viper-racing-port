@@ -45,11 +45,19 @@
 #if defined(VP_FUZZ) || defined(VP_CRT_HARNESS)
 #define CRT_SHADOW_ORIGINAL(NEW)
 #else
+#ifdef VP_GCC
+#define CRT_SHADOW_ORIGINAL(NEW)                                                                                   \
+    static __declspec(naked) void VP_CAT(shadow_orig_, NEW)() {                                                    \
+        __asm__ volatile("jmp dword ptr [%c0]" : : "i"(&VP_CAT(port_, NEW).orig));                                \
+    }                                                                                                              \
+    namespace { const bool VP_CAT(shadow_orig_set_, NEW) = (VP_CAT(port_, NEW).shadow = (void*)&VP_CAT(shadow_orig_, NEW), true); }
+#else
 #define CRT_SHADOW_ORIGINAL(NEW)                                                                                   \
     static __declspec(naked) void VP_CAT(shadow_orig_, NEW)() {                                                    \
         __asm { jmp dword ptr [VP_CAT(port_, NEW).orig] }                                                           \
     }                                                                                                              \
     namespace { const bool VP_CAT(shadow_orig_set_, NEW) = (VP_CAT(port_, NEW).shadow = (void*)&VP_CAT(shadow_orig_, NEW), true); }
+#endif
 #endif
 
 namespace {
@@ -1199,6 +1207,20 @@ PORT_FN(0x004d0a20, "cropzeros", crt_cropzeros, fp_buffer_str)
 
 // _positive (0x4d0a80): !(0.0 > *arg) -- fldz; fcomp qword [arg]; test ah,0x41 (NaN and zeros are "positive")
 static __declspec(naked) int __cdecl crt_positive(const D64*) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "fldz\n\t"
+        "mov eax, dword ptr [esp + 4]\n\t"
+        "fcomp qword ptr [eax]\n\t"
+        "fnstsw ax\n\t"
+        "test ah, 0x41\n\t"
+        "mov eax, 1\n\t"
+        "jne done%=\n\t"
+        "%{load%} xor eax, eax\n\t"
+        "done%=:\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         fldz
         mov eax, dword ptr [esp + 4]
@@ -1211,6 +1233,7 @@ static __declspec(naked) int __cdecl crt_positive(const D64*) {
     done:
         ret
     }
+#endif
 }
 static void fp_positive(Footprint& f, const D64*) { f.pure = true; }
 PORT_FN(0x004d0a80, "positive", crt_positive, fp_positive)
@@ -1385,6 +1408,17 @@ PORT_FN(0x004d0eb0, "shift", crt_shift, fp_shift)
 // ieeemisc.obj, util.obj: _finite, _isnan, _set_exp, _decomp (the original's instructions)
 // =====================================================================================================================
 static __declspec(naked) int __cdecl crt_finite(D64) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov ax, word ptr [esp + 0xa]\n\t"
+        "and ax, 0x7ff0\n\t"
+        "sub ax, 0x7ff0\n\t"
+        "cmp ax, 1\n\t"
+        "%{load%} sbb eax, eax\n\t"
+        "inc eax\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         mov ax, word ptr [esp + 0xa]
         and ax, 0x7ff0
@@ -1394,11 +1428,32 @@ static __declspec(naked) int __cdecl crt_finite(D64) {
         inc eax
         ret
     }
+#endif
 }
 static void fp_d64(Footprint& f, D64) { f.pure = true; }
 PORT_FN(0x004cf550, "finite", crt_finite, fp_d64)
 
 static __declspec(naked) int __cdecl crt_isnan(D64) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov ax, word ptr [esp + 0xa]\n\t"
+        "and ax, 0x7ff8\n\t"
+        "cmp ax, 0x7ff0\n\t"
+        "jne not_inf_class%=\n\t"
+        "test dword ptr [esp + 8], 0x7ffff\n\t"
+        "jne yes%=\n\t"
+        "cmp dword ptr [esp + 4], 0\n\t"
+        "jne yes%=\n\t"
+        "not_inf_class%=:\n\t"
+        "cmp ax, 0x7ff8\n\t"
+        "je yes%=\n\t"
+        "%{load%} xor eax, eax\n\t"
+        "ret\n\t"
+        "yes%=:\n\t"
+        "mov eax, 1\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         mov ax, word ptr [esp + 0xa]
         and ax, 0x7ff8
@@ -1417,11 +1472,31 @@ static __declspec(naked) int __cdecl crt_isnan(D64) {
         mov eax, 1
         ret
     }
+#endif
 }
 PORT_FN(0x004cf570, "isnan", crt_isnan, fp_d64)
 
 // _set_exp (0x4d3050): x with its exponent field replaced by exp + 0x3fe; returned in ST0
 static __declspec(naked) double __cdecl crt_set_exp(D64, int) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov eax, dword ptr [esp + 8]\n\t"
+        "mov ecx, dword ptr [esp + 4]\n\t"
+        "sub esp, 8\n\t"
+        "mov dword ptr [esp + 4], eax\n\t"
+        "mov eax, dword ptr [esp + 0x14]\n\t"
+        "add ax, 0x3fe\n\t"
+        "mov dword ptr [esp], ecx\n\t"
+        "shl ax, 4\n\t"
+        "mov cx, word ptr [esp + 0x12]\n\t"
+        "and cx, 0x800f\n\t"
+        "%{load%} or ax, cx\n\t"
+        "mov word ptr [esp + 6], ax\n\t"
+        "fld qword ptr [esp]\n\t"
+        "add esp, 8\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         mov eax, dword ptr [esp + 8]
         mov ecx, dword ptr [esp + 4]
@@ -1439,12 +1514,96 @@ static __declspec(naked) double __cdecl crt_set_exp(D64, int) {
         add esp, 8
         ret
     }
+#endif
 }
 static void fp_set_exp(Footprint& f, D64, int) { f.pure = true; }
 PORT_FN(0x004d3050, "set_exp", crt_set_exp, fp_set_exp)
 
 // _decomp (0x4d3090): frexp's core -- the mantissa in [0.5, 1) (ST0) and the exponent (*pexp); denormals normalised
 static __declspec(naked) double __cdecl crt_decomp(D64, int*) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov eax, dword ptr [esp + 8]\n\t"
+        "sub esp, 8\n\t"
+        "and eax, 0x7fffffff\n\t"
+        "push esi\n\t"
+        "or eax, dword ptr [esp + 0x10]\n\t"
+        "push edi\n\t"
+        "jne nonzero%=\n\t"
+        "%{load%} xor esi, esi\n\t"
+        "mov dword ptr [esp + 8], esi\n\t"
+        "mov dword ptr [esp + 0xc], esi\n\t"
+        "jmp done%=\n\t"
+        "nonzero%=:\n\t"
+        "mov si, word ptr [esp + 0x1a]\n\t"
+        "and si, 0x7ff0\n\t"
+        "jne normal%=\n\t"
+        "test dword ptr [esp + 0x18], 0xfffff\n\t"
+        "jne denormal%=\n\t"
+        "cmp dword ptr [esp + 0x14], 0\n\t"
+        "je normal%=\n\t"
+        "denormal%=:\n\t"
+        "fldz\n\t"
+        "fcomp qword ptr [esp + 0x14]\n\t"
+        "mov esi, 0xfffffc03\n\t"
+        "fnstsw ax\n\t"
+        "test ah, 0x41\n\t"
+        "mov eax, 1\n\t"
+        "je neg_done%=\n\t"
+        "%{load%} xor eax, eax\n\t"
+        "neg_done%=:\n\t"
+        "test byte ptr [esp + 0x1a], 0x10\n\t"
+        "jne shifted%=\n\t"
+        "mov ecx, 0x80000000\n\t"
+        "mov edx, 1\n\t"
+        "mov edi, 0x10\n\t"
+        "shl_loop%=:\n\t"
+        "shl dword ptr [esp + 0x18], 1\n\t"
+        "test dword ptr [esp + 0x14], ecx\n\t"
+        "je no_carry%=\n\t"
+        "or dword ptr [esp + 0x18], edx\n\t"
+        "no_carry%=:\n\t"
+        "dec esi\n\t"
+        "shl dword ptr [esp + 0x14], 1\n\t"
+        "test word ptr [esp + 0x1a], di\n\t"
+        "je shl_loop%=\n\t"
+        "shifted%=:\n\t"
+        "and word ptr [esp + 0x1a], 0xffef\n\t"
+        "test eax, eax\n\t"
+        "je positive_value%=\n\t"
+        "or byte ptr [esp + 0x1b], 0x80\n\t"
+        "positive_value%=:\n\t"
+        "mov eax, dword ptr [esp + 0x18]\n\t"
+        "push 0\n\t"
+        "mov ecx, dword ptr [esp + 0x18]\n\t"
+        "push eax\n\t"
+        "push ecx\n\t"
+        "call dword ptr [%c0]\n\t"
+        "fstp qword ptr [esp + 0x14]\n\t"
+        "add esp, 0xc\n\t"
+        "jmp done%=\n\t"
+        "normal%=:\n\t"
+        "mov eax, dword ptr [esp + 0x18]\n\t"
+        "push 0\n\t"
+        "shr si, 4\n\t"
+        "push eax\n\t"
+        "movsx esi, si\n\t"
+        "mov ecx, dword ptr [esp + 0x1c]\n\t"
+        "sub esi, 0x3fe\n\t"
+        "push ecx\n\t"
+        "call dword ptr [%c0]\n\t"
+        "fstp qword ptr [esp + 0x14]\n\t"
+        "add esp, 0xc\n\t"
+        "done%=:\n\t"
+        "fld qword ptr [esp + 8]\n\t"
+        "mov eax, dword ptr [esp + 0x1c]\n\t"
+        "pop edi\n\t"
+        "mov dword ptr [eax], esi\n\t"
+        "pop esi\n\t"
+        "add esp, 8\n\t"
+        "ret"
+        : : "i"(&a_set_exp));
+#else
     __asm {
         mov eax, dword ptr [esp + 8]
         sub esp, 8
@@ -1526,6 +1685,7 @@ static __declspec(naked) double __cdecl crt_decomp(D64, int*) {
         add esp, 8
         ret
     }
+#endif
 }
 static void fp_decomp(Footprint& f, D64, int* pexp) { f.add(pexp, 4, "exponent"); }
 PORT_FN(0x004d3090, "decomp", crt_decomp, fp_decomp)
@@ -1596,6 +1756,18 @@ PORT_FN(0x004cfba0, "abstract_sw", crt_abstract_sw, fp_cw)
 
 // _clearfp (0x4cf9e0): the status word's flags (abstracted), then fnclex
 static __declspec(naked) U32 __cdecl crt_clearfp() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "sub esp, 4\n\t"
+        "fnstsw word ptr [esp + 2]\n\t"
+        "fnclex\n\t"
+        "mov eax, dword ptr [esp + 2]\n\t"
+        "push eax\n\t"
+        "call dword ptr [%c0]\n\t"
+        "add esp, 8\n\t"
+        "ret"
+        : : "i"(&a_abstract_sw));
+#else
     __asm {
         sub esp, 4
         fnstsw word ptr [esp + 2]
@@ -1606,6 +1778,7 @@ static __declspec(naked) U32 __cdecl crt_clearfp() {
         add esp, 8
         ret
     }
+#endif
 }
 static void fp_fpu_state(Footprint& f) { f.replay_only = k_asm_reason; }
 PORT_FN(0x004cf9e0, "clearfp", crt_clearfp, fp_fpu_state)
@@ -1613,6 +1786,33 @@ CRT_SHADOW_ORIGINAL(crt_clearfp)
 
 // _control87 (0x4cfa00): (old & ~mask) | (new & mask), loaded into the FPU; returns it (abstracted)
 static __declspec(naked) U32 __cdecl crt_control87(U32, U32) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "sub esp, 4\n\t"
+        "push esi\n\t"
+        "wait\n\t"
+        "fnstcw word ptr [esp + 6]\n\t"
+        "mov eax, dword ptr [esp + 6]\n\t"
+        "push eax\n\t"
+        "call dword ptr [%c0]\n\t"
+        "mov ecx, dword ptr [esp + 0x14]\n\t"
+        "add esp, 4\n\t"
+        "%{load%} mov esi, ecx\n\t"
+        "and ecx, dword ptr [esp + 0xc]\n\t"
+        "not esi\n\t"
+        "%{load%} and esi, eax\n\t"
+        "%{load%} or esi, ecx\n\t"
+        "push esi\n\t"
+        "call dword ptr [%c1]\n\t"
+        "mov word ptr [esp + 8], ax\n\t"
+        "add esp, 4\n\t"
+        "fldcw word ptr [esp + 4]\n\t"
+        "%{load%} mov eax, esi\n\t"
+        "pop esi\n\t"
+        "add esp, 4\n\t"
+        "ret"
+        : : "i"(&a_abstract_cw), "i"(&a_hw_cw));
+#else
     __asm {
         sub esp, 4
         push esi
@@ -1638,6 +1838,7 @@ static __declspec(naked) U32 __cdecl crt_control87(U32, U32) {
         add esp, 4
         ret
     }
+#endif
 }
 static void fp_control87(Footprint& f, U32, U32) { f.replay_only = k_asm_reason; }
 PORT_FN(0x004cfa00, "control87", crt_control87, fp_control87)
@@ -1645,6 +1846,18 @@ CRT_SHADOW_ORIGINAL(crt_control87)
 
 // _controlfp (0x4cfa40): _control87 with _EM_DENORMAL kept out of the mask
 static __declspec(naked) U32 __cdecl crt_controlfp(U32, U32) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov eax, dword ptr [esp + 8]\n\t"
+        "mov ecx, dword ptr [esp + 4]\n\t"
+        "and eax, 0xfff7ffff\n\t"
+        "push eax\n\t"
+        "push ecx\n\t"
+        "call dword ptr [%c0]\n\t"
+        "add esp, 8\n\t"
+        "ret"
+        : : "i"(&a_control87));
+#else
     __asm {
         mov eax, dword ptr [esp + 8]
         mov ecx, dword ptr [esp + 4]
@@ -1655,12 +1868,22 @@ static __declspec(naked) U32 __cdecl crt_controlfp(U32, U32) {
         add esp, 8
         ret
     }
+#endif
 }
 PORT_FN(0x004cfa40, "controlfp", crt_controlfp, fp_control87)
 CRT_SHADOW_ORIGINAL(crt_controlfp)
 
 // _setdefaultprecision (0x4d0820): _controlfp(_PC_53, _MCW_PC)
 static __declspec(naked) void __cdecl crt_setdefaultprecision() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "push 0x30000\n\t"
+        "push 0x10000\n\t"
+        "call dword ptr [%c0]\n\t"
+        "add esp, 8\n\t"
+        "ret"
+        : : "i"(&a_controlfp));
+#else
     __asm {
         push 0x30000
         push 0x10000
@@ -1668,6 +1891,7 @@ static __declspec(naked) void __cdecl crt_setdefaultprecision() {
         add esp, 8
         ret
     }
+#endif
 }
 PORT_FN(0x004d0820, "setdefaultprecision", crt_setdefaultprecision, fp_fpu_state)
 CRT_SHADOW_ORIGINAL(crt_setdefaultprecision)
@@ -1676,6 +1900,16 @@ CRT_SHADOW_ORIGINAL(crt_setdefaultprecision)
 // fpctrl.obj: _statfp, _clrfp, _ctrlfp, _set_statfp
 // =====================================================================================================================
 static __declspec(naked) int __cdecl crt_statfp() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "sub esp, 4\n\t"
+        "wait\n\t"
+        "fnstsw word ptr [esp + 2]\n\t"
+        "movsx eax, word ptr [esp + 2]\n\t"
+        "add esp, 4\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         sub esp, 4
         wait
@@ -1684,11 +1918,22 @@ static __declspec(naked) int __cdecl crt_statfp() {
         add esp, 4
         ret
     }
+#endif
 }
 PORT_FN(0x004d2f70, "statfp", crt_statfp, fp_fpu_state)
 CRT_SHADOW_ORIGINAL(crt_statfp)
 
 static __declspec(naked) int __cdecl crt_clrfp() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "sub esp, 4\n\t"
+        "fnstsw word ptr [esp + 2]\n\t"
+        "fnclex\n\t"
+        "movsx eax, word ptr [esp + 2]\n\t"
+        "add esp, 4\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         sub esp, 4
         fnstsw word ptr [esp + 2]
@@ -1697,11 +1942,31 @@ static __declspec(naked) int __cdecl crt_clrfp() {
         add esp, 4
         ret
     }
+#endif
 }
 PORT_FN(0x004d2f90, "clrfp", crt_clrfp, fp_fpu_state)
 CRT_SHADOW_ORIGINAL(crt_clrfp)
 
 static __declspec(naked) int __cdecl crt_ctrlfp(U32, U32) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "sub esp, 4\n\t"
+        "wait\n\t"
+        "fnstcw word ptr [esp]\n\t"
+        "mov ax, word ptr [esp + 0xc]\n\t"
+        "mov edx, dword ptr [esp + 8]\n\t"
+        "%{load%} mov cx, ax\n\t"
+        "not cx\n\t"
+        "%{load%} and dx, ax\n\t"
+        "and cx, word ptr [esp]\n\t"
+        "%{load%} or cx, dx\n\t"
+        "mov word ptr [esp + 2], cx\n\t"
+        "fldcw word ptr [esp + 2]\n\t"
+        "movsx eax, word ptr [esp]\n\t"
+        "add esp, 4\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         sub esp, 4
         wait
@@ -1719,12 +1984,57 @@ static __declspec(naked) int __cdecl crt_ctrlfp(U32, U32) {
         add esp, 4
         ret
     }
+#endif
 }
 PORT_FN(0x004d2fb0, "ctrlfp", crt_ctrlfp, fp_control87)
 CRT_SHADOW_ORIGINAL(crt_ctrlfp)
 
 // _set_statfp (0x4d2ff0): raise the given exceptions by doing operations that cause them
 static __declspec(naked) void __cdecl crt_set_statfp(U32) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov ecx, dword ptr [esp + 4]\n\t"
+        "sub esp, 0xc\n\t"
+        "test cl, 1\n\t"
+        "je no_inv%=\n\t"
+        "fld tbyte ptr ds:[0x502880]\n\t"
+        "fistp dword ptr [esp]\n\t"
+        "wait\n\t"
+        "no_inv%=:\n\t"
+        "test cl, 8\n\t"
+        "je no_ovf%=\n\t"
+        "wait\n\t"
+        "fnstsw ax\n\t"
+        "fld tbyte ptr ds:[0x502880]\n\t"
+        "fstp qword ptr [esp + 4]\n\t"
+        "wait\n\t"
+        "wait\n\t"
+        "fnstsw ax\n\t"
+        "no_ovf%=:\n\t"
+        "test cl, 0x10\n\t"
+        "je no_unf%=\n\t"
+        "fld tbyte ptr ds:[0x502890]\n\t"
+        "fstp qword ptr [esp + 4]\n\t"
+        "wait\n\t"
+        "no_unf%=:\n\t"
+        "test cl, 4\n\t"
+        "je no_zdiv%=\n\t"
+        "fldz\n\t"
+        "fld1\n\t"
+        "fdivrp st(1), st\n\t"
+        "fstp st(0)\n\t"
+        "wait\n\t"
+        "no_zdiv%=:\n\t"
+        "test cl, 0x20\n\t"
+        "je no_inexact%=\n\t"
+        "fldpi\n\t"
+        "fstp qword ptr [esp + 4]\n\t"
+        "wait\n\t"
+        "no_inexact%=:\n\t"
+        "add esp, 0xc\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         mov ecx, dword ptr [esp + 4]
         sub esp, 0xc
@@ -1767,6 +2077,7 @@ static __declspec(naked) void __cdecl crt_set_statfp(U32) {
         add esp, 0xc
         ret
     }
+#endif
 }
 static void fp_set_statfp(Footprint& f, U32) { f.replay_only = k_asm_reason; }
 PORT_FN(0x004d2ff0, "set_statfp", crt_set_statfp, fp_set_statfp)
@@ -1777,6 +2088,26 @@ CRT_SHADOW_ORIGINAL(crt_set_statfp)
 // =====================================================================================================================
 // __ftol (0x4cf108): ST0 to a 64-bit integer, truncating (fistp qword with the rounding set to chop): edx:eax
 static __declspec(naked) void __cdecl crt_ftol() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "push ebp\n\t"
+        "%{load%} mov ebp, esp\n\t"
+        "add esp, -0xc\n\t"
+        "wait\n\t"
+        "fnstcw word ptr [ebp - 2]\n\t"
+        "wait\n\t"
+        "mov ax, word ptr [ebp - 2]\n\t"
+        "or ah, 0xc\n\t"
+        "mov word ptr [ebp - 4], ax\n\t"
+        "fldcw word ptr [ebp - 4]\n\t"
+        "fistp qword ptr [ebp - 0xc]\n\t"
+        "fldcw word ptr [ebp - 2]\n\t"
+        "mov eax, dword ptr [ebp - 0xc]\n\t"
+        "mov edx, dword ptr [ebp - 8]\n\t"
+        "leave\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         push ebp
         mov ebp, esp
@@ -1795,6 +2126,7 @@ static __declspec(naked) void __cdecl crt_ftol() {
         leave
         ret
     }
+#endif
 }
 static void fp_asm(Footprint& f) { f.replay_only = k_asm_reason; }
 PORT_FN(0x004cf108, "ftol", crt_ftol, fp_asm)
@@ -1802,6 +2134,30 @@ CRT_SHADOW_ORIGINAL(crt_ftol)
 
 // __allmul (0x4d6300): 64 x 64 -> 64, the callee pops its 16 bytes of arguments
 static __declspec(naked) void __cdecl crt_allmul() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov eax, dword ptr [esp + 8]\n\t"
+        "mov ecx, dword ptr [esp + 0x10]\n\t"
+        "%{load%} or ecx, eax\n\t"
+        "mov ecx, dword ptr [esp + 0xc]\n\t"
+        "jne hard%=\n\t"
+        "mov eax, dword ptr [esp + 4]\n\t"
+        "mul ecx\n\t"
+        "ret 0x10\n\t"
+        "hard%=:\n\t"
+        "push ebx\n\t"
+        "mul ecx\n\t"
+        "%{load%} mov ebx, eax\n\t"
+        "mov eax, dword ptr [esp + 8]\n\t"
+        "mul dword ptr [esp + 0x14]\n\t"
+        "%{load%} add ebx, eax\n\t"
+        "mov eax, dword ptr [esp + 8]\n\t"
+        "mul ecx\n\t"
+        "%{load%} add edx, ebx\n\t"
+        "pop ebx\n\t"
+        "ret 0x10"
+        : :);
+#else
     __asm {
         mov eax, dword ptr [esp + 8]
         mov ecx, dword ptr [esp + 0x10]
@@ -1824,12 +2180,95 @@ static __declspec(naked) void __cdecl crt_allmul() {
         pop ebx
         ret 0x10
     }
+#endif
 }
 PORT_FN(0x004d6300, "allmul", crt_allmul, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_allmul)
 
 // __alldiv (0x4cfea0): signed 64 / 64 (a divisor whose high dword is non-zero: the shift-down estimate and one fix-up)
 static __declspec(naked) void __cdecl crt_alldiv() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "push edi\n\t"
+        "push esi\n\t"
+        "push ebx\n\t"
+        "%{load%} xor edi, edi\n\t"
+        "mov eax, dword ptr [esp + 0x14]\n\t"
+        "%{load%} or eax, eax\n\t"
+        "jge a_pos%=\n\t"
+        "inc edi\n\t"
+        "mov edx, dword ptr [esp + 0x10]\n\t"
+        "neg eax\n\t"
+        "neg edx\n\t"
+        "sbb eax, 0\n\t"
+        "mov dword ptr [esp + 0x14], eax\n\t"
+        "mov dword ptr [esp + 0x10], edx\n\t"
+        "a_pos%=:\n\t"
+        "mov eax, dword ptr [esp + 0x1c]\n\t"
+        "%{load%} or eax, eax\n\t"
+        "jge b_pos%=\n\t"
+        "inc edi\n\t"
+        "mov edx, dword ptr [esp + 0x18]\n\t"
+        "neg eax\n\t"
+        "neg edx\n\t"
+        "sbb eax, 0\n\t"
+        "mov dword ptr [esp + 0x1c], eax\n\t"
+        "mov dword ptr [esp + 0x18], edx\n\t"
+        "b_pos%=:\n\t"
+        "%{load%} or eax, eax\n\t"
+        "jne hard%=\n\t"
+        "mov ecx, dword ptr [esp + 0x18]\n\t"
+        "mov eax, dword ptr [esp + 0x14]\n\t"
+        "%{load%} xor edx, edx\n\t"
+        "div ecx\n\t"
+        "%{load%} mov ebx, eax\n\t"
+        "mov eax, dword ptr [esp + 0x10]\n\t"
+        "div ecx\n\t"
+        "%{load%} mov edx, ebx\n\t"
+        "jmp sign%=\n\t"
+        "hard%=:\n\t"
+        "%{load%} mov ebx, eax\n\t"
+        "mov ecx, dword ptr [esp + 0x18]\n\t"
+        "mov edx, dword ptr [esp + 0x14]\n\t"
+        "mov eax, dword ptr [esp + 0x10]\n\t"
+        "shr_loop%=:\n\t"
+        "shr ebx, 1\n\t"
+        "rcr ecx, 1\n\t"
+        "shr edx, 1\n\t"
+        "rcr eax, 1\n\t"
+        "%{load%} or ebx, ebx\n\t"
+        "jne shr_loop%=\n\t"
+        "div ecx\n\t"
+        "%{load%} mov esi, eax\n\t"
+        "mul dword ptr [esp + 0x1c]\n\t"
+        "%{load%} mov ecx, eax\n\t"
+        "mov eax, dword ptr [esp + 0x18]\n\t"
+        "mul esi\n\t"
+        "%{load%} add edx, ecx\n\t"
+        "jb fix%=\n\t"
+        "cmp edx, dword ptr [esp + 0x14]\n\t"
+        "ja fix%=\n\t"
+        "jb ok%=\n\t"
+        "cmp eax, dword ptr [esp + 0x10]\n\t"
+        "jbe ok%=\n\t"
+        "fix%=:\n\t"
+        "dec esi\n\t"
+        "ok%=:\n\t"
+        "%{load%} xor edx, edx\n\t"
+        "%{load%} mov eax, esi\n\t"
+        "sign%=:\n\t"
+        "dec edi\n\t"
+        "jne done%=\n\t"
+        "neg edx\n\t"
+        "neg eax\n\t"
+        "sbb edx, 0\n\t"
+        "done%=:\n\t"
+        "pop ebx\n\t"
+        "pop esi\n\t"
+        "pop edi\n\t"
+        "ret 0x10"
+        : :);
+#else
     __asm {
         push edi
         push esi
@@ -1910,12 +2349,65 @@ static __declspec(naked) void __cdecl crt_alldiv() {
         pop edi
         ret 0x10
     }
+#endif
 }
 PORT_FN(0x004cfea0, "alldiv", crt_alldiv, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_alldiv)
 
 // __aulldiv (0x4d6750): unsigned 64 / 64
 static __declspec(naked) void __cdecl crt_aulldiv() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "push ebx\n\t"
+        "push esi\n\t"
+        "mov eax, dword ptr [esp + 0x18]\n\t"
+        "%{load%} or eax, eax\n\t"
+        "jne hard%=\n\t"
+        "mov ecx, dword ptr [esp + 0x14]\n\t"
+        "mov eax, dword ptr [esp + 0x10]\n\t"
+        "%{load%} xor edx, edx\n\t"
+        "div ecx\n\t"
+        "%{load%} mov ebx, eax\n\t"
+        "mov eax, dword ptr [esp + 0xc]\n\t"
+        "div ecx\n\t"
+        "%{load%} mov edx, ebx\n\t"
+        "jmp done%=\n\t"
+        "hard%=:\n\t"
+        "%{load%} mov ecx, eax\n\t"
+        "mov ebx, dword ptr [esp + 0x14]\n\t"
+        "mov edx, dword ptr [esp + 0x10]\n\t"
+        "mov eax, dword ptr [esp + 0xc]\n\t"
+        "shr_loop%=:\n\t"
+        "shr ecx, 1\n\t"
+        "rcr ebx, 1\n\t"
+        "shr edx, 1\n\t"
+        "rcr eax, 1\n\t"
+        "%{load%} or ecx, ecx\n\t"
+        "jne shr_loop%=\n\t"
+        "div ebx\n\t"
+        "%{load%} mov esi, eax\n\t"
+        "mul dword ptr [esp + 0x18]\n\t"
+        "%{load%} mov ecx, eax\n\t"
+        "mov eax, dword ptr [esp + 0x14]\n\t"
+        "mul esi\n\t"
+        "%{load%} add edx, ecx\n\t"
+        "jb fix%=\n\t"
+        "cmp edx, dword ptr [esp + 0x10]\n\t"
+        "ja fix%=\n\t"
+        "jb ok%=\n\t"
+        "cmp eax, dword ptr [esp + 0xc]\n\t"
+        "jbe ok%=\n\t"
+        "fix%=:\n\t"
+        "dec esi\n\t"
+        "ok%=:\n\t"
+        "%{load%} xor edx, edx\n\t"
+        "%{load%} mov eax, esi\n\t"
+        "done%=:\n\t"
+        "pop esi\n\t"
+        "pop ebx\n\t"
+        "ret 0x10"
+        : :);
+#else
     __asm {
         push ebx
         push esi
@@ -1966,12 +2458,66 @@ static __declspec(naked) void __cdecl crt_aulldiv() {
         pop ebx
         ret 0x10
     }
+#endif
 }
 PORT_FN(0x004d6750, "aulldiv", crt_aulldiv, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_aulldiv)
 
 // __aullrem (0x4d67c0): unsigned 64 % 64
 static __declspec(naked) void __cdecl crt_aullrem() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "push ebx\n\t"
+        "mov eax, dword ptr [esp + 0x14]\n\t"
+        "%{load%} or eax, eax\n\t"
+        "jne hard%=\n\t"
+        "mov ecx, dword ptr [esp + 0x10]\n\t"
+        "mov eax, dword ptr [esp + 0xc]\n\t"
+        "%{load%} xor edx, edx\n\t"
+        "div ecx\n\t"
+        "mov eax, dword ptr [esp + 8]\n\t"
+        "div ecx\n\t"
+        "%{load%} mov eax, edx\n\t"
+        "%{load%} xor edx, edx\n\t"
+        "jmp done%=\n\t"
+        "hard%=:\n\t"
+        "%{load%} mov ecx, eax\n\t"
+        "mov ebx, dword ptr [esp + 0x10]\n\t"
+        "mov edx, dword ptr [esp + 0xc]\n\t"
+        "mov eax, dword ptr [esp + 8]\n\t"
+        "shr_loop%=:\n\t"
+        "shr ecx, 1\n\t"
+        "rcr ebx, 1\n\t"
+        "shr edx, 1\n\t"
+        "rcr eax, 1\n\t"
+        "%{load%} or ecx, ecx\n\t"
+        "jne shr_loop%=\n\t"
+        "div ebx\n\t"
+        "%{load%} mov ecx, eax\n\t"
+        "mul dword ptr [esp + 0x14]\n\t"
+        "xchg ecx, eax\n\t"
+        "mul dword ptr [esp + 0x10]\n\t"
+        "%{load%} add edx, ecx\n\t"
+        "jb fix%=\n\t"
+        "cmp edx, dword ptr [esp + 0xc]\n\t"
+        "ja fix%=\n\t"
+        "jb ok%=\n\t"
+        "cmp eax, dword ptr [esp + 8]\n\t"
+        "jbe ok%=\n\t"
+        "fix%=:\n\t"
+        "sub eax, dword ptr [esp + 0x10]\n\t"
+        "sbb edx, dword ptr [esp + 0x14]\n\t"
+        "ok%=:\n\t"
+        "sub eax, dword ptr [esp + 8]\n\t"
+        "sbb edx, dword ptr [esp + 0xc]\n\t"
+        "neg edx\n\t"
+        "neg eax\n\t"
+        "sbb edx, 0\n\t"
+        "done%=:\n\t"
+        "pop ebx\n\t"
+        "ret 0x10"
+        : :);
+#else
     __asm {
         push ebx
         mov eax, dword ptr [esp + 0x14]
@@ -2023,6 +2569,7 @@ static __declspec(naked) void __cdecl crt_aullrem() {
         pop ebx
         ret 0x10
     }
+#endif
 }
 PORT_FN(0x004d67c0, "aullrem", crt_aullrem, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_aullrem)
@@ -2031,11 +2578,20 @@ CRT_SHADOW_ORIGINAL(crt_aullrem)
 // 87ctriga.obj, 87fmod.obj: the entry stubs -- the operation's jump table in edx, into the dispatchers. The C forms
 // (asin...) take doubles on the stack; the _CI forms take ST0 (ST1, ST0 for two operands).
 // =====================================================================================================================
+#ifdef VP_GCC
+#define CRT_TRAN_STUB(NAME, TABLE, TARGET)                                                                         \
+    static __declspec(naked) void __cdecl NAME() {                                                                 \
+        __asm__ volatile("mov edx, " #TABLE "\n\t"                                                                 \
+                         "jmp dword ptr [%c0]"                                                                     \
+                         : : "i"(&TARGET));                                                                        \
+    }
+#else
 #define CRT_TRAN_STUB(NAME, TABLE, TARGET)                                                                         \
     static __declspec(naked) void __cdecl NAME() {                                                                 \
         __asm { mov edx, TABLE }                                                                                   \
         __asm { jmp dword ptr [TARGET] }                                                                           \
     }
+#endif
 CRT_TRAN_STUB(crt_asin, 0x00502780, a_ctrandisp1)
 PORT_FN(0x004cf050, "asin", crt_asin, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_asin)
@@ -2076,6 +2632,111 @@ CRT_SHADOW_ORIGINAL(crt_CIfmod)
 // =====================================================================================================================
 // the second entry (0x4d1fc5): the _CI dispatchers set 0x5d5608 themselves and come in here
 static __declspec(naked) void crt_cdisp_tail_fc5() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "cmp dword ptr ds:[0x5024b4], 0\n\t"
+        "jne restore%=\n\t"
+        "fst qword ptr ds:[0x5d5600]\n\t"
+        "mov al, byte ptr [ebp - 0x90]\n\t"
+        "%{load%} or al, al\n\t"
+        "je check_status%=\n\t"
+        "cmp al, 0xff\n\t"
+        "je check_range%=\n\t"
+        "cmp al, 0xfe\n\t"
+        "je check_range%=\n\t"
+        "%{load%} or al, al\n\t"
+        "je restore%=\n\t"
+        "movsx eax, al\n\t"
+        "mov dword ptr [ebp - 0x8e], eax\n\t"
+        "jmp raise%=\n\t"
+        "check_status%=:\n\t"
+        "mov ax, word ptr [ebp - 0xa4]\n\t"
+        "and ax, 0x20\n\t"
+        "jne restore%=\n\t"
+        "wait\n\t"
+        "fnstsw ax\n\t"
+        "and ax, 0x20\n\t"
+        "je restore%=\n\t"
+        "mov dword ptr [ebp - 0x8e], 8\n\t"
+        "jmp raise%=\n\t"
+        "restore%=:\n\t"
+        "fldcw word ptr [ebp - 0xa4]\n\t"
+        "wait\n\t"
+        "ret\n\t"
+        "check_range%=:\n\t"
+        "mov ax, word ptr ds:[0x5d5606]\n\t"
+        "and ax, 0x7ff0\n\t"
+        "%{load%} or ax, ax\n\t"
+        "je underflow%=\n\t"
+        "cmp ax, 0x7ff0\n\t"
+        "je overflow%=\n\t"
+        "jmp check_status%=\n\t"
+        "underflow%=:\n\t"
+        "mov dword ptr [ebp - 0x8e], 4\n\t"
+        "fld qword ptr ds:[0x4e01e8]\n\t"
+        "fxch st(1)\n\t"
+        "fscale\n\t"
+        "fstp st(1)\n\t"
+        "fld st(0)\n\t"
+        "fabs\n\t"
+        "fcomp qword ptr ds:[0x4e01d8]\n\t"
+        "wait\n\t"
+        "fnstsw ax\n\t"
+        "sahf\n\t"
+        "jae raise%=\n\t"
+        "fmul qword ptr ds:[0x4e01f8]\n\t"
+        "jmp raise%=\n\t"
+        "overflow%=:\n\t"
+        "mov dword ptr [ebp - 0x8e], 3\n\t"
+        "fld qword ptr ds:[0x4e01e0]\n\t"
+        "fxch st(1)\n\t"
+        "fscale\n\t"
+        "fstp st(1)\n\t"
+        "fld st(0)\n\t"
+        "fabs\n\t"
+        "fcomp qword ptr ds:[0x4e01d0]\n\t"
+        "wait\n\t"
+        "fnstsw ax\n\t"
+        "sahf\n\t"
+        "jbe raise%=\n\t"
+        "fmul qword ptr ds:[0x4e01f0]\n\t"
+        "raise%=:\n\t"
+        "push esi\n\t"
+        "push edi\n\t"
+        "mov ebx, dword ptr [ebp - 0x94]\n\t"
+        "inc ebx\n\t"
+        "mov dword ptr [ebp - 0x8a], ebx\n\t"
+        "cmp byte ptr ds:[0x5d5608], 0\n\t"
+        "jne have_args%=\n\t"
+        "cld\n\t"
+        "lea esi, [ebp + 8]\n\t"
+        "lea edi, [ebp - 0x86]\n\t"
+        "movs dword ptr es:[edi], dword ptr [esi]\n\t"
+        "movs dword ptr es:[edi], dword ptr [esi]\n\t"
+        "cmp byte ptr [ebx + 0xc], 1\n\t"
+        "je have_args%=\n\t"
+        "lea esi, [ebp + 0x10]\n\t"
+        "lea edi, [ebp - 0x7e]\n\t"
+        "movs dword ptr es:[edi], dword ptr [esi]\n\t"
+        "movs dword ptr es:[edi], dword ptr [esi]\n\t"
+        "have_args%=:\n\t"
+        "fstp qword ptr [ebp - 0x76]\n\t"
+        "lea eax, [ebp - 0x8e]\n\t"
+        "lea ebx, [ebp - 0xa4]\n\t"
+        "push ebx\n\t"
+        "push eax\n\t"
+        "mov ebx, dword ptr [ebp - 0x94]\n\t"
+        "mov al, byte ptr [ebx + 0xe]\n\t"
+        "movsx eax, al\n\t"
+        "push eax\n\t"
+        "call dword ptr [%c0]\n\t"
+        "add esp, 0xc\n\t"
+        "pop edi\n\t"
+        "pop esi\n\t"
+        "fld qword ptr [ebp - 0x76]\n\t"
+        "jmp restore%="
+        : : "i"(&a_87except));
+#else
     __asm {
         cmp dword ptr ds:[0x5024b4], 0
         jne restore
@@ -2179,17 +2840,51 @@ static __declspec(naked) void crt_cdisp_tail_fc5() {
         fld qword ptr [ebp - 0x76]
         jmp restore
     }
+#endif
 }
 // the first entry (0x4d1fbe): the C dispatchers, which clear 0x5d5608 (the fall-through into 0x4d1fc5 is a jump here)
 static __declspec(naked) void crt_cdisp_tail_fbe() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov byte ptr ds:[0x5d5608], 0\n\t"
+        "jmp %P0"
+        : : "i"(&crt_cdisp_tail_fc5));
+#else
     __asm {
         mov byte ptr ds:[0x5d5608], 0
         jmp crt_cdisp_tail_fc5
     }
+#endif
 }
 
 // _cintrindisp2 (0x4d1f10): the _CI two-operand dispatcher (ST1, ST0)
 static __declspec(naked) void crt_cintrindisp2() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "push ebp\n\t"
+        "%{load%} mov ebp, esp\n\t"
+        "add esp, 0xfffffd60\n\t"
+        "push ebx\n\t"
+        "wait\n\t"
+        "fnstcw word ptr [ebp - 0xa4]\n\t"
+        "wait\n\t"
+        "cmp dword ptr ds:[0x5036ec], 0\n\t"
+        "je save_args%=\n\t"
+        "go%=:\n\t"
+        "call dword ptr [%c0]\n\t"
+        "mov byte ptr ds:[0x5d5608], 1\n\t"
+        "call %P1\n\t"
+        "pop ebx\n\t"
+        "leave\n\t"
+        "ret\n\t"
+        "save_args%=:\n\t"
+        "fxch st(1)\n\t"
+        "fst qword ptr [ebp - 0x86]\n\t"
+        "fxch st(1)\n\t"
+        "fst qword ptr [ebp - 0x7e]\n\t"
+        "jmp go%="
+        : : "i"(&a_trandisp2), "i"(&crt_cdisp_tail_fc5));
+#else
     __asm {
         push ebp
         mov ebp, esp
@@ -2214,12 +2909,35 @@ static __declspec(naked) void crt_cintrindisp2() {
         fst qword ptr [ebp - 0x7e]
         jmp go
     }
+#endif
 }
 PORT_FN(0x004d1f10, "cintrindisp2", crt_cintrindisp2, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_cintrindisp2)
 
 // _cintrindisp1 (0x4d1f4e): the _CI one-operand dispatcher (ST0)
 static __declspec(naked) void crt_cintrindisp1() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "push ebp\n\t"
+        "%{load%} mov ebp, esp\n\t"
+        "add esp, 0xfffffd60\n\t"
+        "push ebx\n\t"
+        "wait\n\t"
+        "fnstcw word ptr [ebp - 0xa4]\n\t"
+        "cmp dword ptr ds:[0x5036ec], 0\n\t"
+        "je save_arg%=\n\t"
+        "go%=:\n\t"
+        "call dword ptr [%c0]\n\t"
+        "mov byte ptr ds:[0x5d5608], 1\n\t"
+        "call %P1\n\t"
+        "pop ebx\n\t"
+        "leave\n\t"
+        "ret\n\t"
+        "save_arg%=:\n\t"
+        "fst qword ptr [ebp - 0x86]\n\t"
+        "jmp go%="
+        : : "i"(&a_trandisp1), "i"(&crt_cdisp_tail_fc5));
+#else
     __asm {
         push ebp
         mov ebp, esp
@@ -2240,12 +2958,36 @@ static __declspec(naked) void crt_cintrindisp1() {
         fst qword ptr [ebp - 0x86]
         jmp go
     }
+#endif
 }
 PORT_FN(0x004d1f4e, "cintrindisp1", crt_cintrindisp1, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_cintrindisp1)
 
 // _ctrandisp2 (0x4d1f84): the C two-operand dispatcher (two doubles on the stack, loaded by _fload)
 static __declspec(naked) void crt_ctrandisp2() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "push ebp\n\t"
+        "%{load%} mov ebp, esp\n\t"
+        "add esp, 0xfffffd60\n\t"
+        "push ebx\n\t"
+        "push dword ptr [ebp + 0xc]\n\t"
+        "push dword ptr [ebp + 8]\n\t"
+        "call dword ptr [%c0]\n\t"
+        "add esp, 8\n\t"
+        "push dword ptr [ebp + 0x14]\n\t"
+        "push dword ptr [ebp + 0x10]\n\t"
+        "call dword ptr [%c0]\n\t"
+        "add esp, 8\n\t"
+        "wait\n\t"
+        "fnstcw word ptr [ebp - 0xa4]\n\t"
+        "call dword ptr [%c1]\n\t"
+        "call %P2\n\t"
+        "pop ebx\n\t"
+        "leave\n\t"
+        "ret"
+        : : "i"(&a_fload), "i"(&a_trandisp2), "i"(&crt_cdisp_tail_fbe));
+#else
     __asm {
         push ebp
         mov ebp, esp
@@ -2267,12 +3009,32 @@ static __declspec(naked) void crt_ctrandisp2() {
         leave
         ret
     }
+#endif
 }
 PORT_FN(0x004d1f84, "ctrandisp2", crt_ctrandisp2, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_ctrandisp2)
 
 // _ctrandisp1 (0x4d20f5): the C one-operand dispatcher
 static __declspec(naked) void crt_ctrandisp1() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "push ebp\n\t"
+        "%{load%} mov ebp, esp\n\t"
+        "add esp, 0xfffffd60\n\t"
+        "push ebx\n\t"
+        "push dword ptr [ebp + 0xc]\n\t"
+        "push dword ptr [ebp + 8]\n\t"
+        "call dword ptr [%c0]\n\t"
+        "add esp, 8\n\t"
+        "wait\n\t"
+        "fnstcw word ptr [ebp - 0xa4]\n\t"
+        "call dword ptr [%c1]\n\t"
+        "call %P2\n\t"
+        "pop ebx\n\t"
+        "leave\n\t"
+        "ret"
+        : : "i"(&a_fload), "i"(&a_trandisp1), "i"(&crt_cdisp_tail_fbe));
+#else
     __asm {
         push ebp
         mov ebp, esp
@@ -2290,6 +3052,7 @@ static __declspec(naked) void crt_ctrandisp1() {
         leave
         ret
     }
+#endif
 }
 PORT_FN(0x004d20f5, "ctrandisp1", crt_ctrandisp1, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_ctrandisp1)
@@ -2297,6 +3060,34 @@ CRT_SHADOW_ORIGINAL(crt_ctrandisp1)
 // _fload (0x4d2121): a double onto the FPU stack -- a NaN / infinity rebuilt as an extended with the low dword left
 // unshifted (the original's quirk), so a signalling NaN arrives signalling
 static __declspec(naked) void crt_fload() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "push ebp\n\t"
+        "%{load%} mov ebp, esp\n\t"
+        "add esp, -0xc\n\t"
+        "push ebx\n\t"
+        "mov ax, word ptr [ebp + 0xe]\n\t"
+        "%{load%} mov bx, ax\n\t"
+        "and ax, 0x7ff0\n\t"
+        "cmp ax, 0x7ff0\n\t"
+        "jne plain%=\n\t"
+        "or bx, 0x7fff\n\t"
+        "mov word ptr [ebp - 2], bx\n\t"
+        "mov eax, dword ptr [ebp + 0xc]\n\t"
+        "mov ebx, dword ptr [ebp + 8]\n\t"
+        "shld eax, ebx, 0xb\n\t"
+        "mov dword ptr [ebp - 6], eax\n\t"
+        "mov dword ptr [ebp - 0xa], ebx\n\t"
+        "fld tbyte ptr [ebp - 0xa]\n\t"
+        "jmp done%=\n\t"
+        "plain%=:\n\t"
+        "fld qword ptr [ebp + 8]\n\t"
+        "done%=:\n\t"
+        "pop ebx\n\t"
+        "leave\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         push ebp
         mov ebp, esp
@@ -2323,6 +3114,7 @@ static __declspec(naked) void crt_fload() {
         leave
         ret
     }
+#endif
 }
 PORT_FN(0x004d2121, "fload", crt_fload, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_fload)
@@ -2333,6 +3125,42 @@ CRT_SHADOW_ORIGINAL(crt_fload)
 // kernel or the special-case routine. They run in the dispatcher's frame (ebp) with the table in edx.
 // =====================================================================================================================
 static __declspec(naked) void crt_trandisp1() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "cmp byte ptr [edx + 0xe], 5\n\t"
+        "jne full%=\n\t"
+        "mov bx, word ptr [ebp - 0xa4]\n\t"
+        "or bh, 2\n\t"
+        "and bh, 0xfe\n\t"
+        "mov bl, 0x3f\n\t"
+        "jmp set_cw%=\n\t"
+        "full%=:\n\t"
+        "mov bx, 0x133f\n\t"
+        "set_cw%=:\n\t"
+        "mov word ptr [ebp - 0xa2], bx\n\t"
+        "fldcw word ptr [ebp - 0xa2]\n\t"
+        "mov ebx, 0x50286d\n\t"
+        "fxam\n\t"
+        "mov dword ptr [ebp - 0x94], edx\n\t"
+        "wait\n\t"
+        "fnstsw word ptr [ebp - 0xa0]\n\t"
+        "mov byte ptr [ebp - 0x90], 0\n\t"
+        "wait\n\t"
+        "mov cl, byte ptr [ebp - 0x9f]\n\t"
+        "shl cl, 1\n\t"
+        "sar cl, 1\n\t"
+        "rol cl, 1\n\t"
+        "%{load%} mov al, cl\n\t"
+        "and al, 0xf\n\t"
+        "xlatb\n\t"
+        "movsx eax, al\n\t"
+        "and ecx, 0x404\n\t"
+        "%{load%} mov ebx, edx\n\t"
+        "%{load%} add ebx, eax\n\t"
+        "add ebx, 0x10\n\t"
+        "jmp dword ptr [ebx]"
+        : :);
+#else
     __asm {
         cmp byte ptr [edx + 0xe], 5
         jne full
@@ -2367,11 +3195,63 @@ static __declspec(naked) void crt_trandisp1() {
         add ebx, 0x10
         jmp dword ptr [ebx]
     }
+#endif
 }
 PORT_FN(0x004d2da0, "trandisp1", crt_trandisp1, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_trandisp1)
 
 static __declspec(naked) void crt_trandisp2() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "cmp byte ptr [edx + 0xe], 5\n\t"
+        "jne full%=\n\t"
+        "mov bx, word ptr [ebp - 0xa4]\n\t"
+        "or bh, 2\n\t"
+        "and bh, 0xfe\n\t"
+        "mov bl, 0x3f\n\t"
+        "jmp set_cw%=\n\t"
+        "full%=:\n\t"
+        "mov bx, 0x133f\n\t"
+        "set_cw%=:\n\t"
+        "mov word ptr [ebp - 0xa2], bx\n\t"
+        "fldcw word ptr [ebp - 0xa2]\n\t"
+        "mov ebx, 0x50286d\n\t"
+        "fxam\n\t"
+        "mov dword ptr [ebp - 0x94], edx\n\t"
+        "wait\n\t"
+        "fnstsw word ptr [ebp - 0xa0]\n\t"
+        "mov byte ptr [ebp - 0x90], 0\n\t"
+        "fxch st(1)\n\t"
+        "mov cl, byte ptr [ebp - 0x9f]\n\t"
+        "fxam\n\t"
+        "wait\n\t"
+        "fnstsw word ptr [ebp - 0xa0]\n\t"
+        "fxch st(1)\n\t"
+        "mov ch, byte ptr [ebp - 0x9f]\n\t"
+        "shl ch, 1\n\t"
+        "sar ch, 1\n\t"
+        "rol ch, 1\n\t"
+        "%{load%} mov al, ch\n\t"
+        "and al, 0xf\n\t"
+        "xlatb\n\t"
+        "%{load%} mov ah, al\n\t"
+        "shl cl, 1\n\t"
+        "sar cl, 1\n\t"
+        "rol cl, 1\n\t"
+        "%{load%} mov al, cl\n\t"
+        "and al, 0xf\n\t"
+        "xlatb\n\t"
+        "shl ah, 1\n\t"
+        "shl ah, 1\n\t"
+        "%{load%} or al, ah\n\t"
+        "movsx eax, al\n\t"
+        "and ecx, 0x404\n\t"
+        "%{load%} mov ebx, edx\n\t"
+        "%{load%} add ebx, eax\n\t"
+        "add ebx, 0x10\n\t"
+        "jmp dword ptr [ebx]"
+        : :);
+#else
     __asm {
         cmp byte ptr [edx + 0xe], 5
         jne full
@@ -2421,6 +3301,7 @@ static __declspec(naked) void crt_trandisp2() {
         add ebx, 0x10
         jmp dword ptr [ebx]
     }
+#endif
 }
 PORT_FN(0x004d2e07, "trandisp2", crt_trandisp2, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_trandisp2)
@@ -2440,6 +3321,31 @@ const U32 a_rtindfpop = 0x004d2f46, a_rtindfnpop = 0x004d2f48, a_rtzeronpop = 0x
 // 0x4d1e9c (called by the asin / acos kernels): |x|, then sqrt((1 - x)(1 + x)) -- or, when that is negative (|x| > 1),
 // drop the return address and leave through _rtindfpop (the indefinite result)
 static __declspec(naked) void crt_triga_sqrt1mx2() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "fabs\n\t"
+        "fld st(0)\n\t"
+        "fld st(0)\n\t"
+        "fld1\n\t"
+        "fsubrp st(1), st\n\t"
+        "fxch st(1)\n\t"
+        "fld1\n\t"
+        "faddp st(1), st\n\t"
+        "fmulp st(1), st\n\t"
+        "ftst\n\t"
+        "wait\n\t"
+        "fnstsw word ptr [ebp - 0xa0]\n\t"
+        "wait\n\t"
+        "test byte ptr [ebp - 0x9f], 1\n\t"
+        "jne negative%=\n\t"
+        "%{load%} xor ch, ch\n\t"
+        "fsqrt\n\t"
+        "ret\n\t"
+        "negative%=:\n\t"
+        "pop eax\n\t"
+        "jmp dword ptr [%c0]"
+        : : "i"(&a_rtindfpop));
+#else
     __asm {
         fabs
         fld st(0)
@@ -2463,6 +3369,7 @@ static __declspec(naked) void crt_triga_sqrt1mx2() {
         pop eax
         jmp dword ptr [a_rtindfpop]
     }
+#endif
 }
 // the shared tail (0x4d1e8b): fpatan, then pi - result when cl, the sign when ch
 #define CRT_TRIGA_FPATAN_TAIL                                                                                      \
@@ -2477,31 +3384,70 @@ static __declspec(naked) void crt_triga_sqrt1mx2() {
     __asm { fchs }                                                                                                 \
     __asm { no_chs: }                                                                                              \
     __asm { ret }
+#ifdef VP_GCC
+#define CRT_TRIGA_FPATAN_TAIL_GNU                                                                                  \
+    "fpatan\n\t"                                                                                                   \
+    "%{load%} or cl, cl\n\t"                                                                                       \
+    "je no_pi%=\n\t"                                                                                               \
+    "fldpi\n\t"                                                                                                    \
+    "fsubrp st(1), st\n\t"                                                                                         \
+    "no_pi%=:\n\t"                                                                                                 \
+    "%{load%} or ch, ch\n\t"                                                                                       \
+    "je no_chs%=\n\t"                                                                                              \
+    "fchs\n\t"                                                                                                     \
+    "no_chs%=:\n\t"                                                                                                \
+    "ret"
+#endif
 
 // asin (0x4d1e60): atan2(x, sqrt(1 - x^2)), the signs swapped into ch
 static __declspec(naked) void crt_triga_asin() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "call %P0\n\t"
+        "xchg cl, ch\n\t"
+        CRT_TRIGA_FPATAN_TAIL_GNU
+        : : "i"(&crt_triga_sqrt1mx2));
+#else
     __asm {
         call crt_triga_sqrt1mx2
         xchg cl, ch
     }
     CRT_TRIGA_FPATAN_TAIL
+#endif
 }
 PORT_FN(0x004d1e60, "87triga:asin", crt_triga_asin, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_triga_asin)
 
 // acos (0x4d1e69): atan2(sqrt(1 - x^2), x)
 static __declspec(naked) void crt_triga_acos() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "call %P0\n\t"
+        "fxch st(1)\n\t"
+        CRT_TRIGA_FPATAN_TAIL_GNU
+        : : "i"(&crt_triga_sqrt1mx2));
+#else
     __asm {
         call crt_triga_sqrt1mx2
         fxch st(1)
     }
     CRT_TRIGA_FPATAN_TAIL
+#endif
 }
 PORT_FN(0x004d1e69, "87triga:acos", crt_triga_acos, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_triga_acos)
 
 // atan (0x4d1e72): atan2(|x|, 1), the sign from cl
 static __declspec(naked) void crt_triga_atan() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "fabs\n\t"
+        "fld1\n\t"
+        "%{load%} mov ch, cl\n\t"
+        "%{load%} xor cl, cl\n\t"
+        CRT_TRIGA_FPATAN_TAIL_GNU
+        : :);
+#else
     __asm {
         fabs
         fld1
@@ -2509,12 +3455,23 @@ static __declspec(naked) void crt_triga_atan() {
         xor cl, cl
     }
     CRT_TRIGA_FPATAN_TAIL
+#endif
 }
 PORT_FN(0x004d1e72, "87triga:atan", crt_triga_atan, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_triga_atan)
 
 // __fFATN2 (0x4d1e7c): atan2 on the magnitudes (error class 0xfe: the result checked for underflow), signs after
 static __declspec(naked) void crt_fFATN2() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov byte ptr [ebp - 0x90], 0xfe\n\t"
+        "fabs\n\t"
+        "fxch st(1)\n\t"
+        "fabs\n\t"
+        "fxch st(1)\n\t"
+        CRT_TRIGA_FPATAN_TAIL_GNU
+        : :);
+#else
     __asm {
         mov byte ptr [ebp - 0x90], 0xfe
         fabs
@@ -2523,23 +3480,48 @@ static __declspec(naked) void crt_fFATN2() {
         fxch st(1)
     }
     CRT_TRIGA_FPATAN_TAIL
+#endif
 }
 PORT_FN(0x004d1e7c, "fFATN2", crt_fFATN2, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_fFATN2)
 
 // __rtpiby2 (0x4d1ecc): the operand replaced by pi/2 (87disp's 80-bit constant)
 static __declspec(naked) void crt_rtpiby2() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "fstp st(0)\n\t"
+        "fld tbyte ptr ds:[0x50285a]\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         fstp st(0)
         fld tbyte ptr ds:[0x50285a]
         ret
     }
+#endif
 }
 PORT_FN(0x004d1ecc, "rtpiby2", crt_rtpiby2, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_rtpiby2)
 
 // 0x4d1ed5 (atan2's table): drop one operand; with cl, the other too and +-pi (ch); else _rtzeronpop
 static __declspec(naked) void crt_triga_atan2_pi() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "fstp st(0)\n\t"
+        "%{load%} or cl, cl\n\t"
+        "je zero%=\n\t"
+        "fstp st(0)\n\t"
+        "fldpi\n\t"
+        "%{load%} or ch, ch\n\t"
+        "je done%=\n\t"
+        "fchs\n\t"
+        "done%=:\n\t"
+        "ret\n\t"
+        "zero%=:\n\t"
+        "jmp dword ptr [%c0]"
+        : : "i"(&a_rtzeronpop));
+#else
     __asm {
         fstp st(0)
         or cl, cl
@@ -2554,37 +3536,60 @@ static __declspec(naked) void crt_triga_atan2_pi() {
     zero:
         jmp dword ptr [a_rtzeronpop]
     }
+#endif
 }
 PORT_FN(0x004d1ed5, "87triga:atan2 pi", crt_triga_atan2_pi, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_triga_atan2_pi)
 
 // 0x4d1eeb (atan2's table): drop one operand, the indefinite
 static __declspec(naked) void crt_triga_atan2_ind() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "fstp st(0)\n\t"
+        "jmp dword ptr [%c0]"
+        : : "i"(&a_rtindfnpop));
+#else
     __asm {
         fstp st(0)
         jmp dword ptr [a_rtindfnpop]
     }
+#endif
 }
 PORT_FN(0x004d1eeb, "87triga:atan2 indefinite", crt_triga_atan2_ind, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_triga_atan2_ind)
 
 // 0x4d1ef2 (atan / atan2's tables): drop one operand, the sign from ch, into 0x4d1ef8
 static __declspec(naked) void crt_triga_atan2_piby2() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "fstp st(0)\n\t"
+        "%{load%} mov cl, ch\n\t"
+        "jmp dword ptr [%c0]"
+        : : "i"(&a_triga_ef8));
+#else
     __asm {
         fstp st(0)
         mov cl, ch
         jmp dword ptr [a_triga_ef8]
     }
+#endif
 }
 PORT_FN(0x004d1ef2, "87triga:atan2 pi/2", crt_triga_atan2_piby2, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_triga_atan2_piby2)
 
 // 0x4d1ef8 (atan's table): +-pi/2 -- _rtpiby2, then _rtchsifneg
 static __declspec(naked) void crt_triga_piby2_signed() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "call dword ptr [%c0]\n\t"
+        "jmp dword ptr [%c1]"
+        : : "i"(&a_rtpiby2), "i"(&a_rtchsifneg));
+#else
     __asm {
         call dword ptr [a_rtpiby2]
         jmp dword ptr [a_rtchsifneg]
     }
+#endif
 }
 PORT_FN(0x004d1ef8, "87triga:pi/2 signed", crt_triga_piby2_signed, fp_asm)
 CRT_SHADOW_ORIGINAL(crt_triga_piby2_signed)

@@ -921,8 +921,16 @@ static float k_eps_f = 1.1920928955078125e-07f;
 static __forceinline double fild_u32(uint32_t q) {
     uint64_t v = q;
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fild %[v]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [v] "m"(v)
+                     : VP_X87_CLOBBERS);
+#else
     __asm { fild qword ptr v
             fstp r }
+#endif
     return r;
 }
 
@@ -941,6 +949,34 @@ PORT_FN(0x004a4400, "screw_up", screw_up_c, fp_screw_up)
 // rot_convert(Quat&, NetAxisAngle const&): past the axis' length, what the original does with fsin / fcos (their 64-bit
 // results multiplied in the registers, then stored), in the original's instructions
 static __declspec(noinline) void rot_q_tail(float* q, const float* axis, float sumf) {
+#ifdef VP_GCC
+    __asm__ volatile("mov     eax, %[axis]\n\t"
+                     "mov     edx, %[q]\n\t"
+                     "fld     %[sumf]\n\t"
+                     "fsqrt\n\t"
+                     "fld     %[half]\n\t"
+                     "fmul    st, st(1)\n\t"
+                     "fld     st(0)\n\t"
+                     "fsin\n\t"
+                     "fld     dword ptr [eax]\n\t"
+                     "fdiv    st, st(3)\n\t"
+                     "fmul    st, st(1)\n\t"
+                     "fstp    dword ptr [edx]\n\t"
+                     "fld     dword ptr [eax + 4]\n\t"
+                     "fdiv    st, st(3)\n\t"
+                     "fmul    st, st(1)\n\t"
+                     "fstp    dword ptr [edx + 4]\n\t"
+                     "fxch    st(2)\n\t"
+                     "fdivr   dword ptr [eax + 8]\n\t"
+                     "fmul    st, st(2)\n\t"
+                     "fstp    dword ptr [edx + 8]\n\t"
+                     "fcos\n\t"
+                     "fstp    dword ptr [edx + 12]\n\t"
+                     "fstp    st(0)"
+                     :
+                     : [axis] "m"(axis), [q] "m"(q), [sumf] "m"(sumf), [half] "m"(k_half)
+                     : VP_X87_CLOBBERS, "eax", "edx", "memory");
+#else
     __asm {
         mov     eax, axis
         mov     edx, q
@@ -966,6 +1002,7 @@ static __declspec(noinline) void rot_q_tail(float* q, const float* axis, float s
         fstp    dword ptr [edx + 12]
         fstp    st(0)
     }
+#endif
 }
 static void __cdecl rot_convert_q(uint8_t* q, const uint8_t* a) {
     volatile float vmax = FB(K_RMAX), vmin = FB(K_RMIN);
@@ -1046,6 +1083,28 @@ PORT_FN(0x004a44d0, "MakePhysicsPacket", MakePhysicsPacket_c, fp_make_phys)
 // stored as a float, fsin on the register, the sine stored as a float and compared (unrounded) with the epsilon
 static __declspec(noinline) int acos_sin(float w, float* angle, float* sine) {
     int big;
+#ifdef VP_GCC
+    __asm__ volatile("fld     %[w]\n\t"
+                     "mov     eax, 0x004cf07c\n\t"
+                     "call    eax\n\t"
+                     "mov     ecx, %[angle]\n\t"
+                     "fst     dword ptr [ecx]\n\t"
+                     "fsin\n\t"
+                     "mov     ecx, %[sine]\n\t"
+                     "fst     dword ptr [ecx]\n\t"
+                     "fabs\n\t"
+                     "fcomp   %[eps]\n\t"
+                     "fnstsw  ax\n\t"
+                     "xor     ecx, ecx\n\t"
+                     "test    ah, 0x41\n\t"
+                     "jne     done%=\n\t"
+                     "mov     ecx, 1\n"
+                     "done%=:\n\t"
+                     "mov     %[big], ecx"
+                     : [big] "=m"(big)
+                     : [w] "m"(w), [angle] "m"(angle), [sine] "m"(sine), [eps] "m"(k_eps_f)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         fld     w
         mov     eax, 0x004cf07c
@@ -1065,6 +1124,7 @@ static __declspec(noinline) int acos_sin(float w, float* angle, float* sine) {
     done:
         mov     big, ecx
     }
+#endif
     return big;
 }
 static __forceinline float clamp20(float v) {

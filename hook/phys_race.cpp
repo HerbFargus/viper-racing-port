@@ -379,6 +379,20 @@ static const char* const k_snd_start = (const char*)0x004eddec, *const k_snd_tic
 VP_ASM_CALLS static double cifmod_one(double x) {
     static const double one = 1.0;
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[x]\n\t"
+                     "fld %[one]\n\t"
+                     "push ecx\n\t"
+                     "push edx\n\t"
+                     "mov eax, 0x4cf36a\n\t"
+                     "call eax\n\t"
+                     "pop edx\n\t"
+                     "pop ecx\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x), [one] "m"(one)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         push ecx
         push edx
@@ -390,6 +404,7 @@ VP_ASM_CALLS static double cifmod_one(double x) {
         pop ecx
         fstp r
     }
+#endif
     return r;
 }
 

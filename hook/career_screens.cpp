@@ -595,6 +595,39 @@ PORT_FN(0x004c0c10, "SeasonViewer::scalar deleting destructor", SeasonViewer_sdd
 // uninitialised (UIStringList's constructor doesn't set it) and a list box watches it: the second menu reads what the
 // race's frame left there, which only the original's layout reproduces. (Calls by address through eax, free at each.)
 static __declspec(naked) void __cdecl TestingDo_c() {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "sub esp, 0x24\n\t"
+        "lea eax, [esp + 3]\n\t"
+        "lea ecx, [esp + 4]\n\t"
+        "push eax\n\t"
+        "push ecx\n\t"
+        "mov eax, 0x004c1040\n\t"
+        "call eax\n\t"
+        "add esp, 8\n\t"
+        "test al, al\n\t"
+        "je done%=\n"
+        "again%=:\n\t"
+        "mov eax, dword ptr [esp + 3]\n\t"
+        "lea ecx, [esp + 4]\n\t"
+        "push eax\n\t"
+        "push ecx\n\t"
+        "mov eax, 0x004c0ec0\n\t"
+        "call eax\n\t"
+        "lea ecx, [esp + 0xb]\n\t"
+        "lea edx, [esp + 0xc]\n\t"
+        "add esp, 8\n\t"
+        "push ecx\n\t"
+        "push edx\n\t"
+        "mov eax, 0x004c1040\n\t"
+        "call eax\n\t"
+        "add esp, 8\n\t"
+        "test al, al\n\t"
+        "jne again%=\n"
+        "done%=:\n\t"
+        "add esp, 0x24\n\t"
+        "ret" : :);
+#else
     __asm {
         sub esp, 0x24
         lea eax, [esp + 3]
@@ -627,6 +660,7 @@ static __declspec(naked) void __cdecl TestingDo_c() {
         add esp, 0x24
         ret
     }
+#endif
 }
 PORT_FN(0x004c0e70, "TestingDo", TestingDo_c, fp_screen)
 

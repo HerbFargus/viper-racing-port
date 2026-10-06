@@ -31,6 +31,9 @@
 // screen lock / flip). This group's own functions and the C runtime's strncpy / strchr / _CIacos / __ftol run as the
 // game's code, in both passes (each rewrite is checked against its original with the same callees).
 #define _CRT_SECURE_NO_WARNINGS
+#if defined(__GNUC__) && !defined(__clang__)
+#define _WIN32_WINNT 0x0A00               // (mingw: GetCurrentThreadStackLimits)
+#endif
 #include <windows.h>
 #include <float.h>
 #include <math.h>
@@ -40,6 +43,9 @@
 #include <string.h>
 #include <type_traits>
 #include <utility>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes"; the fixes: /DFIX_TESTS)
@@ -1050,16 +1056,31 @@ static int run_guarded(Kind k, Mode m, uint64_t* ret) {
     g_file_pos = 0;
     g_mode = m;
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, g_pc, _MCW_PC);
     if (g_unmask) _controlfp_s(&cw, _MCW_EM & ~(_EM_OVERFLOW | _EM_ZERODIVIDE), _MCW_EM);
     int fault = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+        *ret = call_kind(k);
+        __asm__ volatile("fwait" ::: VP_X87_CLOBBERS, "memory");
+    }, fault_filter)) { fault = 1; }
+#else
     __try {
         *ret = call_kind(k);
         __asm fwait
     } __except (fault_filter(GetExceptionInformation())) { fault = 1; }
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     return fault;
@@ -1136,9 +1157,15 @@ enum : uint32_t { CMP_BYTES = A_PIX + 8 * 0x20000 };
 static int g_fix_fail;
 typedef void(__cdecl* Tri_t)(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t);
 static int tri_guarded(Tri_t f, const int32_t* v, uint32_t c) {
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+        f(v[0], v[1], v[2], v[3], v[4], v[5], c);
+    }, fault_filter)) { return 1; }
+#else
     __try {
         f(v[0], v[1], v[2], v[3], v[4], v[5], c);
     } __except (fault_filter(GetExceptionInformation())) { return 1; }
+#endif
     return 0;
 }
 static void fix_tests() {

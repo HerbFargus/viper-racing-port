@@ -216,6 +216,18 @@ static const double k_two_pi = 6.2831854820251465;       // the qword constant: 
 static const float k_one = 1.0f;
 static __declspec(noinline) double wave_sin_plus_one(double a) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[a]\n\t"
+                     "fld %[k_two_pi]\n\t"
+                     "mov eax, 0x004cf36a\n\t"
+                     "call eax\n\t"
+                     "fsin\n\t"
+                     "fadd %[k_one]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [a] "m"(a), [k_two_pi] "m"(k_two_pi), [k_one] "m"(k_one)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         fld     a
         fld     k_two_pi
@@ -225,6 +237,7 @@ static __declspec(noinline) double wave_sin_plus_one(double a) {
         fadd    k_one
         fstp    r
     }
+#endif
     return r;
 }
 

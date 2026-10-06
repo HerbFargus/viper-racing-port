@@ -46,6 +46,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #ifndef VP_GX_FIXES                 // (built with /DVP_GX_FIXES: the fixes on, and tested -- see main)
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
@@ -416,7 +419,11 @@ static void setup_world() {
     g_nmodels = 0;
     g_script.salt = rnd();
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_24, _MCW_PC);
     g_setup_ok = true;
@@ -426,7 +433,11 @@ static void setup_world() {
         budget -= *(int32_t*)info_at(k);
     }
     random_resource();
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+#else
     __try {
+#endif
         ((V0_t)0x004556f0)();                                        // mr_model_begin
         ((V0_t)0x00457860)();                                        // mr_feature_begin
         ((V0_t)0x0045ae10)();                                        // light_begin
@@ -469,7 +480,11 @@ static void setup_world() {
                 ((void(__cdecl*)(void*, void*, void*))0x004573d0)(info, *(uint8_t**)(info + 0xc), si);
             }
         }
+#if defined(__GNUC__) && !defined(__clang__)
+    }, setup_filter)) { g_setup_ok = false; }
+#else
     } __except (setup_filter(GetExceptionInformation())) { g_setup_ok = false; }
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
 }
 
@@ -1077,16 +1092,31 @@ static int run_guarded(Kind k, bool rw, uint64_t* ret) {
     g_file_next = 0;
     g_deres_left = g_script.deres_frames;
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, g_pc, _MCW_PC);
     if (g_unmask) _controlfp_s(&cw, _MCW_EM & ~(_EM_OVERFLOW | _EM_ZERODIVIDE), _MCW_EM);
     int fault = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+        *ret = call_kind(k, rw);
+        __asm__ volatile("fwait" ::: VP_X87_CLOBBERS, "memory");
+    }, fault_filter)) { fault = 1; }
+#else
     __try {
         *ret = call_kind(k, rw);
         __asm fwait
     } __except (fault_filter(GetExceptionInformation())) { fault = 1; }
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     return fault;
@@ -1102,14 +1132,26 @@ static const char* where(uint32_t a, char* buf) {
 // ---- the fixes, each on the input that used to fail ------------------------------------------------------------------
 static int guarded(void (*fn)()) {
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_53, _MCW_PC);                              // (at 24 bits the lighting's rounding trick gives 0)
     g_log.n = 0;
     g_fix_fired = 0;
     int fault = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { fn(); })) { fault = 1; }
+#else
     __try { fn(); } __except (EXCEPTION_EXECUTE_HANDLER) { fault = 1; }
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     return fault;
 }
@@ -1291,10 +1333,17 @@ static int directed_fix_tests() {
             uint8_t guard_before[64];
             memcpy(guard_before, lit[1] + 0x100000, 64);
             int fl;
+#if defined(__GNUC__) && !defined(__clang__)
+            if (vp_try([&] {
+                light_nopre_nofog_someenv(surf, (uint8_t*)verts, lit[1]);
+                fl = 0;
+            })) { fl = 1; }
+#else
             __try {
                 light_nopre_nofog_someenv(surf, (uint8_t*)verts, lit[1]);
                 fl = 0;
             } __except (EXCEPTION_EXECUTE_HANDLER) { fl = 1; }
+#endif
             check(!fl && !memcmp(guard_before, lit[1] + 0x100000, 64) && memcmp(lit[1] + 32 * 32766, untouched, 32) != 0,
                   "(e) 32,767 vertices lit into the lifted buffer: the last one written, nothing past its end");
         }

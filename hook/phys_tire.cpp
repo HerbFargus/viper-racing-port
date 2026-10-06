@@ -109,16 +109,39 @@ FCONST(k_min_speed, 0x3dcccccd);       // 0x4dc030 0.1
 // atan(y) (fld1; fpatan) times m -- the multiply rounds the full result
 static __declspec(noinline) double x87_atan_mul(double y, double m) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[y]\n\t"
+                     "fld1\n\t"
+                     "fpatan\n\t"
+                     "fmul %[m]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [y] "m"(y), [m] "m"(m)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld y
             fld1
             fpatan
             fmul m
             fstp r }
+#endif
     return r;
 }
 // sin(atan(y) * c) * d
 static __declspec(noinline) double x87_atan_mul_sin_mul(double y, double c, double d) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[y]\n\t"
+                     "fld1\n\t"
+                     "fpatan\n\t"
+                     "fmul %[c]\n\t"
+                     "fsin\n\t"
+                     "fmul %[d]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [y] "m"(y), [c] "m"(c), [d] "m"(d)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld y
             fld1
             fpatan
@@ -126,23 +149,42 @@ static __declspec(noinline) double x87_atan_mul_sin_mul(double y, double c, doub
             fsin
             fmul d
             fstp r }
+#endif
     return r;
 }
 // cos(x) * m: x87_cos_mul, in x87.h
 // sin(x) stored straight to a float (fsin; fstp dword)
 static __declspec(noinline) float x87_sin_float(double x) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[x]\n\t"
+                     "fsin\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld x
             fsin
             fstp r }
+#endif
     return r;
 }
 // fld dword; fchs; fstp dword -- a float negated through the FPU (a signalling NaN comes out quiet)
 static __declspec(noinline) float x87_chs_float(float x) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[x]\n\t"
+                     "fchs\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld x
             fchs
             fstp r }
+#endif
     return r;
 }
 

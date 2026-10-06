@@ -60,6 +60,9 @@
 #include <vector>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
 static const bool k_ordinary = false;
@@ -96,6 +99,9 @@ void Footprint::add(void* p, uint32_t bytes, const char* what) {
 }
 void Footprint::object(void* obj, const char* what) { add(obj, 0x40, what); }
 
+#if defined(__GNUC__) && !defined(__clang__)
+#undef W_OK                                 // (mingw's <io.h> macro; snd_mix.cpp names a global W_OK)
+#endif
 #include "../hook/snd_mix.cpp"
 
 typedef int Edx;
@@ -781,28 +787,47 @@ static uint32_t g_fault_code, g_fault_at;
 static int fault_filter(EXCEPTION_POINTERS* e) {
     g_fault_code = e->ExceptionRecord->ExceptionCode;
     g_fault_at = (uint32_t)(uintptr_t)e->ExceptionRecord->ExceptionAddress;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);                                       // an unmasked x87 exception is still pending
+#else
     __asm fninit                                       // an unmasked x87 exception is still pending
+#endif
     return EXCEPTION_EXECUTE_HANDLER;
 }
 template <typename Run> static int guarded(Run& run, uint64_t* ret) {
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { *ret = run(); }, fault_filter)) {
+        return g_fault_code == PANIC_CODE ? 1 : 2;
+    }
+    return 0;
+#else
     __try {
         *ret = run();
         return 0;
     } __except (fault_filter(GetExceptionInformation())) {
         return g_fault_code == PANIC_CODE ? 1 : 2;
     }
+#endif
 }
 // the BG thread's mode: ExceptDiv0Crashes(1) unmasks overflow, divide-by-zero and denormal
 static void fpu_mode(unsigned pc, bool unmask) {
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _clearfp();
     _controlfp_s(&cw, pc, _MCW_PC);
     if (unmask) _controlfp_s(&cw, _EM_INEXACT | _EM_UNDERFLOW | _EM_INVALID, _MCW_EM);
 }
 static void fpu_reset() {
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _clearfp();
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
@@ -1653,9 +1678,17 @@ static void expect(bool ok, const char* what, const char* res = "", int a = 0, i
 template <typename F> static uint32_t fguard(F f) {                 // 0, or the exception (LogPanic's included)
     unsigned cw;
     uint32_t r = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _PC_24, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { f(); }, fault_filter)) { r = g_fault_code; }
+#else
     __try { f(); } __except (fault_filter(GetExceptionInformation())) { r = g_fault_code; }
+#endif
     fpu_reset();
     return r;
 }

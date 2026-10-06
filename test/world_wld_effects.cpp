@@ -40,6 +40,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
 #include "../hook/port.h"
@@ -281,13 +284,24 @@ static void setup_world() {
     g_model_next = 0;
     g_rand = rnd() | 1;
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _PC_24, _MCW_PC);
     g_setup_ok = true;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+        ((Void_t2)0x00467460)();                                         // EffectsBegin, the original
+        ((SkidCtor_t)0x004687d0)(AR(A_SKIDOBJ), 0, chance(5) ? 0 : 1 + (int)(rnd() % 40));
+    })) { g_setup_ok = false; }
+#else
     __try {
         ((Void_t2)0x00467460)();                                         // EffectsBegin, the original
         ((SkidCtor_t)0x004687d0)(AR(A_SKIDOBJ), 0, chance(5) ? 0 : 1 + (int)(rnd() % 40));
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_setup_ok = false; }
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     g_heap_mark = g_heap;
 }
@@ -997,18 +1011,38 @@ static int run_guarded(Kind k, bool rw, uint64_t* ret) {
     const int tex0 = g_script.tex;
     const int model0 = g_model_next;
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);                                        // (an earlier fault leaves its registers on the x87 stack)
+#else
     __asm fninit                                        // (an earlier fault leaves its registers on the x87 stack)
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, g_pc, _MCW_PC);
     if (g_unmask) _controlfp_s(&cw, _MCW_EM & ~(_EM_OVERFLOW | _EM_ZERODIVIDE), _MCW_EM);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (g_debug_cw && k == K_FACES_UP) { uint16_t x; uint16_t sw; __asm__ volatile("fnstcw %0\n\tfnstsw %1" : "=m"(x), "=m"(sw));
+                                                                             printf("  pass %d: cw %04x sw %04x\n", rw, x, sw); }
+#else
     if (g_debug_cw && k == K_FACES_UP) { uint16_t x; uint16_t sw; __asm { fnstcw x
                                                                              fnstsw sw } printf("  pass %d: cw %04x sw %04x\n", rw, x, sw); }
+#endif
     int fault = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+        *ret = call_kind(k, rw);
+        __asm__ volatile("fwait" ::: VP_X87_CLOBBERS, "memory");                                     // (an exception still pending from the call's last store)
+    }, fault_filter)) { fault = 1; }
+#else
     __try {
         *ret = call_kind(k, rw);
         __asm fwait                                     // (an exception still pending from the call's last store)
     } __except (fault_filter(GetExceptionInformation())) { fault = 1; }
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);                                        // (a fault leaves the x87 stack as it was)
+#else
     __asm fninit                                        // (a fault leaves the x87 stack as it was)
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     g_script.tex = tex0;

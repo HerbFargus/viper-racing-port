@@ -71,6 +71,25 @@ typedef int Edx;                                    // the unused edx of a __thi
 // strcpy: repne scasb (the length, NUL included), then rep movsd, rep movsb: forward, so an overlapping copy
 // smears exactly as the original's does
 static __forceinline void i_strcpy(char* dst, const char* src) {
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %[src]\n\t"
+                     "mov ecx, 0xffffffff\n\t"
+                     "sub eax, eax\n\t"
+                     "repne scasb\n\t"
+                     "not ecx\n\t"
+                     "sub edi, ecx\n\t"
+                     "mov eax, ecx\n\t"
+                     "shr ecx, 2\n\t"
+                     "mov esi, edi\n\t"
+                     "mov edi, %[dst]\n\t"
+                     "rep movsd\n\t"
+                     "mov ecx, eax\n\t"
+                     "and ecx, 3\n\t"
+                     "rep movsb"
+                     :
+                     : [dst] "m"(dst), [src] "m"(src)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "esi", "edi", "cc", "memory");
+#else
     __asm { mov edi, src
             mov ecx, 0xffffffff
             sub eax, eax
@@ -85,9 +104,34 @@ static __forceinline void i_strcpy(char* dst, const char* src) {
             mov ecx, eax
             and ecx, 3
             rep movsb }
+#endif
 }
 // strcat: the source's length first, then the destination's end (repne scasb; dec edi), then the copy
 static __forceinline void i_strcat(char* dst, const char* src) {
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %[src]\n\t"
+                     "mov ecx, 0xffffffff\n\t"
+                     "sub eax, eax\n\t"
+                     "repne scasb\n\t"
+                     "not ecx\n\t"
+                     "sub edi, ecx\n\t"
+                     "mov edx, ecx\n\t"
+                     "mov esi, edi\n\t"
+                     "mov ecx, 0xffffffff\n\t"
+                     "mov edi, %[dst]\n\t"
+                     "sub eax, eax\n\t"
+                     "repne scasb\n\t"
+                     "dec edi\n\t"
+                     "mov ecx, edx\n\t"
+                     "shr ecx, 2\n\t"
+                     "rep movsd\n\t"
+                     "mov ecx, edx\n\t"
+                     "and ecx, 3\n\t"
+                     "rep movsb"
+                     :
+                     : [dst] "m"(dst), [src] "m"(src)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "esi", "edi", "cc", "memory");
+#else
     __asm { mov edi, src
             mov ecx, 0xffffffff
             sub eax, eax
@@ -107,10 +151,23 @@ static __forceinline void i_strcat(char* dst, const char* src) {
             mov ecx, edx
             and ecx, 3
             rep movsb }
+#endif
 }
 // the inlined strlen (repne scasb; not ecx; dec ecx)
 static __forceinline uint32_t i_strlen(const char* s) {
     uint32_t n;
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %[s]\n\t"
+                     "mov ecx, 0xffffffff\n\t"
+                     "sub eax, eax\n\t"
+                     "repne scasb\n\t"
+                     "not ecx\n\t"
+                     "dec ecx\n\t"
+                     "mov %[n], ecx"
+                     : [n] "=m"(n)
+                     : [s] "m"(s)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edi", "cc", "memory");
+#else
     __asm { mov edi, s
             mov ecx, 0xffffffff
             sub eax, eax
@@ -118,6 +175,7 @@ static __forceinline uint32_t i_strlen(const char* s) {
             not ecx
             dec ecx
             mov n, ecx }
+#endif
     return n;
 }
 

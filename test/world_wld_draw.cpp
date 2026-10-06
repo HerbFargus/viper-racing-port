@@ -52,6 +52,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
@@ -768,16 +771,31 @@ static int run_guarded(Kind k, bool rw, uint64_t* ret) {
     g_rand = g_script.seed;
     g_time = g_time0;
     unsigned cw;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, g_pc, _MCW_PC);
     if (g_unmask) _controlfp_s(&cw, _MCW_EM & ~(_EM_OVERFLOW | _EM_ZERODIVIDE), _MCW_EM);
     int fault = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+        *ret = call_kind(k, rw);
+        __asm__ volatile("fwait" ::: VP_X87_CLOBBERS, "memory");
+    }, fault_filter)) { fault = 1; }
+#else
     __try {
         *ret = call_kind(k, rw);
         __asm fwait
     } __except (fault_filter(GetExceptionInformation())) { fault = 1; }
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _MCW_EM, _MCW_EM);
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     return fault;

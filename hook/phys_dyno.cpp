@@ -261,6 +261,82 @@ PORT_FN(0x0043db50, "PhobRoot::~PhobRoot", PhobRoot_dtor, fp_root_dtor)
 static const float k_one = 1.0f;
 static __declspec(noinline) void replay_axis_angle(const float* v, const float* L, float* M) {
     float t0, t1, t2, t3, t4;
+#ifdef VP_GCC
+    __asm__ volatile("mov ecx, %[v]\n\t"
+                     "mov edx, %[L]\n\t"
+                     "mov eax, %[M]\n\t"
+                     "fld dword ptr [edx]\n\t"
+                     "fdivr %[k_one]\n\t"
+                     "fld dword ptr [ecx]\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fld dword ptr [ecx + 4]\n\t"
+                     "fmul st, st(2)\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul dword ptr [ecx + 8]\n\t"
+                     "fld dword ptr [edx]\n\t"
+                     "fsin\n\t"
+                     "fld dword ptr [edx]\n\t"
+                     "fcos\n\t"
+                     "fld %[k_one]\n\t"
+                     "fsub st, st(1)\n\t"
+                     "fld st(4)\n\t"
+                     "fmul st, st(5)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [eax]\n\t"
+                     "fld st(0)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fmul st, st(5)\n\t"
+                     "fstp %[t1]\n\t"
+                     "fld st(2)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fst %[t0]\n\t"
+                     "fadd %[t1]\n\t"
+                     "fstp dword ptr [eax + 4]\n\t"
+                     "fld st(0)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fst %[t2]\n\t"
+                     "fmul st, st(5)\n\t"
+                     "fstp %[t3]\n\t"
+                     "fld st(2)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fst %[t4]\n\t"
+                     "fsubr %[t3]\n\t"
+                     "fstp dword ptr [eax + 8]\n\t"
+                     "fld %[t1]\n\t"
+                     "fsub %[t0]\n\t"
+                     "fstp dword ptr [eax + 12]\n\t"
+                     "fld st(5)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [eax + 16]\n\t"
+                     "fxch st(5)\n\t"
+                     "fmul %[t2]\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fld st(2)\n\t"
+                     "fadd st, st(1)\n\t"
+                     "fstp dword ptr [eax + 20]\n\t"
+                     "fld %[t3]\n\t"
+                     "fadd %[t4]\n\t"
+                     "fstp dword ptr [eax + 24]\n\t"
+                     ".byte 0xdc, 0xea\n\t"
+                     "fxch st(2)\n\t"
+                     "fstp dword ptr [eax + 28]\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul st, st(0)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [eax + 32]\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)"
+                     : [t1] "=m"(t1), [t0] "=m"(t0), [t2] "=m"(t2), [t3] "=m"(t3), [t4] "=m"(t4)
+                     : [v] "m"(v), [L] "m"(L), [M] "m"(M), [k_one] "m"(k_one)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         mov     ecx, v
         mov     edx, L
@@ -335,6 +411,7 @@ static __declspec(noinline) void replay_axis_angle(const float* v, const float* 
         fstp    st(0)
         fstp    st(0)
     }
+#endif
 }
 
 // a packet's rotation vector: three 16-bit angles, u * (2pi/16384) - 2pi
@@ -384,6 +461,25 @@ PORT_FN(0x0043db80, "PhobRoot::UpdateReplay", PhobRoot_UpdateReplay, fp_root_upd
 static const float k_flt_eps = 1.1920928955078125e-07f;
 static __declspec(noinline) int acos_then_sin(const float* w, float* h, float* s) {
     int sw;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[w]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "mov eax, 0x004cf07c\n\t"
+                     "call eax\n\t"
+                     "mov ecx, %[h]\n\t"
+                     "fst dword ptr [ecx]\n\t"
+                     "fsin\n\t"
+                     "mov ecx, %[s]\n\t"
+                     "fst dword ptr [ecx]\n\t"
+                     "fabs\n\t"
+                     "fcomp %[k_flt_eps]\n\t"
+                     "fnstsw ax\n\t"
+                     "movzx eax, ax\n\t"
+                     "mov %[sw], eax"
+                     : [sw] "=m"(sw)
+                     : [w] "m"(w), [h] "m"(h), [s] "m"(s), [k_flt_eps] "m"(k_flt_eps)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         mov     eax, w
         fld     dword ptr [eax]
@@ -400,6 +496,7 @@ static __declspec(noinline) int acos_then_sin(const float* w, float* h, float* s
         movzx   eax, ax
         mov     sw, eax
     }
+#endif
     return sw;
 }
 
@@ -806,6 +903,82 @@ PORT_FN(0x00444ff0, "PhobDyno::GetPointMoment", PhobDyno_GetPointMoment, fp_poin
 // grouping differs from UpdateReplay's); the original's reused stack slots are t10..t1c
 static __declspec(noinline) void dyno_axis_angle(const float* d, const float* L, float* M) {
     float t10, t14, t18, t1c;
+#ifdef VP_GCC
+    __asm__ volatile("mov ecx, %[d]\n\t"
+                     "mov edx, %[L]\n\t"
+                     "mov eax, %[M]\n\t"
+                     "fld dword ptr [edx]\n\t"
+                     "fdivr %[k_one]\n\t"
+                     "fld dword ptr [ecx]\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fld dword ptr [ecx + 4]\n\t"
+                     "fmul st, st(2)\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul dword ptr [ecx + 8]\n\t"
+                     "fld dword ptr [edx]\n\t"
+                     "fsin\n\t"
+                     "fld dword ptr [edx]\n\t"
+                     "fcos\n\t"
+                     "fld %[k_one]\n\t"
+                     "fsub st, st(1)\n\t"
+                     "fld st(4)\n\t"
+                     "fmul st, st(5)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [eax]\n\t"
+                     "fld st(4)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fst %[t10]\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fstp %[t18]\n\t"
+                     "fld st(2)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fst %[t14]\n\t"
+                     "fadd %[t18]\n\t"
+                     "fstp dword ptr [eax + 4]\n\t"
+                     "fld %[t10]\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fstp %[t1c]\n\t"
+                     "fld st(2)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fst %[t10]\n\t"
+                     "fsubr %[t1c]\n\t"
+                     "fstp dword ptr [eax + 8]\n\t"
+                     "fld %[t18]\n\t"
+                     "fsub %[t14]\n\t"
+                     "fstp dword ptr [eax + 12]\n\t"
+                     "fld st(5)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [eax + 16]\n\t"
+                     "fld st(0)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fstp %[t14]\n\t"
+                     "fxch st(4)\n\t"
+                     "fmul st, st(2)\n\t"
+                     "fld %[t14]\n\t"
+                     "fadd st, st(1)\n\t"
+                     "fstp dword ptr [eax + 20]\n\t"
+                     "fld %[t1c]\n\t"
+                     "fadd %[t10]\n\t"
+                     "fstp dword ptr [eax + 24]\n\t"
+                     "fsubr %[t14]\n\t"
+                     "fstp dword ptr [eax + 28]\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul st, st(0)\n\t"
+                     "fmul st, st(3)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [eax + 32]\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)"
+                     : [t10] "=m"(t10), [t18] "=m"(t18), [t14] "=m"(t14), [t1c] "=m"(t1c)
+                     : [d] "m"(d), [L] "m"(L), [M] "m"(M), [k_one] "m"(k_one)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         mov     ecx, d
         mov     edx, L
@@ -879,6 +1052,7 @@ static __declspec(noinline) void dyno_axis_angle(const float* d, const float* L,
         fstp    st(0)
         fstp    st(0)
     }
+#endif
 }
 
 // PhobDyno::Update (0x445210, virtual): one 0.016 s step

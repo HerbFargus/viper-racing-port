@@ -735,6 +735,19 @@ PORT_FN(0x0044ede0, "mrSetProjection", mrSetProjection, fp_mrSetProjection)
 
 // ==== mrMirrorView (0x44ee20) ====================================================================================
 static __forceinline void fpu_abs_neg(float* p, uint8_t negate) {   // fld; fabs; [fchs]; fstp -- through the FPU
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[p]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fabs\n\t"
+                     "cmp %[negate], 0\n\t"
+                     "je keep%=\n\t"
+                     "fchs\n"
+                     "keep%=:\n\t"
+                     "fstp dword ptr [eax]"
+                     :
+                     : [p] "m"(p), [negate] "m"(negate)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { mov eax, p
             fld dword ptr [eax]
             fabs
@@ -742,6 +755,7 @@ static __forceinline void fpu_abs_neg(float* p, uint8_t negate) {   // fld; fabs
             je keep
             fchs
     keep:   fstp dword ptr [eax] }
+#endif
 }
 static void __cdecl mrMirrorView(uint8_t on) {
     fpu_abs_neg(P<float>(S_PROJ), on);
@@ -968,6 +982,32 @@ PORT_FN(0x0044f520, "init_camera", init_camera, fp_init_camera)
 // register short, and the rest of the sequence goes on with that)
 static const float k_half = 0.5f, k_two = 2.0f;
 static void __cdecl calc_projection_matrix(float n, float f, float fov) {
+#ifdef VP_GCC
+    __asm__ volatile("fld     %[fov]\n\t"
+                     "fmul    %[half]\n\t"
+                     "fptan\n\t"
+                     "fstp    st(0)\n\t"
+                     "fld     %[f]\n\t"
+                     "fsub    %[n]\n\t"
+                     "fxch    st(1)\n\t"
+                     "fmul    %[two]\n\t"
+                     "mov     eax, 0x005228f8\n\t"
+                     "fst     dword ptr [eax]\n\t"
+                     "fstp    dword ptr [eax + 0x14]\n\t"
+                     "fld     %[f]\n\t"
+                     "fdiv    st, st(1)\n\t"
+                     "mov     dword ptr [eax + 0x2c], 0x3f800000\n\t"
+                     "mov     dword ptr [eax + 0x3c], 0\n\t"
+                     "fstp    dword ptr [eax + 0x28]\n\t"
+                     "fld     %[f]\n\t"
+                     "fmul    %[n]\n\t"
+                     "fchs\n\t"
+                     "fdivrp  st(1), st\n\t"
+                     "fstp    dword ptr [eax + 0x38]"
+                     :
+                     : [fov] "m"(fov), [f] "m"(f), [n] "m"(n), [half] "m"(k_half), [two] "m"(k_two)
+                     : VP_X87_CLOBBERS, "eax", "memory");
+#else
     __asm {
         fld     fov
         fmul    dword ptr [k_half]
@@ -991,6 +1031,7 @@ static void __cdecl calc_projection_matrix(float n, float f, float fov) {
         fdivrp  st(1), st
         fstp    dword ptr [eax + 0x38]
     }
+#endif
 }
 static void fp_calc_projection_matrix(Footprint& f, float, float, float) { fp_proj(f); }
 PORT_FN(0x0044f590, "calc_projection_matrix", calc_projection_matrix, fp_calc_projection_matrix)
@@ -1805,6 +1846,27 @@ static __forceinline int32_t spec_power(int32_t i, float s) {
     int32_t lo;
     int64_t q;
     uint16_t cw, chop;
+#ifdef VP_GCC
+    __asm__ volatile("fild    %[i]\n\t"
+                     "fmul    %[inv255]\n\t"
+                     "fmul    %[s]\n\t"
+                     "fmul    st, st(0)\n\t"
+                     "fld     st(0)\n\t"
+                     "fmul    st, st(1)\n\t"
+                     "fmul    st, st(0)\n\t"
+                     "fmulp   st(1), st\n\t"
+                     "fmul    %[seventy]\n\t"
+                     "fnstcw  %[cw]\n\t"
+                     "mov     ax, %[cw]\n\t"
+                     "or      ah, 0x0c\n\t"
+                     "mov     %[chop], ax\n\t"
+                     "fldcw   %[chop]\n\t"
+                     "fistp   %[q]\n\t"
+                     "fldcw   %[cw]"
+                     : [cw] "=m"(cw), [chop] "=m"(chop), [q] "=m"(q)
+                     : [i] "m"(i), [s] "m"(s), [inv255] "m"(k_inv255), [seventy] "m"(k_seventy)
+                     : VP_X87_CLOBBERS, "eax", "cc");
+#else
     __asm {
         fild    i
         fmul    dword ptr [k_inv255]
@@ -1823,6 +1885,7 @@ static __forceinline int32_t spec_power(int32_t i, float s) {
         fistp   qword ptr q
         fldcw   cw
     }
+#endif
     lo = (int32_t)q;
     return lo;
 }

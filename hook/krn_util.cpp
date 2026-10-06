@@ -60,6 +60,20 @@ static __forceinline double Db(uint64_t u) { double d; memcpy(&d, &u, 8); return
 // rep movsd (n >> 2 dwords) then rep movsb (n & 3 bytes), forwards: the original's inlined memcpy / strcpy. The
 // count is shifted logically, as the original does (a negative n is a huge copy there too).
 static __forceinline void rep_movs(void* dst, const void* src, uint32_t n) {
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %[dst]\n\t"
+                     "mov esi, %[src]\n\t"
+                     "mov ecx, %[n]\n\t"
+                     "mov edx, ecx\n\t"
+                     "shr ecx, 2\n\t"
+                     "rep movsd\n\t"
+                     "mov ecx, edx\n\t"
+                     "and ecx, 3\n\t"
+                     "rep movsb"
+                     :
+                     : [dst] "m"(dst), [src] "m"(src), [n] "m"(n)
+                     : VP_X87_CLOBBERS, "ecx", "edx", "esi", "edi", "cc", "memory");
+#else
     __asm { mov edi, dst
             mov esi, src
             mov ecx, n
@@ -69,6 +83,7 @@ static __forceinline void rep_movs(void* dst, const void* src, uint32_t n) {
             mov ecx, edx
             and ecx, 3
             rep movsb }
+#endif
 }
 
 #define G8(a) (*(volatile uint8_t*)(uintptr_t)(a))
@@ -1220,38 +1235,85 @@ PORT_FN(0x0041b700, "Random(int,int)", Random2_rw, fp_random2)
 // fild x; fmul qword k; fld qword y; call _CIfmod -- the remainder is exact, so a double holds it
 VP_ASM_CALLS static double ran_fmod_scaled(int32_t x, double k, double y) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fild %[x]\n\t"
+                     "fmul %[k]\n\t"
+                     "fld %[y]\n\t"
+                     "mov eax, %[fmod]\n\t"
+                     "call eax\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x), [k] "m"(k), [y] "m"(y), [fmod] "m"(k_CIfmod)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm { fild x
             fmul k
             fld y
             mov eax, k_CIfmod
             call eax
             fstp r }
+#endif
     return r;
 }
 // fild x; fld qword y; call _CIfmod
 VP_ASM_CALLS static double ran_fmod_int(int32_t x, double y) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fild %[x]\n\t"
+                     "fld %[y]\n\t"
+                     "mov eax, %[fmod]\n\t"
+                     "call eax\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x), [y] "m"(y), [fmod] "m"(k_CIfmod)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm { fild x
             fld y
             mov eax, k_CIfmod
             call eax
             fstp r }
+#endif
     return r;
 }
 // (an exact remainder) fimul k; fld qword y; call _CIfmod
 VP_ASM_CALLS static double ran_fmod_mul(double v, int32_t k, double y) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[v]\n\t"
+                     "fimul %[k]\n\t"
+                     "fld %[y]\n\t"
+                     "mov eax, %[fmod]\n\t"
+                     "call eax\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [v] "m"(v), [k] "m"(k), [y] "m"(y), [fmod] "m"(k_CIfmod)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm { fld v
             fimul k
             fld y
             mov eax, k_CIfmod
             call eax
             fstp r }
+#endif
     return r;
 }
 // fild l; fmul qword 53.0; fadd 1.0 (the register the original keeps); fld qword 169.0; call _CIfmod
 VP_ASM_CALLS static double ran_fmod_lcg(int32_t l, double k53, double one, double y) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fild %[l]\n\t"
+                     "fmul %[k53]\n\t"
+                     "fadd %[one]\n\t"
+                     "fld %[y]\n\t"
+                     "mov eax, %[fmod]\n\t"
+                     "call eax\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [l] "m"(l), [k53] "m"(k53), [one] "m"(one), [y] "m"(y), [fmod] "m"(k_CIfmod)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm { fild l
             fmul k53
             fadd one
@@ -1259,6 +1321,7 @@ VP_ASM_CALLS static double ran_fmod_lcg(int32_t l, double k53, double one, doubl
             mov eax, k_CIfmod
             call eax
             fstp r }
+#endif
     return r;
 }
 
@@ -1735,6 +1798,28 @@ PORT_FN(0x004d8df0, "MemStreamGetReal", MemStreamGetReal_rw, fp_ms_get_real)
 // would overwrite before it could be read, so this one is written in the original's frame layout: the same two
 // calls by address, the length read from that slot.
 static __declspec(naked) void __cdecl MemStreamGetString_rw(MemStreamPtr*, char*, int32_t) {
+#ifdef VP_GCC
+    __asm__ volatile("sub esp, 4\n\t"
+                     "lea eax, [esp]\n\t"
+                     "push esi\n\t"
+                     "mov esi, [esp + 0xc]\n\t"
+                     "push eax\n\t"
+                     "push esi\n\t"
+                     "mov eax, 0x004d8dc0\n\t"
+                     "call eax\n\t"
+                     "mov ecx, [esp + 0xc]\n\t"
+                     "mov eax, [esp + 0x18]\n\t"
+                     "add esp, 8\n\t"
+                     "push ecx\n\t"
+                     "push eax\n\t"
+                     "push esi\n\t"
+                     "mov eax, 0x004d8e50\n\t"
+                     "call eax\n\t"
+                     "add esp, 0xc\n\t"
+                     "pop esi\n\t"
+                     "add esp, 4\n\t"
+                     "ret" : :);
+#else
     __asm {
         sub esp, 4
         lea eax, [esp]
@@ -1757,6 +1842,7 @@ static __declspec(naked) void __cdecl MemStreamGetString_rw(MemStreamPtr*, char*
         add esp, 4
         ret
     }
+#endif
 }
 static void fp_ms_get_string(Footprint& f, MemStreamPtr* p, char* buf, int32_t) {
     fp_ms_ptr(f, p);
@@ -1789,16 +1875,47 @@ PORT_FN(0x004d8e50, "MemStreamGetData", MemStreamGetData_rw, fp_ms_get_data)
 
 // fld dword [p]; fchs; fstp dword [p] -- a negation through the FPU (a signalling NaN comes out quiet)
 static __forceinline void fneg_store(float* p) {
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[p]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fchs\n\t"
+                     "fstp dword ptr [eax]"
+                     :
+                     : [p] "m"(p)
+                     : VP_X87_CLOBBERS, "eax", "memory");
+#else
     __asm { mov eax, p
             fld dword ptr [eax]
             fchs
             fstp dword ptr [eax] }
+#endif
 }
 // omega = fpatan(sinom, cosom) (full precision, never stored), then sin((1 - t) omega) / sinom and
 // sin(t omega) / sinom: products rounded to the FPU's precision, so doubles hold them
 static void slerp_scales(float sinom, float cosom, float t, double* s0, double* s1) {
     float one = 1.0f;
     double a, b;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[sinom]\n\t"
+                     "fld %[cosom]\n\t"
+                     "fpatan\n\t"
+                     "fld %[sinom]\n\t"
+                     "fdivr %[one]\n\t"
+                     "fld %[one]\n\t"
+                     "fsub %[t]\n\t"
+                     "fmul st, st(2)\n\t"
+                     "fsin\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul %[t]\n\t"
+                     "fsin\n\t"
+                     "fmulp st(1), st\n\t"
+                     "fstp %[b]\n\t"
+                     "fstp %[a]"
+                     : [a] "=m"(a), [b] "=m"(b)
+                     : [sinom] "m"(sinom), [cosom] "m"(cosom), [one] "m"(one), [t] "m"(t)
+                     : VP_X87_CLOBBERS);
+#else
     __asm { fld sinom
             fld cosom
             fpatan
@@ -1815,6 +1932,7 @@ static void slerp_scales(float sinom, float cosom, float t, double* s0, double* 
             fmulp st(1), st
             fstp b
             fstp a }
+#endif
     *s0 = a;
     *s1 = b;
 }

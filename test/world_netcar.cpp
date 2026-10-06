@@ -42,6 +42,9 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #include "../hook/port.h"
 
 #undef PORT_FN_BUILDS
@@ -565,6 +568,16 @@ static int crash_filter(EXCEPTION_POINTERS* e, bool orig) {
            e->ExceptionRecord->ExceptionCode, e->ExceptionRecord->ExceptionAddress);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+template <typename Run> static uint64_t guarded(Run& run, bool orig) {
+    uint64_t r = 0;
+    if (vp_try([&] { r = run(orig); }, [&](EXCEPTION_POINTERS* e) { return crash_filter(e, orig); })) {
+        if (!orig && g_chain) chain(false);
+        return 0xdeaddeaddeaddeadull;
+    }
+    return r;
+}
+#else
 template <typename Run> static uint64_t guarded(Run& run, bool orig) {
     __try {
         return run(orig);
@@ -573,6 +586,7 @@ template <typename Run> static uint64_t guarded(Run& run, bool orig) {
         return 0xdeaddeaddeaddeadull;
     }
 }
+#endif
 static bool log_has(uint32_t tag) {
     for (int i = 0; i < g_nlog[0]; i++) if (g_log[0][i] == tag) return true;
     return false;

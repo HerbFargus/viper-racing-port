@@ -42,6 +42,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                                 // the original's behaviour, bit for bit (the fixes: /DFIX_TESTS)
@@ -742,7 +745,11 @@ static int run_guarded(Kind k, bool rw, uint64_t* ret) {
     unsigned cw;
     _clearfp();
     _controlfp_s(&cw, _PC_24, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { *ret = call_kind(k, rw); }, fault_filter)) { return 1; }
+#else
     __try { *ret = call_kind(k, rw); } __except (fault_filter(GetExceptionInformation())) { return 1; }
+#endif
     return 0;
 }
 
@@ -751,7 +758,11 @@ static int footprint_of(Kind k, Footprint& fp) {
     AICar* c = car();
     fp.n = 0; fp.pure = false; fp.replay_only = 0;
     reset_run();
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+#else
     __try {
+#endif
         switch (k) {
         case K_REPL: fpof_AICar_repl_handler(fp, g_event, 0); break;
         case K_STUFF: fpof_AICar_stuff_event(fp, c, 0, g_args.ev_kind, g_args.ev_value, g_args.text); break;
@@ -797,7 +808,11 @@ static int footprint_of(Kind k, Footprint& fp) {
         case K_REAL: fpof_AICar_get_real_target(fp, c, 0); break;
         default: break;
         }
+#if defined(__GNUC__) && !defined(__clang__)
+    })) { return 1; }
+#else
     } __except (EXCEPTION_EXECUTE_HANDLER) { return 1; }
+#endif
     return 0;
 }
 static bool in_footprint(const Footprint& fp, const uint8_t* p) {
@@ -1074,7 +1089,11 @@ static void run_fix_tests() {
         unsigned cw;
         _controlfp_s(&cw, _PC_24, _MCW_PC);
         bool fault = false;
+#if defined(__GNUC__) && !defined(__clang__)
+        if (vp_try([&] { AICar_stuff_event(car(), 0, g_args.ev_kind & 1, g_args.ev_value, text); })) { fault = true; }
+#else
         __try { AICar_stuff_event(car(), 0, g_args.ev_kind & 1, g_args.ev_value, text); } __except (EXCEPTION_EXECUTE_HANDLER) { fault = true; }
+#endif
         FIXCHECK(!fault, "stuff_event faulted on a %d-character text", len);
         // the event as the replay got it: {kind, car, value, text[32]} after the stub's (0xadde0000, type, size)
         FIXCHECK(g_log.n >= 3 + 11 && g_log.e[0] == 0xadde0000u && g_log.e[2] == 0x2c, "stuff_event: no event");

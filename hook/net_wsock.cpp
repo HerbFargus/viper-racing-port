@@ -112,8 +112,13 @@ Role g_roles[64];
 int g_nroles, g_next_role;
 struct Req { HANDLE h; char* buf; int len; };             // WSAAsyncGetHostByName's requests: where the reply goes
 Req g_reqs[16];
+#if defined(__GNUC__) && !defined(__clang__)
+__thread int t_err;                             // a replay: the error of a failure made up here
+__thread char t_hostent[1024];                  // a replay: gethostbyname's (winsock's is per thread too)
+#else
 __declspec(thread) int t_err;                             // a replay: the error of a failure made up here
 __declspec(thread) char t_hostent[1024];                  // a replay: gethostbyname's (winsock's is per thread too)
+#endif
 long g_moved_binds, g_dup_broadcasts;
 
 inline bool live() { return session_net_live(); }

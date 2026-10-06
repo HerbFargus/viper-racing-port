@@ -230,26 +230,56 @@ static __forceinline uint32_t ed_bits(const volatile void* s) { return *(const v
 // The result is the register's, rounded by the precision control (so a double holds it).
 static __forceinline double ed_addm(double x, const volatile float* m) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[x]\n\t"
+                     "mov eax, %[m]\n\t"
+                     "fadd dword ptr [eax]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x), [m] "m"(m)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { fld x
             mov eax, m
             fadd dword ptr [eax]
             fstp r }
+#endif
     return r;
 }
 static __forceinline double ed_subm(double x, const volatile float* m) {   // x - [m]
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[x]\n\t"
+                     "mov eax, %[m]\n\t"
+                     "fsub dword ptr [eax]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x), [m] "m"(m)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { fld x
             mov eax, m
             fsub dword ptr [eax]
             fstp r }
+#endif
     return r;
 }
 static __forceinline double ed_mulm(double x, const volatile float* m) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[x]\n\t"
+                     "mov eax, %[m]\n\t"
+                     "fmul dword ptr [eax]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [x] "m"(x), [m] "m"(m)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { fld x
             mov eax, m
             fmul dword ptr [eax]
             fstp r }
+#endif
     return r;
 }
 

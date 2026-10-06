@@ -47,10 +47,20 @@ template <typename T> static inline T* P(uint32_t addr) { return (T*)(uintptr_t)
 static inline float as_float(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 // rep movsd: n dwords, forward, as the original moves them (a bit copy, and the same result if they overlap)
 static __forceinline void movsd(void* dst, const void* src, uint32_t n) {
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %[dst]\n\t"
+                     "mov esi, %[src]\n\t"
+                     "mov ecx, %[n]\n\t"
+                     "rep movsd"
+                     :
+                     : [dst] "m"(dst), [src] "m"(src), [n] "m"(n)
+                     : VP_X87_CLOBBERS, "ecx", "esi", "edi", "cc", "memory");
+#else
     __asm { mov edi, dst
             mov esi, src
             mov ecx, n
             rep movsd }
+#endif
 }
 // the inlined strcpy (repne scasb; rep movsd; rep movsb): strlen + 1 bytes
 static __forceinline void str_copy(void* dst, const char* src) { memcpy(dst, src, strlen(src) + 1); }
@@ -281,6 +291,18 @@ static const Ctor_t AIDriver2_ctorA = (Ctor_t)0x00420eb0;
 // random_real(lo, hi) with its result stored straight from ST0 to a float (the callers' fstp dword): no C
 // variable in between, so it's exact whatever the precision control
 static __declspec(noinline) void random_real_store(float* dst, uint32_t lo, uint32_t hi) {
+#ifdef VP_GCC
+    __asm__ volatile("push %[hi]\n\t"
+                     "push %[lo]\n\t"
+                     "mov eax, 0x0041e3e0\n\t"
+                     "call eax\n\t"
+                     "add esp, 8\n\t"
+                     "mov ecx, %[dst]\n\t"
+                     "fstp dword ptr [ecx]"
+                     :
+                     : [hi] "m"(hi), [lo] "r"(lo), [dst] "m"(dst)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm { push hi
             push lo
             mov eax, 0x0041e3e0
@@ -288,6 +310,7 @@ static __declspec(noinline) void random_real_store(float* dst, uint32_t lo, uint
             add esp, 8
             mov ecx, dst
             fstp dword ptr [ecx] }
+#endif
 }
 
 // ---- footprint helpers ----------------------------------------------------------------------------------------------

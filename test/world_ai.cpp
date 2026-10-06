@@ -36,6 +36,9 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                                 // the original's behaviour, bit for bit (the fixes: /DFIX_TESTS)
 #endif
@@ -237,8 +240,12 @@ static uint32_t hash_bytes(const void* p, size_t n, uint32_t h = 2166136261u) {
 static uint32_t hs(const char* s) {
     if (!s) return 0;
     uint32_t h = 2166136261u;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { for (int i = 0; i < 512 && s[i]; i++) h = (h ^ (uint8_t)s[i]) * 16777619u; })) { h = 0xbadbad; }
+#else
     __try { for (int i = 0; i < 512 && s[i]; i++) h = (h ^ (uint8_t)s[i]) * 16777619u; }
     __except (EXCEPTION_EXECUTE_HANDLER) { h = 0xbadbad; }
+#endif
     return h;
 }
 enum LogKind {
@@ -643,14 +650,22 @@ template <typename Run, typename Fp> static void check(const char* name, Run run
     g_pass = 0; g_nlog[0] = 0; g_si = 0;
     uint64_t ro = 0, rn = 0;
     int fo = 0, fn = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { ro = run(true); })) { fo = 1; }
+#else
     __try { ro = run(true); } __except (EXCEPTION_EXECUTE_HANDLER) { fo = 1; }
+#endif
     save(g_after);
     if (memcmp(g_after.arena, g_start.arena, ARENA_SIZE) || memcmp(g_after.globals, g_start.globals, GLOBALS_BYTES)) st.changed++;
     load(g_start);
     g_pass = 1; g_nlog[1] = 0; g_si = 0;
     _clearfp();
     _controlfp_s(&cw, (unsigned)g_pc, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { rn = run(false); })) { fn = 1; }
+#else
     __try { rn = run(false); } __except (EXCEPTION_EXECUTE_HANDLER) { fn = 1; }
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     ro &= g_ret_mask;
     rn &= g_ret_mask;
@@ -1197,7 +1212,11 @@ static void run_fix_tests() {
         unsigned cw;
         _controlfp_s(&cw, _PC_53, _MCW_PC);
         bool fault = false;
+#if defined(__GNUC__) && !defined(__clang__)
+        if (vp_try([&] { generate_notes_for(ri(0, 3), ri(0, 3), ri(0, 15), cname); })) { fault = true; }
+#else
         __try { generate_notes_for(ri(0, 3), ri(0, 3), ri(0, 15), cname); } __except (EXCEPTION_EXECUTE_HANDLER) { fault = true; }
+#endif
         FIXCHECK(!fault, "generate_notes_for faulted (driver %d, car %d characters)", dl, cl);
         const int dw = dl < 12 ? dl : 12, cw2 = cl < 34 ? cl : 34;
         FIXCHECK(!memcmp(g_cap_world + 0x2c, dname, dw) && g_cap_world[0x2c + dw] == 0, "the World's driver name (%d characters)", dl);

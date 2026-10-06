@@ -31,11 +31,19 @@
 #define CRT_SHADOW_ORIGINAL_FMT(NEW)
 #else
 // a register-convention routine can't go through the C checking wrapper: in shadow mode it stays original
+#ifdef VP_GCC
+#define CRT_SHADOW_ORIGINAL_FMT(NEW)                                                                               \
+    static __declspec(naked) void VP_CAT(shadow_orig_, NEW)() {                                                    \
+        __asm__ volatile("jmp dword ptr [%c0]" : : "i"(&VP_CAT(port_, NEW).orig));                                \
+    }                                                                                                              \
+    namespace { const bool VP_CAT(shadow_orig_set_, NEW) = (VP_CAT(port_, NEW).shadow = (void*)&VP_CAT(shadow_orig_, NEW), true); }
+#else
 #define CRT_SHADOW_ORIGINAL_FMT(NEW)                                                                               \
     static __declspec(naked) void VP_CAT(shadow_orig_, NEW)() {                                                    \
         __asm { jmp dword ptr [VP_CAT(port_, NEW).orig] }                                                           \
     }                                                                                                              \
     namespace { const bool VP_CAT(shadow_orig_set_, NEW) = (VP_CAT(port_, NEW).shadow = (void*)&VP_CAT(shadow_orig_, NEW), true); }
+#endif
 #endif
 
 namespace {
@@ -166,6 +174,16 @@ PORT_FN(0x004d2d20, "write_string", crt_write_string, fp_write_string)
 // get_int_arg (0x4d2d60) / get_int64_arg (0x4d2d70) / get_short_arg (0x4d2d90): the next argument. In assembly:
 // get_short_arg returns only ax (eax's top half is the va_list pointer's), get_int64_arg leaves ecx = the old pointer.
 static __declspec(naked) int __cdecl crt_get_int_arg(char**) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov eax, dword ptr [esp + 4]\n\t"
+        "mov ecx, dword ptr [eax]\n\t"
+        "add ecx, 4\n\t"
+        "mov dword ptr [eax], ecx\n\t"
+        "mov eax, dword ptr [ecx - 4]\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         mov eax, dword ptr [esp + 4]
         mov ecx, dword ptr [eax]
@@ -174,11 +192,24 @@ static __declspec(naked) int __cdecl crt_get_int_arg(char**) {
         mov eax, dword ptr [ecx - 4]
         ret
     }
+#endif
 }
 static void fp_get_arg(Footprint& f, char** pargptr) { f.add(pargptr, 4, "va_list"); }
 PORT_FN(0x004d2d60, "get_int_arg", crt_get_int_arg, fp_get_arg)
 
 static __declspec(naked) uint64_t __cdecl crt_get_int64_arg(char**) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov eax, dword ptr [esp + 4]\n\t"
+        "mov ecx, dword ptr [eax]\n\t"
+        "add ecx, 8\n\t"
+        "mov dword ptr [eax], ecx\n\t"
+        "mov eax, dword ptr [ecx - 8]\n\t"
+        "mov edx, dword ptr [ecx - 4]\n\t"
+        "sub ecx, 8\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         mov eax, dword ptr [esp + 4]
         mov ecx, dword ptr [eax]
@@ -189,10 +220,21 @@ static __declspec(naked) uint64_t __cdecl crt_get_int64_arg(char**) {
         sub ecx, 8
         ret
     }
+#endif
 }
 PORT_FN(0x004d2d70, "get_int64_arg", crt_get_int64_arg, fp_get_arg)
 
 static __declspec(naked) uint16_t __cdecl crt_get_short_arg(char**) {
+#ifdef VP_GCC
+    __asm__ volatile(
+        "mov eax, dword ptr [esp + 4]\n\t"
+        "mov ecx, dword ptr [eax]\n\t"
+        "add ecx, 4\n\t"
+        "mov dword ptr [eax], ecx\n\t"
+        "mov ax, word ptr [ecx - 4]\n\t"
+        "ret"
+        : :);
+#else
     __asm {
         mov eax, dword ptr [esp + 4]
         mov ecx, dword ptr [eax]
@@ -201,6 +243,7 @@ static __declspec(naked) uint16_t __cdecl crt_get_short_arg(char**) {
         mov ax, word ptr [ecx - 4]
         ret
     }
+#endif
 }
 PORT_FN(0x004d2d90, "get_short_arg", crt_get_short_arg, fp_get_arg)
 

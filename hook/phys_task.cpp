@@ -1266,6 +1266,16 @@ PORT_FN(0x0042c220, "TimerWatchdog::tick_begin", TimerWatchdog_tick_begin_rw, fp
 // fld [steer]; fabs; fmul [steer]; fstp -- by construction (a NaN's sign and payload follow the x87's rules)
 static __forceinline float steer_squared_signed() {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, 0x00522200\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fabs\n\t"
+                     "fmul dword ptr [eax]\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     :
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm {
         mov eax, 0x00522200
         fld dword ptr [eax]
@@ -1273,6 +1283,7 @@ static __forceinline float steer_squared_signed() {
         fmul dword ptr [eax]
         fstp r
     }
+#endif
     return r;
 }
 

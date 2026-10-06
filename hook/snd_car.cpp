@@ -98,9 +98,18 @@ static __forceinline float st(double d) {
 // and that fld raises a pending overflow at once, where the original's lone fstp leaves it pending until its next
 // x87 instruction (EngineSoundSample::Update writes `off` in between)
 static __forceinline void st_to(float* dst, double d) {
+#ifdef VP_GCC
+    __asm__ volatile("fld %[d]\n\t"
+                     "mov eax, %[dst]\n\t"
+                     "fstp dword ptr [eax]"
+                     :
+                     : [d] "m"(d), [dst] "m"(dst)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { fld d
             mov eax, dst
             fstp dword ptr [eax] }
+#endif
 }
 // FIX: num / den, where a zero den gives what the FPU gives with the divide-by-zero exception masked -- num x the
 // infinity of den's sign: a finite non-zero num gives the signed infinity, 0 the default NaN (0/0's), an infinity or a

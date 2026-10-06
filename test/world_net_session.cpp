@@ -128,7 +128,11 @@ template <typename T> static T saw_v(int role, T v) { saw(role, &v, sizeof v); r
 static CRITICAL_SECTION g_net_cs;
 struct Packet { std::vector<uint8_t> b; sockaddr_in from; };
 static std::deque<Packet> g_inbox;                       // the game's one socket
+#if defined(__GNUC__) && !defined(__clang__)
+static __thread int t_fake_err;                          // (GCC ignores __declspec(thread): a plain global)
+#else
 static __declspec(thread) int t_fake_err;
+#endif
 static int g_next_socket = 100;
 static unsigned long g_peer_count, g_dup_to_2002, g_bound_port;
 static char* g_async_buf;

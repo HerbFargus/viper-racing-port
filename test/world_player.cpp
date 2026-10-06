@@ -29,6 +29,10 @@
 #include <ctype.h>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#include <initializer_list>                    // (a range-for over a braced list)
+#endif
 #include "../hook/port.h"
 
 #undef PORT_FN_BUILDS
@@ -553,6 +557,14 @@ static int crash_filter(EXCEPTION_POINTERS* e, bool orig) {
            e->ExceptionRecord->ExceptionCode, e->ExceptionRecord->ExceptionAddress);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+template <typename Run> static uint64_t guarded(Run& run, bool orig) {
+    uint64_t r = 0;
+    if (vp_try([&] { r = run(orig); }, [&](EXCEPTION_POINTERS* e) { return crash_filter(e, orig); }))
+        return 0xdeaddeaddeaddeadull;
+    return r;
+}
+#else
 template <typename Run> static uint64_t guarded(Run& run, bool orig) {
     __try {
         return run(orig);
@@ -560,6 +572,7 @@ template <typename Run> static uint64_t guarded(Run& run, bool orig) {
         return 0xdeaddeaddeaddeadull;
     }
 }
+#endif
 
 template <typename Run, typename Fp> static void check(const char* name, Run run, Fp footprint) {
     Stat& st = stat(name);

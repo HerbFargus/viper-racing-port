@@ -43,6 +43,10 @@
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
 #define VP_CRT_HARNESS              // (no shadow-mode redirection: rewrites are registered below)
 #include "../hook/port.h"
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                 // vp_guard: the GCC build's __try / __except
+#include <malloc.h>                 // _resetstkoflw
+#endif
 
 struct ChainReg {
     uint32_t at; void* fn; const char* name; ChainReg* next;
@@ -131,10 +135,18 @@ static u64 rand_double() {
 static void rand_ext(uint8_t out[10]) {
     if (chance(80)) {
         const double d = bitsd(rand_double());
+#if defined(__GNUC__) && !defined(__clang__)
+        uint8_t* o = out;                                       // (one statement: the load stays on the x87 stack)
+        __asm__ volatile("fld %0\n\t"
+                         "mov eax, %1\n\t"
+                         "fstp tbyte ptr [eax]"
+                         : : "m"(d), "m"(o) : VP_X87_CLOBBERS, "eax", "memory");
+#else
         __asm { fld qword ptr d }                               // (an exact load; a signalling NaN quietened -- also tested raw)
         uint8_t* o = out;
         __asm { mov eax, o
                 fstp tbyte ptr [eax] }
+#endif
         if (chance(10)) { u64 m = rnd64(); memcpy(out, &m, 8); }
     } else {
         u64 m = rnd64();
@@ -268,6 +280,52 @@ static uint8_t g_st_out[10];
 static uint8_t g_fenv[28];
 
 static __declspec(naked) void call_thunk() {
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile(
+        "pushad\n\t"
+        "mov dword ptr [%c0], esp\n\t"
+        "fninit\n\t"
+        "fldcw word ptr [%c1]\n\t"
+        "cmp dword ptr [%c2], 2\n\t"
+        "jb one_in%=\n\t"
+        "lea eax, [%c3]\n\t"
+        "fld tbyte ptr [eax + 10]\n"
+        "one_in%=:\n\t"
+        "cmp dword ptr [%c2], 1\n\t"
+        "jb no_in%=\n\t"
+        "lea eax, [%c3]\n\t"
+        "fld tbyte ptr [eax]\n"
+        "no_in%=:\n\t"
+        "mov ecx, dword ptr [%c4]\n"
+        "push_loop%=:\n\t"
+        "test ecx, ecx\n\t"
+        "jz go%=\n\t"
+        "dec ecx\n\t"
+        "lea eax, [%c5]\n\t"
+        "push dword ptr [eax + ecx * 4]\n\t"
+        "jmp push_loop%=\n"
+        "go%=:\n\t"
+        "call dword ptr [%c6]\n\t"
+        "mov dword ptr [%c7], eax\n\t"
+        "mov dword ptr [%c8], edx\n\t"
+        "fnstsw word ptr [%c9]\n\t"
+        "fnstcw word ptr [%c10]\n\t"
+        "fnclex\n\t"
+        "fldcw word ptr [%c11]\n\t"
+        "cmp dword ptr [%c12], 0\n\t"
+        "je no_st%=\n\t"
+        "lea eax, [%c13]\n\t"
+        "fstp tbyte ptr [eax]\n"
+        "no_st%=:\n\t"
+        "fnstenv [%c14]\n\t"
+        "fninit\n\t"
+        "mov esp, dword ptr [%c0]\n\t"
+        "popad\n\t"
+        "ret"
+        : : "i"(&g_esp_save), "i"(&g_cw_in), "i"(&g_nst_in), "i"(&g_st_in), "i"(&g_nargs), "i"(&g_args), "i"(&g_fn),
+            "i"(&g_eax), "i"(&g_edx), "i"(&g_sw_out), "i"(&g_cw_out), "i"(&g_cw_masked), "i"(&g_st_ret),
+            "i"(&g_st_out), "i"(&g_fenv));
+#else
     __asm {
         pushad
         mov g_esp_save, esp
@@ -310,8 +368,19 @@ static __declspec(naked) void call_thunk() {
         popad
         ret
     }
+#endif
 }
 static u32 run_guarded() {
+#if defined(__GNUC__) && !defined(__clang__)
+    const u32 code = vp_guard([](void*) { call_thunk(); }, nullptr);
+    if (code) {
+        if (code == EXCEPTION_STACK_OVERFLOW) _resetstkoflw();
+        _clearfp();
+        _fpreset();
+        return code;
+    }
+    return 0;
+#else
     __try {
         call_thunk();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -322,6 +391,7 @@ static u32 run_guarded() {
         return code;
     }
     return 0;
+#endif
 }
 
 struct Result {
@@ -461,6 +531,9 @@ static void set_args(std::initializer_list<u32> a) {
     g_nst_in = 0;
 }
 static u32 P(const void* p) { return (u32)(uintptr_t)p; }
+#if defined(__GNUC__) && !defined(__clang__)
+template <class F> static u32 P(F* f) { return (u32)(uintptr_t)f; }   // (a function pointer: MSVC converts)
+#endif
 
 // ---- strings ---------------------------------------------------------------------------------------------------------------
 static char* astr(const std::string& s) {

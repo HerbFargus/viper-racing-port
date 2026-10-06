@@ -11,3 +11,5 @@ __pycache__/
 *.obj
 test/build/
 loader/build/
+hook/build-gcc/
+loader/build-gcc/

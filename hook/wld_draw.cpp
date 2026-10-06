@@ -90,10 +90,20 @@ static __forceinline uint8_t*& Pat(void* p, uint32_t off) { return *(uint8_t**)(
 // fld dword; fchs; fstp dword -- through the FPU, as the original does (a signalling NaN comes out quiet)
 static __forceinline float fpu_neg(const float* p) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[p]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fchs\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [p] "m"(p)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { mov eax, p
             fld dword ptr [eax]
             fchs
             fstp r }
+#endif
     return r;
 }
 
@@ -101,6 +111,24 @@ static __forceinline float fpu_neg(const float* p) {
 // the angle and its cosine and sine never leave the x87 (docs/PORTING.md 9: fpatan / fsin / fcos aren't rounded)
 static __forceinline void atan_roll(double y, double x, float* c, float* s, float* ns) {
     float vc, vs, vn;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[y]\n\t"
+                     "fld %[x]\n\t"
+                     "fpatan\n\t"
+                     "fld st(0)\n\t"
+                     "fcos\n\t"
+                     "fxch st(1)\n\t"
+                     "fsin\n\t"
+                     "fld st(1)\n\t"
+                     "fstp %[vc]\n\t"
+                     "fst %[vs]\n\t"
+                     "fchs\n\t"
+                     "fstp %[vn]\n\t"
+                     "fstp st(0)"
+                     : [vc] "=m"(vc), [vs] "=m"(vs), [vn] "=m"(vn)
+                     : [y] "m"(y), [x] "m"(x)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld y
             fld x
             fpatan
@@ -114,10 +142,30 @@ static __forceinline void atan_roll(double y, double x, float* c, float* s, floa
             fchs
             fstp vn
             fstp st(0) }
+#endif
     *c = vc; *s = vs; *ns = vn;
 }
 static __forceinline void atan_roll_neg(double y, double x, float* c, float* s, float* ns) {   // (with the fchs)
     float vc, vs, vn;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[y]\n\t"
+                     "fld %[x]\n\t"
+                     "fpatan\n\t"
+                     "fchs\n\t"
+                     "fld st(0)\n\t"
+                     "fcos\n\t"
+                     "fxch st(1)\n\t"
+                     "fsin\n\t"
+                     "fld st(1)\n\t"
+                     "fstp %[vc]\n\t"
+                     "fst %[vs]\n\t"
+                     "fchs\n\t"
+                     "fstp %[vn]\n\t"
+                     "fstp st(0)"
+                     : [vc] "=m"(vc), [vs] "=m"(vs), [vn] "=m"(vn)
+                     : [y] "m"(y), [x] "m"(x)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld y
             fld x
             fpatan
@@ -132,11 +180,29 @@ static __forceinline void atan_roll_neg(double y, double x, float* c, float* s, 
             fchs
             fstp vn
             fstp st(0) }
+#endif
     *c = vc; *s = vs; *ns = vn;
 }
 // the spindles: fld a; fld st0; fcos; fxch; fsin; fld st1; fstp c; fld st0; fchs; fstp ns; fstp s; fstp c
 static __forceinline void yaw_cs(double a, float* c, float* s, float* ns) {
     float vc, vs, vn, c2;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[a]\n\t"
+                     "fld st(0)\n\t"
+                     "fcos\n\t"
+                     "fxch st(1)\n\t"
+                     "fsin\n\t"
+                     "fld st(1)\n\t"
+                     "fstp %[vc]\n\t"
+                     "fld st(0)\n\t"
+                     "fchs\n\t"
+                     "fstp %[vn]\n\t"
+                     "fstp %[vs]\n\t"
+                     "fstp %[c2]"
+                     : [vc] "=m"(vc), [vn] "=m"(vn), [vs] "=m"(vs), [c2] "=m"(c2)
+                     : [a] "m"(a)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld a
             fld st(0)
             fcos
@@ -149,6 +215,7 @@ static __forceinline void yaw_cs(double a, float* c, float* s, float* ns) {
             fstp vn
             fstp vs
             fstp c2 }
+#endif
     *c = vc; *s = vs; *ns = vn;
     (void)c2;
 }

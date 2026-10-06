@@ -72,10 +72,20 @@ static __forceinline void mv(void* d, uint32_t doff, const void* s, uint32_t sof
 }
 // rep movsd: n dwords, forward
 static __forceinline void movsd(void* dst, const void* src, uint32_t n) {
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %[dst]\n\t"
+                     "mov esi, %[src]\n\t"
+                     "mov ecx, %[n]\n\t"
+                     "rep movsd"
+                     :
+                     : [dst] "m"(dst), [src] "m"(src), [n] "m"(n)
+                     : VP_X87_CLOBBERS, "ecx", "esi", "edi", "cc", "memory");
+#else
     __asm { mov edi, dst
             mov esi, src
             mov ecx, n
             rep movsd }
+#endif
 }
 // the inlined strcpy / strcat (repne scasb; rep movsd; rep movsb): the string and its terminator
 static __forceinline void s_copy(char* d, const char* s) { memcpy(d, s, strlen(s) + 1); }

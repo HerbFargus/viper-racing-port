@@ -521,12 +521,24 @@ PORT_FN(0x00438830, "Car::UpdateDraft", Car_UpdateDraft, fp_update_draft)
 // register contents, not reproducible; unreachable (steering is clamped to +-1, max_steer_angle < 1 rad).
 static __forceinline double yaw_tan_ratio(double steer, double wheelbase) {
     double r;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[steer]\n\t"
+                     "fptan\n\t"
+                     "fstp st(0)\n\t"
+                     "fld %[wheelbase]\n\t"
+                     "fdivp st(1), st(0)\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [steer] "m"(steer), [wheelbase] "m"(wheelbase)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm { fld steer
             fptan
             fstp st(0)
             fld wheelbase
             fdivp st(1), st(0)
             fstp r }
+#endif
     return r;
 }
 // Brakes single wheels toward the bicycle model's yaw rate (v tan(steer) / wheelbase), once the car moves

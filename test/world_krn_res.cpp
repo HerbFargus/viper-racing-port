@@ -68,6 +68,9 @@
 #include <string>
 #include <vector>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
 static const bool k_ordinary = false;
@@ -353,6 +356,16 @@ enum { LOG_CAP = 1 << 20 };                                  // a call that logs
 static void lg(uint32_t v) {
     if (g_log[g_pass].size() < LOG_CAP) g_log[g_pass].push_back(v);
 }
+#if defined(__GNUC__) && !defined(__clang__)
+static uint32_t safe_hash_str(const char* s, int max = 512) {  // a string that may not be one
+    uint32_t h = 2166136261u;
+    if (vp_try([&] {
+            volatile uint32_t& vh = h;                   // its value at a fault stays in memory
+            for (int i = 0; i < max && s[i]; i++) vh = (vh ^ (uint8_t)s[i]) * 16777619u;
+        })) { h ^= 0xbadbad; }
+    return h;
+}
+#else
 static uint32_t safe_hash_str(const char* s, int max = 512) {  // a string that may not be one
     uint32_t h = 2166136261u;
     __try {
@@ -360,6 +373,7 @@ static uint32_t safe_hash_str(const char* s, int max = 512) {  // a string that 
     } __except (EXCEPTION_EXECUTE_HANDLER) { h ^= 0xbadbad; }
     return h;
 }
+#endif
 static void lg_str(const char* s) { lg(s ? safe_hash_str(s) : 0xdeadbeef); }
 // a report's arguments, read by its own format (%s hashed, %d / %x as they are)
 static void lg_fmt(const char* fmt, va_list ap) {
@@ -803,6 +817,19 @@ static int fault_filter(EXCEPTION_POINTERS* e) {
     g_fault_at = (uint32_t)(uintptr_t)e->ExceptionRecord->ExceptionAddress;
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+template <typename Run> static int guarded(Run& run, uint64_t* ret) {
+    if (vp_try([&] { *ret = run(); }, fault_filter)) {
+        _fpreset();
+        return g_fault_code == PANIC_CODE ? 1 : 2;
+    }
+    return 0;
+}
+template <typename Fp> static int guarded_fp(Fp& fp, Footprint* f) {
+    if (vp_try([&] { fp(*f); })) { return 1; }
+    return 0;
+}
+#else
 template <typename Run> static int guarded(Run& run, uint64_t* ret) {
     __try {
         *ret = run();
@@ -820,6 +847,7 @@ template <typename Fp> static int guarded_fp(Fp& fp, Footprint* f) {
         return 1;
     }
 }
+#endif
 static __declspec(noinline) void stack_fill(uint32_t pat) {
     volatile uint32_t buf[0x3000];
     for (int i = 0; i < 0x3000; i++) buf[i] = pat;
@@ -835,6 +863,9 @@ static Stat& stat(const std::string& nm) {
 }
 static Footprint g_fp;
 static std::string g_phase_name;
+#if defined(__GNUC__) && !defined(__clang__)
+static const char* g_phase = "setup";                        // (here for GCC: check() names it; MSVC finds it at main)
+#endif
 static std::vector<uint8_t> g_s0, g_s1, g_after;
 static bool g_chain;
 static long g_mismatch_total, g_checks_total;
@@ -1139,6 +1170,40 @@ static SynSet make_synset(int kind) {
 static long g_payload_ok, g_payload_bad, g_payload_unknown, g_names16, g_names16_found;
 // the entry whose data + 8 is p: its payload's offset in its file, its size, its set's file handle (0: hunted)
 struct EntryInfo { uint32_t off, size; int32_t fh; char name[17]; bool hunted; };
+#if defined(__GNUC__) && !defined(__clang__)
+static bool locate_entry(const uint8_t* p, EntryInfo* info) {
+    bool found = false;                                  // (the MSVC body's `return true`, out of the lambda)
+    vp_try([&] {
+        for (ResourceSetNode* n = g_res_sets; n; n = n->next)
+            for (uint32_t i = 0; i < n->count && i < 100000; i++) {
+                ResourceTOCEntry* e = &n->toc[i];
+                if (e->data + 8 != p) continue;
+                info->size = e->size & 0x7fffffff;
+                info->fh = n->file.fh;
+                memset(info->name, 0, sizeof info->name);
+                memcpy(info->name, e->name, 16);
+                info->hunted = n->name[0] == 0 && n->file.fh == 0;
+                if (info->hunted) {
+                    info->off = 20;                              // a file resource: its payload from byte 20
+                } else {
+                    uint32_t off = 16 + 36 * n->count;
+                    for (uint32_t k = 0; k < i; k++) off += (n->toc[k].size & 0x7fffffff) + 8;
+                    info->off = off + 8;
+                }
+                found = true;
+                return;
+            }
+    });
+    return found;
+}
+static int safe_memcmp(const void* a, const void* b, size_t n) {
+    int r = 0;
+    if (vp_try([&] { r = memcmp(a, b, n) ? 1 : 0; })) {
+        return 2;
+    }
+    return r;
+}
+#else
 static bool locate_entry(const uint8_t* p, EntryInfo* info) {
     __try {
         for (ResourceSetNode* n = g_res_sets; n; n = n->next)
@@ -1169,6 +1234,7 @@ static int safe_memcmp(const void* a, const void* b, size_t n) {
         return 2;
     }
 }
+#endif
 static void verify_payload(const uint8_t* p) {
     if (!p) return;
     EntryInfo in;
@@ -1285,6 +1351,20 @@ struct RawReq { char set[16]; char res[17]; uint32_t type; };
 static RawReq g_raw[30000];
 static int collect_reqs(RawReq* out, int max) {             // every entry of every set in the list (read guarded)
     int n = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    vp_try([&] {
+        volatile int& vn = n;                            // its value at a fault stays in memory
+        for (ResourceSetNode* nd = g_res_sets; nd && vn < max; nd = nd->next)
+            for (uint32_t i = 0; i < nd->count && i < 10000 && vn < max; i++) {
+                RawReq& r = out[vn];
+                memset(&r, 0, sizeof r);
+                memcpy(r.set, nd->name, 15);
+                memcpy(r.res, nd->toc[i].name, 16);
+                r.type = nd->toc[i].type;
+                vn = vn + 1;
+            }
+    });
+#else
     __try {
         for (ResourceSetNode* nd = g_res_sets; nd && n < max; nd = nd->next)
             for (uint32_t i = 0; i < nd->count && i < 10000 && n < max; i++) {
@@ -1296,6 +1376,7 @@ static int collect_reqs(RawReq* out, int max) {             // every entry of ev
                 n++;
             }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
     return n;
 }
 static void fetch_all(int budget) {
@@ -1844,6 +1925,20 @@ static std::vector<uint8_t> make_lang(const std::string& lname, int n, uint32_t 
 static long g_xlate_keys;
 static int lang_keys(const char** out, int max) {           // the current language's keys (read guarded)
     int n = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    vp_try([&] {
+        volatile int& vn = n;                            // its value at a fault stays in memory
+        LangResource* lr = g_lang_res;
+        if (lr)
+            for (int32_t i = 0; i < lr->count && vn < max; i++) {
+                const char* k = lr->pairs[i].key;
+                volatile size_t len = strlen(k);
+                (void)len;
+                out[vn] = k;
+                vn = vn + 1;
+            }
+    });
+#else
     __try {
         LangResource* lr = g_lang_res;
         if (lr)
@@ -1854,6 +1949,7 @@ static int lang_keys(const char** out, int max) {           // the current langu
                 out[n++] = k;
             }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
     return n;
 }
 static void round_locale(int r) {
@@ -2447,7 +2543,9 @@ static void fix_tests() {
 #endif
 
 // ---- main ---------------------------------------------------------------------------------------------------------------------
+#if !(defined(__GNUC__) && !defined(__clang__))       // (GCC: defined above, before check())
 static const char* g_phase = "setup";
+#endif
 static LONG WINAPI unhandled(EXCEPTION_POINTERS* e) {
     printf("UNHANDLED exception %08lx at %08x (reading/writing %08x) during %s / %s, pass %d\n", e->ExceptionRecord->ExceptionCode,
            (uint32_t)(uintptr_t)e->ExceptionRecord->ExceptionAddress,

@@ -158,6 +158,20 @@ static const Chdir_t chdir_o = (Chdir_t)0x004cf830;
 static __forceinline uint32_t str_len(const char* s) { return (uint32_t)strlen(s); }
 static __forceinline void str_copy(char* dst, const char* src) {
     uint32_t n = str_len(src) + 1;
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %[dst]\n\t"
+                     "mov esi, %[src]\n\t"
+                     "mov ecx, %[n]\n\t"
+                     "mov eax, ecx\n\t"
+                     "shr ecx, 2\n\t"
+                     "rep movsd\n\t"
+                     "mov ecx, eax\n\t"
+                     "and ecx, 3\n\t"
+                     "rep movsb"
+                     :
+                     : [dst] "m"(dst), [src] "m"(src), [n] "m"(n)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "esi", "edi", "cc", "memory");
+#else
     __asm { mov edi, dst
             mov esi, src
             mov ecx, n
@@ -167,6 +181,7 @@ static __forceinline void str_copy(char* dst, const char* src) {
             mov ecx, eax
             and ecx, 3
             rep movsb }
+#endif
 }
 static __forceinline void str_cat(char* dst, const char* src) { str_copy(dst + str_len(dst), src); }
 

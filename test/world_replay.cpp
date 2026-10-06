@@ -47,6 +47,9 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #include "../hook/port.h"
 
 // the rewrites, compiled in: each PORT_FN just names the original's address and the footprint function
@@ -745,8 +748,13 @@ static int fault_filter(EXCEPTION_POINTERS* e) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 static int guarded(void (*fn)(void*), void* ctx) {
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { fn(ctx); }, fault_filter)) { _fpreset(); return 1; }
+    return 0;
+#else
     __try { fn(ctx); } __except (fault_filter(GetExceptionInformation())) { _fpreset(); return 1; }
     return 0;
+#endif
 }
 static void reset_pass(int pass) {
     g_pass = pass;

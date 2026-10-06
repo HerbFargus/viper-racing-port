@@ -43,6 +43,9 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
 #define VP_TEST_FIXES           // (the flag the other harnesses use)
 #endif
@@ -667,7 +670,11 @@ template <typename Run, typename Fp> static void check(const char* name, Run run
     g_pass = 0; g_nlog[0] = 0; g_si = 0;
     uint64_t ro = 0, rn = 0;
     int fo = 0, fn = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { ro = run(true); })) { fo = 1; }
+#else
     __try { ro = run(true); } __except (EXCEPTION_EXECUTE_HANDLER) { fo = 1; }
+#endif
     save(g_after);
     if (memcmp(g_after.arena, g_start.arena, ARENA_SIZE) || memcmp(g_after.globals, g_start.globals, GLOBALS_BYTES)) st.changed++;
     g_last_ret = ro;
@@ -678,7 +685,11 @@ template <typename Run, typename Fp> static void check(const char* name, Run run
     g_pass = 1; g_nlog[1] = 0; g_si = 0;
     _clearfp();
     _controlfp_s(&cw, pc, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { rn = run(false); })) { fn = 1; }
+#else
     __try { rn = run(false); } __except (EXCEPTION_EXECUTE_HANDLER) { fn = 1; }
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     if (fo || fn) {
         st.faults++;
@@ -1245,9 +1256,17 @@ static int fix_create_phob() {
         uint8_t r[3] = {9, 9, 9};
         int32_t pos[3] = {0, 0, 0};
         bool ran = true;
+#if defined(__GNUC__) && !defined(__clang__)
+        if (vp_try([&] {
+                volatile uint8_t* vr = r;                // the calls' results so far stay in memory at a fault
+                volatile int32_t* vpos = pos;
+                for (int k = 0; k < 3; k++) { vr[k] = create_phob_rw((void*)p, out); vpos[k] = p->pos; }
+            })) { ran = false; }
+#else
         __try {
             for (int k = 0; k < 3; k++) { r[k] = create_phob_rw((void*)p, out); pos[k] = p->pos; }
         } __except (EXCEPTION_EXECUTE_HANDLER) { ran = false; }
+#endif
         // the reads and the constructions, in order
         uint32_t reads[8], types[4];
         int nr = 0, nt = 0;

@@ -66,6 +66,9 @@
 #include <tuple>
 #include <utility>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #ifndef VP_NET_FIXES
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
 #define NET_FIXES 0
@@ -919,6 +922,32 @@ static void install_fakes() {
 // ---- calling ------------------------------------------------------------------------------------------------------------
 // fn with a[0..n): thiscall (ecx = a[0], the rest pushed) or not (all pushed); esp restored after (cdecl and stdcall alike);
 // edx = 0 (a rewrite's unused edx)
+#if defined(__GNUC__) && !defined(__clang__)
+// The same sequence, its operands in registers: GCC may address the locals through esp, which the pushes move (MSVC's
+// asm frames them through ebp). saved = edi, a = esi, n/first = ecx/edx, a0 = ebx, fn/r = eax.
+static uint32_t __declspec(noinline) raw_call(uint32_t fn, bool thiscall, const uint32_t* a, int n) {
+    uint32_t r, a0 = n ? a[0] : 0;
+    int first = thiscall ? 1 : 0;
+    int cnt = n;
+    __asm__ volatile(
+        "mov edi, esp\n"
+        "1:\n\t"                                          // l_push
+        "cmp ecx, edx\n\t"
+        "jle 2f\n\t"
+        "dec ecx\n\t"
+        "push dword ptr [esi + ecx*4]\n\t"
+        "jmp 1b\n"
+        "2:\n\t"                                          // l_done
+        "mov ecx, ebx\n\t"
+        "xor edx, edx\n\t"
+        "call eax\n\t"
+        "mov esp, edi"
+        : "=a"(r), "+c"(cnt), "+d"(first)
+        : "0"(fn), "S"(a), "b"(a0)
+        : "edi", "cc", "memory", VP_X87_CLOBBERS);
+    return r;
+}
+#else
 static uint32_t __declspec(noinline) raw_call(uint32_t fn, bool thiscall, const uint32_t* a, int n) {
     uint32_t r, saved, a0 = n ? a[0] : 0;
     int first = thiscall ? 1 : 0;
@@ -941,6 +970,7 @@ static uint32_t __declspec(noinline) raw_call(uint32_t fn, bool thiscall, const 
     }
     return r;
 }
+#endif
 
 enum Mode { ORIG, ISOLATED, CHAIN };
 static Mode g_mode;
@@ -961,6 +991,11 @@ static bool in_regions(const Footprint& f, uintptr_t a) {
         if (a >= (uintptr_t)f.r[i].p && a < (uintptr_t)f.r[i].p + f.r[i].n) return true;
     return false;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+static int seh_call(uint32_t fn, bool thiscall, const uint32_t* a, int n, uint32_t* r) {
+    return (int)vp_try([&] { *r = raw_call(fn, thiscall, a, n); });
+}
+#else
 static int seh_call(uint32_t fn, bool thiscall, const uint32_t* a, int n, uint32_t* r) {
     __try {
         *r = raw_call(fn, thiscall, a, n);
@@ -969,6 +1004,7 @@ static int seh_call(uint32_t fn, bool thiscall, const uint32_t* a, int n, uint32
         return (int)GetExceptionCode();
     }
 }
+#endif
 static std::vector<uint8_t> g_snap_data, g_snap_arena;
 static World g_snap_world;
 static Rng g_snap_rng;

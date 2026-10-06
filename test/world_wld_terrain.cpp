@@ -36,6 +36,9 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #define VP_FAITHFUL                 // the rewrites exactly as the originals (docs/PORTING.md, "Fixes")
 #include "../hook/port.h"
 #undef PORT_FN_BUILDS
@@ -267,11 +270,19 @@ static int run_pass(Thunk th, bool orig, FpMode fm, unsigned* code) {
     if (fm == FP_PHYS_EXC) _controlfp_s(&cw, _EM_INVALID | _EM_UNDERFLOW | _EM_INEXACT | _EM_DENORMAL, _MCW_EM);
     int fault = 0;
     g_code = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+            th(orig);
+            volatile float z = 1.0f;
+            z = z + 0.0f;                                        // a pending x87 exception is raised here
+        }, filt)) { fault = 1; _fpreset(); }
+#else
     __try {
         th(orig);
         volatile float z = 1.0f;
         z = z + 0.0f;                                            // a pending x87 exception is raised here
     } __except (filt(GetExceptionInformation())) { fault = 1; _fpreset(); }
+#endif
     _controlfp_s(&cw, _CW_DEFAULT, 0xffffffff);
     _clearfp();
     *code = fault ? g_code : 0;

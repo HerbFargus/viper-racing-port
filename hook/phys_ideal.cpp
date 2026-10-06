@@ -59,18 +59,39 @@ static __forceinline void cp4(void* d, const void* s) { memcpy(d, s, 4); }      
 
 // fld dword [src]; fchs; fstp dword [dst] -- a negation through the FPU (a signalling NaN comes out quiet)
 static __forceinline void fneg_store(float* dst, const float* src) {
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[src]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fchs\n\t"
+                     "mov eax, %[dst]\n\t"
+                     "fstp dword ptr [eax]"
+                     :
+                     : [src] "m"(src), [dst] "m"(dst)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { mov eax, src
             fld dword ptr [eax]
             fchs
             mov eax, dst
             fstp dword ptr [eax] }
+#endif
 }
 // fld dword [src]; fstp dword [dst] -- a copy through the FPU
 static __forceinline void fpu_copy(float* dst, const float* src) {
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[src]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "mov eax, %[dst]\n\t"
+                     "fstp dword ptr [eax]"
+                     :
+                     : [src] "m"(src), [dst] "m"(dst)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { mov eax, src
             fld dword ptr [eax]
             mov eax, dst
             fstp dword ptr [eax] }
+#endif
 }
 
 // ---- layouts -----------------------------------------------------------------------------------------------------

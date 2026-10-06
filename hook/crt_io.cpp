@@ -83,6 +83,20 @@ static __forceinline intptr_t osfhandle(int32_t fh) { return gcall<intptr_t>(F_g
 
 // rep movsd (n / 4 dwords), then rep movsb (n & 3), forwards: the original's inlined memcpy
 static __forceinline void rep_movs(void* d, const void* s, uint32_t n) {
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %0\n\t"
+                     "mov esi, %1\n\t"
+                     "mov ecx, %2\n\t"
+                     "%{load%} mov eax, ecx\n\t"
+                     "shr ecx, 2\n\t"
+                     "rep movsd\n\t"
+                     "%{load%} mov ecx, eax\n\t"
+                     "and ecx, 3\n\t"
+                     "rep movsb"
+                     :
+                     : "m"(d), "m"(s), "m"(n)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "esi", "edi", "cc", "memory");
+#else
     __asm {
         mov edi, d
         mov esi, s
@@ -94,6 +108,7 @@ static __forceinline void rep_movs(void* d, const void* s, uint32_t n) {
         and ecx, 3
         rep movsb
     }
+#endif
 }
 
 static void fp_io(Footprint& f) { f.replay_only = "file I/O"; }

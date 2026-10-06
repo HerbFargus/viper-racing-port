@@ -47,6 +47,9 @@
 #include <vector>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
 #endif
@@ -774,6 +777,31 @@ static int fault_filter(EXCEPTION_POINTERS* e) {
 }
 enum { R_RAN, R_PANIC, R_EXIT, R_HANG, R_FAULT };
 static const char* const k_result[] = {"returned", "panicked", "exited", "hung", "faulted"};
+#if defined(__GNUC__) && !defined(__clang__)
+template <typename Run> static int guarded(Run& run, uint64_t* ret, uint16_t* cw) {
+    if (vp_try([&] {
+            *ret = run();
+            uint16_t w;
+            __asm__ volatile("fnstcw %0" : "=m"(w));
+            *cw = w;
+        }, fault_filter)) {
+        uint16_t w;
+        __asm__ volatile("fnclex" ::: VP_X87_CLOBBERS);  // an x87 fault is still pending: /fp:precise ends this block with fwait
+        __asm__ volatile("fnstcw %0" : "=m"(w));
+        *cw = w;
+        return g_fault_code == PANIC_CODE ? R_PANIC : g_fault_code == EXIT_CODE ? R_EXIT : g_fault_code == HANG_CODE ? R_HANG : R_FAULT;
+    }
+    return R_RAN;
+}
+static void fpu_start(uint16_t cw) {
+    __asm__ volatile("fninit\n\tfldcw %0" :: "m"(cw) : VP_X87_CLOBBERS);
+}
+static void fpu_reset() {
+    unsigned cw;
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+    _controlfp_s(&cw, _PC_53, _MCW_PC);
+}
+#else
 template <typename Run> static int guarded(Run& run, uint64_t* ret, uint16_t* cw) {
     __try {
         *ret = run();
@@ -798,6 +826,7 @@ static void fpu_reset() {
     __asm fninit
     _controlfp_s(&cw, _PC_53, _MCW_PC);
 }
+#endif
 template <typename Run, typename Fp> static void check(const char* fname, Run run, Fp footprint) {
     std::string name = fname;
     if (g_chain) name += " [chain]";
@@ -1418,7 +1447,11 @@ static volatile int g_hook_prio;
 static volatile DWORD g_hook_tid;
 static void __cdecl live_hook() {
     uint16_t w;
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fnstcw %0" : "=m"(w));
+#else
     __asm fnstcw w
+#endif
     g_hook_cw = w;
     g_hook_prio = GetThreadPriority(GetCurrentThread());
     g_hook_tid = GetCurrentThreadId();
@@ -1447,6 +1480,37 @@ static LiveResult live_run(bool rewrite) {
     g_live = true;
     g_hook_calls = 0;
     if (rewrite) chain_patch();
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] {
+            FN(Void_t, 0x004133a0)();                        // prof $E7
+            FN(Void_t, 0x00415270)();                        // sync $E5
+            r.began = FN(Flag_t, 0x00418620)();              // KernelBegin
+            if (r.began) {
+                FN(void(__cdecl*)(void(__cdecl*)(), int), 0x004189f0)(live_hook, 0);   // BGHook, as the physics is
+                Sleep(500);
+                FN(void(__cdecl*)(void(__cdecl*)()), 0x00418ac0)(live_hook);           // BGUnhook
+                r.hooks = g_hook_calls;
+                r.cw = g_hook_cw;
+                r.prio = g_hook_prio;
+                void* b[5];
+                for (int i = 0; i < 5; i++) b[i] = FN(void*(__cdecl*)(int), 0x004140e0)(100 + i * 1000);
+                for (int i = 0; i < 5; i += 2) FN(PtrArg_t, 0x00414300)(b[i]);
+                r.mem_cur = G32(M_CUR);
+                r.mem_max = G32(M_MAX);
+                for (int i = 0; i < 8; i++) r.ntasks_named += ((VTask*)(uintptr_t)(T_TABLE + i * 0x1c))->name != 0;
+                r.nmulti = G32(Y_NMULTI);
+                r.nsingle = G32(Y_NSINGLE);
+                r.ncs = G32(Y_NCS);
+                r.bg_n = G32(B_N);
+                for (int i = 1; i < 5; i += 2) FN(PtrArg_t, 0x00414300)(b[i]);
+                FN(Void_t, 0x00418710)();                    // KernelEnd
+                r.up_after = G8(K_UP);
+            }
+            r.ok = true;
+        }, fault_filter)) {
+        printf("  live pass (%s) faulted: %08x at %08x\n", rewrite ? "rewrites" : "originals", g_fault_code, g_fault_at);
+    }
+#else
     __try {
         FN(Void_t, 0x004133a0)();                        // prof $E7
         FN(Void_t, 0x00415270)();                        // sync $E5
@@ -1476,6 +1540,7 @@ static LiveResult live_run(bool rewrite) {
     } __except (fault_filter(GetExceptionInformation())) {
         printf("  live pass (%s) faulted: %08x at %08x\n", rewrite ? "rewrites" : "originals", g_fault_code, g_fault_at);
     }
+#endif
     if (rewrite) chain_unpatch();
     g_live = false;
     set_slots(false);
@@ -1506,12 +1571,19 @@ static int fix_except_begin() {
         for (int i = 0; i < 256; i++) g_script[i] = 1;   // (FileCreate succeeds: File 7)
         g_modname_override = k.exe;
         g_pass = 1; g_nlog[1] = 0; g_si = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+        if (vp_try([&] { ExceptBegin_rw(); })) {
+            printf("  FAIL ExceptBegin (exe \"%.40s\") faulted\n", k.exe);
+            bad++;
+        }
+#else
         __try {
             ExceptBegin_rw();
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             printf("  FAIL ExceptBegin (exe \"%.40s\") faulted\n", k.exe);
             bad++;
         }
+#endif
         fpu_reset();
         uint32_t dirs = 0, dir_hash = 0, creates = 0, create_hash = 0;
         for (int i = 0; i < g_nlog[1] && i < LOGN; i++) {
@@ -1620,15 +1692,31 @@ static int live_check() {
 int main(int argc, char** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     _set_error_mode(_OUT_TO_STDERR);
+#if defined(__GNUC__) && !defined(__clang__) && !defined(_UCRT)
+    // (mingw on msvcrt.dll: no _set_abort_behavior there -- and its abort() never calls Windows Error Reporting)
+#else
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
     _set_invalid_parameter_handler(invalid_parameter);
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
+#if defined(__GNUC__) && !defined(__clang__)
+    struct Unhandled {                                   // (GCC doesn't convert a lambda to a WINAPI function pointer)
+        static LONG WINAPI filter(EXCEPTION_POINTERS* e) {
+            printf("unhandled exception %08lx at %p (world %d, pass %d)\n", e->ExceptionRecord->ExceptionCode,
+                   e->ExceptionRecord->ExceptionAddress, g_wno, g_pass);
+            ExitProcess(3);
+            return 0;
+        }
+    };
+    SetUnhandledExceptionFilter(Unhandled::filter);
+#else
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* e) -> LONG {
         printf("unhandled exception %08lx at %p (world %d, pass %d)\n", e->ExceptionRecord->ExceptionCode,
                e->ExceptionRecord->ExceptionAddress, g_wno, g_pass);
         ExitProcess(3);
         return 0;
     });
+#endif
     setvbuf(stdout, 0, _IONBF, 0);
     int worlds = argc > 1 ? atoi(argv[1]) : 1200;
     if (argc > 2) g_rng = ((uint32_t)strtoul(argv[2], 0, 0) * 2654435761u) | 1;

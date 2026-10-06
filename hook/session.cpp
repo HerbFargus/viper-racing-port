@@ -303,7 +303,11 @@ volatile DWORD g_lb_arrived;                    // when it came to its gate (Get
 HANDLE g_ev_lb_grant, g_ev_lb_park;
 unsigned long g_lb_steps, g_lb_implied, g_lb_drops, g_lb_free_frames;
 // a lobby step or physics update the main thread is waiting for: its sends are hashed into the frame
+#ifdef VP_GCC
+__thread bool t_stepping;
+#else
 __declspec(thread) bool t_stepping;
+#endif
 
 // ---- hashing -------------------------------------------------------------------------------------------------------------
 inline uint64_t mix(uint64_t h, uint64_t v) {
@@ -569,7 +573,11 @@ void align_clocks() {
 bool net_take(uint8_t op, const uint8_t** p, uint32_t* n);
 void net_put(uint8_t op, const void* p, size_t n);
 volatile LONG g_net_race;                       // a network race of a session: its physics task's clock is recorded
+#ifdef VP_GCC
+__thread bool t_phys_clock;           // this thread is in that physics task (replay.cpp's entries)
+#else
 __declspec(thread) bool t_phys_clock;           // this thread is in that physics task (replay.cpp's entries)
+#endif
 unsigned long g_phys_clock_reads, g_phys_clock_short;
 
 BOOL WINAPI h_QPC(LARGE_INTEGER* p) {

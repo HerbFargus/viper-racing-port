@@ -245,7 +245,11 @@ static const FieldInfo k_fields[] = {
 
 const char* class_of(const void* obj, uint32_t* size) {
     uint32_t vt = 0;
+#ifdef VP_GCC
+    if (!IsBadReadPtr(obj, 4)) vt = *(const uint32_t*)obj;      // (GCC has no __try: an unreadable object is 0, as there)
+#else
     __try { vt = *(const uint32_t*)obj; } __except (EXCEPTION_EXECUTE_HANDLER) { vt = 0; }
+#endif
     for (const ClassInfo& c : k_classes)
         if (c.vtable == vt) { if (size) *size = c.size; return c.name; }
     if (size) *size = 0;
@@ -324,9 +328,15 @@ static const HeapBlock k_heap_blocks[] = {
 // belongs to the output, and isn't recorded again.
 enum OutPhase { OUT_OFF, OUT_NEW, OUT_ORIG };
 enum { OUT_PLAY_VEL = 1, OUT_PLAY_F, OUT_ADD_EVENT, OUT_COM, OUT_MAX_DATA = 4096 };
+#ifdef VP_GCC
+static __thread int t_out_phase;
+static __thread int t_in_output;
+static __thread std::vector<uint8_t>* t_out[3];
+#else
 static __declspec(thread) int t_out_phase;
 static __declspec(thread) int t_in_output;
 static __declspec(thread) std::vector<uint8_t>* t_out[3];
+#endif
 static volatile LONG g_outputs_deferred;
 
 // record an output call, as [id][self][bytes: u16][payload]; true = not in a check: run it now
@@ -375,7 +385,11 @@ static void __cdecl out_add_event(int type, const void* data, int size) {
 }
 
 // ---- DirectDraw / Direct3D calls (port.h) ----
+#ifdef VP_GCC
+static __thread unsigned t_com_checks;
+#else
 static __declspec(thread) unsigned t_com_checks;
+#endif
 
 int shadow_com_phase() {
     if (t_in_output) return 0;
@@ -437,8 +451,13 @@ typedef void*(__cdecl* MemAlloc_t)(int);
 typedef void(__cdecl* MemFree_t)(void*);
 static MemAlloc_t o_mem_alloc;
 static MemFree_t o_mem_free;
+#ifdef VP_GCC
+static __thread uint8_t t_heap;             // 1: the original's pass allocated or freed; 2: the rewrite's
+static __thread const char* t_keep_what;    // what the rewrite's pass did that it can't (shadow_keep_original)
+#else
 static __declspec(thread) uint8_t t_heap;             // 1: the original's pass allocated or freed; 2: the rewrite's
 static __declspec(thread) const char* t_keep_what;    // what the rewrite's pass did that it can't (shadow_keep_original)
+#endif
 static void note_heap() { t_heap |= t_out_phase == OUT_ORIG ? 1 : t_out_phase == OUT_NEW ? 2 : 0; }
 static const ShadowState* g_state;
 void shadow_set_state(const ShadowState* s) { g_state = s; }
@@ -458,7 +477,11 @@ typedef void(__fastcall* Undent_t)(void*, void*);
 static Dent_t o_dent;
 static Undent_t o_undent;
 static volatile LONG g_dents;
+#ifdef VP_GCC
+static __thread LONG t_dents_at;
+#else
 static __declspec(thread) LONG t_dents_at;
+#endif
 static void __fastcall dent_front(void* car, void* edx, const void* force, const void* point, uint32_t rev, uint32_t no_dent) {
     InterlockedIncrement(&g_dents);
     o_dent(car, edx, force, point, rev, no_dent);
@@ -500,6 +523,18 @@ static void install_outputs() {
 struct Span { uint8_t* p; uint32_t n; int kind; int index; };   // kind 0 footprint, 1 global, 2 heap block
 static int g_shadow_every = 1, g_shadow_per_tick = 4;
 static bool g_shadow_on;
+#ifdef VP_GCC
+static __thread int t_depth;
+static __thread Footprint* t_fp;
+static __thread std::vector<Span>* t_spans;
+static __thread std::vector<uint8_t>* t_before;
+static __thread std::vector<uint8_t>* t_after_orig;
+static __thread std::vector<uint8_t>* t_inputs;     // [kind][n][bytes], as the original read them
+static __thread size_t t_input_at;
+static __thread const char* t_input_problem;
+static __thread uint8_t t_ret_orig[16];
+static __thread size_t t_ret_n;
+#else
 static __declspec(thread) int t_depth;
 static __declspec(thread) Footprint* t_fp;
 static __declspec(thread) std::vector<Span>* t_spans;
@@ -510,6 +545,7 @@ static __declspec(thread) size_t t_input_at;
 static __declspec(thread) const char* t_input_problem;
 static __declspec(thread) uint8_t t_ret_orig[16];
 static __declspec(thread) size_t t_ret_n;
+#endif
 
 bool shadow_on() { return g_shadow_on; }
 volatile unsigned long g_physics_thread_id;

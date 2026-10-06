@@ -37,6 +37,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
 #define VP_TEST_FIXES           // (the flag the other harnesses use)
@@ -546,7 +549,11 @@ static int run_guarded(Kind k, bool rw, uint32_t* ret) {
     _clearfp();
     _controlfp_s(&cw, g_pc, _MCW_PC);
     int fault = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { *ret = call_kind(k, rw); }, fault_filter)) { fault = 1; }
+#else
     __try { *ret = call_kind(k, rw); } __except (fault_filter(GetExceptionInformation())) { fault = 1; }
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     return fault;
 }
@@ -645,7 +652,11 @@ int main(int argc, char** argv) {
             g_log.n = 0;
             unsigned cw;
             _controlfp_s(&cw, _PC_24, _MCW_PC);
+#if defined(__GNUC__) && !defined(__clang__)
+            if (vp_try([&] { ((Void_t)0x00428db0)(); })) {}
+#else
             __try { ((Void_t)0x00428db0)(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
             if (*(int32_t*)S_NUM_TV > 32) *(int32_t*)S_NUM_TV = 32;
             loaded = true;
             c_loaded++;

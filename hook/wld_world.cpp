@@ -56,17 +56,37 @@ static __forceinline float Fb(uint32_t u) { float f; memcpy(&f, &u, 4); return f
 static __forceinline uint32_t Ub(const float& x) { uint32_t u; memcpy(&u, &x, 4); return u; }
 // rep movsd: n dwords, forward (a bit copy)
 static __forceinline void movsd(void* dst, const void* src, uint32_t n) {
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %[dst]\n\t"
+                     "mov esi, %[src]\n\t"
+                     "mov ecx, %[n]\n\t"
+                     "rep movsd"
+                     :
+                     : [dst] "m"(dst), [src] "m"(src), [n] "m"(n)
+                     : VP_X87_CLOBBERS, "ecx", "esi", "edi", "cc", "memory");
+#else
     __asm { mov edi, dst
             mov esi, src
             mov ecx, n
             rep movsd }
+#endif
 }
 // fld dword; fstp dword -- a float moved through the FPU (a signalling NaN comes out quiet), as the original does
 static __forceinline void fcopy(float* dst, const float* src) {
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[src]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "mov eax, %[dst]\n\t"
+                     "fstp dword ptr [eax]"
+                     :
+                     : [src] "m"(src), [dst] "m"(dst)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { mov eax, src
             fld dword ptr [eax]
             mov eax, dst
             fstp dword ptr [eax] }
+#endif
 }
 // the inlined strcpy (repne scasb; rep movsd; rep movsb): strlen + 1 bytes, forward
 static __forceinline void str_copy(char* dst, const char* src) { memcpy(dst, src, strlen(src) + 1); }
@@ -1286,6 +1306,79 @@ static void __declspec(noinline) static_rotation(const float* len_p, const float
     float lenv = *len_p, a0 = a[0], a1 = a[1], a2 = a[2];
     float A, Bv, C, Dd, E;
     float r0, r1, r2, r3, r4, r5, r6, r7, r8_;
+#ifdef VP_GCC
+    __asm__ volatile("fld %[lenv]\n\t"
+                     "fdivr %[one]\n\t"
+                     "fld %[a0]\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fld %[a1]\n\t"
+                     "fmul st, st(2)\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul %[a2]\n\t"
+                     "fld %[lenv]\n\t"
+                     "fsin\n\t"
+                     "fld %[lenv]\n\t"
+                     "fcos\n\t"
+                     "fld %[one]\n\t"
+                     "fsub st, st(1)\n\t"
+                     "fld st(4)\n\t"
+                     "fmul st, st(5)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp %[r0]\n\t"
+                     "fld st(0)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fmul st, st(5)\n\t"
+                     "fstp %[A]\n\t"
+                     "fld st(2)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fst %[Bv]\n\t"
+                     "fadd %[A]\n\t"
+                     "fstp %[r1]\n\t"
+                     "fld st(0)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fst %[C]\n\t"
+                     "fmul st, st(5)\n\t"
+                     "fstp %[Dd]\n\t"
+                     "fld st(2)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fst %[E]\n\t"
+                     "fsubr %[Dd]\n\t"
+                     "fstp %[r2]\n\t"
+                     "fld %[A]\n\t"
+                     "fsub %[Bv]\n\t"
+                     "fstp %[r3]\n\t"
+                     "fld st(5)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp %[r4]\n\t"
+                     "fxch st(5)\n\t"
+                     "fmul %[C]\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fld st(2)\n\t"
+                     "fadd st, st(1)\n\t"
+                     "fstp %[r5]\n\t"
+                     "fld %[Dd]\n\t"
+                     "fadd %[E]\n\t"
+                     "fstp %[r6]\n\t"
+                     ".byte 0xdc, 0xea\n\t"
+                     "fxch st(2)\n\t"
+                     "fstp %[r7]\n\t"
+                     "fxch st(2)\n\t"
+                     ".byte 0xdc, 0xc8\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp %[r8_]\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)"
+                     : [r0] "=m"(r0), [A] "=m"(A), [Bv] "=m"(Bv), [r1] "=m"(r1), [C] "=m"(C), [Dd] "=m"(Dd), [E] "=m"(E), [r2] "=m"(r2), [r3] "=m"(r3), [r4] "=m"(r4), [r5] "=m"(r5), [r6] "=m"(r6), [r7] "=m"(r7), [r8_] "=m"(r8_)
+                     : [lenv] "m"(lenv), [one] "m"(one), [a0] "m"(a0), [a1] "m"(a1), [a2] "m"(a2)
+                     : VP_X87_CLOBBERS, "cc");
+#else
     __asm {
         fld     lenv
         fdivr   one                    ; 1 / len
@@ -1358,6 +1451,7 @@ static void __declspec(noinline) static_rotation(const float* len_p, const float
         fstp    st(0)
         fstp    st(0)
     }
+#endif
     R[0] = r0; R[1] = r1; R[2] = r2; R[3] = r3; R[4] = r4; R[5] = r5; R[6] = r6; R[7] = r7; R[8] = r8_;   // (float moves)
 }
 static void __cdecl parse_static_rw(const char* line) {

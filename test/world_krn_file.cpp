@@ -63,6 +63,9 @@
 #include <map>
 #include <algorithm>
 #include <tuple>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #include <type_traits>
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
@@ -1059,6 +1062,18 @@ static int fault_filter(EXCEPTION_POINTERS* e) {
     g_fault_data = e->ExceptionRecord->NumberParameters >= 2 ? (uint32_t)e->ExceptionRecord->ExceptionInformation[1] : 0;
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+template <typename Run> static int guarded(Run& run, uint64_t* ret) {
+    if (vp_try([&] { *ret = run(); }, fault_filter)) {
+        return g_fault_code == EXCEPTION_ACCESS_VIOLATION && g_fault_at == 0x00416049 ? 1 : 2;   // abend: a panic
+    }
+    return 0;
+}
+template <typename F> static int guarded_fp(F& f) {
+    if (vp_try([&] { f(); })) { return 1; }
+    return 0;
+}
+#else
 template <typename Run> static int guarded(Run& run, uint64_t* ret) {
     __try {
         *ret = run();
@@ -1075,6 +1090,7 @@ template <typename F> static int guarded_fp(F& f) {
         return 1;
     }
 }
+#endif
 template <typename F, typename... A> static uint64_t invoke(F f, A... a) {
     typedef decltype(f(a...)) R;
     if constexpr (std::is_void_v<R>) {
@@ -2480,7 +2496,11 @@ int main(int argc, char** argv) {
     // never a dialog on the desktop: no Windows error boxes, no CRT message boxes (inherited by the child)
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     _set_error_mode(_OUT_TO_STDERR);
+#if defined(__GNUC__) && !defined(__clang__) && !defined(_UCRT)
+    // (mingw on msvcrt.dll: no _set_abort_behavior there -- and its abort() never calls Windows Error Reporting)
+#else
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
     if (!GetEnvironmentVariableA("VP_K2_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
     const int scenarios = argc > 1 ? atoi(argv[1]) : 300;

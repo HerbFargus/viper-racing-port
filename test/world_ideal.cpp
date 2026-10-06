@@ -55,6 +55,9 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #include "../hook/port.h"
 
 // the rewrites, compiled in: each PORT_FN just names the original's address and the footprint function (and
@@ -490,10 +493,17 @@ static void fix_validate(const char* name, Stat&) {
 }
 #endif
 static void fpu_reset() {
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+    unsigned cw;
+    _clearfp();
+    _controlfp_s(&cw, g_pc53 ? _PC_53 : _PC_24, _MCW_PC);
+#else
     __asm fninit
     unsigned cw;
     _clearfp();
     _controlfp_s(&cw, g_pc53 ? _PC_53 : _PC_24, _MCW_PC);
+#endif
 }
 
 template <typename Run, typename Fp> static void check(const char* name, Run run, Fp footprint) {
@@ -505,21 +515,33 @@ template <typename Run, typename Fp> static void check(const char* name, Run run
     save(g_start);
     g_fp.n = 0; g_fp.replay_only = 0; g_fp.pure = false;
     int ff = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { footprint(g_fp); })) { ff = 1; }
+#else
     __try { footprint(g_fp); } __except (EXCEPTION_EXECUTE_HANDLER) { ff = 1; }
+#endif
     if (ff) { g_fp.n = 0; g_fp.replay_only = "(the footprint faulted)"; }
     if (g_fp.replay_only) st.replay_only++;
     g_pass = 0; g_nlog[0] = 0; g_si = 0;
     uint64_t ro = 0, rn = 0;
     int fo = 0, fn = 0;
     fpu_reset();
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { ro = run(true); })) { fo = 1; }
+#else
     __try { ro = run(true); } __except (EXCEPTION_EXECUTE_HANDLER) { fo = 1; }
+#endif
     fpu_reset();
     save(g_after);
     if (memcmp(g_after.arena, g_start.arena, ARENA_SIZE) || memcmp(g_after.globals, g_start.globals, GLOBALS_BYTES)) st.changed++;
     load(g_start);
     g_pass = 1; g_nlog[1] = 0; g_si = 0;
     fpu_reset();
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { rn = run(false); })) { fn = 1; }
+#else
     __try { rn = run(false); } __except (EXCEPTION_EXECUTE_HANDLER) { fn = 1; }
+#endif
     fpu_reset();
     g_last_fault = fo != 0;
     g_last_ret = ro;
@@ -1250,6 +1272,12 @@ static DWORD WINAPI watchdog(void*) {
 
 #ifdef FIX_TESTS
 // ==== the fix tests ================================================================================================
+#if defined(__GNUC__) && !defined(__clang__)
+template <typename F> static bool ran(F f) {
+    if (vp_try([&] { f(); })) return false;
+    return true;
+}
+#else
 template <typename F> static bool ran(F f) {
     __try {
         f();
@@ -1258,6 +1286,7 @@ template <typename F> static bool ran(F f) {
         return false;
     }
 }
+#endif
 static void busy(const char* what) {
     g_busy_name = what;
     InterlockedIncrement(&g_busy);

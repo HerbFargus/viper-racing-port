@@ -36,6 +36,9 @@
 #include <string.h>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
 #define VP_TEST_FIXES           // (the flag the other harnesses use)
 #endif
@@ -464,8 +467,13 @@ template <typename Run> struct Guard {
     static void call(void* c) { Guard* g = (Guard*)c; g->ret = (*g->run)(g->orig); }
 };
 static int guarded(void (*fn)(void*), void* ctx) {
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_guard(fn, ctx)) { _fpreset(); return 1; }
+    return 0;
+#else
     __try { fn(ctx); } __except (EXCEPTION_EXECUTE_HANDLER) { _fpreset(); return 1; }
     return 0;
+#endif
 }
 static void reset_pass(int pass) {
     g_pass = pass; g_nlog[pass] = 0;

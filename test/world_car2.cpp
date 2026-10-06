@@ -31,6 +31,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #if defined(FIX_TESTS) && !defined(VP_TEST_FIXES)
 #define VP_TEST_FIXES
 #endif
@@ -82,8 +85,12 @@ float fuzz_float() {
 void fuzz_fill(Arena&) {}
 int fuzz_report(int it, const Arena&, const void*, const void*, size_t) { return it + 1; }
 int fuzz_guarded(void (*fn)(void*), void* arg) {
+#if defined(__GNUC__) && !defined(__clang__)
+    return vp_guard(fn, arg) ? 1 : 0;
+#else
     __try { fn(arg); } __except (EXCEPTION_EXECUTE_HANDLER) { return 1; }
     return 0;
+#endif
 }
 
 static float uni() { return (float)(fuzz_rand() & 0xffffff) / 16777216.0f; }

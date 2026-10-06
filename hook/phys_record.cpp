@@ -53,17 +53,37 @@ static __forceinline uint32_t Ub(const float& x) { uint32_t u; memcpy(&u, &x, 4)
 static __forceinline float Fb(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 // rep movsd: n dwords, forward, as the original moves them (a bit copy)
 static __forceinline void movsd(void* dst, const void* src, uint32_t n) {
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %[dst]\n\t"
+                     "mov esi, %[src]\n\t"
+                     "mov ecx, %[n]\n\t"
+                     "rep movsd"
+                     :
+                     : [dst] "m"(dst), [src] "m"(src), [n] "m"(n)
+                     : VP_X87_CLOBBERS, "ecx", "esi", "edi", "cc", "memory");
+#else
     __asm { mov edi, dst
             mov esi, src
             mov ecx, n
             rep movsd }
+#endif
 }
 // rep stosd of zero
 static __forceinline void stosd0(void* dst, uint32_t n) {
+#ifdef VP_GCC
+    __asm__ volatile("mov edi, %[dst]\n\t"
+                     "xor eax, eax\n\t"
+                     "mov ecx, %[n]\n\t"
+                     "rep stosd"
+                     :
+                     : [dst] "m"(dst), [n] "m"(n)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "esi", "edi", "cc", "memory");
+#else
     __asm { mov edi, dst
             xor eax, eax
             mov ecx, n
             rep stosd }
+#endif
 }
 // the inlined strcpy / strcat (repne scasb; rep movsd; rep movsb): strlen + 1 bytes, forward
 static __forceinline void str_copy(char* dst, const char* src) { memcpy(dst, src, strlen(src) + 1); }

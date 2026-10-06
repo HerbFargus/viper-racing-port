@@ -57,10 +57,20 @@ static __forceinline int32_t& Iat(void* p, uint32_t off) { return *(int32_t*)((u
 // fld dword; fchs; fstp dword -- through the FPU (a signalling NaN comes out quiet), as the original does
 static __forceinline float fpu_neg(const float* p) {
     float r;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[p]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fchs\n\t"
+                     "fstp %[r]"
+                     : [r] "=m"(r)
+                     : [p] "m"(p)
+                     : VP_X87_CLOBBERS, "eax", "cc", "memory");
+#else
     __asm { mov eax, p
             fld dword ptr [eax]
             fchs
             fstp r }
+#endif
     return r;
 }
 
@@ -236,6 +246,81 @@ PORT_FN(0x00428790, "camera_look", camera_look, fp_camera_look)
 // floats ([esp+0x20], [esp+0x84], [esp+0x88] in the original), which it overwrites as the original does.
 static void tv_axis_angle(float* w, float* r) {
     float one = 1.0f;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[w]\n\t"
+                     "mov edx, %[r]\n\t"
+                     "fld dword ptr [eax+12]\n\t"
+                     "fdivr %[one]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fld dword ptr [eax+4]\n\t"
+                     "fmul st, st(2)\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul dword ptr [eax+8]\n\t"
+                     "fld dword ptr [eax+12]\n\t"
+                     "fsin\n\t"
+                     "fld dword ptr [eax+12]\n\t"
+                     "fcos\n\t"
+                     "fld %[one]\n\t"
+                     "fsub st, st(1)\n\t"
+                     "fld st(4)\n\t"
+                     "fmul st, st(5)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [edx]\n\t"
+                     "fld st(0)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fmul st, st(5)\n\t"
+                     "fstp dword ptr [eax+20]\n\t"
+                     "fld st(2)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fst dword ptr [eax]\n\t"
+                     "fadd dword ptr [eax+20]\n\t"
+                     "fstp dword ptr [edx+4]\n\t"
+                     "fld st(0)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fst dword ptr [eax+12]\n\t"
+                     "fmul st, st(5)\n\t"
+                     "fstp dword ptr [eax+24]\n\t"
+                     "fld st(2)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fst dword ptr [eax+16]\n\t"
+                     "fsubr dword ptr [eax+24]\n\t"
+                     "fstp dword ptr [edx+8]\n\t"
+                     "fld dword ptr [eax+20]\n\t"
+                     "fsub dword ptr [eax]\n\t"
+                     "fstp dword ptr [edx+12]\n\t"
+                     "fld st(5)\n\t"
+                     "fmul st, st(6)\n\t"
+                     "fmul st, st(1)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [edx+16]\n\t"
+                     "fxch st(5)\n\t"
+                     "fmul dword ptr [eax+12]\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fld st(2)\n\t"
+                     "fadd st, st(1)\n\t"
+                     "fstp dword ptr [edx+20]\n\t"
+                     "fld dword ptr [eax+24]\n\t"
+                     "fadd dword ptr [eax+16]\n\t"
+                     "fstp dword ptr [edx+24]\n\t"
+                     ".byte 0xdc, 0xea\n\t"
+                     "fxch st(2)\n\t"
+                     "fstp dword ptr [edx+28]\n\t"
+                     "fxch st(2)\n\t"
+                     "fmul st, st(0)\n\t"
+                     "fmul st, st(4)\n\t"
+                     "fadd st, st(2)\n\t"
+                     "fstp dword ptr [edx+32]\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)\n\t"
+                     "fstp st(0)"
+                     :
+                     : [w] "m"(w), [r] "m"(r), [one] "m"(one)
+                     : VP_X87_CLOBBERS, "eax", "edx", "cc", "memory");
+#else
     __asm {
         mov   eax, w
         mov   edx, r
@@ -309,6 +394,7 @@ static void tv_axis_angle(float* w, float* r) {
         fstp  st(0)
         fstp  st(0)
     }
+#endif
 }
 
 // the rotation's other rows from its forward row (r6..r8) with y up; the TV cameras' look-at (inlined twice in
@@ -655,6 +741,19 @@ PORT_FN(0x00427610, "update_camera", update_camera, fp_update_camera)
 // the forward row). fpatan's result isn't rounded: the multiply by 57.29578 happens in the same asm block.
 static void atan2_deg(const float* y, const float* x, float* dst) {
     float k = FB(0x42652ee1);                           // 57.29578
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[y]\n\t"
+                     "mov ecx, %[x]\n\t"
+                     "mov edx, %[dst]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "fld dword ptr [ecx]\n\t"
+                     "fpatan\n\t"
+                     "fmul %[k]\n\t"
+                     "fstp dword ptr [edx]"
+                     :
+                     : [y] "m"(y), [x] "m"(x), [dst] "m"(dst), [k] "m"(k)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         mov  eax, y
         mov  ecx, x
@@ -665,6 +764,7 @@ static void atan2_deg(const float* y, const float* x, float* dst) {
         fmul k
         fstp dword ptr [edx]
     }
+#endif
 }
 static void __cdecl blimp_to_tv() {
     const int32_t cur = *P<int32_t>(S_CUR_TV);

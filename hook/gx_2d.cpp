@@ -3244,6 +3244,25 @@ static const float k_cam_eps = 1.1920928955078125e-07f;          // 0x34000000
 // unrounded acos) stored to s; true if |sine| > FLT_EPSILON (the unrounded sine is compared)
 VP_ASM_CALLS static uint8_t cam_acos_sin(const float* qw, float* a, float* s) {
     uint8_t big;
+#ifdef VP_GCC
+    __asm__ volatile("mov eax, %[qw]\n\t"
+                     "fld dword ptr [eax]\n\t"
+                     "mov eax, 0x004cf07c\n\t"
+                     "call eax\n\t"
+                     "mov eax, %[a]\n\t"
+                     "fst dword ptr [eax]\n\t"
+                     "fsin\n\t"
+                     "mov eax, %[s]\n\t"
+                     "fst dword ptr [eax]\n\t"
+                     "fabs\n\t"
+                     "fcomp %[eps]\n\t"
+                     "fnstsw ax\n\t"
+                     "test ah, 0x41\n\t"
+                     "setz %[big]"
+                     : [big] "=m"(big)
+                     : [qw] "m"(qw), [a] "m"(a), [s] "m"(s), [eps] "m"(k_cam_eps)
+                     : VP_X87_CLOBBERS, "eax", "ecx", "edx", "cc", "memory");
+#else
     __asm {
         mov eax, qw
         fld dword ptr [eax]
@@ -3260,6 +3279,7 @@ VP_ASM_CALLS static uint8_t cam_acos_sin(const float* qw, float* a, float* s) {
         test ah, 0x41
         setz big
     }
+#endif
     return big;
 }
 

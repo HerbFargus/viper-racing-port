@@ -52,6 +52,9 @@
 #include <vector>
 #include <tuple>
 #include <type_traits>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 #define VP_FAITHFUL                 // the rewrites exactly as the originals, bugs included (docs/PORTING.md, "Fixes")
 #include "../hook/port.h"
 
@@ -711,12 +714,19 @@ static int fault_filter(EXCEPTION_POINTERS* e) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 template <typename Run> static int guarded(Run& run, uint64_t* ret) {
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { *ret = run(); }, fault_filter)) {
+        return g_fault_code == PANIC_CODE ? 1 : 2;
+    }
+    return 0;
+#else
     __try {
         *ret = run();
         return 0;
     } __except (fault_filter(GetExceptionInformation())) {
         return g_fault_code == PANIC_CODE ? 1 : 2;
     }
+#endif
 }
 template <typename Run, typename Fp> static void check(const char* fname, Run run, Fp footprint) {
     std::string name = fname;
@@ -733,7 +743,11 @@ template <typename Run, typename Fp> static void check(const char* fname, Run ru
     unsigned cw;
     uint64_t ro = 0, rn = 0;
     // the original
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _clearfp();
     _controlfp_s(&cw, pc, _MCW_PC);
     g_pass = 0; g_nlog[0] = 0; g_si = 0;
@@ -741,7 +755,11 @@ template <typename Run, typename Fp> static void check(const char* fname, Run ru
     auto r1 = [&]() { return run(false); };
     stack_fill(pat);
     int fo = guarded(r0, &ro);
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     save(g_after);
     if (memcmp(g_after.arena + sizeof(Ctrl), g_start.arena + sizeof(Ctrl), ARENA_SIZE - sizeof(Ctrl)) ||
@@ -759,7 +777,11 @@ template <typename Run, typename Fp> static void check(const char* fname, Run ru
     stack_fill(pat);
     int fn = guarded(r1, &rn);
     if (g_chain) chain_unpatch();
+#if defined(__GNUC__) && !defined(__clang__)
+    __asm__ volatile("fninit" ::: VP_X87_CLOBBERS);
+#else
     __asm fninit
+#endif
     _controlfp_s(&cw, _PC_53, _MCW_PC);
     if (fo == 1) st.panics++;
     if (fo == 2 || fn == 2) {
@@ -1356,7 +1378,11 @@ int main(int argc, char** argv) {
     // never a dialog on the desktop: no Windows error boxes, no CRT message boxes (inherited by the child)
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     _set_error_mode(_OUT_TO_STDERR);
+#if defined(__GNUC__) && !defined(__clang__) && !defined(_UCRT)
+    // (mingw on msvcrt.dll: no _set_abort_behavior there -- and its abort() never calls Windows Error Reporting)
+#else
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
     if (!GetEnvironmentVariableA("VP_WORLD_CHILD", 0, 0)) return relaunch();
     setvbuf(stdout, 0, _IONBF, 0);
     int worlds = argc > 1 ? atoi(argv[1]) : 300;

@@ -50,6 +50,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__GNUC__) && !defined(__clang__)
+#include "vp_seh.h"                           // vp_try: the GCC stand-in for __try / __except
+#endif
 
 #ifndef FIX_TESTS
 #define VP_FAITHFUL                                 // the original's behaviour, bit for bit (the fixes: /DFIX_TESTS)
@@ -759,10 +762,16 @@ static int run_guarded(Kind k, bool rewrite, uint64_t* ret) {
     _clearfp();
     _controlfp_s(&cw, _PC_24, _MCW_PC);
     int faulted = 0;
+#if defined(__GNUC__) && !defined(__clang__)
+    if (vp_try([&] { *ret = call_kind(k, rewrite); }, fault_filter)) { faulted = 1; }
+    unsigned short fcw = 0x027f;                          // the x87 back to a clean state after a fault
+    if (faulted) __asm__ volatile("fninit\n\tfldcw %0" :: "m"(fcw) : VP_X87_CLOBBERS);
+#else
     __try { *ret = call_kind(k, rewrite); } __except (fault_filter(GetExceptionInformation())) { faulted = 1; }
     unsigned short fcw = 0x027f;                          // the x87 back to a clean state after a fault
     if (faulted) __asm { fninit
                          fldcw fcw }
+#endif
     return faulted;
 }
 
