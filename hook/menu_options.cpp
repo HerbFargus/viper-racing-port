@@ -745,8 +745,13 @@ enum : uint32_t { BAR_W = 0x10, BAR_GAP = 2 };
 
 static void __fastcall Hack_Added_n(HackOptionsControl* self, Edx) {
     Frame<VP_FIX ? 0x1f8 : 0x1c0> fr;                     // FIX: (above) room for one more item
-    const ListGeom g = vehicle_list_geometry();
+    ListGeom g = vehicle_list_geometry();
     const bool bar = VP_FIX && (int32_t)g.h >= 0x40 && (int32_t)g.w >= 0x20;
+    // FIX: stock v1.0's list runs from y 200 to 400, past the black panel (y 125..382): without a bar its empty lower
+    // part never showed, but the bar spans the list's height, so on a stock race.exe it stuck out over the panel's
+    // frame (seen on Linux with the disc's race.exe). There the list is trimmed to 12 rows (180: y 200..380); vrmod's
+    // geometry (y 111..366) already fits and is kept.
+    if (bar && g.x == 0x12c && g.y == 0xc8 && g.w == 0x64 && g.h == 0xc8) g.h = 12 * 15;
     const uint32_t k = bar ? 0x38u : 0u;                  // the items before the bar sit one item further up the frame
     once_xl(S_HACK_ADDED_ONCE, 1, 0x005d5bb0, 0x004f80ac, 0x00486630);
     once_xl(S_HACK_ADDED_ONCE, 2, 0x005d5bd0, 0x004f8094, 0x00486620);
