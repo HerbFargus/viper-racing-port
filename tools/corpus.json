@@ -1,6 +1,12 @@
 {
   "about": "The regression corpus (tools/corpus.py): recorded sessions in the test install's sessions\\ (and sessions-2\\), by name only. exe = the race.exe it was recorded on (beside the port's dinput.dll). ini = extra viperport.ini settings for its replays. routes = how it must replay IDENTICAL: dll (rewrites), original (MGI's code; never for a session that visits Options), standalone (viperport.exe --race exe). provisional = recorded before the corpus existed, kept for what the fresh set lacks (the stock race.exe, career saves).",
   "sessions": [
+    {"name": "standin-live", "session": "20261006-074010", "exe": "race.exe", "routes": ["dll", "original", "standalone"],
+     "what": "recorded LIVE on the GCC standalone with the Win32 stand-ins (R2a.1: clocks, scans through them); menus, a race"},
+    {"name": "standin-lan-1", "session": "20261006-074552", "exe": "race.exe", "routes": ["dll", "original", "standalone"],
+     "ini": {"test": {"two_copies": 1}}, "what": "two-copy UDP LAN race recorded LIVE on the stand-ins (real sockets through w32_net), copy 1 (host)"},
+    {"name": "standin-lan-2", "session": "sessions-2/20261006-074558", "exe": "race.exe", "routes": ["dll", "original", "standalone"],
+     "ini": {"test": {"two_copies": 1}}, "what": "the same race, copy 2 (client), replayed alone"},
     {"name": "paint-race", "session": "20261005-095426", "exe": "race.exe", "routes": ["dll", "original", "standalone"],
      "what": "fresh set 1: paint kit (paint0 saved), one race, quit from the menu"},
     {"name": "vrmod-jeeps", "session": "20261005-100421", "exe": "race.exe", "routes": ["dll", "standalone"],
