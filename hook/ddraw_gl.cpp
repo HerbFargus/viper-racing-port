@@ -8,6 +8,7 @@
 // directly, on the same objects.
 #define _CRT_SECURE_NO_WARNINGS
 #include "gl_core.h"
+#include "vp_os.h"
 #include <string.h>
 #include "viperport.h"
 #include "port.h"
@@ -187,7 +188,7 @@ HRESULT WINAPI emu_DirectDrawEnumerateA(LPDDENUMCALLBACKA cb, LPVOID ctx) {
 
 // point the main module's imports of `dll!name` at `to`
 bool patch_import(const char* dll, const char* name, void* to) {
-    uint8_t* base = (uint8_t*)GetModuleHandleA(0);
+    uint8_t* base = (uint8_t*)vpos_GetModuleHandleA(0);
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
     IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     for (IMAGE_IMPORT_DESCRIPTOR* imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; imp++) {
@@ -199,9 +200,9 @@ bool patch_import(const char* dll, const char* name, void* to) {
             IMAGE_IMPORT_BY_NAME* ibn = (IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData);
             if (strcmp((char*)ibn->Name, name) != 0) continue;
             DWORD old;
-            VirtualProtect(&iat->u1.Function, 4, PAGE_READWRITE, &old);
+            vpos_VirtualProtect(&iat->u1.Function, 4, PAGE_READWRITE, &old);
             iat->u1.Function = (DWORD)(uintptr_t)to;
-            VirtualProtect(&iat->u1.Function, 4, old, &old);
+            vpos_VirtualProtect(&iat->u1.Function, 4, old, &old);
             return true;
         }
     }

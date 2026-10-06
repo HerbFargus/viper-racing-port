@@ -1257,6 +1257,7 @@ static bool fix_user_directory() {
             memcpy(cand[nc] + n, "Config\\", 8);
             nc++;
         }
+#ifdef _WIN32                                                      // (VirtualStore: Windows only)
         if (lit[0] && lit[1] == ':' && lit[2] == '\\') {
             char la[MAX_PATH];
             const DWORD k = GetEnvironmentVariableA("LOCALAPPDATA", la, sizeof la);   // (not a game import: the DLL's)
@@ -1269,6 +1270,7 @@ static bool fix_user_directory() {
                 }
             }
         }
+#endif
         const DWORD k = kGetFullPathNameA(lit, MAX_PATH, cand[nc], 0);
         if (k && k < MAX_PATH) nc++;
         const char* old = 0;

@@ -33,6 +33,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <winsock.h>
+#include "vp_os.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -136,21 +137,21 @@ template <typename T> void put(uint8_t op, const T& v) { session_net_put(op, &v,
 void fail(int err) { t_err = err; }
 
 int role_of(SOCKET s) {
-    EnterCriticalSection(&g_cs);
+    vpos_EnterCriticalSection(&g_cs);
     int r = 255;
     for (int i = 0; i < g_nroles; i++)
         if (g_roles[i].s == s) { r = g_roles[i].role; break; }
-    LeaveCriticalSection(&g_cs);
+    vpos_LeaveCriticalSection(&g_cs);
     return r;
 }
 void role_add(SOCKET s) {
     if (s == INVALID_SOCKET) return;
-    EnterCriticalSection(&g_cs);
+    vpos_EnterCriticalSection(&g_cs);
     int i = 0;
     while (i < g_nroles && g_roles[i].s != s) i++;
     if (i == g_nroles && g_nroles < 64) g_nroles++;
     if (i < 64) g_roles[i] = {s, g_next_role++ & 0xff};
-    LeaveCriticalSection(&g_cs);
+    vpos_LeaveCriticalSection(&g_cs);
 }
 
 Req* req_find(HANDLE h) {
@@ -160,13 +161,13 @@ Req* req_find(HANDLE h) {
 }
 void req_add(HANDLE h, char* buf, int len) {
     if (!h) return;
-    EnterCriticalSection(&g_cs);
+    vpos_EnterCriticalSection(&g_cs);
     Req* r = req_find(h);
     for (int i = 0; !r && i < 16; i++)
         if (!g_reqs[i].buf) r = &g_reqs[i];
     if (!r) r = &g_reqs[0];
     *r = {h, buf, len};
-    LeaveCriticalSection(&g_cs);
+    vpos_LeaveCriticalSection(&g_cs);
 }
 
 // ---- a hostent, flattened: u16 addrtype, u16 length, name, aliases, addresses (the pointers rebuilt on the way back) ----
@@ -645,9 +646,9 @@ int WINAPI h_WSACancelAsyncRequest(HANDLE h) {
         r = o_WSACancelAsyncRequest(h);
         if (recording()) put(NOP_ASYNC_CANCEL, r);
     }
-    EnterCriticalSection(&g_cs);
+    vpos_EnterCriticalSection(&g_cs);
     if (Req* q = req_find(h)) q->buf = 0;
-    LeaveCriticalSection(&g_cs);
+    vpos_LeaveCriticalSection(&g_cs);
     return r;
 }
 
@@ -662,10 +663,10 @@ uint8_t __cdecl h_async_hook(unsigned msg, int wparam, int lparam) {
     if (ours && recording() && session_net_main()) {
         uint8_t b[sizeof(AsyncRec) + 1024];
         AsyncRec a = {msg, (uint32_t)wparam, (uint32_t)lparam, 0};
-        EnterCriticalSection(&g_cs);
+        vpos_EnterCriticalSection(&g_cs);
         Req* q = req_find((HANDLE)(uintptr_t)(uint32_t)wparam);
         if (q && !HIWORD(lparam)) a.hlen = (uint32_t)flatten((const struct hostent*)q->buf, b + sizeof a, 1024);
-        LeaveCriticalSection(&g_cs);
+        vpos_LeaveCriticalSection(&g_cs);
         memcpy(b, &a, sizeof a);
         session_net_put(NOP_ASYNC_REPLY, b, sizeof a + a.hlen);
         session_net_async_event();                                    // where it arrived: this Win32Idle
@@ -739,14 +740,14 @@ const int N_IMPS = sizeof g_imps / sizeof g_imps[0];
 
 void write_slot(void** slot, void* to) {
     DWORD old;
-    VirtualProtect(slot, 4, PAGE_READWRITE, &old);
+    vpos_VirtualProtect(slot, 4, PAGE_READWRITE, &old);
     *slot = to;
-    VirtualProtect(slot, 4, old, &old);
+    vpos_VirtualProtect(slot, 4, old, &old);
 }
 
 // race.exe's wsock32 slots (by ordinal, as v1.0 imports them, or by name), any build
 int patch_imports() {
-    uint8_t* base = (uint8_t*)GetModuleHandleA(0);
+    uint8_t* base = (uint8_t*)vpos_GetModuleHandleA(0);
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
     IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (!dir.VirtualAddress) return 0;
@@ -780,11 +781,11 @@ bool patch_rel32(uint32_t at, uint32_t from, void* to) {
     memcpy(&rel, p + 1, 4);
     if (at + 5 + (uint32_t)rel != from) return false;
     DWORD old;
-    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
+    if (!vpos_VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
     rel = (int32_t)((uint32_t)(uintptr_t)to - (at + 5));
     memcpy(p + 1, &rel, 4);
-    VirtualProtect(p, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    vpos_VirtualProtect(p, 5, old, &old);
+    vpos_flush_code(p, 5);
     return true;
 }
 
@@ -823,11 +824,11 @@ bool patch_push_hook() {
     memcpy(&imm, p + 1, 4);
     if (p[0] != 0x68 || imm != 0x004adc00) return false;
     DWORD old;
-    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
+    if (!vpos_VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
     imm = (uint32_t)(uintptr_t)h_async_hook;
     memcpy(p + 1, &imm, 4);
-    VirtualProtect(p, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    vpos_VirtualProtect(p, 5, old, &old);
+    vpos_flush_code(p, 5);
     return true;
 }
 #endif
@@ -838,7 +839,7 @@ void net_install(const char* ini) {
     (void)ini;
     const bool session = g_session_mode != SESSION_OFF;
     if (!session && !vp_two_copies()) return;
-    InitializeCriticalSection(&g_cs);
+    vpos_InitializeCriticalSection(&g_cs);
 #ifndef SESSION_TEST
     const int n = patch_imports();
     if (n != N_IMPS) {
@@ -952,9 +953,9 @@ void net_play_async() {
     }
     AsyncRec a;
     memcpy(&a, p, sizeof a);
-    EnterCriticalSection(&g_cs);
+    vpos_EnterCriticalSection(&g_cs);
     Req* q = req_find((HANDLE)(uintptr_t)a.wparam);
     if (q && a.hlen && sizeof a + a.hlen <= n) unflatten(p + sizeof a, a.hlen, q->buf, (size_t)q->len);
-    LeaveCriticalSection(&g_cs);
+    vpos_LeaveCriticalSection(&g_cs);
     o_async_hook(a.msg, (int)a.wparam, (int)a.lparam);
 }

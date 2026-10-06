@@ -11,17 +11,23 @@ void platform_set_view(int x0, int y0, int w, int h, int game_w, int game_h);
 GLApi gl_api;
 
 bool gl_api_load() {
-    HMODULE gl32 = GetModuleHandleA("opengl32.dll");
+#ifdef _WIN32
+    HMODULE gl32 = GetModuleHandleA("opengl32.dll");     // (Windows: OpenGL 1.1's functions are opengl32.dll's exports)
+#define VP_GL32_PROC(p, n) if (!p && gl32) p = (void*)GetProcAddress(gl32, n)
+#else
+#define VP_GL32_PROC(p, n)                            // (elsewhere SDL_GL_GetProcAddress finds every one)
+#endif
     bool ok = true;
 #define GL_API_FN(ret, name, args)                                                                                   \
     {                                                                                                                \
         void* p = SDL_GL_GetProcAddress("gl" #name);                                                                 \
-        if (!p && gl32) p = (void*)GetProcAddress(gl32, "gl" #name);                                                 \
+        VP_GL32_PROC(p, "gl" #name);                                                                                 \
         *(void**)&gl_api.name = p;                                                                                   \
         if (!p) logf("gl_table: gl" #name " is missing"), ok = false;                                                \
     }
 #include "gl_api.inc"
 #undef GL_API_FN
+#undef VP_GL32_PROC
     gl_api.SwapWindow = SDL_GL_SwapWindow;
     gl_api.GetDrawableSize = SDL_GL_GetDrawableSize;
     gl_api.SetView = platform_set_view;

@@ -35,6 +35,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include "vp_os.h"
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
@@ -2547,10 +2548,10 @@ bool crt_islands_install() {
             island_bytes(is, want, &n);
             uint8_t* p = (uint8_t*)(uintptr_t)is.at;
             DWORD old;
-            VirtualProtect(p, (SIZE_T)n, PAGE_EXECUTE_READWRITE, &old);
+            vpos_VirtualProtect(p, (SIZE_T)n, PAGE_EXECUTE_READWRITE, &old);
             memcpy(p, want, (size_t)n);
-            VirtualProtect(p, (SIZE_T)n, old, &old);
-            FlushInstructionCache(GetCurrentProcess(), p, (SIZE_T)n);
+            vpos_VirtualProtect(p, (SIZE_T)n, old, &old);
+            vpos_flush_code(p, (SIZE_T)n);
         }
         logf("crt: %s redirected to their rewrites", k_group[g]);
     }

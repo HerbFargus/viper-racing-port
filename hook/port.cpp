@@ -1,6 +1,7 @@
 // port.cpp -- M3's framework: rewritten functions switched per function, and shadow checks (port.h).
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include "vp_os.h"
 #include <stdio.h>
 #include <string.h>
 #include <vector>
@@ -37,7 +38,7 @@ static void* make_trampoline(const Prologue& p) {
     // 32 bytes each, room for every function in race.exe (10,219 in the inventory) and the harness's own detours;
     // a full page is logged by the caller, never silent
     enum { TRAMP_BYTES = 32 * 16384 };
-    if (!g_tramp_page) g_tramp_page = (uint8_t*)VirtualAlloc(0, TRAMP_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!g_tramp_page) g_tramp_page = (uint8_t*)vpos_VirtualAlloc(0, TRAMP_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!g_tramp_page || g_tramp_used + 32 > TRAMP_BYTES) return 0;
     uint8_t* t = g_tramp_page + g_tramp_used;
     g_tramp_used += 32;
@@ -49,18 +50,18 @@ static void* make_trampoline(const Prologue& p) {
     }
     t[p.len] = 0xE9;                                              // then on into the rest of the original
     *(int32_t*)(t + p.len + 1) = (int32_t)((p.v10 + p.len) - (uint32_t)(t + p.len + 5));
-    FlushInstructionCache(GetCurrentProcess(), t, 32);
+    vpos_flush_code(t, 32);
     return t;
 }
 
 static void write_jmp(uint32_t at, void* to) {
     uint8_t* p = (uint8_t*)at;
     DWORD old;
-    VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+    vpos_VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
     p[0] = 0xE9;
     *(int32_t*)(p + 1) = (int32_t)((uint8_t*)to - (p + 5));
-    VirtualProtect(p, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    vpos_VirtualProtect(p, 5, old, &old);
+    vpos_flush_code(p, 5);
 }
 
 // M1's patches (viperport.cpp, patch_fields): an operand it moved can lie in a function's first bytes -- FileVerifyNoOpenFiles'
@@ -246,7 +247,7 @@ static const FieldInfo k_fields[] = {
 const char* class_of(const void* obj, uint32_t* size) {
     uint32_t vt = 0;
 #ifdef VP_GCC
-    if (!IsBadReadPtr(obj, 4)) vt = *(const uint32_t*)obj;      // (GCC has no __try: an unreadable object is 0, as there)
+    if (!vpos_IsBadReadPtr(obj, 4)) vt = *(const uint32_t*)obj;      // (GCC has no __try: an unreadable object is 0, as there)
 #else
     __try { vt = *(const uint32_t*)obj; } __except (EXCEPTION_EXECUTE_HANDLER) { vt = 0; }
 #endif
@@ -623,7 +624,7 @@ void shadow_snapshot() {
     sp.clear();
     for (int i = 0; i < t_fp->n; i++) sp.push_back({(uint8_t*)t_fp->r[i].p, t_fp->r[i].n, 0, i});
     // a pure function (maths) changes no globals; a check on another thread mustn't touch the physics'
-    if (!t_fp->pure && GetCurrentThreadId() == g_physics_thread_id) {
+    if (!t_fp->pure && vpos_GetCurrentThreadId() == g_physics_thread_id) {
         for (int i = 0; i < (int)(sizeof k_globals / sizeof k_globals[0]); i++)
             sp.push_back({(uint8_t*)k_globals[i].va, k_globals[i].size, 1, i});
         for (int i = 0; i < (int)(sizeof k_heap_blocks / sizeof k_heap_blocks[0]); i++)
@@ -751,7 +752,7 @@ void shadow_finish(PortFn* f, const void* ret, size_t n) {
         differs = true;
     }
     if (!differs && g_state && g_state->differs(where, sizeof where)) differs = true;
-    if (differs && GetCurrentThreadId() != g_physics_thread_id && g_dents != t_dents_at) {
+    if (differs && vpos_GetCurrentThreadId() != g_physics_thread_id && g_dents != t_dents_at) {
         InterlockedIncrement(&f->raced);             // a dent landed during the check: the passes saw different models
         differs = false;
     }
@@ -792,7 +793,7 @@ static PortMode parse_mode(const char* s, PortMode dflt) {
 void port_install(const char* ini) {
     for (const Global& g : k_globals) g_globals_bytes += g.size;
     char buf[64];
-    GetPrivateProfileStringA("port", "default", "new", buf, sizeof buf, ini);
+    vpos_GetPrivateProfileStringA("port", "default", "new", buf, sizeof buf, ini);
     PortMode dflt = parse_mode(buf, PORT_NEW);
     // viperport.exe (standalone.h): the originals are int3, so every rewrite is new -- no shadow, no original
     const bool standalone = vp_standalone();
@@ -800,9 +801,9 @@ void port_install(const char* ini) {
         if (dflt != PORT_NEW) logf("port: standalone: default=%s ignored, every rewrite is new", buf);
         dflt = PORT_NEW;
     }
-    g_shadow_every = GetPrivateProfileIntA("port", "shadow_every", 1, ini);
+    g_shadow_every = vpos_GetPrivateProfileIntA("port", "shadow_every", 1, ini);
     if (g_shadow_every < 1) g_shadow_every = 1;
-    g_shadow_per_tick = GetPrivateProfileIntA("port", "shadow_per_tick", 4, ini);
+    g_shadow_per_tick = vpos_GetPrivateProfileIntA("port", "shadow_per_tick", 4, ini);
     if (g_shadow_per_tick < 0) g_shadow_per_tick = 0;
     int on = 0;
     // M1's texture lift (viperport.cpp) is carried by these rewrites: the originals would write past the stock
@@ -816,7 +817,7 @@ void port_install(const char* ini) {
     const bool sdl_audio = platform_plans_sdl_audio(ini);
     int kept_for_dsound = 0;
     for (PortFn* f : registry()) {
-        GetPrivateProfileStringA("port", f->name, "", buf, sizeof buf, ini);
+        vpos_GetPrivateProfileStringA("port", f->name, "", buf, sizeof buf, ini);
         f->mode = buf[0] && !standalone ? parse_mode(buf, dflt) : dflt;
         if (f->needs_renderer && !gl && f->mode != PORT_ORIGINAL) { f->mode = PORT_ORIGINAL; kept_for_ddraw++; continue; }
         if (f->needs_audio && !sdl_audio && f->mode != PORT_ORIGINAL) { f->mode = PORT_ORIGINAL; kept_for_dsound++; continue; }

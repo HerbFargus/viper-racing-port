@@ -18,6 +18,7 @@
 // and stays out of the way.
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include "vp_os.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <algorithm>
@@ -29,6 +30,8 @@
 #include "standalone.h"
 
 // ---- the one export, forwarded ---------------------------------------------------------------------
+// (Windows only: the dinput.dll route's real DirectInput, for the game's own input code when SDL is off)
+#ifdef _WIN32
 typedef HRESULT(WINAPI* DirectInputCreateA_t)(HINSTANCE, DWORD, void**, void*);
 static HMODULE g_real_dinput;
 
@@ -36,19 +39,20 @@ extern "C" HRESULT WINAPI DirectInputCreateA(HINSTANCE inst, DWORD version, void
     if (!g_real_dinput) {
         char path[MAX_PATH];
         GetSystemDirectoryA(path, MAX_PATH);             // WOW64 redirects this to SysWOW64 for us
-        lstrcatA(path, "\\dinput.dll");
+        vpos_lstrcatA(path, "\\dinput.dll");
         g_real_dinput = LoadLibraryA(path);
     }
     DirectInputCreateA_t real = g_real_dinput ? (DirectInputCreateA_t)GetProcAddress(g_real_dinput, "DirectInputCreateA") : 0;
     return real ? real(inst, version, out, outer) : E_FAIL;
 }
+#endif
 
 // ---- logging -------------------------------------------------------------------------------------------
 static FILE* g_log;
 static HMODULE g_self;
 void logf(const char* fmt, ...) {
     if (!g_log) return;
-    SYSTEMTIME t; GetLocalTime(&t);
+    SYSTEMTIME t; vpos_GetLocalTime(&t);
     fprintf(g_log, "%02d:%02d:%02d.%03d  ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
     va_list ap; va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap);
     fputc('\n', g_log); fflush(g_log);
@@ -68,7 +72,9 @@ const char* vp_copy_suffix() { return vp_g_copy_suffix; }
 bool vp_two_copies() { return vp_g_two_copies; }
 
 static void decide_copy(const char* ini) {
-    if (!GetPrivateProfileIntA("test", "two_copies", 0, ini)) return;
+    if (!vpos_GetPrivateProfileIntA("test", "two_copies", 0, ini)) return;
+#ifdef _WIN32
+    // (Windows' own named mutexes and their last error -- not the game's: a Windows-only test feature)
     for (int c = 1; c <= 2; c++) {
         HANDLE h = CreateMutexA(0, FALSE, c == 1 ? "viperport two_copies 1" : "viperport two_copies 2");
         if (!h) continue;
@@ -85,24 +91,27 @@ static void decide_copy(const char* ini) {
         return;
     }
     g_copy_note = "two_copies: two copies already run; this start is the game's own (its single-instance check decides)";
+#else
+#error "R2b: [test] two_copies' two slots -- e.g. flock() on two lock files in the temp folder, held for the process's life"
+#endif
 }
 
 // the DLL's own log: viperport.log beside the DLL; copy 2's in <race.exe's folder>\log-2\ (made)
 static FILE* open_dll_log() {
     char path[MAX_PATH];
     if (vp_g_copy == 2) {
-        const DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+        const DWORD n = vpos_GetModuleFileNameA(NULL, path, MAX_PATH);
         char* slash = n && n < MAX_PATH ? strrchr(path, '\\') : 0;
         if (slash && (size_t)(slash + 1 - path) + 20 < MAX_PATH) {
-            lstrcpyA(slash + 1, "log-2");
-            CreateDirectoryA(path, 0);
-            lstrcatA(path, "\\viperport.log");
+            vpos_lstrcpyA(slash + 1, "log-2");
+            vpos_CreateDirectoryA(path, 0);
+            vpos_lstrcatA(path, "\\viperport.log");
             if (FILE* f = fopen(path, "w")) return f;
         }
     }
-    GetModuleFileNameA(g_self, path, MAX_PATH);
+    vpos_GetModuleFileNameA(g_self, path, MAX_PATH);
     char* slash = strrchr(path, '\\');
-    lstrcpyA(slash ? slash + 1 : path, "viperport.log");
+    vpos_lstrcpyA(slash ? slash + 1 : path, "viperport.log");
     return fopen(path, "w");
 }
 
@@ -142,7 +151,7 @@ static bool g_probe;
 bool vp_probe_build() {
     const uint8_t* base = (const uint8_t*)0x400000;
     MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery(base, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return false;
+    if (!vpos_VirtualQuery(base, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return false;
     const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
     for (const Build& b : k_builds)
         if (nt->FileHeader.TimeDateStamp == b.timestamp) g_build = &b;
@@ -225,11 +234,11 @@ bool jmp_hook(uint32_t v10, const uint8_t* expect, size_t n, void* to, const cha
     uint32_t at = A(v10);
     uint8_t* p = (uint8_t*)at;
     DWORD old;
-    VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+    vpos_VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
     p[0] = 0xE9;
     *(int32_t*)(p + 1) = (int32_t)((uint8_t*)to - (p + 5));
-    VirtualProtect(p, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    vpos_VirtualProtect(p, 5, old, &old);
+    vpos_flush_code(p, 5);
     logf("hooked %s at %08x -> %p", what, at, to);
     return true;
 }
@@ -276,10 +285,10 @@ static bool patch_fields(Field* f, int n, const char* what) {
         uint32_t neu = f[i].neu;
         if (f[i].at_least && *(uint32_t*)p > neu) neu = *(uint32_t*)p;
         DWORD old;
-        VirtualProtect(p, 4, PAGE_EXECUTE_READWRITE, &old);
+        vpos_VirtualProtect(p, 4, PAGE_EXECUTE_READWRITE, &old);
         *(uint32_t*)p = neu;
-        VirtualProtect(p, 4, old, &old);
-        FlushInstructionCache(GetCurrentProcess(), p, 4);
+        vpos_VirtualProtect(p, 4, old, &old);
+        vpos_flush_code(p, 4);
         port_note_m1((uint32_t)p, 4);                                // (a trampoline over it must copy the new value)
     }
     logf("lifted %s (%d fields)", what, n);
@@ -684,23 +693,23 @@ static LONG CALLBACK fault_logger(EXCEPTION_POINTERS* e) {
     const uintptr_t at = (uintptr_t)e->ExceptionRecord->ExceptionAddress;
     const uintptr_t self = (uintptr_t)g_self;
     char where[48];
-    if (at >= 0x400000 && at < 0x600000) wsprintfA(where, "race.exe %08lx", (unsigned long)at);
-    else wsprintfA(where, "dinput.dll+%05lx", (unsigned long)(at - self));
+    if (at >= 0x400000 && at < 0x600000) vpos_wsprintfA(where, "race.exe %08lx", (unsigned long)at);
+    else vpos_wsprintfA(where, "dinput.dll+%05lx", (unsigned long)(at - self));
     char stack[16 * 22] = "";
     const uint32_t* sp = (const uint32_t*)(uintptr_t)e->ContextRecord->Esp;
     int n = 0;
-    for (int i = 0; i < 256 && n < 16 && !IsBadReadPtr(sp + i, 4); i++) {
+    for (int i = 0; i < 256 && n < 16 && !vpos_IsBadReadPtr(sp + i, 4); i++) {
         const uint32_t v = sp[i];
         char one[24];
-        if (v >= 0x401000 && v < 0x4d0000) wsprintfA(one, " %08lx", (unsigned long)v);
-        else if (v >= self + 0x1000 && v < self + 0x400000) wsprintfA(one, " dll+%05lx", (unsigned long)(v - self));
+        if (v >= 0x401000 && v < 0x4d0000) vpos_wsprintfA(one, " %08lx", (unsigned long)v);
+        else if (v >= self + 0x1000 && v < self + 0x400000) vpos_wsprintfA(one, " dll+%05lx", (unsigned long)(v - self));
         else continue;
-        lstrcatA(stack, one);
+        vpos_lstrcatA(stack, one);
         n++;
     }
     const ULONG_PTR* info = e->ExceptionRecord->ExceptionInformation;
-    logf("FAULT %08lx at %s (thread %lu%s)%s%08lx; code on the stack:%s", code, where, GetCurrentThreadId(),
-         GetCurrentThreadId() == g_physics_thread_id ? ", physics" : "",
+    logf("FAULT %08lx at %s (thread %lu%s)%s%08lx; code on the stack:%s", code, where, vpos_GetCurrentThreadId(),
+         vpos_GetCurrentThreadId() == g_physics_thread_id ? ", physics" : "",
          code == EXCEPTION_ACCESS_VIOLATION ? (info[0] ? ", writing " : ", reading ") : ", ",
          code == EXCEPTION_ACCESS_VIOLATION ? (unsigned long)info[1] : (unsigned long)e->ContextRecord->Eip, stack);
     return EXCEPTION_CONTINUE_SEARCH;
@@ -713,12 +722,12 @@ static uint8_t __cdecl h_LogBegin() {
     return r;
 }
 static void install_diagnostics() {
-    AddVectoredExceptionHandler(0, fault_logger);
+    vpos_AddVectoredExceptionHandler(0, fault_logger);
     if (g_build == &k_builds[0]) *(void**)&o_LogBegin = detour_front(0x00410d10, (void*)h_LogBegin, "LogBegin (the game's log, mirrored)");
 }
 
 static void install() {
-    uint8_t* base = (uint8_t*)GetModuleHandleA(NULL);
+    uint8_t* base = (uint8_t*)vpos_GetModuleHandleA(NULL);
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
     for (const Build& b : k_builds)
         if (nt->FileHeader.TimeDateStamp == b.timestamp) g_build = &b;
@@ -740,9 +749,9 @@ static void install() {
     relocate_graf_lists();
     lift_sound_limits();
     char ini[MAX_PATH];                         // viperport.ini, beside this DLL
-    GetModuleFileNameA(g_self, ini, MAX_PATH);
+    vpos_GetModuleFileNameA(g_self, ini, MAX_PATH);
     char* slash = strrchr(ini, '\\');
-    lstrcpyA(slash ? slash + 1 : ini, "viperport.ini");
+    vpos_lstrcpyA(slash ? slash + 1 : ini, "viperport.ini");
     port_install(ini);                          // M3: rewritten functions (Obstacle::Update, collide_phobs, ...)
     session_install(ini);                       // M3: the session recorder (before the race recorder, which it drives)
     replay_install(ini);                        // M3: the race recorder and replayer
@@ -759,10 +768,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
             g_probe = true;
             return TRUE;
         }
+#ifdef VP_GCC
+        vp_os_init(vp_standalone());            // the stand-ins are race.exe's imports: the port's own calls go there too
+#endif
         char ini[MAX_PATH];                     // viperport.ini, beside this DLL: [test] two_copies, before the log
-        GetModuleFileNameA(inst, ini, MAX_PATH);
+        vpos_GetModuleFileNameA(inst, ini, MAX_PATH);
         char* slash = strrchr(ini, '\\');
-        lstrcpyA(slash ? slash + 1 : ini, "viperport.ini");
+        vpos_lstrcpyA(slash ? slash + 1 : ini, "viperport.ini");
         decide_copy(ini);
         g_log = open_dll_log();
         logf("viperport loaded (M1: object limits, texture limit + table, options + language + open-file tables; M3: rewritten functions, race recorder)");
@@ -785,6 +797,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         port_report();
         renderer_report();
         platform_report();
+#ifdef VP_GCC
+        vp_os_report();
+#endif
         if (g_pair_ticks)
             logf("exit: collisions: %.0f volume pair tests per tick on average (stock tests every pair)",
                  (double)g_pair_tests / (double)g_pair_ticks);

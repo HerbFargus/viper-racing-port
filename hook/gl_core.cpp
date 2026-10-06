@@ -1,6 +1,7 @@
 // gl_core.cpp -- the renderer (gl_core.h): OpenGL 3.3 through gl_table.h, and its state in shadow checks.
 #define _CRT_SECURE_NO_WARNINGS
 #include "gl_core.h"
+#include "vp_os.h"
 #include <string.h>
 #include <math.h>
 #include <unordered_map>
@@ -153,9 +154,9 @@ void make_program(Program& pr, bool flat) {
 
 bool on_gl_thread() {
     if (!in.ready) return false;
-    if (GetCurrentThreadId() == in.thread) return true;
+    if (vpos_GetCurrentThreadId() == in.thread) return true;
     static bool said;
-    if (!said) logf("renderer: a drawing call from another thread (%lu) was skipped", GetCurrentThreadId()), said = true;
+    if (!said) logf("renderer: a drawing call from another thread (%lu) was skipped", vpos_GetCurrentThreadId()), said = true;
     return false;
 }
 
@@ -625,7 +626,7 @@ bool start() {
     }
     glr::Direct direct;
     SDL_GL_SetSwapInterval(1);
-    in.thread = GetCurrentThreadId();
+    in.thread = vpos_GetCurrentThreadId();
     logf("renderer: OpenGL %s on %s", (const char*)gl_api.GetString(GL_VERSION), (const char*)gl_api.GetString(GL_RENDERER));
     // FIX: present through a DXGI flip-model swap chain where the driver allows (gl_dxgi.h), so screenshots and the
     // taskbar's preview see the game on NVIDIA; anything else presents through SDL_GL_SwapWindow as before
@@ -764,15 +765,15 @@ uint32_t g_capture_ms, g_capture_next, g_capture_n;
 
 bool write_bmp(const char* name, int w, int h, const uint32_t* rgba, bool top_down) {
     char path[MAX_PATH];                         // <race.exe's folder>\log\capture\<name> (any build: plain Win32)
-    DWORD n = GetModuleFileNameA(0, path, MAX_PATH);
+    DWORD n = vpos_GetModuleFileNameA(0, path, MAX_PATH);
     while (n && path[n - 1] != '\\') n--;
     if (!n || n + 24 + strlen(name) >= MAX_PATH) return false;
     _snprintf(path + n, MAX_PATH - n, "log%s", vp_g_copy_suffix);     // log-2\ for the second copy ([test] two_copies)
     path[MAX_PATH - 1] = 0;
-    CreateDirectoryA(path, 0);
+    vpos_CreateDirectoryA(path, 0);
     const size_t m = strlen(path);
     _snprintf(path + m, MAX_PATH - m, "\\capture");
-    CreateDirectoryA(path, 0);
+    vpos_CreateDirectoryA(path, 0);
     const size_t k = strlen(path);
     _snprintf(path + k, MAX_PATH - k, "\\%s", name);
     path[MAX_PATH - 1] = 0;
@@ -799,7 +800,7 @@ bool write_bmp(const char* name, int w, int h, const uint32_t* rgba, bool top_do
 
 void capture_frame() {                           // with st.fbo bound for reading
     if (!g_capture_ms || shadow_com_check()) return;
-    const uint32_t now = GetTickCount();
+    const uint32_t now = vpos_GetTickCount();
     if (g_capture_next && (int32_t)(now - g_capture_next) < 0) return;
     g_capture_next = now + g_capture_ms;
     if (g_capture_n >= 500) return;
@@ -824,7 +825,7 @@ void capture_frame() {                           // with st.fbo bound for readin
 }  // namespace
 
 void capture_install(const char* ini) {
-    g_capture_ms = (uint32_t)GetPrivateProfileIntA("debug", "capture", 0, ini) * 1000u;
+    g_capture_ms = (uint32_t)vpos_GetPrivateProfileIntA("debug", "capture", 0, ini) * 1000u;
 }
 
 void present() {
@@ -1533,7 +1534,7 @@ void report() {
 // the shader programs, vertex arrays and page texture, whose names stay 0. Never called by the DLL.
 bool start_headless() {
     if (in.ready) return true;
-    in.thread = GetCurrentThreadId();
+    in.thread = vpos_GetCurrentThreadId();
     in.ready = true;
     set_defaults();
     set_mode(st.w, st.h);

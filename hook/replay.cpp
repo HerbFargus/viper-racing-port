@@ -34,6 +34,7 @@
 // v1.0 only (the hooks go through trampolines; see port.h).
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include "vp_os.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -85,7 +86,7 @@ static long g_races_recorded;
 static char g_cur_dir[MAX_PATH], g_cur_play[128], g_cur_label[96];
 static bool g_session_race;
 
-static bool on_physics_thread() { return g_active && GetCurrentThreadId() == g_physics_thread; }
+static bool on_physics_thread() { return g_active && vpos_GetCurrentThreadId() == g_physics_thread; }
 
 // The pause flag is an input: each update's is recorded and fed back. But the game sets it from the main thread
 // (the Esc menu, the P key, the switch-away pause in platform.cpp) at any moment, even in the middle of an update,
@@ -243,7 +244,7 @@ static void finish(const char* why);
 
 static void make_name() {
     SYSTEMTIME t;
-    GetLocalTime(&t);
+    vpos_GetLocalTime(&t);
     _snprintf(g_name, sizeof g_name, "%04d%02d%02d-%02d%02d%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
     if (g_races_recorded) {                             // a restart within the same second
         size_t l = strlen(g_name);
@@ -278,7 +279,7 @@ static void open_trace(const char* name) {
 }
 
 static void begin_race() {
-    g_physics_thread = GetCurrentThreadId();
+    g_physics_thread = vpos_GetCurrentThreadId();
     g_ticks = g_updates = g_diverged_ticks = 0;
     g_first_diverged = UINT32_MAX;
     // a session's race, or [replay]'s
@@ -344,7 +345,7 @@ static void copy_to_replays() {
         _snprintf(from, sizeof from, "%s\\%s%s", g_cur_dir, race, ext);
         _snprintf(to, sizeof to, "%s\\%s%s", g_dir, stamp, ext);
         from[sizeof from - 1] = to[sizeof to - 1] = 0;
-        CopyFileA(from, to, TRUE);
+        vpos_CopyFileA(from, to, TRUE);
     }
     logf("replay: the session's %s copied to %s\\%s.vpr ([replay] record=1)", race, g_dir, stamp);
 }
@@ -406,7 +407,7 @@ static void __cdecl h_PhysTaskRestart(void) {
 }
 
 static void __cdecl h_PhysTaskUpdate(void) {
-    g_physics_thread_id = GetCurrentThreadId();          // for shadow checks (port.h), race or not
+    g_physics_thread_id = vpos_GetCurrentThreadId();          // for shadow checks (port.h), race or not
     bool granted;
     if (!session_update_gate(&granted)) return;          // a session's lockstep: the update waits for the main thread
     if (on_physics_thread()) {
@@ -428,7 +429,7 @@ static unsigned char(__cdecl* o_PhysicsIsPaused)(void);
 
 // true when the request is handled here (waiting for the next update, or left out of a replay)
 static bool pause_request(LONG want, void* from) {
-    if (!g_active || GetCurrentThreadId() == g_physics_thread) return false;
+    if (!g_active || vpos_GetCurrentThreadId() == g_physics_thread) return false;
     if (g_playing) {
         g_game_wanted = want;
         InterlockedExchange(&g_replay_wanted, want);
@@ -446,7 +447,7 @@ static void __cdecl h_PhysicsUnpause(void) { if (!pause_request(0, _ReturnAddres
 static unsigned char __cdecl h_PhysicsIsPaused(void) {
     LONG w = g_pause_wanted;
     if (w < 0 && g_playing) w = g_replay_wanted;
-    if (w >= 0 && GetCurrentThreadId() != g_physics_thread) return (unsigned char)w;
+    if (w >= 0 && vpos_GetCurrentThreadId() != g_physics_thread) return (unsigned char)w;
     return o_PhysicsIsPaused();
 }
 
@@ -468,7 +469,7 @@ static int __fastcall h_GetTicks(void* self, void* edx) {
 // recorder picks the seed the same way and keeps it, and a replay reuses the recording's.
 static void __cdecl h_Randomize(void) {
     if (g_seed == UINT32_MAX) {
-        uint32_t t = GetTickCount();
+        uint32_t t = vpos_GetTickCount();
         g_seed = ((t % 30000) << 16) | ((t / 7) % 30000);
     }
     const uint32_t chosen = g_seed;
@@ -551,7 +552,7 @@ enum { IN_CLOCK = 3 };
 typedef double(__cdecl* Clock_t)();
 static Clock_t o_PhysicsGetTime;
 static double __cdecl h_PhysicsGetTime() {
-    if (GetCurrentThreadId() == g_physics_thread_id) return o_PhysicsGetTime();
+    if (vpos_GetCurrentThreadId() == g_physics_thread_id) return o_PhysicsGetTime();
     double v;                                          // exact: a tick count times a float
     if (shadow_feed(IN_CLOCK, &v, 8)) return v;
     v = o_PhysicsGetTime();
@@ -561,11 +562,11 @@ static double __cdecl h_PhysicsGetTime() {
 
 // ---- install and report -----------------------------------------------------------------------------------
 void replay_install(const char* ini) {
-    g_record = GetPrivateProfileIntA("replay", "record", 0, ini) != 0;
-    GetPrivateProfileStringA("replay", "play", "", g_play, sizeof g_play, ini);
-    GetPrivateProfileStringA("replay", "label", "", g_label, sizeof g_label, ini);
+    g_record = vpos_GetPrivateProfileIntA("replay", "record", 0, ini) != 0;
+    vpos_GetPrivateProfileStringA("replay", "play", "", g_play, sizeof g_play, ini);
+    vpos_GetPrivateProfileStringA("replay", "label", "", g_label, sizeof g_label, ini);
     char dumps[256];
-    GetPrivateProfileStringA("replay", "dump_ticks", "", dumps, sizeof dumps, ini);
+    vpos_GetPrivateProfileStringA("replay", "dump_ticks", "", dumps, sizeof dumps, ini);
     for (char* s = strtok(dumps, ", "); s; s = strtok(0, ", ")) g_dump_ticks.push_back(atoi(s));
     // the input hooks (Random, DriverGet*, the clock) are also a shadow check's inputs, so they go in for either; a
     // session (session_install, before this) needs the race hooks whatever [replay] says
@@ -574,13 +575,13 @@ void replay_install(const char* ini) {
     if (!race && !shadow_on()) return;
     if (race && !g_label[0]) {
         SYSTEMTIME t;
-        GetLocalTime(&t);
+        vpos_GetLocalTime(&t);
         _snprintf(g_label, sizeof g_label, "run-%02d%02d%02d", t.wHour, t.wMinute, t.wSecond);
     }
     strcpy(g_dir, ini);
     char* slash = strrchr(g_dir, '\\');
     strcpy(slash ? slash + 1 : g_dir, "replays");
-    if (g_record || g_play[0]) CreateDirectoryA(g_dir, 0);
+    if (g_record || g_play[0]) vpos_CreateDirectoryA(g_dir, 0);
     if (g_play[0]) {                                   // the seed must be known before start-up rolls the AI
         std::vector<uint8_t> v;
         if (load_file(g_play, ".vpr", v) && v.size() >= sizeof(StreamHeader) && !memcmp(v.data(), "VPRP", 4) &&

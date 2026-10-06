@@ -46,6 +46,8 @@
 #include "viperport.h"
 #if !defined(VP_FAITHFUL) && !defined(VP_FUZZ)
 extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void);
+#define VP_OS_LITE                  // (no <windows.h> here)
+#include "vp_os.h"
 #endif
 #include "port.h"
 #include "x87.h"
@@ -1190,7 +1192,7 @@ static void fp_ran_state(Footprint& f) {
 #if !defined(VP_FAITHFUL) && !defined(VP_FUZZ)
     // Both threads draw. A check on the main thread would save and restore the state outside the generator's
     // lock, losing or repeating a physics-thread draw made in between: those are checked on the physics thread.
-    if (::GetCurrentThreadId() != g_physics_thread_id) { f.replay_only = "a main-thread draw (the physics thread shares the state)"; return; }
+    if (::vpos_GetCurrentThreadId() != g_physics_thread_id) { f.replay_only = "a main-thread draw (the physics thread shares the state)"; return; }
 #endif
     FP_ADD(f, A_RAN_FIRST, RAN_BYTES, "random state (c, u[97], cd, cm, i97, j97)");
     FP_ADD(f, A_RAN_U + 4u * GU32(A_RAN_I97), 4, "random u[i97]");

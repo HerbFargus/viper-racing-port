@@ -367,7 +367,9 @@ bool audio_install() {
     }
     // the game's sound thread sleeps 16 ms a tick and never asks for a fine timer; at Windows' default
     // 15.6 ms granularity a tick can stretch to ~31 ms, close to its 40 ms of queued audio
-    timeBeginPeriod(1);
+#ifdef _WIN32
+    timeBeginPeriod(1);                                          // (Windows only)
+#endif
     logf("audio: SDL2 (DirectSound emulated)");
     return true;
 }

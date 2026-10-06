@@ -18,6 +18,11 @@
 // top of the resolved IAT, with GetModuleHandle(NULL) briefly race.exe's (set_process_module); the one export does the
 // rest.
 //
+// The stand-ins (relink stage R2a): the DLL's table (hook/w32_table.h -- the port's own implementations of race.exe's
+// Windows imports; every one in the GCC build, none in MSVC's) is read as Windows maps the DLL, before its DllMain
+// installs the port, and fills race.exe's import slots; what has no stand-in keeps Windows' function and is logged
+// (viperport.log, --check's report, and VP_TRACE_IMPORTS' import-trace.txt, where each import says what serves it).
+//
 // This program is linked at 0x00800000 (fixed), away from race.exe's 0x400000-0x62c000. The process heap can still
 // land there before main runs; then the program starts itself again suspended, with the range reserved before the
 // child's heap exists, and waits for it.
@@ -31,6 +36,7 @@
 #include <string>
 #include <vector>
 #include "../hook/standalone.h"
+#include "../hook/w32_table.h"
 
 namespace {
 
@@ -324,21 +330,43 @@ LPSTR WINAPI race_GetCommandLineA() { return (LPSTR)g_race_cmdline.c_str(); }
 // race.exe's DINPUT import, until the port DLL is loaded and its own export takes the slot
 HRESULT WINAPI dinput_not_yet(HINSTANCE, DWORD, void**, void*) { return E_FAIL; }
 
+// ---- race.exe's import slots ------------------------------------------------------------------------------------------
+// Every slot resolve_imports filled, with what it imports and how it's served now. A slot's value goes through set_slot,
+// which keeps VP_TRACE_IMPORTS' counting stub in front of whatever serves it.
+enum Served { WINDOWS, SHIM, STAND_IN, PORT };          // Windows' own; the loader's shim; a stand-in; the DLL's own
+struct Slot {
+    uint32_t* at;
+    std::string dll, name;                              // name empty: by ordinal
+    uint32_t ordinal;
+    std::string what;                                   // "KERNEL32.dll!CreateFileA", "WSOCK32.dll #23"
+    int trace;                                          // its VP_TRACE_IMPORTS entry, or -1
+    Served served;
+};
+std::vector<Slot> g_slots;
+Slot* slot_named(const char* what) {
+    for (Slot& s : g_slots)
+        if (!_stricmp(s.what.c_str(), what)) return &s;
+    return 0;
+}
+
 // ---- VP_TRACE_IMPORTS=1: which of race.exe's imports the game calls (relink stage R2a.0) -----------------------------------
 // Each import slot gets a counting stub -- `lock inc dword [count]; jmp dword [real]`, no register or stack touched (only
-// the flags, which no call passes) -- and ExitProcess writes the counts, appended, to import-trace.txt beside viperport.exe.
+// the flags, which no call passes) -- and ExitProcess writes the counts, appended, to import-trace.txt beside viperport.exe,
+// each import marked with what serves it ([stand-in], [Windows], [loader] shim or the [port]'s own).
 // (The session recorder patches some slots later; its hooks call on through the stub, so those calls still count.)
-struct TraceSlot { volatile LONG count; FARPROC real; char what[64]; };
+struct TraceSlot { volatile LONG count; FARPROC real; char what[64]; uint8_t served; };
 TraceSlot* g_trace;
 int g_trace_n;
 typedef VOID(WINAPI* ExitProcess_t)(UINT);
 ExitProcess_t g_trace_exit;
 void trace_write() {
+    static const char* const how[] = {"[Windows]", "[loader]", "[stand-in]", "[port]"};
     if (FILE* f = fopen((g_self_dir + "import-trace.txt").c_str(), "a")) {
         SYSTEMTIME t;
         GetLocalTime(&t);
         fprintf(f, "== %04d-%02d-%02d %02d:%02d:%02d %s\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, GetCommandLineA());
-        for (int i = 0; i < g_trace_n; i++) fprintf(f, "%10ld  %s\n", (long)g_trace[i].count, g_trace[i].what);
+        for (int i = 0; i < g_trace_n; i++)
+            fprintf(f, "%10ld  %-40s %s\n", (long)g_trace[i].count, g_trace[i].what, how[g_trace[i].served & 3]);
         fclose(f);
     }
 }
@@ -346,15 +374,17 @@ VOID WINAPI trace_ExitProcess(UINT code) {
     trace_write();
     g_trace_exit(code);
 }
-FARPROC trace_stub(const char* what, FARPROC real) {
+FARPROC trace_stub(const char* what, FARPROC real, int* index) {
     static uint8_t* code;
     static int used;
+    *index = -1;
     if (!g_trace) {
         g_trace = (TraceSlot*)VirtualAlloc(0, 512 * sizeof(TraceSlot), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         code = (uint8_t*)VirtualAlloc(0, 512 * 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!g_trace || !code) return real;
     }
     if (g_trace_n >= 512) return real;
+    *index = g_trace_n;
     TraceSlot* s = &g_trace[g_trace_n++];
     s->real = real;
     lstrcpynA(s->what, what, sizeof s->what);
@@ -368,6 +398,26 @@ FARPROC trace_stub(const char* what, FARPROC real) {
     p[7] = 0xFF; p[8] = 0x25;                                      // jmp dword ptr [&s->real]
     *(uint32_t*)(p + 9) = (uint32_t)(uintptr_t)&s->real;
     return (FARPROC)p;
+}
+
+// what serves a slot from now on (behind its counting stub, if it has one)
+void set_slot(Slot& s, FARPROC f, Served served) {
+    s.served = served;
+    if (s.trace >= 0) {
+        TraceSlot* t = &g_trace[s.trace];
+        t->served = (uint8_t)served;
+        if (!_stricmp(s.what.c_str(), "KERNEL32.dll!ExitProcess")) g_trace_exit = (ExitProcess_t)f;   // (after the counts)
+        else t->real = f;
+        return;
+    }
+    DWORD old;
+    VirtualProtect(s.at, 4, PAGE_READWRITE, &old);
+    *s.at = (uint32_t)(uintptr_t)f;
+    VirtualProtect(s.at, 4, old, &old);
+}
+// what a slot calls now (through its counting stub)
+uint32_t slot_target(const Slot& s) {
+    return s.trace >= 0 ? (uint32_t)(uintptr_t)g_trace[s.trace].real : *s.at;
 }
 
 // every import into its IAT slot; DINPUT.dll's -> dinput_not_yet for now (the slots it names, returned)
@@ -384,36 +434,209 @@ int resolve_imports(Image& im, std::vector<uint32_t*>& dinput_slots) {
         const IMAGE_THUNK_DATA32* names = (const IMAGE_THUNK_DATA32*)(im.base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
         IMAGE_THUNK_DATA32* iat = (IMAGE_THUNK_DATA32*)(im.base + imp->FirstThunk);
         for (; names->u1.AddressOfData; names++, iat++, n++) {
+            Slot s = {(uint32_t*)&iat->u1.Function, dll, "", 0, "", -1, WINDOWS};
+            char what[128];
+            if (IMAGE_SNAP_BY_ORDINAL32(names->u1.Ordinal)) {
+                s.ordinal = IMAGE_ORDINAL32(names->u1.Ordinal);
+                _snprintf(what, sizeof what, "%s #%u", dll, (unsigned)s.ordinal);
+            } else {
+                s.name = (const char*)((const IMAGE_IMPORT_BY_NAME*)(im.base + names->u1.AddressOfData))->Name;
+                _snprintf(what, sizeof what, "%s!%s", dll, s.name.c_str());
+            }
+            what[sizeof what - 1] = 0;
+            s.what = what;
             if (dinput) {
                 iat->u1.Function = (DWORD)(uintptr_t)&dinput_not_yet;
                 dinput_slots.push_back((uint32_t*)&iat->u1.Function);
+                s.served = PORT;
+                g_slots.push_back(s);
                 continue;
             }
-            FARPROC f;
-            char what[128];
-            if (IMAGE_SNAP_BY_ORDINAL32(names->u1.Ordinal)) {
-                f = GetProcAddress(m, (LPCSTR)(uintptr_t)IMAGE_ORDINAL32(names->u1.Ordinal));
-                _snprintf(what, sizeof what, "%s #%u", dll, (unsigned)IMAGE_ORDINAL32(names->u1.Ordinal));
-            } else {
-                const char* nm = (const char*)((const IMAGE_IMPORT_BY_NAME*)(im.base + names->u1.AddressOfData))->Name;
-                f = GetProcAddress(m, nm);
-                _snprintf(what, sizeof what, "%s!%s", dll, nm);
-            }
-            what[sizeof what - 1] = 0;
+            FARPROC f = s.name.empty() ? GetProcAddress(m, (LPCSTR)(uintptr_t)s.ordinal) : GetProcAddress(m, s.name.c_str());
             if (!f) return refuse("viperport: race.exe's import %s wasn't found", what);
-            if (!_stricmp(what, "KERNEL32.dll!GetCommandLineA")) f = (FARPROC)&race_GetCommandLineA;
-            if (!_stricmp(what, "KERNEL32.dll!GetModuleHandleA")) f = (FARPROC)&race_GetModuleHandleA;
+            if (!_stricmp(what, "KERNEL32.dll!GetCommandLineA")) f = (FARPROC)&race_GetCommandLineA, s.served = SHIM;
+            if (!_stricmp(what, "KERNEL32.dll!GetModuleHandleA")) f = (FARPROC)&race_GetModuleHandleA, s.served = SHIM;
             if (!_stricmp(what, "TAPI32.dll!lineInitialize")) {
                 g_line_initialize = (LineInitialize_t)f;
                 f = (FARPROC)&race_lineInitialize;
+                s.served = SHIM;
             }
             if (!_stricmp(what, "KERNEL32.dll!GetModuleFileNameA")) {
                 f = (FARPROC)&race_GetModuleFileNameA;
                 g_gmfn_slot = (void**)&iat->u1.Function;
+                s.served = SHIM;
             }
-            if (trace) f = trace_stub(what, f);
+            if (trace) {
+                f = trace_stub(what, f, &s.trace);
+                if (s.trace >= 0) g_trace[s.trace].served = (uint8_t)s.served;
+            }
             iat->u1.Function = (DWORD)(uintptr_t)f;
+            g_slots.push_back(s);
         }
+    }
+    return 0;
+}
+
+// ---- the stand-ins (relink stage R2a) -------------------------------------------------------------------------------
+// The port DLL exports its table of Win32 stand-ins (hook/w32_table.h: every one in the GCC build, none in MSVC's). Its
+// DllMain installs the port at once, and the session recorder and net_wsock take what they find in race.exe's slots as
+// the real functions -- so the slots must hold the stand-ins before DllMain runs. Windows tells the loader when it has
+// mapped a DLL, before the DLL's own initialisation (LdrRegisterDllNotification, documented in ntdll; Wine has it):
+// there the table -- constant data, already relocated -- is read and the slots filled. Three slots keep the loader's
+// shims until the DLL is up (GetModuleHandleA / GetModuleFileNameA / GetCommandLineA: the stand-ins answer for race.exe
+// only once told who it is, set_process_image, which needs the DLL initialised); then they get the stand-ins too.
+// lineInitialize's shim goes at once (TAPI is not available: the stand-in never calls TAPI). An import without a
+// stand-in keeps Windows' function and is logged.
+const VpStandIns* g_table;                              // the DLL's table (null: none, or an older DLL)
+bool g_filled_early;                                    // filled from the notification, before the DLL's DllMain
+int g_filled;                                           // slots the table filled
+std::string g_table_unmatched;                          // table entries no slot imports (names)
+const char* const IDENTITY[] = {"KERNEL32.dll!GetModuleHandleA", "KERNEL32.dll!GetModuleFileNameA", "KERNEL32.dll!GetCommandLineA"};
+
+bool is_identity(const Slot& s) {
+    for (const char* w : IDENTITY)
+        if (!_stricmp(s.what.c_str(), w)) return true;
+    return false;
+}
+const VpStandIn* entry_for(const Slot& s) {
+    if (!g_table) return 0;
+    for (uint32_t i = 0; i < g_table->count; i++) {
+        const VpStandIn& e = g_table->entries[i];
+        if (!e.dll || !e.fn || _stricmp(e.dll, s.dll.c_str())) continue;
+        if (e.name ? !s.name.empty() && s.name == e.name : s.name.empty() && e.ordinal == s.ordinal) return &e;
+    }
+    return 0;
+}
+
+// an export of a mapped image, found without GetProcAddress (the notification comes under the loader lock)
+void* export_of(uint8_t* base, const char* name) {
+    const IMAGE_NT_HEADERS32* nt = (const IMAGE_NT_HEADERS32*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY d = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!d.VirtualAddress) return 0;
+    const IMAGE_EXPORT_DIRECTORY* e = (const IMAGE_EXPORT_DIRECTORY*)(base + d.VirtualAddress);
+    const DWORD* names = (const DWORD*)(base + e->AddressOfNames);
+    const WORD* ords = (const WORD*)(base + e->AddressOfNameOrdinals);
+    const DWORD* funcs = (const DWORD*)(base + e->AddressOfFunctions);
+    for (DWORD i = 0; i < e->NumberOfNames; i++)
+        if (!strcmp((const char*)(base + names[i]), name)) return base + funcs[ords[i]];
+    return 0;
+}
+
+// every slot the table has a stand-in for (the identity three: later, fill_identity)
+void fill_from(const VpStandIns* t) {
+    if (!t || t->size < sizeof(VpStandIns) || t->version != VP_STAND_INS_VERSION) return;
+    g_table = t;
+    std::vector<bool> used(t->count);
+    for (Slot& s : g_slots) {
+        if (s.dll == "DINPUT.dll") continue;
+        const VpStandIn* e = entry_for(s);
+        if (!e) continue;
+        used[e - t->entries] = true;
+        if (is_identity(s)) continue;
+        set_slot(s, (FARPROC)e->fn, STAND_IN);
+        g_filled++;
+    }
+    for (uint32_t i = 0; i < t->count; i++) {
+        const VpStandIn& e = t->entries[i];
+        if (!used[i]) {
+            char one[96];
+            if (e.name) _snprintf(one, sizeof one, "%s!%s", e.dll, e.name);
+            else _snprintf(one, sizeof one, "%s #%u", e.dll, e.ordinal);
+            one[sizeof one - 1] = 0;
+            g_table_unmatched += (g_table_unmatched.empty() ? "" : ", ") + std::string(one);
+        }
+    }
+}
+
+// the identity three, once the stand-ins know race.exe (the DLL is up)
+void fill_identity(const std::string& exe, const std::string& cmdline) {
+    if (!g_table || !g_table->count || !g_table->set_process_image) return;
+    g_table->set_process_image(BASE, exe.c_str(), cmdline.c_str());
+    for (Slot& s : g_slots)
+        if (is_identity(s))
+            if (const VpStandIn* e = entry_for(s)) {
+                set_slot(s, (FARPROC)e->fn, STAND_IN);
+                g_filled++;
+            }
+}
+
+// LdrRegisterDllNotification's types (winternl.h has them only in newer SDKs)
+struct LdrString { USHORT Length, MaximumLength; PWSTR Buffer; };
+struct LdrLoaded { ULONG Flags; const LdrString* FullDllName; const LdrString* BaseDllName; PVOID DllBase; ULONG SizeOfImage; };
+typedef VOID(CALLBACK* LdrNotify_t)(ULONG reason, const LdrLoaded* data, PVOID context);
+typedef LONG(NTAPI* LdrRegister_t)(ULONG flags, LdrNotify_t fn, PVOID context, PVOID* cookie);
+typedef LONG(NTAPI* LdrUnregister_t)(PVOID cookie);
+void* g_notify_cookie;
+VOID CALLBACK on_dll_loaded(ULONG reason, const LdrLoaded* data, PVOID) {
+    if (reason != 1 || g_table || !data || !data->DllBase) return;     // LDR_DLL_NOTIFICATION_REASON_LOADED
+    if (const void* t = export_of((uint8_t*)data->DllBase, VP_STAND_INS_EXPORT)) {
+        fill_from((const VpStandIns*)t);
+        g_filled_early = g_table != 0;
+    }
+}
+void watch_dll_loads(bool on) {
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+    if (on) {
+        if (LdrRegister_t reg = (LdrRegister_t)GetProcAddress(nt, "LdrRegisterDllNotification"))
+            if (reg(0, on_dll_loaded, 0, &g_notify_cookie) != 0) g_notify_cookie = 0;
+    } else if (g_notify_cookie) {
+        if (LdrUnregister_t un = (LdrUnregister_t)GetProcAddress(nt, "LdrUnregisterDllNotification")) un(g_notify_cookie);
+        g_notify_cookie = 0;
+    }
+}
+
+// what serves each slot once the port is installed: a slot left Windows' that the DLL itself took over since (DDRAW
+// and DSOUND: the renderer's and the audio's emulations) is the port's. Returns how many still reach Windows (their
+// names in *list).
+int still_windows(HMODULE port, std::string* list) {
+    uint32_t lo = (uint32_t)(uintptr_t)port, hi = lo;
+    if (port) {
+        const IMAGE_NT_HEADERS32* nt = (const IMAGE_NT_HEADERS32*)((uint8_t*)port + ((const IMAGE_DOS_HEADER*)port)->e_lfanew);
+        hi = lo + nt->OptionalHeader.SizeOfImage;
+    }
+    int n = 0;
+    for (Slot& s : g_slots) {
+        if (s.served != WINDOWS) continue;
+        const uint32_t to = slot_target(s), now = *s.at;     // (the DLL may have put its own over a counting stub)
+        if ((to >= lo && to < hi) || (now >= lo && now < hi)) {
+            s.served = PORT;
+            if (s.trace >= 0) g_trace[s.trace].served = PORT;
+            continue;
+        }
+        *list += (n++ ? ", " : "") + s.what;
+    }
+    return n;
+}
+
+// the stand-ins' report: --check prints it (a FAIL if the table came too late), a launch writes it to viperport.log
+int report_stand_ins(HMODULE port) {
+    std::string windows;
+    const int nw = still_windows(port, &windows);
+    int shims = 0;
+    for (const Slot& s : g_slots) shims += s.served == SHIM;
+    char line[512];
+    if (!g_table || !g_table->count) {
+        if (g_check)
+            say("viperport.exe: stand-ins: none (this DLL's table is %s): race.exe's %u imports stay Windows' (%d) and the "
+                "port's own (%u), %d loader shims", g_table ? "empty -- the MSVC build" : "missing", (unsigned)g_slots.size(),
+                nw, (unsigned)g_slots.size() - nw - shims, shims);
+        return 0;
+    }
+    _snprintf(line, sizeof line, "stand-ins: %d of race.exe's %u imports filled from the DLL's table of %u (%s the port "
+              "installed); %d still reach Windows; %d loader shims", g_filled, (unsigned)g_slots.size(),
+              (unsigned)g_table->count, g_filled_early ? "before" : "AFTER", nw, shims);
+    line[sizeof line - 1] = 0;
+    std::vector<std::string> lines;
+    lines.push_back(line);
+    if (nw) lines.push_back("stand-ins: still Windows' (no stand-in yet): " + windows);
+    if (!g_table_unmatched.empty()) lines.push_back("stand-ins: table entries race.exe doesn't import: " + g_table_unmatched);
+    for (const std::string& l : lines) {
+        if (g_check) say("viperport.exe: %s", l.c_str());
+        else if (g_table->log) g_table->log(("viperport.exe: " + l).c_str());
+    }
+    if (g_check && !g_filled_early) {
+        say("FAIL: the stand-ins were filled after the port installed (no DLL load notification)");
+        return 1;
     }
     return 0;
 }
@@ -599,7 +822,9 @@ int run(int argc_unused) {
     if (_stricmp(folder_of(dll).c_str(), self_dir.c_str()) != 0)
         SetDllDirectoryA(folder_of(dll).c_str());       // --dll elsewhere: SDL2.dll beside it (else the app folder has it)
     void* own = set_process_module((void*)(uintptr_t)BASE);   // (see set_process_module)
+    if (!g_probe) watch_dll_loads(true);               // (the stand-ins go in as Windows maps the DLL: see fill_from)
     HMODULE port = LoadLibraryA(dll.c_str());
+    watch_dll_loads(false);
     set_process_module(own);
     SetEnvironmentVariableA(VP_STANDALONE_ENV, 0);
     if (!port) return refuse("viperport: the port DLL %s didn't load (%lu)", dll.c_str(), GetLastError());
@@ -613,18 +838,26 @@ int run(int argc_unused) {
         if (*slot == (uint32_t)(uintptr_t)&dinput_not_yet) *slot = (uint32_t)(uintptr_t)create;   // (unless the DLL took it)
         VirtualProtect(slot, 4, old, &old);
     }
+    if (!g_table)                                       // (no load notification: filled now, after the install -- a FAIL)
+        if (const void* t = (const void*)GetProcAddress(port, VP_STAND_INS_EXPORT)) fill_from((const VpStandIns*)t);
+    fill_identity(exe, g_race_cmdline);
+    int loader_fails = report_stand_ins(port);
 
-    int loader_fails = 0;
     if (g_check) {
         // what the game will see of its module, through its own import slots (as it calls them)
         char name[MAX_PATH] = "";
+        const Slot* gmh = slot_named("KERNEL32.dll!GetModuleHandleA");
+        const Slot* gcl = slot_named("KERNEL32.dll!GetCommandLineA");
         const DWORD nn = g_gmfn_slot ? ((DWORD(WINAPI*)(HMODULE, LPSTR, DWORD))*g_gmfn_slot)(0, name, MAX_PATH) : 0;
-        const HMODULE mh = race_GetModuleHandleA(0);
+        const HMODULE mh = gmh ? ((HMODULE(WINAPI*)(LPCSTR))(uintptr_t)*gmh->at)(0) : 0;
+        const char* cl = gcl ? ((LPSTR(WINAPI*)())(uintptr_t)*gcl->at)() : "(none)";
         say("viperport.exe: the game's GetModuleHandleA(NULL) = %p, GetModuleFileNameA(NULL) = \"%s\"; the process's "
             "GetModuleHandle(NULL) = %p (viperport.exe)", (void*)mh, nn ? name : "(fails)", (void*)GetModuleHandleA(0));
         if (!nn || _stricmp(name, exe.c_str()) != 0) { say("FAIL: the game's module file name isn't race.exe's"); loader_fails++; }
+        if (mh != (HMODULE)(uintptr_t)BASE) { say("FAIL: the game's GetModuleHandleA(NULL) isn't race.exe's image"); loader_fails++; }
         if (GetModuleHandleA(0) == (HMODULE)(uintptr_t)BASE) { say("FAIL: the process's module is still race.exe's image"); loader_fails++; }
-        say("viperport.exe: the game's command line (its GetCommandLineA) = %s", g_race_cmdline.c_str());
+        say("viperport.exe: the game's command line (its GetCommandLineA) = %s", cl);
+        if (strcmp(cl, g_race_cmdline.c_str()) != 0) { say("FAIL: the game's command line isn't race.exe's"); loader_fails++; }
         // its resources and its window class, on its hInstance 0x400000 (an image Windows didn't load)
         const HINSTANCE inst = (HINSTANCE)(uintptr_t)BASE;
         HRSRC icon = FindResourceA(inst, MAKEINTRESOURCEA(1), (LPCSTR)RT_GROUP_ICON);
@@ -644,8 +877,10 @@ int run(int argc_unused) {
         if (w) DestroyWindow(w);
         if (cls) UnregisterClassA(wc.lpszClassName, inst);
         if (lb) DeleteObject(lb);
-        // TAPI on 0x400000 straight, and through the game's slot (race_lineInitialize): the second must start it
-        if (g_line_initialize) {
+        // TAPI on 0x400000 straight, and through the game's slot (race_lineInitialize, or the stand-in: TAPI with no
+        // modem): the second must start it
+        const Slot* li_slot = slot_named("TAPI32.dll!lineInitialize");
+        if (g_line_initialize && li_slot) {
             struct Cb { static void CALLBACK f(DWORD, DWORD, DWORD_PTR, DWORD_PTR, DWORD_PTR, DWORD_PTR) {} };
             typedef LONG(WINAPI* LineShutdown_t)(DWORD);
             const LineShutdown_t shut = (LineShutdown_t)GetProcAddress(GetModuleHandleA("TAPI32.dll"), "lineShutdown");
@@ -653,8 +888,11 @@ int run(int argc_unused) {
             const LONG raw = g_line_initialize(&app, inst, (void*)&Cb::f, "viperport check", &devs);
             if (raw == 0 && shut) shut(app);
             app = 0;
-            const LONG via = race_lineInitialize(&app, inst, (void*)&Cb::f, "viperport check", &devs);
-            if (via == 0 && shut) shut(app);
+            const LineInitialize_t game = (LineInitialize_t)(uintptr_t)*li_slot->at;
+            const LONG via = game(&app, inst, (void*)&Cb::f, "viperport check", &devs);
+            typedef LONG(WINAPI* GameShutdown_t)(DWORD);
+            const Slot* sd = slot_named("TAPI32.dll!lineShutdown");
+            if (via == 0 && sd) ((GameShutdown_t)(uintptr_t)*sd->at)(app);
             say("viperport.exe: TAPI lineInitialize on hInstance 0x400000: %s (%08lx); through the game's slot: %s (%lu "
                 "devices)", raw ? "refused" : "ok", (unsigned long)raw, via ? "FAILS" : "ok", (unsigned long)devs);
             if (via) { say("FAIL: TAPI doesn't start for the game (the modem line)"); loader_fails++; }

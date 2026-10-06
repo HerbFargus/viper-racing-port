@@ -22,6 +22,7 @@
 // the window still quits), and switching away really doesn't change the game (the recording's switches are applied).
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include "vp_os.h"
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
@@ -132,7 +133,7 @@ void clip_cursor(bool on) {                                      // restrict_cur
 // window inside the screen's top-left 640x480 (copy 1: its top-left corner; copy 2, on the right half: none of it)
 // until Alt-Tab. A clip request is ignored; freeing goes through.
 BOOL WINAPI copies_clip_cursor(const RECT* r) {
-    if (!r) return ClipCursor(0);
+    if (!r) return vpos_ClipCursor(0);
     static bool said;
     if (!said) {
         said = true;
@@ -146,8 +147,10 @@ BOOL WINAPI copies_clip_cursor(const RECT* r) {
 // focus events don't line up with it while DirectDraw holds the screen, and drawing on after the
 // switch meets lost surfaces (DDERR_WRONGMODE) and crashes. WM_ACTIVATEAPP is sent, not posted, so it
 // never passes SDL's message hook (which sees only what its loop takes from the queue): the window
-// procedure is subclassed for it.
+// procedure is subclassed for it. (Windows only; R2b: SDL's SDL_WINDOWEVENT_FOCUS_GAINED / FOCUS_LOST, see below.)
+#ifdef _WIN32
 static WNDPROC g_sdl_wndproc;
+#endif
 
 // what switching away or back does to the game: its inactive flag, and the switch-away pause
 void set_game_active(bool active) {
@@ -172,6 +175,7 @@ void set_game_active(bool active) {
     }
 }
 
+#ifdef _WIN32
 static LRESULT CALLBACK game_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == WM_ACTIVATEAPP) {
         bool active = wparam != 0;
@@ -185,6 +189,7 @@ static LRESULT CALLBACK game_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
     }
     return CallWindowProcA(g_sdl_wndproc, hwnd, msg, wparam, lparam);
 }
+#endif
 
 void SDLCALL raw_message(void*, void*, unsigned int msg, Uint64 wparam, Sint64 lparam) {
     MsgHook_t* hooks = (MsgHook_t*)G.hooks;                      // Win32RegisterMessageHook's two slots
@@ -198,14 +203,18 @@ void SDLCALL raw_message(void*, void*, unsigned int msg, Uint64 wparam, Sint64 l
 // follows the window's size (gl_core.cpp make_target, Hor+ for 16:9) and hands the picture's place back through
 // platform_set_view, which the mouse is mapped by. *w, *h: the picture's size.
 void place_copy_window(SDL_Window* win, int* w, int* h) {
-    SDL_Rect area = {0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    SDL_Rect area = {0, 0, vpos_GetSystemMetrics(SM_CXSCREEN), vpos_GetSystemMetrics(SM_CYSCREEN)};
     SDL_GetDisplayUsableBounds(0, &area);
     int top = 0, left = 0, bottom = 0, right = 0;
+#ifdef _WIN32
     if (SDL_GetWindowBordersSize(win, &top, &left, &bottom, &right) != 0) {
         RECT r = {0, 0, 640, 480};                               // (SDL can't tell yet: ask Windows for the frame)
         AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX), FALSE, 0);
         top = -r.top, left = -r.left, bottom = r.bottom - 480, right = r.right - 640;
     }
+#else
+    SDL_GetWindowBordersSize(win, &top, &left, &bottom, &right);  // (R2b: 0s until the window manager has framed it)
+#endif
     const int half = area.w / 2;
     const int aw = half - left - right, ah = area.h - top - bottom;   // the room for the picture
     int best_w = 0, best_h = 0;
@@ -236,7 +245,7 @@ void place_copy_window(SDL_Window* win, int* w, int* h) {
 }
 
 unsigned char __cdecl sdl_create_window(void* instance) {
-    *(HWND*)G.prev_foreground = GetForegroundWindow();
+    *(HWND*)G.prev_foreground = vpos_GetForegroundWindow();
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");  // DirectInput had the joystick in background mode
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
     // the game's own window class name, so start_unique_instance's FindWindow still finds a running copy
@@ -245,14 +254,14 @@ unsigned char __cdecl sdl_create_window(void* instance) {
     // keep the game DPI-unaware, as it always was: DirectDraw's fullscreen and the mouse coordinates are
     // built on it (stage 2, with our own renderer, is where the game learns real pixels)
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "unaware");
-    int before_w = GetSystemMetrics(SM_CXSCREEN), before_h = GetSystemMetrics(SM_CYSCREEN);
+    int before_w = vpos_GetSystemMetrics(SM_CXSCREEN), before_h = vpos_GetSystemMetrics(SM_CYSCREEN);
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC) != 0) {
         logf("SDL: can't start: %s", SDL_GetError());
         return 0;
     }
     SDL_SetWindowsMessageHook(raw_message, 0);
     const char* title = *(const char**)G.title;
-    int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+    int w = vpos_GetSystemMetrics(SM_CXSCREEN), h = vpos_GetSystemMetrics(SM_CYSCREEN);
     if (vp_two_copies()) {                                       // [test] two_copies: a window on its half
         // (the first copy keeps the game's title, which start_unique_instance's FindWindow looks for)
         g_window = SDL_CreateWindow(vp_copy() == 2 ? "Viper Racing (copy 2)" : title ? title : "Viper Racing", 0, 0,
@@ -269,16 +278,24 @@ unsigned char __cdecl sdl_create_window(void* instance) {
         logf("SDL: can't create the window: %s", SDL_GetError());
         return 0;
     }
+#ifdef _WIN32
     SDL_SysWMinfo info;
     SDL_VERSION(&info.version);
     SDL_GetWindowWMInfo(g_window, &info);
     g_hwnd = info.info.win.window;
     g_sdl_wndproc = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)game_wndproc);
-    HICON icon = LoadIconA((HINSTANCE)instance, MAKEINTRESOURCEA(1));
+    HICON icon = vpos_LoadIconA((HINSTANCE)instance, MAKEINTRESOURCEA(1));
     if (icon) {
         SendMessageA(g_hwnd, WM_SETICON, ICON_BIG, (LPARAM)icon);
         SendMessageA(g_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon);
     }
+#else
+    // R2b: the game's HWND -- a handle the window stand-ins (w32_user.h) know as this SDL window; switching away and
+    // back from SDL_WINDOWEVENT_FOCUS_LOST / FOCUS_GAINED in handle() (what game_wndproc does on WM_ACTIVATEAPP);
+    // SDL_SetWindowsMessageHook and SDL_RegisterApp above are Windows-only (the game's message hooks get nothing);
+    // the icon from race.exe's resource 1 through SDL_SetWindowIcon
+#error "R2b: the SDL window's Windows side (HWND, activation, message hook, icon) -- see the comment above"
+#endif
     *(HWND*)G.hwnd = g_hwnd;
     SDL_ShowCursor(SDL_DISABLE);                                 // the game draws its own
     SDL_RaiseWindow(g_window);
@@ -314,9 +331,9 @@ void mouse_event(int type, int x, int y, int buttons) {
 
 void queue_text(const char* utf8) {                              // typed text: the game's character set is ANSI
     wchar_t wide[32];
-    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, 32);
+    int n = vpos_MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, 32);
     char ansi[64];
-    int m = n > 0 ? WideCharToMultiByte(CP_ACP, 0, wide, -1, ansi, sizeof ansi, 0, 0) : 0;
+    int m = n > 0 ? vpos_WideCharToMultiByte(CP_ACP, 0, wide, -1, ansi, sizeof ansi, 0, 0) : 0;
     for (int i = 0; i + 1 < m; i++) key_char((unsigned char)ansi[i], 0);
 }
 
@@ -336,7 +353,7 @@ void handle(const SDL_Event& e) {
         session_op(SOP_QUIT);
         clip_cursor(false);
         SDL_ShowCursor(SDL_ENABLE);
-        ExitProcess(0);
+        vpos_ExitProcess(0);
     case SDL_KEYDOWN: {                                          // WM_KEYDOWN / WM_SYSKEYDOWN
         g_n_keys++;
         const Key* k = key_for(e.key.keysym.scancode);
@@ -422,10 +439,10 @@ void __cdecl sdl_idle(void) {                                    // Win32Idle
             gxRestore();
         }
     } else if (*(uint8_t*)G.inactive) {                          // switched away: wait to be switched back
-        DWORD t0 = GetTickCount();
+        DWORD t0 = vpos_GetTickCount();
         if (g_gl) gfx_repaint();                                 // the taskbar's preview: the race, not a menu
         while (*(uint8_t*)G.inactive && SDL_WaitEvent(&e)) handle(e);
-        logf("platform: the game loop waited %lu ms while switched away", GetTickCount() - t0);
+        logf("platform: the game loop waited %lu ms while switched away", vpos_GetTickCount() - t0);
         session_op(SOP_CLEAR_BITS);
         KeyClearBits();
         session_op(SOP_RESTORE);
@@ -619,7 +636,7 @@ void platform_session_apply(uint8_t op, const uint8_t* p, uint8_t n) {
         logf("platform: the recording closed the game here");
         clip_cursor(false);
         SDL_ShowCursor(SDL_ENABLE);
-        ExitProcess(0);
+        vpos_ExitProcess(0);
     }
 }
 
@@ -641,34 +658,43 @@ void platform_set_view(int x0, int y0, int w, int h, int game_w, int game_h) {
 // ---- switching it on -------------------------------------------------------------------------------------
 // viperport.exe (standalone.h): the game's own window, DirectDraw and DirectSound code is int3 there, so the platform is
 // always SDL, the OpenGL renderer and SDL audio, whatever viperport.ini says
-static int platform_ini_sdl(const char* ini) { return vp_standalone() ? 1 : GetPrivateProfileIntA("platform", "sdl", 0, ini); }
+static int platform_ini_sdl(const char* ini) { return vp_standalone() ? 1 : vpos_GetPrivateProfileIntA("platform", "sdl", 0, ini); }
 static void platform_ini_str(const char* key, const char* dflt, const char* standalone, char* out, DWORD n, const char* ini) {
-    if (vp_standalone()) lstrcpynA(out, standalone, (int)n);
-    else GetPrivateProfileStringA("platform", key, dflt, out, n, ini);
+    if (vp_standalone()) vpos_lstrcpynA(out, standalone, (int)n);
+    else vpos_GetPrivateProfileStringA("platform", key, dflt, out, n, ini);
 }
 
 bool platform_switched_away() { return G.inactive && *(volatile uint8_t*)G.inactive; }
 
+// SDL2.dll is there (the MSVC build delay-loads it; GCC links it, and a Linux build has it always)
+#ifdef _WIN32
+#define VP_SDL2_THERE() LoadLibraryA("SDL2.dll")
+#else
+#define VP_SDL2_THERE() true
+#endif
+
 bool platform_plans_gl(const char* ini) {
     char renderer[16];
     platform_ini_str("renderer", "ddraw", "gl", renderer, sizeof renderer, ini);
-    return platform_ini_sdl(ini) && _stricmp(renderer, "gl") == 0 && LoadLibraryA("SDL2.dll");
+    return platform_ini_sdl(ini) && _stricmp(renderer, "gl") == 0 && VP_SDL2_THERE();
 }
 
 bool platform_plans_sdl_audio(const char* ini) {
     char audio[16];
     platform_ini_str("audio", "dsound", "sdl", audio, sizeof audio, ini);
-    return platform_ini_sdl(ini) && _stricmp(audio, "sdl") == 0 && LoadLibraryA("SDL2.dll");
+    return platform_ini_sdl(ini) && _stricmp(audio, "sdl") == 0 && VP_SDL2_THERE();
 }
 
 void platform_install(const char* build) {
     char ini[MAX_PATH];
-    HMODULE self = 0;
+    HMODULE self = 0;                                            // this DLL (R2b: 0 -- the one executable)
+#ifdef _WIN32
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCSTR)&platform_install, &self);
-    GetModuleFileNameA(self, ini, MAX_PATH);
+#endif
+    vpos_GetModuleFileNameA(self, ini, MAX_PATH);
     char* slash = strrchr(ini, '\\');
-    lstrcpyA(slash ? slash + 1 : ini, "viperport.ini");
+    vpos_lstrcpyA(slash ? slash + 1 : ini, "viperport.ini");
     if (!platform_ini_sdl(ini)) {
         logf("platform: the game's own (viperport.ini [platform] sdl=0)");
         return;
@@ -676,7 +702,7 @@ void platform_install(const char* build) {
     char renderer[16];
     platform_ini_str("renderer", "ddraw", "gl", renderer, sizeof renderer, ini);
     g_gl = _stricmp(renderer, "gl") == 0;
-    if (!LoadLibraryA("SDL2.dll")) {                             // delay-loaded: make sure it's there first
+    if (!VP_SDL2_THERE()) {                             // delay-loaded: make sure it's there first
         logf("platform: NOT switching to SDL2 -- SDL2.dll isn't next to the game");
         return;
     }

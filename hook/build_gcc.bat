@@ -18,7 +18,7 @@ set PATH=%GCC%;%PATH%
 set SDL=%~dp0..\..\sdl2\SDL2-2.32.10
 set VP_OUT=%~dp0build-gcc
 set VP_CFLAGS=-m32 -O2 -march=i686 -mfpmath=387 -fexcess-precision=standard -fno-strict-aliasing -masm=intel -std=c++17 -fms-extensions -Wno-invalid-offsetof -I"%SDL%\include"
-set VP_SOURCES=viperport.cpp port.cpp replay.cpp session.cpp standalone.cpp net_*.cpp crt_*.cpp edit_*.cpp phys_*.cpp wld_*.cpp krn_*.cpp gx_*.cpp snd_*.cpp ui_*.cpp menu_*.cpp root_*.cpp career_*.cpp paint_*.cpp w32_*.cpp platform.cpp gl_table.cpp gl_core.cpp gl_dxgi.cpp ddraw_gl.cpp dsound_sdl.cpp
+set VP_SOURCES=viperport.cpp port.cpp replay.cpp session.cpp standalone.cpp net_*.cpp crt_*.cpp edit_*.cpp phys_*.cpp wld_*.cpp krn_*.cpp gx_*.cpp snd_*.cpp ui_*.cpp menu_*.cpp root_*.cpp career_*.cpp paint_*.cpp w32_*.cpp vp_os.cpp platform.cpp gl_table.cpp gl_core.cpp gl_dxgi.cpp ddraw_gl.cpp dsound_sdl.cpp
 if not exist "%VP_OUT%\obj" mkdir "%VP_OUT%\obj"
 pushd "%~dp0" || exit /b 1
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = [IO.File]::ReadAllText('%~f0'); iex $s.Substring($s.LastIndexOf('#' + 'COMPILE'))"

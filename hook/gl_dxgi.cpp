@@ -6,6 +6,9 @@
 // (vsync, as SDL_GL_SetSwapInterval(1)). The texture follows the render target's size (ResizeBuffers, re-registered).
 #define _CRT_SECURE_NO_WARNINGS
 #include "gl_dxgi.h"
+// Windows only (DXGI, D3D11, WGL): a Linux build compiles the fallback at the end -- SDL_GL_SwapWindow presents, as
+// when the swap chain is missing here (no extension, Wine). The GetLastError calls below are WGL's: Windows' own.
+#ifdef _WIN32
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include "SDL_syswm.h"
@@ -220,3 +223,12 @@ void present(SDL_Window* win, GLuint src_fbo, int w, int h) {
 }
 
 }  // namespace dxgi
+#else
+#include "SDL.h"
+
+namespace dxgi {
+bool start(SDL_Window*) { return false; }
+void present(SDL_Window* win, GLuint, int, int) { SDL_GL_SwapWindow(win); }
+bool active() { return false; }
+}  // namespace dxgi
+#endif

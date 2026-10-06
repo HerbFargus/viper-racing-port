@@ -111,6 +111,7 @@
 // v1.0 only, on the SDL platform layer ([platform] sdl=1); frames are hashed on the OpenGL renderer (renderer=gl).
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include "vp_os.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -277,7 +278,7 @@ uint32_t g_last_tgt;
 
 // the session's thread -- and not a shadow check's rewrite pass (port.h), whose reads are never really made: they go
 // live, unrecorded, so a recording with shadow checks on holds only what the game really read
-inline bool on_main() { return GetCurrentThreadId() == g_main && shadow_com_phase() != 2; }
+inline bool on_main() { return vpos_GetCurrentThreadId() == g_main && shadow_com_phase() != 2; }
 
 // the network (net_wsock.cpp): the stream is written from the lobby and physics threads too (while the main thread
 // waits for them, in lockstep -- or not, once a lockstep is dropped), so writing takes a lock
@@ -318,7 +319,7 @@ inline uint64_t mix(uint64_t h, uint64_t v) {
 
 // ---- files ---------------------------------------------------------------------------------------------------------------
 bool is_dir(const char* p) {
-    DWORD a = GetFileAttributesA(p);
+    DWORD a = vpos_GetFileAttributesA(p);
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
@@ -330,12 +331,12 @@ void path_in(char* out, size_t n, const char* dir, const char* name) {
 // every file and folder under from (no trailing backslash) copied into to, made; the source only read
 struct TreeCount { unsigned files, failed, skipped; unsigned long long bytes; };
 void copy_tree(const char* from, const char* to, TreeCount& c, int depth) {
-    CreateDirectoryA(to, 0);
+    vpos_CreateDirectoryA(to, 0);
     char pat[MAX_PATH];
     if (strlen(from) + 3 > MAX_PATH) { c.skipped++; return; }
     path_in(pat, sizeof pat, from, "*");
     WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
+    HANDLE h = vpos_FindFirstFileA(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
@@ -349,14 +350,14 @@ void copy_tree(const char* from, const char* to, TreeCount& c, int depth) {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (depth >= 16 || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) { c.skipped++; continue; }
             copy_tree(a, b, c, depth + 1);
-        } else if (CopyFileA(a, b, FALSE)) {
+        } else if (vpos_CopyFileA(a, b, FALSE)) {
             c.files++;
             c.bytes += ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
         } else {
             c.failed++;
         }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+    } while (vpos_FindNextFileA(h, &fd));
+    vpos_FindClose(h);
 }
 
 bool load_file(const char* path, std::vector<uint8_t>& out) {
@@ -374,13 +375,13 @@ bool load_file(const char* path, std::vector<uint8_t>& out) {
 // ---- the stream: writing (record) ------------------------------------------------------------------------------------------
 void put(uint8_t kind, const void* p, size_t n) {
     if (!g_stream) return;
-    if (g_put_cs_ok) EnterCriticalSection(&g_put_cs);
+    if (g_put_cs_ok) vpos_EnterCriticalSection(&g_put_cs);
     uint32_t len = (uint32_t)n;
     fputc(kind, g_stream);
     fwrite(&len, 4, 1, g_stream);
     if (n) fwrite(p, 1, n, g_stream);
     g_records++;
-    if (g_put_cs_ok) LeaveCriticalSection(&g_put_cs);
+    if (g_put_cs_ok) vpos_LeaveCriticalSection(&g_put_cs);
 }
 
 // ---- the stream: reading (play) ----------------------------------------------------------------------------------------------
@@ -582,7 +583,7 @@ unsigned long g_phys_clock_reads, g_phys_clock_short;
 
 BOOL WINAPI h_QPC(LARGE_INTEGER* p) {
     const int mode = g_session_mode;
-    if (t_phys_clock && GetCurrentThreadId() != g_main) {
+    if (t_phys_clock && vpos_GetCurrentThreadId() != g_main) {
         QpcRec r;
         g_phys_clock_reads++;
         if (mode == SESSION_PLAY || mode == SESSION_ENDED) {
@@ -658,10 +659,10 @@ void WINAPI h_GetLocalTime(LPSYSTEMTIME t) {
 void* patch_slot(uint32_t slot, void* to) {
     void** p = (void**)(uintptr_t)slot;
     DWORD old;
-    if (!VirtualProtect(p, 4, PAGE_READWRITE, &old)) return 0;
+    if (!vpos_VirtualProtect(p, 4, PAGE_READWRITE, &old)) return 0;
     void* was = *p;
     *p = to;
-    VirtualProtect(p, 4, old, &old);
+    vpos_VirtualProtect(p, 4, old, &old);
     return was;
 }
 
@@ -671,7 +672,7 @@ void end_of_recording(const char* why) {
     align_clocks();                                                   // the player's clocks carry on from the recording's
     g_session_mode = SESSION_ENDED;
     InterlockedExchange(&g_lb_on, 0);                                 // nobody lets the lobby's steps run from here
-    if (g_ev_lb_grant) SetEvent(g_ev_lb_grant);
+    if (g_ev_lb_grant) vpos_SetEvent(g_ev_lb_grant);
     logf("session: %s at frame %u (%.3f s in) -- the player has control from here", why, g_frame, game_ms() / 1000.0);
 }
 
@@ -708,20 +709,20 @@ inline bool gated_state(int32_t s) { return s == 3 || s == 6; }
 enum Grant { G_NONE, G_DONE, G_LOST };
 // the main thread: one physics update let run, and waited for. G_NONE: the task isn't in a run state (nothing to let)
 Grant grant_one(DWORD limit) {
-    DWORD t0 = GetTickCount();
+    DWORD t0 = vpos_GetTickCount();
     while (!g_at_gate) {
         if (!g_gate_on) return G_LOST;
         if (!gated_state(PHYS_STATE)) return G_NONE;
-        if (GetTickCount() - t0 > limit) return G_LOST;
-        WaitForSingleObject(g_ev_arrive, 2);
+        if (vpos_GetTickCount() - t0 > limit) return G_LOST;
+        vpos_WaitForSingleObject(g_ev_arrive, 2);
     }
     const LONG d0 = g_done;
     InterlockedIncrement(&g_grants);
-    SetEvent(g_ev_grant);
-    t0 = GetTickCount();
+    vpos_SetEvent(g_ev_grant);
+    t0 = vpos_GetTickCount();
     while (g_done == d0) {
-        if (GetTickCount() - t0 > limit) return G_LOST;
-        WaitForSingleObject(g_ev_done, 2);
+        if (vpos_GetTickCount() - t0 > limit) return G_LOST;
+        vpos_WaitForSingleObject(g_ev_done, 2);
     }
     g_grants_given++;
     return G_DONE;
@@ -736,7 +737,7 @@ void lockstep_on() {
 void lockstep_off() {
     InterlockedExchange(&g_gate_on, 0);
     InterlockedExchange(&g_grants, 0);
-    SetEvent(g_ev_grant);
+    vpos_SetEvent(g_ev_grant);
     g_lockstep_race = false;
 }
 
@@ -759,7 +760,7 @@ uint8_t sync_record(bool idle) {
     if (!g_lockstep_race) return 0;
     g_sync_points++;
     if (g_gate_lost) { lose("the physics waited 3 s for the main thread"); return 0; }
-    if (idle && !(g_at_gate && GetTickCount() - g_arrived >= 16)) return 0;
+    if (idle && !(g_at_gate && vpos_GetTickCount() - g_arrived >= 16)) return 0;
     const Grant r = grant_one(2000);
     if (r == G_LOST) { lose("the physics didn't come to its update in 2 s"); return 0; }
     return r == G_DONE ? 1 : 0;
@@ -848,14 +849,14 @@ inline bool lobby_gating() { return g_session_mode == SESSION_RECORD || g_sessio
 volatile TaskInfo* task_info(LONG id) { return id >= 1 && id <= 8 ? &TASKS[id - 1] : 0; }
 int lmi_task(const void* lmi) { return lmi ? *(const int32_t*)((const uint8_t*)lmi + LMI_TASK) : 0; }
 bool task_gone(const volatile TaskInfo* t) {
-    return !t || !t->name || (t->flags & 2) || (t->handle && WaitForSingleObject(t->handle, 0) == WAIT_OBJECT_0);
+    return !t || !t->name || (t->flags & 2) || (t->handle && vpos_WaitForSingleObject(t->handle, 0) == WAIT_OBJECT_0);
 }
 // really suspended (TaskSuspendMe sets the flag just before SuspendThread): its suspend count, looked at and put back
 bool task_suspended(const volatile TaskInfo* t) {
     if (!t || !(t->flags & 1) || !t->handle) return false;
-    const DWORD c = SuspendThread(t->handle);
+    const DWORD c = vpos_SuspendThread(t->handle);
     if (c == (DWORD)-1) return false;
-    ResumeThread(t->handle);
+    vpos_ResumeThread(t->handle);
     return c >= 1;
 }
 
@@ -865,9 +866,9 @@ enum Leave { LV_GRANT, LV_SUSPEND, LV_KILL, LV_FREE };
 Leave lobby_wait(LONG where) {
     volatile TaskInfo* t = task_info(g_lb_task);
     t_stepping = false;
-    g_lb_arrived = GetTickCount();
+    g_lb_arrived = vpos_GetTickCount();
     InterlockedExchange(&g_lb_state, where);
-    SetEvent(g_ev_lb_park);
+    vpos_SetEvent(g_ev_lb_park);
     const DWORD limit = g_session_mode == SESSION_RECORD ? 5000 : 60000;
     Leave r;
     for (;;) {
@@ -876,24 +877,24 @@ Leave lobby_wait(LONG where) {
         if (t && t->kill) { r = LV_KILL; break; }
         if (t && t->suspend_req) { r = LV_SUSPEND; break; }
         if (!g_lb_on) { r = LV_FREE; break; }
-        if (GetTickCount() - g_lb_arrived > limit) {
+        if (vpos_GetTickCount() - g_lb_arrived > limit) {
             InterlockedExchange(&g_lb_on, 0);
             if (g_session_mode == SESSION_RECORD) InterlockedExchange(&g_lb_lost, 1);
             r = LV_FREE;
             break;
         }
-        WaitForSingleObject(g_ev_lb_grant, 2);
+        vpos_WaitForSingleObject(g_ev_lb_grant, 2);
     }
     InterlockedExchange(&g_lb_state, LB_RUNNING);
     t_stepping = r != LV_FREE;
     InterlockedIncrement(&g_lb_left);
-    SetEvent(g_ev_lb_park);
+    vpos_SetEvent(g_ev_lb_park);
     return r;
 }
 
 // the lobby's thread: who it is (its LiveMultiInfo's task); a new lobby starts in lockstep
 void lobby_note_self() {
-    const DWORD me = GetCurrentThreadId();
+    const DWORD me = vpos_GetCurrentThreadId();
     if (g_lb_tid == me) return;
     uint8_t* lmi = LMI_NOW;
     const int id = lmi_task(lmi);
@@ -909,7 +910,7 @@ void lobby_note_self() {
 
 // another thread: wait until the lobby `id` is parked -- at a gate, really suspended, or gone. -1: it didn't in time
 LONG lobby_park(int id, DWORD limit) {
-    const DWORD t0 = GetTickCount();
+    const DWORD t0 = vpos_GetTickCount();
     for (;;) {
         volatile TaskInfo* t = task_info(id);
         if (task_gone(t)) return LB_NONE;
@@ -918,8 +919,8 @@ LONG lobby_park(int id, DWORD limit) {
             if (s == LB_SLEEP || s == LB_RESUME) return s;
             if (s == LB_SUSPENDING && task_suspended(t)) return s;
         }
-        if (GetTickCount() - t0 > limit) return -1;
-        WaitForSingleObject(g_ev_lb_park, 2);
+        if (vpos_GetTickCount() - t0 > limit) return -1;
+        vpos_WaitForSingleObject(g_ev_lb_park, 2);
     }
 }
 
@@ -927,11 +928,11 @@ LONG lobby_park(int id, DWORD limit) {
 bool lobby_step(int id, bool implied, DWORD limit) {
     const LONG left0 = g_lb_left;
     InterlockedIncrement(&g_lb_grants);
-    SetEvent(g_ev_lb_grant);
-    const DWORD t0 = GetTickCount();
+    vpos_SetEvent(g_ev_lb_grant);
+    const DWORD t0 = vpos_GetTickCount();
     while (g_lb_left == left0) {
-        if (GetTickCount() - t0 > limit || !g_lb_on) { InterlockedExchange(&g_lb_grants, 0); return false; }
-        WaitForSingleObject(g_ev_lb_park, 2);
+        if (vpos_GetTickCount() - t0 > limit || !g_lb_on) { InterlockedExchange(&g_lb_grants, 0); return false; }
+        vpos_WaitForSingleObject(g_ev_lb_park, 2);
     }
     if (lobby_park(id, limit) < 0) return false;
     if (implied) g_lb_implied++;
@@ -945,9 +946,9 @@ void lobby_suspend_now(int id) {
     if (s != LB_SLEEP && s != LB_RESUME) return;
     const LONG left0 = g_lb_left;
     TASK_SUSPEND(id);                                                 // the request: it leaves its gate on it
-    SetEvent(g_ev_lb_grant);
-    const DWORD t0 = GetTickCount();
-    while (g_lb_left == left0 && GetTickCount() - t0 < 3000) WaitForSingleObject(g_ev_lb_park, 2);
+    vpos_SetEvent(g_ev_lb_grant);
+    const DWORD t0 = vpos_GetTickCount();
+    while (g_lb_left == left0 && vpos_GetTickCount() - t0 < 3000) vpos_WaitForSingleObject(g_ev_lb_park, 2);
     lobby_park(id, 3000);
     g_lb_implied++;
 }
@@ -965,7 +966,7 @@ void lobby_sync_record() {
         logf("session: the lobby task waited 5 s for the main thread -- its lockstep is dropped at frame %u: it runs free"
              " and the frames aren't compared until the next Grab parks it", g_frame);
     }
-    if (!g_lb_on || g_lb_state != LB_SLEEP || GetTickCount() - g_lb_arrived < 250) return;
+    if (!g_lb_on || g_lb_state != LB_SLEEP || vpos_GetTickCount() - g_lb_arrived < 250) return;
     if (lobby_step(g_lb_task, false, 2000)) {
         const uint8_t v = 1;
         put(K_LOBBY, &v, 1);
@@ -976,7 +977,7 @@ void lobby_sync_record() {
 void lobby_play(uint8_t v) {
     if (v == 0xff) {
         InterlockedExchange(&g_lb_on, 0);
-        SetEvent(g_ev_lb_grant);
+        vpos_SetEvent(g_ev_lb_grant);
         InterlockedExchange(&g_lb_free, 1);
         frame_lobby_free();
         g_lb_drops++;
@@ -998,7 +999,7 @@ void lobby_play(uint8_t v) {
 
 // ---- the network's channels (net_wsock.cpp) ----------------------------------------------------------------------------------
 int channel() {
-    const DWORD t = GetCurrentThreadId();
+    const DWORD t = vpos_GetCurrentThreadId();
     if (t == g_main) return CH_MAIN;
     if (t == g_lb_tid) return CH_LOBBY;
     return CH_PHYS;
@@ -1018,7 +1019,7 @@ const char* nop_name(uint8_t op) {
 bool net_take(uint8_t op, const uint8_t** p, uint32_t* n) {
     if (g_session_mode != SESSION_PLAY && g_session_mode != SESSION_ENDED) return false;
     const int ch = channel();
-    if (g_put_cs_ok) EnterCriticalSection(&g_put_cs);
+    if (g_put_cs_ok) vpos_EnterCriticalSection(&g_put_cs);
     std::vector<uint32_t>& c = g_ch[ch];
     size_t& at = g_ch_at[ch];
     bool ok = false;
@@ -1062,7 +1063,7 @@ bool net_take(uint8_t op, const uint8_t** p, uint32_t* n) {
     } else {
         g_ch_short[ch]++;
     }
-    if (g_put_cs_ok) LeaveCriticalSection(&g_put_cs);
+    if (g_put_cs_ok) vpos_LeaveCriticalSection(&g_put_cs);
     return ok;
 }
 
@@ -1071,21 +1072,21 @@ void net_put(uint8_t op, const void* p, size_t n);
 // a replay's lobby running free (its lockstep dropped): it ticks as often as the recording's did before that one was
 // parked again -- where its channel has the park mark next, it waits to be asked to suspend (or end)
 bool lobby_at_fence() {
-    if (g_put_cs_ok) EnterCriticalSection(&g_put_cs);
+    if (g_put_cs_ok) vpos_EnterCriticalSection(&g_put_cs);
     const std::vector<uint32_t>& c = g_ch[CH_LOBBY];
     const bool fence = g_ch_at[CH_LOBBY] < c.size() && payload(g_recs[c[g_ch_at[CH_LOBBY]]])[1] == NOP_PARK;
-    if (g_put_cs_ok) LeaveCriticalSection(&g_put_cs);
+    if (g_put_cs_ok) vpos_LeaveCriticalSection(&g_put_cs);
     return fence;
 }
 void lobby_fence() {
     if (g_session_mode != SESSION_PLAY || g_lb_on) return;
     volatile TaskInfo* t = task_info(g_lb_task);
-    const DWORD t0 = GetTickCount();
+    const DWORD t0 = vpos_GetTickCount();
     for (;;) {
         const bool fence = lobby_at_fence();
-        if (!fence || g_lb_on || !t || t->suspend_req || t->kill || g_session_mode != SESSION_PLAY || GetTickCount() - t0 > 60000)
+        if (!fence || g_lb_on || !t || t->suspend_req || t->kill || g_session_mode != SESSION_PLAY || vpos_GetTickCount() - t0 > 60000)
             return;
-        Sleep(2);
+        vpos_Sleep(2);
     }
 }
 
@@ -1096,7 +1097,7 @@ void lobby_park_mark() {
         net_put(NOP_PARK, 0, 0);
         return;
     }
-    if (g_put_cs_ok) EnterCriticalSection(&g_put_cs);
+    if (g_put_cs_ok) vpos_EnterCriticalSection(&g_put_cs);
     std::vector<uint32_t>& c = g_ch[CH_LOBBY];
     size_t& at = g_ch_at[CH_LOBBY];
     size_t j = at;
@@ -1107,7 +1108,7 @@ void lobby_park_mark() {
         g_ch_fed[CH_LOBBY]++;
         g_ch_parted[CH_LOBBY] = false;
     }
-    if (g_put_cs_ok) LeaveCriticalSection(&g_put_cs);
+    if (g_put_cs_ok) vpos_LeaveCriticalSection(&g_put_cs);
 }
 
 void net_put(uint8_t op, const void* p, size_t n) {
@@ -1278,7 +1279,7 @@ uint8_t __cdecl h_get_user_directory() {
         char copy[MAX_PATH];
         path_in(copy, sizeof copy, g_run_dir, "config");
         TreeCount c = {0, 0, 0, 0};
-        CreateDirectoryA(g_run_dir, 0);
+        vpos_CreateDirectoryA(g_run_dir, 0);
         copy_tree(snap, copy, c, 0);
         char with[MAX_PATH];
         _snprintf(with, sizeof with, "%s\\", copy);
@@ -1430,12 +1431,12 @@ HANDLE WINAPI h_FindFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA fd) {
         if (take_scan(K_SCAN_FIRST, &r, sizeof r, offsetof(ScanFirstRec, pattern), ph, norm)) {
             g_scans++;
             if (!r.ok) {
-                SetLastError(r.err);
+                vpos_SetLastError(r.err);
                 return INVALID_HANDLE_VALUE;
             }
             if (fd) memcpy(fd, &r.fd, sizeof *fd);
             g_scan_entries++;
-            const ScanHandle s = {CreateEventA(0, TRUE, FALSE, 0), r.scan, true};
+            const ScanHandle s = {vpos_CreateEventA(0, TRUE, FALSE, 0), r.scan, true};
             g_scan_handles.push_back(s);
             return s.h;
         }
@@ -1445,7 +1446,7 @@ HANDLE WINAPI h_FindFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA fd) {
     memset(&r, 0, sizeof r);
     const HANDLE h = o_FindFirstFileA(pattern, &r.fd);
     r.ok = h != INVALID_HANDLE_VALUE;
-    r.err = r.ok ? 0 : GetLastError();
+    r.err = r.ok ? 0 : vpos_GetLastError();
     r.scan = r.ok ? ++g_scan_ids : 0;
     r.pattern = ph;
     const size_t nn = strlen(norm);
@@ -1455,7 +1456,7 @@ HANDLE WINAPI h_FindFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA fd) {
     put(K_SCAN_FIRST, b.data(), b.size());
     g_scans++;
     if (!r.ok) {
-        SetLastError(r.err);
+        vpos_SetLastError(r.err);
         return h;
     }
     g_scan_entries++;
@@ -1472,7 +1473,7 @@ BOOL WINAPI h_FindNextFileA(HANDLE h, LPWIN32_FIND_DATAA fd) {
     if (s->fake) {                                                    // a replay's: fed, or the listing ends
         if (on_main() && take_scan(K_SCAN_NEXT, &r, sizeof r, offsetof(ScanNextRec, scan), s->scan, 0)) {
             if (!r.ok) {
-                SetLastError(r.err);
+                vpos_SetLastError(r.err);
                 return FALSE;
             }
             if (fd) memcpy(fd, &r.fd, sizeof *fd);
@@ -1480,17 +1481,17 @@ BOOL WINAPI h_FindNextFileA(HANDLE h, LPWIN32_FIND_DATAA fd) {
             return TRUE;
         }
         g_scan_ends++;
-        SetLastError(ERROR_NO_MORE_FILES);
+        vpos_SetLastError(ERROR_NO_MORE_FILES);
         return FALSE;
     }
     if (g_session_mode != SESSION_RECORD || !on_main()) return o_FindNextFileA(h, fd);
     memset(&r, 0, sizeof r);
     r.scan = s->scan;
     r.ok = o_FindNextFileA(h, &r.fd) ? 1 : 0;
-    r.err = r.ok ? 0 : GetLastError();
+    r.err = r.ok ? 0 : vpos_GetLastError();
     put(K_SCAN_NEXT, &r, sizeof r);
     if (!r.ok) {
-        SetLastError(r.err);
+        vpos_SetLastError(r.err);
         return FALSE;
     }
     g_scan_entries++;
@@ -1507,8 +1508,8 @@ BOOL WINAPI h_FindClose(HANDLE h) {
     if (s.fake) {                                                     // a replay's: its event closed, the recorded result
         ScanCloseRec f;
         if (on_main() && take_scan(K_SCAN_CLOSE, &f, sizeof f, offsetof(ScanCloseRec, scan), s.scan, 0)) r.ok = f.ok;
-        CloseHandle(s.h);
-        if (!r.ok) SetLastError(ERROR_INVALID_HANDLE);
+        vpos_CloseHandle(s.h);
+        if (!r.ok) vpos_SetLastError(ERROR_INVALID_HANDLE);
         return r.ok;
     }
     r.ok = o_FindClose(h) ? 1 : 0;
@@ -1754,9 +1755,9 @@ void session_frame() {
 bool session_update_gate(bool* granted) {
     *granted = false;
     if (!g_gate_on || !gated_state(PHYS_STATE)) return true;
-    g_arrived = GetTickCount();
+    g_arrived = vpos_GetTickCount();
     InterlockedExchange(&g_at_gate, 1);
-    SetEvent(g_ev_arrive);
+    vpos_SetEvent(g_ev_arrive);
     const DWORD limit = g_session_mode == SESSION_RECORD ? 3000 : 30000;
     bool run = true;
     for (;;) {
@@ -1764,12 +1765,12 @@ bool session_update_gate(bool* granted) {
         if (g > 0 && InterlockedCompareExchange(&g_grants, g - 1, g) == g) { *granted = t_stepping = true; break; }
         if (!g_gate_on) break;                                            // dropped: it runs free
         if (!gated_state(PHYS_STATE)) { run = false; break; }             // the main thread moved the task on
-        if (GetTickCount() - g_arrived > limit) {
+        if (vpos_GetTickCount() - g_arrived > limit) {
             InterlockedExchange(&g_gate_lost, 1);
             InterlockedExchange(&g_gate_on, 0);
             break;
         }
-        WaitForSingleObject(g_ev_grant, 2);
+        vpos_WaitForSingleObject(g_ev_grant, 2);
     }
     InterlockedExchange(&g_at_gate, 0);
     return run;
@@ -1777,7 +1778,7 @@ bool session_update_gate(bool* granted) {
 void session_update_done() {
     t_stepping = false;
     InterlockedIncrement(&g_done);
-    SetEvent(g_ev_done);
+    vpos_SetEvent(g_ev_done);
 }
 
 // ---- reads from the platform layer (platform.cpp) ---------------------------------------------------------------------------------
@@ -1863,7 +1864,7 @@ uint32_t session_seed(uint32_t chosen) {
 bool session_random_feed(int range, int* v) {
     if (g_session_mode != SESSION_PLAY) return false;
     if (!on_main()) {
-        if (!g_in_race && GetCurrentThreadId() != g_lb_tid) g_other_thread_draws++;   // (the lobby's: net_wsock.cpp)
+        if (!g_in_race && vpos_GetCurrentThreadId() != g_lb_tid) g_other_thread_draws++;   // (the lobby's: net_wsock.cpp)
         return false;
     }
     int rec[2];
@@ -1887,7 +1888,7 @@ bool session_random_feed(int range, int* v) {
 void session_random_saw(int range, int v) {
     if (g_session_mode != SESSION_RECORD) return;
     if (!on_main()) {
-        if (!g_in_race && GetCurrentThreadId() != g_lb_tid) g_other_thread_draws++;
+        if (!g_in_race && vpos_GetCurrentThreadId() != g_lb_tid) g_other_thread_draws++;
         return;
     }
     int rec[2] = {range, v};
@@ -1913,7 +1914,7 @@ namespace {
 
 void make_name(char* out, size_t n) {
     SYSTEMTIME t;
-    GetLocalTime(&t);
+    vpos_GetLocalTime(&t);
     _snprintf(out, n, "%04d%02d%02d-%02d%02d%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
     out[n - 1] = 0;
 }
@@ -1933,9 +1934,9 @@ bool load_reference(const char* path) {
 }
 
 bool hook_all() {
-    g_ev_grant = CreateEventA(0, FALSE, FALSE, 0);
-    g_ev_arrive = CreateEventA(0, FALSE, FALSE, 0);
-    g_ev_done = CreateEventA(0, FALSE, FALSE, 0);
+    g_ev_grant = vpos_CreateEventA(0, FALSE, FALSE, 0);
+    g_ev_arrive = vpos_CreateEventA(0, FALSE, FALSE, 0);
+    g_ev_done = vpos_CreateEventA(0, FALSE, FALSE, 0);
 #ifndef SESSION_TEST
     struct D { uint32_t v10; void* to; void** orig; const char* what; } d[] = {
         // detour(0x00412430) detour(0x0042ba30) detour(0x0042bae0) detour(0x0042bd70) -- rewrites, so prologues.inc
@@ -1966,19 +1967,19 @@ bool hook_all() {
 
 namespace {
 void session_install_mode(const char* ini) {
-    const bool record = GetPrivateProfileIntA("session", "record", 0, ini) != 0;
+    const bool record = vpos_GetPrivateProfileIntA("session", "record", 0, ini) != 0;
     char play[128], label[64];
-    GetPrivateProfileStringA("session", "play", "", play, sizeof play, ini);
-    GetPrivateProfileStringA("session", "label", "", label, sizeof label, ini);
+    vpos_GetPrivateProfileStringA("session", "play", "", play, sizeof play, ini);
+    vpos_GetPrivateProfileStringA("session", "label", "", label, sizeof label, ini);
     if (!record && !play[0]) return;
-    g_main = GetCurrentThreadId();
-    InitializeCriticalSection(&g_put_cs);
+    g_main = vpos_GetCurrentThreadId();
+    vpos_InitializeCriticalSection(&g_put_cs);
     g_put_cs_ok = true;
-    g_ev_lb_grant = CreateEventA(0, FALSE, FALSE, 0);
-    g_ev_lb_park = CreateEventA(0, FALSE, FALSE, 0);
+    g_ev_lb_grant = vpos_CreateEventA(0, FALSE, FALSE, 0);
+    g_ev_lb_park = vpos_CreateEventA(0, FALSE, FALSE, 0);
 #ifndef SESSION_TEST
     if (!build_is_v10()) { logf("session: NOT %s -- sessions need v1.0 race.exe", play[0] ? "replaying" : "recording"); return; }
-    if (!vp_standalone() && !GetPrivateProfileIntA("platform", "sdl", 0, ini)) {   // (standalone: SDL is forced on)
+    if (!vp_standalone() && !vpos_GetPrivateProfileIntA("platform", "sdl", 0, ini)) {   // (standalone: SDL is forced on)
         logf("session: NOT %s -- sessions need the SDL platform layer ([platform] sdl=1): it's where the input is recorded",
              play[0] ? "replaying" : "recording");
         return;
@@ -1994,7 +1995,7 @@ void session_install_mode(const char* ini) {
     *(slash ? slash : home) = 0;
     _snprintf(base, sizeof base, "%s\\sessions%s", home, vp_copy_suffix());
     base[sizeof base - 1] = 0;
-    CreateDirectoryA(base, 0);
+    vpos_CreateDirectoryA(base, 0);
     char path[MAX_PATH];
     if (play[0]) {
         if (record) logf("session: both record and play are set -- replaying %s, not recording", play);
@@ -2033,7 +2034,7 @@ void session_install_mode(const char* ini) {
         }
         if (!label[0]) {
             SYSTEMTIME t;
-            GetLocalTime(&t);
+            vpos_GetLocalTime(&t);
             _snprintf(label, sizeof label, "run-%02d%02d%02d", t.wHour, t.wMinute, t.wSecond);
         }
         // this run's name: the label, made unique (a replay never reuses another's user directory or trace)
@@ -2043,7 +2044,7 @@ void session_install_mode(const char* ini) {
             path_in(g_run_dir, sizeof g_run_dir, g_dir, g_run);
             char tr[MAX_PATH];
             _snprintf(tr, sizeof tr, "%s.trace", g_run_dir);
-            if (!is_dir(g_run_dir) && GetFileAttributesA(tr) == INVALID_FILE_ATTRIBUTES) break;
+            if (!is_dir(g_run_dir) && vpos_GetFileAttributesA(tr) == INVALID_FILE_ATTRIBUTES) break;
         }
         if (strlen(g_run_dir) + 9 >= 0xc8) {
             logf("session: NOT replaying -- the replay's user directory %s\\config\\ would be %u characters (the game takes"
@@ -2069,7 +2070,7 @@ void session_install_mode(const char* ini) {
             n2[sizeof n2 - 1] = 0;
             path_in(g_dir, sizeof g_dir, base, n2);
         }
-        CreateDirectoryA(g_dir, 0);
+        vpos_CreateDirectoryA(g_dir, 0);
         const char* nm = strrchr(g_dir, '\\');
         _snprintf(g_name, sizeof g_name, "%s", nm ? nm + 1 : g_dir);
         if (!hook_all()) { logf("session: NOT recording -- its hooks need v1.0 race.exe"); return; }
@@ -2079,7 +2080,7 @@ void session_install_mode(const char* ini) {
         setvbuf(g_stream, 0, _IOFBF, 1 << 16);
         StreamHeader h = {{'V', 'P', 'S', 'S'}, 2, 0, 0};
 #ifndef SESSION_TEST
-        uint8_t* exe = (uint8_t*)GetModuleHandleA(0);
+        uint8_t* exe = (uint8_t*)vpos_GetModuleHandleA(0);
         h.build = ((IMAGE_NT_HEADERS*)(exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew))->FileHeader.TimeDateStamp;
 #endif
         fwrite(&h, sizeof h, 1, g_stream);
@@ -2152,8 +2153,8 @@ void session_report() {
 // ---- the network: what net_wsock.cpp calls -----------------------------------------------------------------------------------
 bool session_net_live() { return g_session_mode == SESSION_OFF || g_session_mode == SESSION_RECORD; }
 bool session_net_recording() { return g_session_mode == SESSION_RECORD; }
-bool session_net_main() { return GetCurrentThreadId() == g_main; }
-bool session_net_lobby() { return GetCurrentThreadId() == g_lb_tid; }
+bool session_net_main() { return vpos_GetCurrentThreadId() == g_main; }
+bool session_net_lobby() { return vpos_GetCurrentThreadId() == g_lb_tid; }
 bool session_net_take(uint8_t op, const uint8_t** p, uint32_t* n) { return net_take(op, p, n); }
 void session_net_put(uint8_t op, const void* p, size_t n) { net_put(op, p, n); }
 
@@ -2258,7 +2259,7 @@ void session_net_async_event() {
 void session_lobby_sleep(int ms, void(__cdecl* real)(int)) {
     if (!lobby_gating()) { real(ms); return; }
     lobby_note_self();
-    if (GetCurrentThreadId() != g_lb_tid) { real(ms); return; }
+    if (vpos_GetCurrentThreadId() != g_lb_tid) { real(ms); return; }
     if (g_lb_on && lobby_wait(LB_SLEEP) != LV_FREE) return;
     real(ms);                                                         // (dropped: it sleeps out its time, as the original)
     lobby_fence();
@@ -2267,12 +2268,12 @@ void session_lobby_sleep(int ms, void(__cdecl* real)(int)) {
 void session_lobby_suspend_me(void(__cdecl* real)(void)) {
     if (!lobby_gating()) { real(); return; }
     lobby_note_self();
-    if (GetCurrentThreadId() != g_lb_tid) { real(); return; }
+    if (vpos_GetCurrentThreadId() != g_lb_tid) { real(); return; }
     for (;;) {
         t_stepping = false;
         if (!g_lb_on) lobby_park_mark();                              // (running free: its channel's place)
         InterlockedExchange(&g_lb_state, LB_SUSPENDING);
-        SetEvent(g_ev_lb_park);
+        vpos_SetEvent(g_ev_lb_park);
         real();                                                       // until TaskResume
         if (!g_lb_on || !lobby_gating()) { InterlockedExchange(&g_lb_state, LB_RUNNING); return; }
         if (lobby_wait(LB_RESUME) != LV_SUSPEND) return;               // asked again before it ran: suspends again
@@ -2280,7 +2281,7 @@ void session_lobby_suspend_me(void(__cdecl* real)(void)) {
 }
 
 void session_lobby_grab(void* lmi, bool after) {
-    if (!lobby_gating() || GetCurrentThreadId() == g_lb_tid) return;
+    if (!lobby_gating() || vpos_GetCurrentThreadId() == g_lb_tid) return;
     const int id = lmi_task(lmi);
     if (!after) {
         if (g_lb_on) { lobby_suspend_now(id); return; }
@@ -2289,12 +2290,12 @@ void session_lobby_grab(void* lmi, bool after) {
         volatile TaskInfo* t = task_info(id);
         if (!t || task_gone(t) || task_suspended(t)) return;
         if (g_session_mode == SESSION_PLAY) {                         // a replay: once it has ticked as the recording's did
-            const DWORD t1 = GetTickCount();
-            while (!lobby_at_fence() && !task_gone(t) && GetTickCount() - t1 < 60000) Sleep(2);
+            const DWORD t1 = vpos_GetTickCount();
+            while (!lobby_at_fence() && !task_gone(t) && vpos_GetTickCount() - t1 < 60000) vpos_Sleep(2);
         }
         TASK_SUSPEND(id);
-        const DWORD t0 = GetTickCount();
-        while (!task_suspended(t) && !task_gone(t) && GetTickCount() - t0 < 3000) Sleep(1);
+        const DWORD t0 = vpos_GetTickCount();
+        while (!task_suspended(t) && !task_gone(t) && vpos_GetTickCount() - t0 < 3000) vpos_Sleep(1);
         return;
     }
     // after the original: a dropped lobby, parked (suspended) again, goes back into lockstep
@@ -2308,7 +2309,7 @@ void session_lobby_grab(void* lmi, bool after) {
 }
 
 void session_lobby_release(void* lmi, bool after) {
-    if (!lobby_gating() || !g_lb_on || GetCurrentThreadId() == g_lb_tid) return;
+    if (!lobby_gating() || !g_lb_on || vpos_GetCurrentThreadId() == g_lb_tid) return;
     const int id = lmi_task(lmi);
     if (!after) {
         // the original resumes a suspended task; a lobby waiting at a gate is suspended first (as it would have been)
