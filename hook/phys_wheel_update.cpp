@@ -263,7 +263,7 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
     const float long_slip_prev = w->long_slip;          // +0x8c, an integer copy
     const uint8_t broken = w->broken;                   // cl, held to the drive torque below
     float brake;                                        // +0x24
-    if (broken) brake = (float)(D(w->brake_torque_max) * 0.2f);
+    if (broken) brake = (float)(D(w->brake_torque_max) * (float)0.2f);
     else brake = (float)(abs_brake_r * w->brake_torque_max);
     if (w->abs_mode != 0 && I(w->brake_input) > 0 && !broken && I(w->surface_speed) > 0x3f800000) {
         const float target = Fb(w->abs_mode == 1 ? k_abs_target_1 : k_abs_target);
@@ -286,7 +286,7 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
     const double applied = D(brake) > slip_lim ? slip_lim : D(brake);
     const float applied_f = (float)applied;             // +0x10
     w->brake_power = (float)(applied * absw);
-    double rr = D(absw) * 0.1f;
+    double rr = D(absw) * (float)0.1f;
     rr = 1.0f > rr ? rr : 1.0f;                         // min(|omega| x 0.1, 1); a NaN gives 1
     const double r_static = fabs(rr * w->roll_resist_static * load);
     const double r_speed = fabs(D(w->roll_resist_speed) * w->omega * radius * load);
@@ -301,7 +301,7 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
         v = 1.0f > v ? v : 1.0f;
         lock = (float)v;
         torque = (float)((1.0f - v) * torque);
-        w->omega = (float)((D(lock) * -0.2f + 1.0f) * w->omega);
+        w->omega = (float)((D(lock) * -(float)0.2f + 1.0f) * w->omega);
     }
 
     // ---- drive torque, as a force at the rim; traction control / the digital throttle's slip limit
@@ -325,7 +325,7 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
             } else excess = ef;
         } else excess = (float)e;
         if (I(excess) > 0) {
-            const double r = (D(excess) * -0.1f + 1.0f) * drive;
+            const double r = (D(excess) * -(float)0.1f + 1.0f) * drive;
             drive = (float)(!(0.0f >= r) ? r : 0.0f);
         }
     }
@@ -374,7 +374,7 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
     if (I(M[4]) > 0) {                                  // right way up
         P3 hit;                                         // +0xf4
         if (TerrainGetHeight(Ub(w->droop_point_world.x), Ub(w->droop_point_world.z), &hit, &N, &w->surface) &&
-            (D(Up.z) * N.z + D(Up.y) * N.y) + D(Up.x) * N.x > 0.1f && w->surface != 14) {
+            (D(Up.z) * N.z + D(Up.y) * N.y) + D(Up.x) * N.x > (float)0.1f && w->surface != 14) {
             if (HackPaveTheWorld()) w->surface = 0;
             const double len = x87_sqrt((D(N.y) * N.y + D(N.z) * N.z) + D(N.x) * N.x);
             ASSERT_MSG(!(fabs(len - 1.0f) >= k_normal_tol) ? 1 : 0, k_bad_normal, len);
@@ -409,7 +409,7 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
     const float spring = (float)(D(w->spring_rate) * comp);                     // +0x10
     const double f = (((D(rate) * speed + w->spring_preload) + w->anti_roll_force) + spring) + bump;
     float F;                                            // +0x20 the suspension force
-    if (w->broken) F = (float)(D(spring) * -0.9f + (float)f);   // a broken wheel keeps 10 % of its spring
+    if (w->broken) F = (float)(D(spring) * -(float)0.9f + (float)f);   // a broken wheel keeps 10 % of its spring
     else F = (float)f;
 
     // ---- road noise: a random +- kick, by speed, by surface
@@ -424,7 +424,7 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
     if (!w->is_remote && w->surface == 10) kick = (float)(D(kick) * 9.0f);   // bumpy
     else if (w->surface != 0) kick = (float)(D(kick) * 3.0f);              // off-road
     else kick = 0.0f;                                                       // road
-    F = (float)(D(kick) * 0.3f + F);
+    F = (float)(D(kick) * (float)0.3f + F);
     w->susp_force = F;
 
     // ---- hitting the bump stop hard: an impulse along the ground normal (breaks the wheel past 2892.5)
@@ -432,7 +432,7 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
         const double mag = get_impulse_magnitude(&car->frame.pos, &V, Ub(car->mass), &car->inv_inertia_world,
                                                  &w->droop_point_world, &N, 0);
         const float magf = (float)mag;                  // +0x2c
-        if (mag > 0.01f) {                              // test ah,0x41
+        if (mag > (float)0.01f) {                              // test ah,0x41
             if (I(magf) > (int32_t)k_break_impulse && PhysicsIsDamageOn()) w->broken = 1;
             P3 J;                                       // +0x10
             J.x = (float)(D(N.x) * magf);
@@ -571,11 +571,12 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
 
     // ---- filtered slips (quicker above 10 m/s) and the combined slip
     const bool fast = I(avl) > 0x41200000;
-    const float blend = fast ? 0.4f : 0.6f;             // +0xb8
-    const float lat_new = fast ? 0.0f : 0.2f;           // +0x10 (the lateral filter takes 1 - this of the new)
+    const float blend = fast ? (float)0.4f : (float)0.6f;             // +0xb8
+    const float lat_new = fast ? 0.0f : (float)0.2f;           // +0x10 (the lateral filter takes 1 - this of the new)
     w->long_slip_raw = long_norm;
-    const double nlat = (1.0f - D(lat_new)) * lat_norm + D(w->lat_slip) * blend;
-    const double nlong = (1.0f - D(blend)) * long_norm + D(w->long_slip) * blend;
+    // (VP_KEEP: GCC would fold 1 - 0.2f / 1 - 0.4f exactly; the original's fsub rounds at the physics thread's 24 bits)
+    const double nlat = (1.0f - D(VP_KEEP(lat_new))) * lat_norm + D(w->lat_slip) * blend;
+    const double nlong = (1.0f - D(VP_KEEP(blend))) * long_norm + D(w->long_slip) * blend;
     w->lat_slip = (float)nlat;
     w->long_slip = (float)nlong;
     const double comb = x87_sqrt(D(lat_eff) * lat_eff + nlong * nlong);
@@ -608,7 +609,7 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
         w->lat_force_ratio = (float)(D(Fy) / mufz);
         w->long_force_ratio = (float)(D(Fx) / (D(Fz) * mu_long));
     }
-    w->lat_force_filtered = (float)(D(w->lat_force_filtered) * 0.9f + D(Fy) * 0.1f);
+    w->lat_force_filtered = (float)(D(w->lat_force_filtered) * (float)0.9f + D(Fy) * (float)0.1f);
 
     // ---- the tyre force in the world, capped at 10,000 N; its rolling part acts back on the wheel
     const double a = -(D(w->tire_load_factor) * Fy);
@@ -664,9 +665,9 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
     Dg.z = (float)-(((D(Vn.z) * scale) * Fz) * sdrag);
     const P3& pos = car->frame.pos;
     P3 Pd;                                              // +0xc4
-    Pd.x = (float)(D(w->droop_point_world.x) * 0.3f + D(pos.x) * 0.7f);
-    Pd.y = (float)(D(w->droop_point_world.y) * 0.3f + D(pos.y) * 0.7f);
-    Pd.z = (float)(D(w->droop_point_world.z) * 0.3f + D(pos.z) * 0.7f);
+    Pd.x = (float)(D(w->droop_point_world.x) * (float)0.3f + D(pos.x) * (float)0.7f);
+    Pd.y = (float)(D(w->droop_point_world.y) * (float)0.3f + D(pos.y) * (float)0.7f);
+    Pd.z = (float)(D(w->droop_point_world.z) * (float)0.3f + D(pos.z) * (float)0.7f);
     PhobDyno_ApplyForce(car, 0, &Dg, &Pd);
 
     // ---- realism 0: a sliding wheel pushes the car sideways back, and slows it, at its centre
@@ -688,7 +689,7 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
         memcpy(&Vc, &car->velocity, 12);
         const double c2 = (D(Vc.y) * Vc.y + D(Vc.z) * Vc.z) + D(Vc.x) * Vc.x;
         const float c2f = (float)c2;                    // +0x28
-        if (c2 > 0.1f) {                                // test ah,0x41
+        if (c2 > (float)0.1f) {                                // test ah,0x41
             const double k = 1.0f / x87_sqrt(D(c2f));
             Vc.x = (float)(D(Vc.x) * k);
             Vc.y = (float)(D(Vc.y) * k);
@@ -702,7 +703,7 @@ static void __fastcall Wheel_Update(Wheel* w, Edx, Car* car) {
     }
 
     // ---- integrate the spin
-    const double dom = (1.0f - D(lock)) * w->inv_inertia * torque * 0.016f;
+    const double dom = (1.0f - D(lock)) * w->inv_inertia * torque * (float)0.016f;
     w->fx_flags |= w->broken ? 0x40 : 0;
     w->omega = (float)(dom + w->omega);
     w->rpm = (float)(D(w->omega) * k_rad_to_rpm);

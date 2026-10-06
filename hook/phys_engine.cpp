@@ -645,7 +645,7 @@ static void __fastcall QuarterCar_Step(QuarterCar* self, Edx, float dt, float ro
     if (!(tyre >= 0.0f)) tyre_f = 0.0f;             // fcom 0; test ah,1
     else self->contact_steps++;
     float mass = (float)(D(self->wheel_mass) + self->body_mass);
-    double mu = (D(tyre_f) - k_grip_ref) * k_grip_slope + k_grip_top;
+    double mu = (D(VP_KEEP(tyre_f)) - k_grip_ref) * k_grip_slope + k_grip_top;   // (VP_KEEP: tyre_f = 0 would fold)
     mu = !(k_grip_floor >= mu) ? mu : D(k_grip_floor);   // test ah,1: a NaN passes through
     mu = k_grip_top > mu ? mu : D(k_grip_top);           // test ah,0x41: a NaN gives 1.19
     self->grip = (float)((mu / (D(mass) * k_g)) * tyre_f + self->grip);

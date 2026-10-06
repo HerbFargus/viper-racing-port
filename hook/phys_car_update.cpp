@@ -691,7 +691,8 @@ static void __fastcall Car_Update(Car* self, Edx) {
             double r = fabs(D(w_up)) * k_w_scale;
             r = !(k_w_min1 >= r) ? r : D(k_w_min1);     // max(r, 0.2); a NaN stays
             r = 1.0f > r ? r : 1.0;                     // min(r, 1); a NaN gives 1
-            const double dist = r * k_ahead;
+            const double dist = VP_KEEP(r) * k_ahead;   // (VP_KEEP: GCC would fold 0.2f * 70 exactly; the fmul rounds
+                                                        //  at the physics thread's 24 bits)
             const float distf = (float)dist;            // [+0x1c]
             P.x = (float)(dist * M[6] + pos.x);
             P.y = (float)(D(M[7]) * distf + pos.y);
@@ -755,7 +756,7 @@ static void __fastcall Car_Update(Car* self, Edx) {
         if (self->wheels[0].broken != 0 || self->wheels[1].broken != 0) ok = false;
         if (ok) {
             const double fwd = (D(M[6]) * vel.x + D(vel.y) * M[7]) + D(M[8]) * vel.z;
-            if (fwd > 0.1f) PhobDyno_ApplyForce(self, 0, &F, &P);   // test ah,0x41
+            if (fwd > (float)0.1f) PhobDyno_ApplyForce(self, 0, &F, &P);   // test ah,0x41
         }
     }
 

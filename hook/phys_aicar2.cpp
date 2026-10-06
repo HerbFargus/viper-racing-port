@@ -1408,12 +1408,8 @@ static void __fastcall AICar_lonslam(AICar* self, Edx, float* brake) {
         const float t = (float)-q;                      // [+0]
         if (!far_off) return;
         if (I(t) <= 0) return;
-#ifdef VP_GCC
         const double k = (D(2.5f) - t) * (float)0.4f;   // (GCC reads a bare 0.4f as the long double 0.4L: the cast
                                                         //  gives the float the original multiplies by)
-#else
-        const double k = (D(2.5f) - t) * 0.4f;
-#endif
         float kf = (float)k;
         if (!(k >= 0.0f)) SET4(kf, 0);                  // test ah,1
         else if (I(kf) > 0x3f800000) SET4(kf, 0x3f800000u);

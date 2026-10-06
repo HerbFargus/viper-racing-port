@@ -47,7 +47,7 @@ using namespace ebld;
 using uit::crt_strlen; using uit::crt_copy; using uit::iabs;
 
 static const double EPS = (double)1.1920928955078125e-07f;     // 0x34000000 (2^-23)
-static const double WELD = (double)2.499999936844688e-05f;     // 0x37d1b717
+static const double WELD = (double)(float)2.499999936844688e-05f;     // 0x37d1b717
 
 // callees, by their v1.0 addresses
 static __forceinline void* MemAlloc(int32_t n) { return ccall<void*>(F_MemAlloc, n); }
@@ -1024,9 +1024,9 @@ PORT_FN(0x004b9070, "do_3dface", do_3dface_n, fp_dxf_mb)
 
 // make_vertex: a DXF point to metres (x 0.01)
 static EbP3* __cdecl make_vertex_n(EbP3* out, float x, float y, float z) {
-    eb_st(&out->x, (double)x * (double)0.009999999776482582f);
-    eb_st(&out->y, (double)y * (double)0.009999999776482582f);
-    eb_st(&out->z, (double)z * (double)0.009999999776482582f);
+    eb_st(&out->x, (double)x * (double)(float)0.009999999776482582f);
+    eb_st(&out->y, (double)y * (double)(float)0.009999999776482582f);
+    eb_st(&out->z, (double)z * (double)(float)0.009999999776482582f);
     return out;
 }
 static void fp_make_vertex(Footprint& f, EbP3* out, float, float, float) { f.add(out, 12, "out"); f.pure = true; }
@@ -1088,9 +1088,9 @@ static void __cdecl do_polyline_n(ModBuilder* mb, int32_t fd) {
                 // the original's jump table: 10 20 30 -> 0 1 2, 70..74 -> 3..7, the rest nothing
                 const uint32_t sel = e == 0 ? 0 : e == 10 ? 1 : e == 20 ? 2 : (e >= 60 && e <= 64) ? e - 57 : 8;
                 switch (sel) {
-                case 0: eb_st(&px, (double)EB_GF(S_DXF_FLOAT) * (double)-2.5399999618530273f); break;
-                case 1: eb_st(&py, (double)EB_GF(S_DXF_FLOAT) * (double)2.5399999618530273f); break;
-                case 2: eb_st(&pz, (double)EB_GF(S_DXF_FLOAT) * (double)2.5399999618530273f); break;
+                case 0: eb_st(&px, (double)EB_GF(S_DXF_FLOAT) * (double)-(float)2.5399999618530273f); break;
+                case 1: eb_st(&py, (double)EB_GF(S_DXF_FLOAT) * (double)(float)2.5399999618530273f); break;
+                case 2: eb_st(&pz, (double)EB_GF(S_DXF_FLOAT) * (double)(float)2.5399999618530273f); break;
                 case 3: vflags = EB_G32(S_DXF_INT); break;
                 case 4: a71 = iabs(EB_G32(S_DXF_INT)); break;
                 case 5: a72 = iabs(EB_G32(S_DXF_INT)); break;

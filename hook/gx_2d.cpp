@@ -2474,7 +2474,8 @@ static __forceinline uint32_t fbits(float f) { uint32_t u; memcpy(&u, &f, 4); re
 // graph (the columns aren't checked; get_graph_coords's own verdicts are ignored)
 static void __cdecl GraphDrawLinePlot_n(const GraphInfo* g, PlotFn_t fn, void* ctx, uint32_t c) {
     uint32_t x = fbits(g->xmin);                                                  // integer copies of the floats
-    const float step = (float)((D(g->xmax) - D(g->xmin)) / D(g->n - 1));
+    float step = (float)((D(g->xmax) - D(g->xmin)) / D(g->n - 1));
+    VP_OPAQUE(step);                    // (GCC: divided here, as the original does, though n = 1 leaves it unused)
     const float y0f = fn(x, ctx);
     uint32_t yp = fbits(y0f);
     for (int32_t i = 1; g->n > i; i++) {

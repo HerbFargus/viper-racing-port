@@ -741,13 +741,13 @@ static void __fastcall Car_ActuallyApplyDamage(Car* self, Edx, const P3* force, 
                 if (i < first || i >= end) continue;
                 if (D(lo[pass]) > vv) continue;                  // test ah,0x41; je
                 if (!(D(hi[pass]) > vv)) continue;               // test ah,0x41; jne
-                const double x1 = D(vx->u) - 0.05f;
+                const double x1 = D(vx->u) - (float)0.05f;
                 r_umin = r_umin > x1 ? x1 : r_umin;
-                const double y1 = D(vx->v) - 0.05f;
+                const double y1 = D(vx->v) - (float)0.05f;
                 r_vmin = r_vmin > y1 ? y1 : r_vmin;
-                const double x2 = D(vx->u) + 0.05f;
+                const double x2 = D(vx->u) + (float)0.05f;
                 r_umax = !(r_umax >= x2) ? x2 : r_umax;
-                const double y2 = D(vx->v) + 0.05f;
+                const double y2 = D(vx->v) + (float)0.05f;
                 r_vmax = !(r_vmax >= y2) ? y2 : r_vmax;
             }
             umax = (float)r_umax;

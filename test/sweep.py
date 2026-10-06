@@ -36,7 +36,7 @@ TEST = os.path.join(REPO, "test")
 VCVARS = r"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
 MINGW = r"C:\msys64\mingw32\bin"
 GPP = os.path.join(MINGW, "g++.exe")
-GCC_FLAGS = ["-m32", "-O2", "-march=i686", "-mfpmath=387", "-fexcess-precision=standard", "-masm=intel", "-std=c++17",
+GCC_FLAGS = ["-m32", "-O2", "-march=i686", "-mfpmath=387", "-fexcess-precision=standard", "-fno-strict-aliasing", "-masm=intel", "-std=c++17",
              "-fms-extensions"]
 EXTRA_GCC_FLAGS = []                                             # --gcc-flags "..." (an experiment's extra flags)
 GCC_LIBS = ["-luser32", "-lgdi32", "-lwinmm", "-lws2_32", "-ladvapi32", "-lshell32", "-lole32", "-ldxguid"]

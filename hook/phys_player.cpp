@@ -393,7 +393,7 @@ PORT_FN(0x0044ceb0, "ControlReadAnalog", ControlReadAnalog, fp_control_read_anal
 // ControlReadDigital: analog > 0.2 (a NaN reads as not pressed)
 static unsigned char __cdecl ControlReadDigital(const Control* c) {
     double v = ControlReadAnalogA(c);
-    return v > D(0.2f) ? 1 : 0;                                          // fcomp 0.2; test ah,0x41; sete
+    return v > D((float)0.2f) ? 1 : 0;                                          // fcomp 0.2; test ah,0x41; sete
 }
 static void fp_control_read_digital(Footprint&, const Control*) {}
 PORT_FN(0x0044d470, "ControlReadDigital", ControlReadDigital, fp_control_read_digital)
@@ -1200,7 +1200,7 @@ static void __fastcall PlayCar_Update(void* self, Edx) {
     if (DriverGetReverse()) {
         Car_SetGear(self, 0, -1);
         float t = DriverGetThrottle();
-        Car_SetThrottle(self, 0, D(t) <= D(0.3f) ? 0.3f : t);         // at least 0.3 in reverse (NaN: t)
+        Car_SetThrottle(self, 0, D(t) <= D((float)0.3f) ? (float)0.3f : t);         // at least 0.3 in reverse (NaN: t)
     } else if (at<uint8_t>(self, PC_AUTO_SHIFT)) {
         Car_SetGearAuto(self, 0);
     } else {
@@ -1221,7 +1221,7 @@ static void __fastcall PlayCar_Update(void* self, Edx) {
             void* deity = *g_deity;
             VFN(deity, 0x3c, void, int, void*)(deity, 0, at<int32_t>(self, C_CAR_INDEX), self);
             airlift_time = PhysicsGetTime();
-        } else if (D(PhysicsGetTime()) - D(airlift_time) > D(0.1f)) {
+        } else if (D(PhysicsGetTime()) - D(airlift_time) > D((float)0.1f)) {
             at<uint32_t>(self, PC_AIRLIFT_TIME) = 0x4ceb79a3u;          // 1.2345e8: held, no second lift
         }
     } else {
@@ -1238,7 +1238,7 @@ static void __fastcall PlayCar_Update(void* self, Edx) {
     if (at<int32_t>(self, C_RACE_STATE) == 3) {                          // finished: coast to a stop
         Car_SetThrottle(self, 0, as_float(0));
         float b = at<float>(self, C_BRAKING);
-        Car_SetBraking(self, 0, D(b) <= D(0.2f) ? 0.2f : b);
+        Car_SetBraking(self, 0, D(b) <= D((float)0.2f) ? (float)0.2f : b);
     }
     if (at<uint8_t>(self, C_IS_PLANE)) Car_SetPitch(self, 0, DriverGetPitch());
     Car_Update(self, 0);

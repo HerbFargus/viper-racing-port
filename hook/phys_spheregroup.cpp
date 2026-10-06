@@ -160,7 +160,7 @@ static uint8_t __fastcall MoveableSphereVolume_ApplyInternalForce(MoveableSphere
     P3 b;
     MatrixMulPointInv(&b, &s, &self->frame->rot);
     double len = x87_sqrt(len2);
-    double k = (((len - self->crush_threshold) * self->crush_rate) * 0.016f) / len;   // float constant
+    double k = (((len - self->crush_threshold) * self->crush_rate) * (float)0.016f) / len;   // float constant
     self->local_center.x = (float)(D(b.x) * k + self->local_center.x);
     self->local_center.y = (float)(D(b.y) * k + self->local_center.y);
     self->crushed = 1;

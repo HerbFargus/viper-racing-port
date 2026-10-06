@@ -313,10 +313,10 @@ static Wheel* __fastcall Wheel_ctor(Wheel* self, Edx) {
     self->static_toe = 0.0f;
     self->radius = 1.0f;
     self->inertia = 10.0f;
-    self->inv_inertia = 0.1f;
+    self->inv_inertia = (float)0.1f;
     self->susp_axis_world.y = 1.0f;
     self->inv_brake_heat_capacity = (float)inv;
-    self->brake_cooling = (float)(D(80.4f) * 1.66666675f);
+    self->brake_cooling = (float)(D((float)80.4f) * (float)1.66666675f);
     self->omega = 0.0f;
     self->prev_omega = 0.0f;
     self->heading.x = 0.0f; self->heading.y = 0.0f; self->heading.z = 1.0f;
@@ -382,46 +382,46 @@ static void __fastcall Wheel_Setup(Wheel* self, Edx, const CarData* cd, Car* car
 
     const float wheelbase = (float)(D(cd->wheelbase) * K_INCH);
     const float track = (float)(fabs(D(cd->track[r])) * K_INCH);
-    double wd = D(cd->weight_distribution) * 0.01f;
+    double wd = D(cd->weight_distribution) * (float)0.01f;
     const float front_share = (float)wd;
     const float rear_share = (float)(1.0f - wd);
     self->static_camber = (float)-((D(cd->camber[r]) * K_DEG) * side);
     self->static_toe = (float)-((D(cd->toe[r]) * K_DEG) * side);
-    self->spring_rate = (float)(D(cd->springs[r]) * 175.196838f);
+    self->spring_rate = (float)(D(cd->springs[r]) * (float)175.196838f);
     double inch_r = D(K_INCH) / 1.0f;                   // 0.0254 / 1.0, in a register
     const float inch = (float)inch_r;
-    const float bump_lo = (float)((D(cd->bump[r]) / inch_r) * 4.45f);
-    const float bump_hi = (float)((D(cd->bump[r]) / inch) * 2.67f);
-    const float rebound_lo = (float)((D(cd->rebound[r]) / inch) * 4.45f);
-    const float rebound_hi = (float)((D(cd->rebound[r]) / inch) * 4.45f);
+    const float bump_lo = (float)((D(cd->bump[r]) / inch_r) * (float)4.45f);
+    const float bump_hi = (float)((D(cd->bump[r]) / inch) * (float)2.67f);
+    const float rebound_lo = (float)((D(cd->rebound[r]) / inch) * (float)4.45f);
+    const float rebound_hi = (float)((D(cd->rebound[r]) / inch) * (float)4.45f);
     DamperSetup(&self->damper, 0, bump_lo, bump_hi, rebound_lo, rebound_hi);
 
     COPY4(self->bump_stop_rate, self->spring_rate);
     const float ride = (float)(D(cd->ride_height[r]) * K_INCH);
     self->travel = (float)(D(ride) * 2.0f);
     COPY4(self->static_deflection, ride);
-    self->radius = (float)(D(cd->tyre[r].rim) * 0.0127f);
-    const float width = (float)(D(cd->tyre[r].width) * 0.001f);
+    self->radius = (float)(D(cd->tyre[r].rim) * (float)0.0127f);
+    const float width = (float)(D(cd->tyre[r].width) * (float)0.001f);
     memcpy(frame + 36, &width, 4);
-    double aspect_r = D(cd->tyre[r].aspect) * 0.01f;
+    double aspect_r = D(cd->tyre[r].aspect) * (float)0.01f;
     const float aspect = (float)aspect_r;
     self->radius = (float)(aspect_r * width + self->radius);
     const float share = front ? front_share : rear_share;
     self->spring_preload = 0.0f;
-    const float corner_load = (float)((D(car->mass) * share) * 4.905f);
+    const float corner_load = (float)((D(car->mass) * share) * (float)4.905f);
     // the static deflection that holds the corner load, from the middle of the travel
     double defl = (D(corner_load) - (D(self->travel) * 0.5f) * self->spring_rate) / self->spring_rate;
     self->travel = (float)(D(self->travel) + defl);
     self->static_deflection = (float)(defl + ride);
     self->steer_quadratic = 0.0f;
     const float height = (float)(D(cd->cm_height) * K_INCH + self->travel);
-    const float bump_toe = (float)((D(cd->bump_toe[r]) * K_DEG) * 39.370079f);
-    self->bump_camber = (float)(((D(cd->bump_camber[r]) * K_DEG) * side) * -39.370079f);
+    const float bump_toe = (float)((D(cd->bump_toe[r]) * K_DEG) * (float)39.370079f);
+    self->bump_camber = (float)(((D(cd->bump_camber[r]) * K_DEG) * side) * -(float)39.370079f);
     self->bump_steer = (float)-(D(side) * bump_toe);
     if (front) self->caster = (float)(D(cd->caster) * K_DEG);
     else self->caster = 0.0f;
-    self->camber_compliance = (float)((D(cd->camber_compliance[r]) * K_DEG) * -0.000224719101f);
-    self->toe_compliance = (float)((D(cd->toe_compliance[r]) * K_DEG) * 0.000224719101f);
+    self->camber_compliance = (float)((D(cd->camber_compliance[r]) * K_DEG) * -(float)0.000224719101f);
+    self->toe_compliance = (float)((D(cd->toe_compliance[r]) * K_DEG) * (float)0.000224719101f);
     float along;                                        // the axle's distance from the centre of mass, / wheelbase
     if (front) COPY4(along, rear_share);
     else along = (float)-D(front_share);
@@ -458,14 +458,14 @@ static void __fastcall Wheel_Setup(Wheel* self, Edx, const CarData* cd, Car* car
     self->droop_offset.x = (float)(D(self->droop_offset.x) - hv->x);
     self->droop_offset.y = (float)(D(self->droop_offset.y) - hv->y);
     self->droop_offset.z = (float)(D(self->droop_offset.z) - hv->z);
-    self->brake_torque_max = (float)(D(cd->brake[r]) * 4.45f);
+    self->brake_torque_max = (float)(D(cd->brake[r]) * (float)4.45f);
     COPY4(self->grip_scale, cd->grip_scale[r]);
     COPY4(self->stiffness_scale, cd->tyre_stiffness_scale[r]);
-    double ft_r = D(0.305f) / 1.0f;                     // 0.305 / 1.0, in a register
-    const float roll_k = (float)((D(cd->rolling_resistance) / ft_r) * 2.225f);
-    double half = front ? D(0.50015f) : D(0.50085f);
+    double ft_r = D((float)0.305f) / 1.0f;                     // 0.305 / 1.0, in a register
+    const float roll_k = (float)((D(cd->rolling_resistance) / ft_r) * (float)2.225f);
+    double half = front ? D((float)0.50015f) : D((float)0.50085f);
     self->roll_resist_speed = (float)((half / corner_load) * roll_k);
-    self->roll_resist_static = (float)((D(cd->static_rolling_resistance) / corner_load) * 1.1125f);
+    self->roll_resist_static = (float)((D(cd->static_rolling_resistance) / corner_load) * (float)1.1125f);
 
     // the tyre: <car name>f.tir / r.tir, else the default
     // FIX: the original's name buffer is 36 bytes with the tyre width right after it, so a 31-character car name
@@ -481,8 +481,8 @@ static void __fastcall Wheel_Setup(Wheel* self, Edx, const CarData* cd, Car* car
     if (!ResourceExists(tire_file)) memcpy(tire_file, "def_tire.tir", 13);   // strcpy, inlined
     float width_now;
     memcpy(&width_now, frame + 36, 4);
-    Tire* tire = TireCreate((float)(D(width_now) * 999.999939f), (float)(D(aspect) * 100.0f),
-                            (float)(D(self->radius) * 78.7401581f), tire_file);
+    Tire* tire = TireCreate((float)(D(width_now) * (float)999.999939f), (float)(D(aspect) * 100.0f),
+                            (float)(D(self->radius) * (float)78.7401581f), tire_file);
     self->tire = tire;
     COPY4(self->tire_load_factor, tire->load_factor);
     COPY4(self->inertia, tire->inertia);
@@ -495,13 +495,13 @@ static void __fastcall Wheel_Setup(Wheel* self, Edx, const CarData* cd, Car* car
     self->tire_sound = TireSoundCreate(car->car_index, index, self, car);
 
     // road noise: the load fluctuation of the quarter car at two frequencies, fitted to a line and a square
-    const float unsprung = (float)(D(self->tire->mass) + 9.09f);
+    const float unsprung = (float)(D(self->tire->mass) + (float)9.09f);
     const float sprung = (float)((D(car->mass) * share) * 0.5f - unsprung);
-    const float lf_lo = (float)GetLoadFluctuation(sprung, unsprung, 350393.688f, self->spring_rate, &self->damper,
-                                                  26.666666f);
-    double lf_hi = GetLoadFluctuation(sprung, unsprung, 350393.688f, self->spring_rate, &self->damper, 71.1111145f);
-    self->road_noise_quad = (float)((-26.666666f * lf_hi + D(lf_lo) * 71.1111145f) * -1.18652333e-05f);
-    self->road_noise_lin = (float)((lf_hi * 711.111084f - D(lf_lo) * 5056.79053f) * -1.18652333e-05f);
+    const float lf_lo = (float)GetLoadFluctuation(sprung, unsprung, (float)350393.688f, self->spring_rate, &self->damper,
+                                                  (float)26.666666f);
+    double lf_hi = GetLoadFluctuation(sprung, unsprung, (float)350393.688f, self->spring_rate, &self->damper, (float)71.1111145f);
+    self->road_noise_quad = (float)((-(float)26.666666f * lf_hi + D(lf_lo) * (float)71.1111145f) * -(float)1.18652333e-05f);
+    self->road_noise_lin = (float)((lf_hi * (float)711.111084f - D(lf_lo) * (float)5056.79053f) * -(float)1.18652333e-05f);
 }
 static void fp_wheel_setup(Footprint& f, Wheel*, Edx, const CarData*, Car*, int, const P3*) {
     f.replay_only = "allocates the Tire (TireCreate) and the TireSound";
@@ -533,10 +533,10 @@ static void __fastcall Wheel_update_wheel_position(Wheel* self, Edx, Car* car) {
             D(self->toe_compliance) * self->lat_force_filtered;
         s = s + self->static_toe;
     } else {
-        s = x87_sin_mul(self->spin_angle, 0.0872664601f) + D(self->bump_steer) * bump;   // fsin; fmul dword
+        s = x87_sin_mul(self->spin_angle, (float)0.0872664601f) + D(self->bump_steer) * bump;   // fsin; fmul dword
         s = s + D(self->static_toe) * 2.0f;
-        s = s + D(self->lat_force_filtered) * 1.96104411e-05f;
-        s = s + D(side) * 0.261799395f;
+        s = s + D(self->lat_force_filtered) * (float)1.96104411e-05f;
+        s = s + D(side) * (float)0.261799395f;
     }
     self->steer_angle = (float)s;
     self->heading.x = x87_sin_f(self->steer_angle);              // fsin; fstp dword
@@ -546,7 +546,7 @@ static void __fastcall Wheel_update_wheel_position(Wheel* self, Edx, Car* car) {
                self->static_camber;
     self->camber = (float)(c * self->heading.z - D(self->caster) * self->heading.x);
     if (broken)
-        self->camber = (float)((D(self->lat_force_filtered) * -3.92208822e-05f + self->camber) + D(side) * 0.17453292f);
+        self->camber = (float)((D(self->lat_force_filtered) * -(float)3.92208822e-05f + self->camber) + D(side) * (float)0.17453292f);
     const float* m = car->frame.rot.m;
     const P3& a = self->susp_axis;
     self->susp_axis_world.x = (float)((D(m[0]) * a.x + D(m[6]) * a.z) + D(m[3]) * a.y);
@@ -612,8 +612,8 @@ static void __fastcall Wheel_UpdateReplay(Wheel* self, Edx, const WheelReplayPac
                                           float t, Car* car) {
     double c0 = (double)(p0->compression * 256), c1 = (double)(p1->compression * 256);
     self->compression = (float)((c1 - c0) * 2.0f * K_Q15 * t + 2.0f * c0 * K_Q15);
-    double s0 = (double)(p0->spin * 256) * 0.000383495208f;
-    double s1 = (double)(p1->spin * 256) * 0.000383495208f;
+    double s0 = (double)(p0->spin * 256) * (float)0.000383495208f;
+    double s1 = (double)(p1->spin * 256) * (float)0.000383495208f;
     self->spin_angle = (float)((s0 + (s1 - s0) * t) - K_2PI);
     double o0 = (double)(p0->omega * 256), o1 = (double)(p1->omega * 256);
     double orange = D(100.0f) - -100.0f;
@@ -643,7 +643,7 @@ static void __fastcall Wheel_MakeReplayPacket(const Wheel* self, Edx, WheelRepla
     p->compression = (uint8_t)(x87_ftol((D(v) / 2.0f) * 32768.0f) >> 8);
     if (bits(self->spin_angle) > 0xc0c90fdbu) v = -K_2PI;          // integer compare: below -2pi
     else v = (float)(D(K_2PI) > self->spin_angle ? D(self->spin_angle) : D(K_2PI));
-    p->spin = (uint8_t)(x87_ftol((D(v) + K_2PI) * 2607.59448f) >> 8);
+    p->spin = (uint8_t)(x87_ftol((D(v) + K_2PI) * (float)2607.59448f) >> 8);
     if (!(D(self->omega) >= -100.0f)) v = -100.0f;
     else v = (float)(D(100.0f) > self->omega ? D(self->omega) : D(100.0f));
     p->omega = (uint8_t)(x87_ftol(((D(v) - -100.0f) / (D(100.0f) - -100.0f)) * 32768.0f) >> 8);

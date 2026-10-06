@@ -196,7 +196,15 @@ static void __fastcall stub_fadein(void* self, int) { log_put(0xfade0000u); log_
 static void __fastcall stub_reset_damage(void* self, int) { log_put(0xda3a0000u); log_put((uint32_t)self); }
 static void* __cdecl stub_getball(int i) { log_put(0xba110000u); log_put((uint32_t)i); return g_script.have_ball ? g_ball : 0; }
 static void __fastcall stub_throw(void* self, int, const Frame* fr, const P3* v, float t) {
+#if defined(__GNUC__) && !defined(__clang__)
+    // (in the blimp's view SetHorn throws with its own local zero vector: that address is its frame's layout, which
+    // only the MSVC build shares with the original -- a stack address is logged as one marker; the contents below)
+    const NT_TIB* tib = (const NT_TIB*)NtCurrentTeb();
+    const bool on_stack = (const void*)v >= tib->StackLimit && (const void*)v < tib->StackBase;
+    log_put(0x7c000000u); log_put((uint32_t)self); log_put((uint32_t)fr); log_put(on_stack ? 0x57ac0000u : (uint32_t)v); log_put(fbits(t));
+#else
     log_put(0x7c000000u); log_put((uint32_t)self); log_put((uint32_t)fr); log_put((uint32_t)v); log_put(fbits(t));
+#endif
     if (v) { log_put(fbits(v->x)); log_put(fbits(v->y)); log_put(fbits(v->z)); }
 }
 static float __cdecl stub_terrain_xz(uint32_t x, uint32_t z) { log_put(0x7e450000u); log_put(x); log_put(z); return g_script.super_h; }

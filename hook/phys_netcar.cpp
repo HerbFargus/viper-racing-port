@@ -371,7 +371,7 @@ PORT_FN(0x004405b0, "get_quat_extrapolation", get_quat_extrapolation, fp_get_qua
 static double __cdecl wheels_on_bumpy(WheelPart* w) {
     double sum = 0.0;                                               // mov [esp],0; fld [esp]
     for (int i = 0; i < 4; i++)
-        if (w[i].surface == 10) sum = sum + D(0.2f);
+        if (w[i].surface == 10) sum = sum + D((float)0.2f);
     return sum;
 }
 static void fp_wheels_on_bumpy(Footprint& f, WheelPart*) { f.pure = true; }

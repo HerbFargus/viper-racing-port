@@ -759,9 +759,14 @@ static int crash_filter(EXCEPTION_POINTERS* e, bool orig) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 #if defined(__GNUC__) && !defined(__clang__)
+// (the cushion: GameDoSingle -- the original and the rewrite alike -- with GAME car_count 17 has GenerateCarList run
+// one entry past the World at the top of its frame, writing a driver index and a horn-ball byte 0x94 / 0x98 bytes
+// above its return address, into its caller's frame. MSVC's frame here takes it harmlessly; GCC kept check()'s seed
+// there. The cushion is the caller's frame those writes land in.)
 template <typename Run> static uint64_t guarded(Run& run, bool orig) {
     uint64_t r = 0;
-    if (vp_try([&] { r = run(orig); }, [&](EXCEPTION_POINTERS* e) { return crash_filter(e, orig); })) {
+    if (vp_try([&] { volatile uint8_t cushion[0x100]; cushion[0] = 0; r = run(orig); (void)cushion[0]; },
+               [&](EXCEPTION_POINTERS* e) { return crash_filter(e, orig); })) {
         return 0xdeaddeaddeaddeadull;
     }
     return r;

@@ -383,8 +383,8 @@ static uint8_t __cdecl collide_sphere_box_rw(SphereVolume* s, BoxVolume* b) {
     d.z = W.z - C.z;
     double dist = x87_sqrt((D(d.y) * d.y + D(d.z) * d.z) + D(d.x) * d.x);
     float distf = (float)dist;
-    if (!(dist >= 0.05f)) return 0;                             // 0x4dbcf0; test ah,1
-    double depth = (D(s->radius) - distf) + 0.2f;               // 0x4dbc84
+    if (!(dist >= (float)0.05f)) return 0;                             // 0x4dbcf0; test ah,1
+    double depth = (D(s->radius) - distf) + (float)0.2f;               // 0x4dbc84
     float depthf = (float)depth;
     if (!(depth > 0.0f)) return 0;
 

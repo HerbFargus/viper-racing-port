@@ -425,7 +425,7 @@ static inline float packet_angle(const uint8_t* p) {
 static void packet_rotation(const float* v, M3* M) {
     double L = x87_sqrt((D(v[2]) * v[2] + D(v[1]) * v[1]) + D(v[0]) * v[0]);
     float Lf = (float)L;
-    if (L > 9.999999747378752e-05f) {                        // fcom; test ah,0x41; jne identity
+    if (L > (float)9.999999747378752e-05f) {                        // fcom; test ah,0x41; jne identity
         replay_axis_angle(v, &Lf, M->m);
     } else {
         uint32_t* m = (uint32_t*)M->m;
@@ -693,10 +693,10 @@ static PhobDyno* __fastcall PhobDyno_ctor(PhobDyno* self, Edx, const uint8_t* da
     self->vtable = VT_PhobDyno;
     self->collide_ground = 0;
     self->num_corners = 0;
-    self->mass = (float)(D(df[2]) * 0.4544999897480011f);
-    self->inertia.x = (float)(D(df[3]) * 0.042279861867427826f);
-    self->inertia.y = (float)(D(df[4]) * 0.042279861867427826f);
-    self->inertia.z = (float)(D(df[5]) * 0.042279861867427826f);
+    self->mass = (float)(D(df[2]) * (float)0.4544999897480011f);
+    self->inertia.x = (float)(D(df[3]) * (float)0.042279861867427826f);
+    self->inertia.y = (float)(D(df[4]) * (float)0.042279861867427826f);
+    self->inertia.z = (float)(D(df[5]) * (float)0.042279861867427826f);
     self->inv_mass = (float)(1.0 / D(self->mass));
     self->inv_inertia.x = (float)(1.0 / D(self->inertia.x));
     double iy = 1.0 / D(self->inertia.y);
@@ -1058,7 +1058,7 @@ static __declspec(noinline) void dyno_axis_angle(const float* d, const float* L,
 // PhobDyno::Update (0x445210, virtual): one 0.016 s step
 static void __fastcall PhobDyno_Update(PhobDyno* self, Edx) {
     uint8_t* d = (uint8_t*)self;
-    self->force.y = (float)(D(self->mass) * -9.8100004196167f + self->force.y);
+    self->force.y = (float)(D(self->mass) * -(float)9.8100004196167f + self->force.y);
     for (int i = 0; self->num_corners > i; i++) CornerUpdate(&self->corners[i], 0, self);
     if (self->num_volumes > 0 && self->volumes[0] && self->collide_ground) {
         CollisionVolume* v = self->volumes[0];
@@ -1094,7 +1094,7 @@ static void __fastcall PhobDyno_Update(PhobDyno* self, Edx) {
             } while (self->num_external_impulses > i);
         }
     }
-    double k = D(self->inv_mass) * 0.01600000075995922f;
+    double k = D(self->inv_mass) * (float)0.01600000075995922f;
     set_bits(&self->impulse_weight, 0);
     self->num_external_impulses = 0;
     self->velocity.x = (float)(D(self->force.x) * k + self->velocity.x);
@@ -1117,15 +1117,15 @@ static void __fastcall PhobDyno_Update(PhobDyno* self, Edx) {
         v.y = (float)(D(v.y) * 300.0f);
         v.z = (float)(D(v.z) * 300.0f);
     }
-    self->frame.pos.x = (float)(D(v.x) * 0.01600000075995922f + self->frame.pos.x);
-    self->frame.pos.y = (float)(D(v.y) * 0.01600000075995922f + self->frame.pos.y);
-    self->frame.pos.z = (float)(D(v.z) * 0.01600000075995922f + self->frame.pos.z);
+    self->frame.pos.x = (float)(D(v.x) * (float)0.01600000075995922f + self->frame.pos.x);
+    self->frame.pos.y = (float)(D(v.y) * (float)0.01600000075995922f + self->frame.pos.y);
+    self->frame.pos.z = (float)(D(v.z) * (float)0.01600000075995922f + self->frame.pos.z);
     P3 aa;
     MatrixMulPoint(&aa, &self->torque, &self->inv_inertia_world);
     P3& w = self->angular_velocity;
-    w.x = (float)(D(aa.x) * 0.01600000075995922f + w.x);
-    w.y = (float)(D(aa.y) * 0.01600000075995922f + w.y);
-    w.z = (float)(D(aa.z) * 0.01600000075995922f + w.z);
+    w.x = (float)(D(aa.x) * (float)0.01600000075995922f + w.x);
+    w.y = (float)(D(aa.y) * (float)0.01600000075995922f + w.y);
+    w.z = (float)(D(aa.z) * (float)0.01600000075995922f + w.z);
     double w2 = (D(w.z) * w.z + D(w.x) * w.x) + D(w.y) * w.y;
     float w2f = (float)w2;
     if (w2 > 100.0f) {                                      // 10 rad/s at most
@@ -1138,13 +1138,13 @@ static void __fastcall PhobDyno_Update(PhobDyno* self, Edx) {
         w.z = (float)(D(w.z) * 10.0f);
     }
     P3 step;
-    step.x = (float)(D(w.x) * 0.01600000075995922f);
-    step.y = (float)(D(w.y) * 0.01600000075995922f);
-    step.z = (float)(D(w.z) * 0.01600000075995922f);
+    step.x = (float)(D(w.x) * (float)0.01600000075995922f);
+    step.y = (float)(D(w.y) * (float)0.01600000075995922f);
+    step.z = (float)(D(w.z) * (float)0.01600000075995922f);
     double L = VectorLength(&step);
     float Lf = (float)L;
     M3 R;
-    if (L > 9.999999747378752e-05f) dyno_axis_angle(&step.x, &Lf, R.m);    // fcom; test ah,0x41
+    if (L > (float)9.999999747378752e-05f) dyno_axis_angle(&step.x, &Lf, R.m);    // fcom; test ah,0x41
     else MatrixMakeIdentity(&R);
     M3* rot = &self->frame.rot;
     MatrixConcat(rot, rot, &R);
@@ -1280,13 +1280,13 @@ static void __fastcall Corner_Update(Corner* self, Edx, PhobDyno* dyno) {
     }
     float d = (float)-(((D(H.y) - A.y) * N.y + (D(H.z) - A.z) * N.z) + (D(H.x) - A.x) * N.x);
     float k;
-    if (surf == SURFACE_WATER) k = (float)(D(self->stiffness) * 0.03999999910593033f);
+    if (surf == SURFACE_WATER) k = (float)(D(self->stiffness) * (float)0.03999999910593033f);
     else set_bits(&k, bits(self->stiffness));
     P3 F;
     if (!(D(self->prev_depth) >= D(d))) {                   // fcomp; test ah,1: less, or a NaN
-        F.x = (float)(((D(N.x) * k) * d) * -0.010000000707805157f);
-        F.y = (float)(((D(N.y) * k) * d) * -0.010000000707805157f);
-        F.z = (float)(((D(N.z) * k) * d) * -0.010000000707805157f);
+        F.x = (float)(((D(N.x) * k) * d) * -(float)0.010000000707805157f);
+        F.y = (float)(((D(N.y) * k) * d) * -(float)0.010000000707805157f);
+        F.z = (float)(((D(N.z) * k) * d) * -(float)0.010000000707805157f);
     } else {
         F.x = (float)-((D(N.x) * k) * d);
         F.y = (float)-((D(N.y) * k) * d);
@@ -1310,7 +1310,7 @@ static void __fastcall Corner_Update(Corner* self, Edx, PhobDyno* dyno) {
         T[1] = (float)(D(V.y) * -3000.0f);
         T[2] = (float)(D(V.z) * -3000.0f);
         float tm = (float)x87_sqrt((D(T[1]) * T[1] + D(T[2]) * T[2]) + D(T[0]) * T[0]);
-        double fn = ((D(N.y) * F.y + D(N.z) * F.z) + D(N.x) * F.x) * 1.3299999237060547f;
+        double fn = ((D(N.y) * F.y + D(N.z) * F.z) + D(N.x) * F.x) * (float)1.3299999237060547f;
         double lim = (D(20000000.0f) > fn) ? fn : D(20000000.0f);   // fcom st(1); test ah,0x41: a NaN gives 2e7
         float limf = (float)lim;
         if (!(lim >= D(tm))) {                              // fcom; test ah,1: less, or a NaN
@@ -1360,7 +1360,7 @@ static Obstacle* __fastcall Obstacle_ctor(Obstacle* self, Edx, const uint8_t* da
     fr[11] = dp[2];
     const float* df = (const float*)data;
     M3 Y, P;
-    float yaw = (float)(D(df[9]) * 0.01745329238474369f);
+    float yaw = (float)(D(df[9]) * (float)0.01745329238474369f);
     MatrixMakeYaw(&Y, bits(yaw));
     MatrixMakePitch(&P, 0);
     MatrixConcat(&Y, &P, &Y);
@@ -1370,14 +1370,14 @@ static Obstacle* __fastcall Obstacle_ctor(Obstacle* self, Edx, const uint8_t* da
     float h = (float)(D(df[11]) * 0.5f);                    // data +0x2c: the radius
     float mp[3];                                            // the message point: (0, -h, 0), then 0
     set_bits(&mp[0], 0);
-    mp[1] = (float)(D(df[11]) * -0.5f);
+    mp[1] = (float)(D(df[11]) * VP_KEEP(-0.5f));           // (an fmul by -0.5: a NaN keeps its sign)
     set_bits(&mp[2], 0);
     movsd(message_point(self), mp, 3);
     set_bits(&mp[0], 0);
     set_bits(&mp[1], 0);
     set_bits(&mp[2], 0);
     movsd(message_point(self), mp, 3);
-    float stiff = (float)(D(df[2]) * 16.350000381469727f);  // data +8
+    float stiff = (float)(D(df[2]) * (float)16.350000381469727f);  // data +8
     float C[3];
     set_bits(&C[0], 0);
     set_bits(&C[1], 0);
@@ -1397,10 +1397,10 @@ static Obstacle* __fastcall Obstacle_ctor(Obstacle* self, Edx, const uint8_t* da
         self->collide_ground = 1;
         self->num_volumes++;
     } else if (type == 2) {
-        double nsx = D(sx) * -0.5f;                         // kept in a register, stored twice
+        double nsx = D(sx) * VP_KEEP(-0.5f);                // kept in a register, stored twice
         float nsxf = (float)nsx;
-        float nsy = (float)(D(sy) * -0.5f);
-        float nsz = (float)(D(sz) * -0.5f);
+        float nsy = (float)(D(sy) * VP_KEEP(-0.5f));
+        float nsz = (float)(D(sz) * VP_KEEP(-0.5f));
         float hsx = (float)(D(sx) * 0.5f);
         float hsz = (float)(D(sz) * 0.5f);
         float hsy = (float)(D(sy) * 0.5f);
@@ -1529,18 +1529,18 @@ static void __fastcall Wobble_Update(Wobble* self, Edx) {
         set_bits(&self->angular_velocity.y, 0);
         set_bits(&self->angular_velocity.z, 0);
     }
-    self->angular_velocity.x = (float)(D(self->angular_velocity.x) * 0.949999988079071f);
-    self->angular_velocity.y = (float)(D(self->angular_velocity.y) * 0.949999988079071f);
+    self->angular_velocity.x = (float)(D(self->angular_velocity.x) * (float)0.949999988079071f);
+    self->angular_velocity.y = (float)(D(self->angular_velocity.y) * (float)0.949999988079071f);
     set_bits(&self->velocity.x, 0);
     set_bits(&self->velocity.y, 0);
-    self->angular_velocity.z = (float)(D(self->angular_velocity.z) * 0.949999988079071f);
+    self->angular_velocity.z = (float)(D(self->angular_velocity.z) * (float)0.949999988079071f);
     set_bits(&self->velocity.z, 0);
     uint32_t m7 = get_bits(&self->frame.rot.m[7]);
     movsd(&self->frame.pos, &self->spawn_frame.pos, 3);
     if (m7 >= 0xbdb295eau) return;                          // cmp; jae
     float* m = self->frame.rot.m;
     set_bits(&m[7], 0xbdb295ea);                            // -0.0872
-    m[0] = (float)(D(m[8]) * m[4] + D(m[5]) * 0.08720000088214874f);
+    m[0] = (float)(D(m[8]) * m[4] + D(m[5]) * (float)0.08720000088214874f);
     m[1] = (float)(D(m[5]) * m[6] - D(m[8]) * m[3]);
     m[2] = (float)(D(m[7]) * m[3] - D(m[4]) * m[6]);
     m[3] = (float)(D(m[2]) * m[7] - D(m[1]) * m[8]);
@@ -1766,7 +1766,7 @@ static Ball* __fastcall Ball_ctor(Ball* self, Edx, const uint8_t* data, void* ar
     PhobDynoCtor(self, 0, data, arg);
     self->vtable = VT_Ball;
     const float* df = (const float*)data;
-    float r = (float)(D(df[9]) * 0.02539999969303608f);
+    float r = (float)(D(df[9]) * (float)0.02539999969303608f);
     double spring = (D(df[10]) * 175.19683837890625f) * (D(df[11]) * df[11]);
     uint32_t friction = get_bits(data + 0x30);
     float C[3];

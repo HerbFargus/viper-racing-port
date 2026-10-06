@@ -1298,7 +1298,8 @@ static float __cdecl DriverGetSteering_rw(float speed) {
     if (sb > 0x4178e38e) {
         double v = D(speed), cap = D(Fb(k_steer_speed));
         v = !(cap > v) ? cap : v;
-        s = (float)((v * D(Fb(k_steer_slope)) + D(Fb(k_steer_base))) * D(s));
+        s = (float)((VP_KEEP(v) * D(Fb(k_steer_slope)) + D(Fb(k_steer_base))) * D(s));   // (VP_KEEP: v = cap would
+                                                                                    //  fold, exactly, at compile time)
     }
     return s;
 }

@@ -116,7 +116,7 @@ static uint8_t __cdecl collide_sphere_sphere_rw(SphereVolume* a, SphereVolume* b
     rb.z = (float)(D(p.z) - pb.z);
     double closing = (D(rv.y) * n.y + D(rv.z) * n.z) + D(rv.x) * n.x;
     if (!(closing >= 0.0f)) {                           // test ah,1: <, or unordered
-        n.y = (float)(D(n.y) * 0.2f);
+        n.y = (float)(D(n.y) * (float)0.2f);
         double inv = 1.0f / x87_sqrt((D(n.z) * n.z + D(n.y) * n.y) + D(n.x) * n.x);
         n.x = (float)(n.x * inv);
         n.y = (float)(n.y * inv);
@@ -262,7 +262,7 @@ static double __cdecl get_impulse_magnitude_rw(const P3* pos, const P3* vel, flo
     t.z = (float)(D(r.y) * w.x - D(r.x) * w.y);
     double den = ((D(n.y) * t.y + D(n.z) * t.z) + D(n.x) * t.x) + 1.0f / D(mass);
     float denf = (float)den;                            // fst: the division uses the stored value
-    if (!(fabs(den) > 1e-7f)) return 0.0f;              // test ah,0x41: <=, or unordered
+    if (!(fabs(den) > (float)1e-7f)) return 0.0f;              // test ah,0x41: <=, or unordered
     double num = (D(n.y) * v.y + D(n.z) * v.z) + D(n.x) * v.x;
     double j = -((num * (D(restitution) + 1.0f)) / denf);
     if (100000.0f > j) return j;                        // fcom; test ah,0x41; je: 100000 > j, ordered

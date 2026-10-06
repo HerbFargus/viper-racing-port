@@ -3,6 +3,8 @@ rem Builds hook\build-gcc\dinput.dll (32-bit) with GCC (mingw-w64 i686, MSYS2's 
 rem ..\..\sdl2: the same sources as hook\build.bat (relink stage R1: the second build beside MSVC's).
 rem   -fexcess-precision=standard rounds a float or double at every assignment, cast and return, as MSVC /fp:precise does
 rem   on the x87 (see compiler.h); -mfpmath=387 -march=i686 keep everything on the x87, as /arch:IA32 does.
+rem   -fno-strict-aliasing: the rewrites read a float's bits through an int (and back) on purpose, as the original does;
+rem   MSVC never optimises on type-based aliasing, and with this GCC doesn't either.
 rem   SDL2.dll is linked normally (GNU ld has no delay-load): the DLL needs SDL2.dll beside it to load at all.
 rem   libgcc, libstdc++ and winpthread are linked in (-static), so the DLL needs nothing of MSYS2's at run time.
 rem   DirectInputCreateA is __stdcall (_DirectInputCreateA@16): viperport.def's undecorated name binds to it through ld's
@@ -15,7 +17,7 @@ if not exist "%GCC%\g++.exe" echo build_gcc: no GCC at %GCC% (MSYS2: pacman -S m
 set PATH=%GCC%;%PATH%
 set SDL=%~dp0..\..\sdl2\SDL2-2.32.10
 set VP_OUT=%~dp0build-gcc
-set VP_CFLAGS=-m32 -O2 -march=i686 -mfpmath=387 -fexcess-precision=standard -masm=intel -std=c++17 -fms-extensions -Wno-invalid-offsetof -I"%SDL%\include"
+set VP_CFLAGS=-m32 -O2 -march=i686 -mfpmath=387 -fexcess-precision=standard -fno-strict-aliasing -masm=intel -std=c++17 -fms-extensions -Wno-invalid-offsetof -I"%SDL%\include"
 set VP_SOURCES=viperport.cpp port.cpp replay.cpp session.cpp standalone.cpp net_*.cpp crt_*.cpp edit_*.cpp phys_*.cpp wld_*.cpp krn_*.cpp gx_*.cpp snd_*.cpp ui_*.cpp menu_*.cpp root_*.cpp career_*.cpp paint_*.cpp platform.cpp gl_table.cpp gl_core.cpp gl_dxgi.cpp ddraw_gl.cpp dsound_sdl.cpp
 if not exist "%VP_OUT%\obj" mkdir "%VP_OUT%\obj"
 pushd "%~dp0" || exit /b 1

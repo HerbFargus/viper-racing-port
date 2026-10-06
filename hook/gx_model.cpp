@@ -1317,8 +1317,8 @@ static void __cdecl light_begin() {
     Ua(L_FOG_END) = 0x4a095440;
     const float s0 = x87_sin_f(0.0);
     const float ns0 = -s0;                                            // fld; fchs; fstp
-    const float c85 = x87_cos_f(1.4835298527032137);
-    const float s85 = x87_sin_f(1.4835298527032137);
+    const float c85 = x87_cos_f((double)1.4835298527032137);
+    const float s85 = x87_sin_f((double)1.4835298527032137);
     const float ns85 = -s85;
     float a[9] = {c0, 0.0f, ns0, 0.0f, FB(0x3f800000), 0.0f, s0, 0.0f, c0};
     float b[9] = {FB(0x3f800000), 0.0f, 0.0f, 0.0f, c85, s85, 0.0f, ns85, c85};
@@ -1580,7 +1580,8 @@ static void __cdecl calc_night(uint8_t* info, uint8_t* out) {
                     }
                     float accf = st(acc);
                     if (acc > 128.0) accf = FB(0x43000000);
-                    int32_t ci = magic_int(D(accf));
+                    VP_OPAQUE(accf);                                 // (GCC: 128 + 2^52 + 2^31 added at run time, at
+                    int32_t ci = magic_int(D(accf));                 // the precision control's width, not folded)
                     if (ci < 0) ci = 0;
                     if (ci > 0xff) ci = 0xff;
                     Up(o, 0x10) = Ua(L_DIFF + 4u * (uint32_t)(Ia(L_BASE) + ci)) | Ua(L_ALPHA_OR);

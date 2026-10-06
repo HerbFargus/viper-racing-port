@@ -175,7 +175,7 @@ static void __cdecl CollideWater_rw(CollisionVolume* volume, P3* pos, const P3* 
     uint32_t vy;
     memcpy(&vy, &vel->y, 4);
     if (vy <= 0x80000000u) return;                      // cmp [esi+4],0x80000000; jbe
-    if (!((D(vel->x) * vel->x + D(vel->y) * vel->y) + D(vel->z) * vel->z > 4.44444466f)) return;   // test ah,0x41
+    if (!((D(vel->x) * vel->x + D(vel->y) * vel->y) + D(vel->z) * vel->z > (float)4.44444466f)) return;   // test ah,0x41
     uint32_t ev[7];
     memcpy(&ev[0], vel, 12);                            // integer copies
     memcpy(&ev[3], pos, 12);
@@ -189,7 +189,7 @@ static void __cdecl CollideWater_rw(CollisionVolume* volume, P3* pos, const P3* 
     if (g_splash_sound == 0) return;
     memcpy(g_splash_vel, vel, 12);
     memcpy(g_splash_pos, pos, 12);
-    double s = x87_sqrt((D(vel->x) * vel->x + D(vel->y) * vel->y) + D(vel->z) * vel->z) * 0.0562499985f;
+    double s = x87_sqrt((D(vel->x) * vel->x + D(vel->y) * vel->y) + D(vel->z) * vel->z) * (float)0.0562499985f;
     // fld 1.0f; fcom st(1); test ah,0x41; je: s is kept only when 1 > s (ordered), else 1
     double loud = (1.0f > s) ? s : 1.0f;
     float* volume_field = (float*)(g_splash_sound + 8);

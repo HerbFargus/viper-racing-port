@@ -270,7 +270,7 @@ static inline bpp_header* bpp() { return G(bpp_header*, S_BPP_HEADER); }
 // as integers.
 static __forceinline uint32_t snap(double d) {
     float f = (float)d;
-    return fabs(d) >= 0.001f ? Ub(f) : 0u;
+    return fabs(d) >= (float)0.001f ? Ub(f) : 0u;
 }
 
 static void fp_bpp_finds(Footprint& f) { f.add((void*)(uintptr_t)S_BPP_FINDS, 4, "bpp_find calls (0x4f50c8)"); }
@@ -507,14 +507,14 @@ static uint8_t __fastcall BPPFinder_intersect_plane(BPPFinder* self, Edx) {
     const P3* a = self->p0;
     double d0 = ((D(t->n.x) * a->x + D(a->z) * t->n.z) + D(a->y) * t->n.y) + t->d;
     float d0f = st(d0);
-    if (!(fabs(d0) >= 0.001f)) {                            // test ah,1; je: a NaN is on the plane
+    if (!(fabs(d0) >= (float)0.001f)) {                            // test ah,1; je: a NaN is on the plane
         cp12(self->out, a);
         self->hit = t;
         return 1;
     }
     const P3* b = self->p1;
     double d1 = ((D(t->n.x) * b->x + D(b->y) * t->n.y) + D(b->z) * t->n.z) + t->d;
-    if (!(fabs(d1) >= 0.001f)) {
+    if (!(fabs(d1) >= (float)0.001f)) {
         cp12(self->out, b);
         self->hit = t;
         return 1;
@@ -524,10 +524,10 @@ static uint8_t __fastcall BPPFinder_intersect_plane(BPPFinder* self, Edx) {
     float dz = (float)(D(b->z) - a->z);
     double den = (D(t->n.x) * dx + D(t->n.y) * dy) + D(t->n.z) * dz;
     float denf = st(den);
-    if (!(fabs(den) >= 0.001f)) return 0;
+    if (!(fabs(den) >= (float)0.001f)) return 0;
     double tt = -(D(d0f) / denf);                           // from the stored floats
     float tf = st(tt);                                      // (fcom, then fstp, then the test)
-    if (!(tt >= -0.0001f)) return 0;                        // fcom; test ah,1: less, or a NaN
+    if (!(tt >= -(float)0.0001f)) return 0;                        // fcom; test ah,1: less, or a NaN
     if (I(tf) > 0x3f800347) return 0;                       // cmp dword, 0x3f800347; jg (signed)
     P3* o = self->out;
     o->x = (float)(D(tf) * dx + self->p0->x);
@@ -712,8 +712,8 @@ PORT_FN(0x0046d740, "bpp_find_point", bpp_find_point, fp_bpp_find_point)
 // triangle standing on edge (|n.y| <= FLT_EPSILON, or a NaN) is no ground. out = (p.x, height, p.z), the height
 // from the triangle's plane at the unsnapped point.
 static __forceinline float mm(float v) {
-    int32_t i = x87_ftol(D(v) / 0.001f + 0.5f);
-    return (float)(D(i) * 0.001f);                          // fild; fmul 0.001f; fstp
+    int32_t i = x87_ftol(D(v) / (float)0.001f + 0.5f);
+    return (float)(D(i) * (float)0.001f);                          // fild; fmul 0.001f; fstp
 }
 static bpp_tri* __cdecl BPPHitXZ(P3* p, P3* out) {
     P3 q;
@@ -936,13 +936,13 @@ PORT_FN(0x0046ff30, "intersect_all", intersect_all, fp_intersect_all)
 // outward normal e_i; a NaN is outside
 static uint8_t __cdecl bsp_point_in_poly(P3* p, bsp_tri* t) {
     if (!(((D(t->v[0].x) - p->x) * t->e[0].x + (D(t->v[0].z) - p->z) * t->e[0].z) + (D(t->v[0].y) - p->y) * t->e[0].y
-          >= -0.1f))
+          >= -(float)0.1f))
         return 0;
     if (!(((D(t->v[1].y) - p->y) * t->e[1].y + (D(t->v[1].z) - p->z) * t->e[1].z) + (D(t->v[1].x) - p->x) * t->e[1].x
-          >= -0.1f))
+          >= -(float)0.1f))
         return 0;
     if (!(((D(t->v[2].x) - p->x) * t->e[2].x + (D(t->v[2].z) - p->z) * t->e[2].z) + (D(t->v[2].y) - p->y) * t->e[2].y
-          >= -0.1f))
+          >= -(float)0.1f))
         return 0;
     return 1;
 }
@@ -955,12 +955,12 @@ PORT_FN(0x00470240, "point_in_poly(bsp.obj)", bsp_point_in_poly, fp_bsp_point_in
 static uint8_t __cdecl bsp_intersect_plane(P3* p0, P3* p1, bsp_tri* t, P3* out, float* tout) {
     double d0 = ((D(p0->x) * t->n.x + D(p0->y) * t->n.y) + D(p0->z) * t->n.z) + t->d;
     float d0f = st(d0);
-    if (!(fabs(d0) >= 0.001f)) {
+    if (!(fabs(d0) >= (float)0.001f)) {
         if (out) cp12(out, p0);
         return 1;
     }
     double d1 = ((D(p1->x) * t->n.x + D(p1->y) * t->n.y) + D(p1->z) * t->n.z) + t->d;
-    if (!(fabs(d1) >= 0.001f)) {
+    if (!(fabs(d1) >= (float)0.001f)) {
         if (out) cp12(out, p1);
         return 1;
     }
@@ -970,7 +970,7 @@ static uint8_t __cdecl bsp_intersect_plane(P3* p0, P3* p1, bsp_tri* t, P3* out, 
     float dz = st(dzr);
     double den = ((dzr * t->n.z) + D(t->n.y) * dy) + D(t->n.x) * dx;
     float denf = st(den);
-    if (!(fabs(den) >= 0.001f)) return 0;
+    if (!(fabs(den) >= (float)0.001f)) return 0;
     double tt = -(D(d0f) / denf);
     float tf = st(tt);                                      // (fcom, then fstp, then the test)
     if (!(tt >= 0.0)) return 0;                             // fcom 0.0f; test ah,1: negative, or a NaN

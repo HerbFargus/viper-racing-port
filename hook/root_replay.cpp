@@ -1253,7 +1253,8 @@ static void __fastcall GraphControl_Draw_n(GraphControl* self, Edx, gxCanvas* cv
     static const uint32_t k005 = 0x3ba3d70a;                     // 0.005 (0x4db0e8)
     const double q = D(k1) / D(n);
     // FIX CANDIDATE: w / n divides by zero for a control narrower than 4 pixels (the analysis screen's is 0x104)
-    const int32_t bw = w / n;
+    int32_t bw = w / n;
+    VP_OPAQUE(bw);                      // (GCC: divided here, as the original does -- n = 0 faults before the return)
     const float inv = (float)q;
     const int32_t k0 = x87_ftol(D(t) / (q * D(GF(S_GRAPH_ZOOM))));
     if (n <= 0) return;

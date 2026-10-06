@@ -1387,6 +1387,7 @@ static void __fastcall ShadowObject_Draw(uint8_t* self, Edx) {
     uint32_t h2 = 0x4314d70b;                                          // 148.84 = 12.2^2
     uint8_t first = 1;
     d.y = (float)(D(d.y) + FB(0x3dcccccd));
+    VP_OPAQUE(d);                       // (GCC: the divide done here, as the original does, though no vertex uses d)
     P3 delta;
     for (int i = 0, off = 0; (*(mrModelInfo**)(self + 0x10))->nverts > i;) {
         P3 v, q, t;

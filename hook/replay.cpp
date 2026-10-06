@@ -208,7 +208,7 @@ static void trace_tick() {
                         checkpoint |= cls && !strcmp(cls, "CheckPoint");
                         w += _snprintf(which + w, sizeof which - w, "%s#%d %s", w ? ", " : "", i, cls ? cls : "?");
                     }
-                logf("replay: DIVERGED from the recording at tick %u (%.3f s): %s%s%s", g_ticks, g_ticks * 0.016,
+                logf("replay: DIVERGED from the recording at tick %u (%.3f s): %s%s%s", g_ticks, g_ticks * (double)0.016,
                      r.nobjects != t.nobjects ? "the number of objects differs; " : "",
                      which[0] ? which : "an object past the first 32",
                      g_ticks == 0 && (checkpoint || r.nobjects != t.nobjects)

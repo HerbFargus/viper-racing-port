@@ -682,7 +682,7 @@ static void __fastcall RC_SendAll(RaceClient* self, Edx) {
     tcall<void>(A_check_status, self);
     if (self->state < 0x14) return;
     const double dev = ((Deviation_t)(uintptr_t)F_PhysicsGetDeviation)();
-    if (dev >= (double)0.1f) return;                                    // fcomp 0.1f; test ah,1: on when less or unordered
+    if (dev >= (double)(float)0.1f) return;                                    // fcomp 0.1f; test ah,1: on when less or unordered
     const int32_t now = net_PTimeNow();                                 // site 0x4a9108
     if (wrap_sub(now, self->last_send) <= 0x42) return;
     uint8_t phys[0x42];                                                 // CarPhysicsPacket

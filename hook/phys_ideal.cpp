@@ -435,7 +435,7 @@ static uint8_t __cdecl project(const Point2D* pt, Point2D* out) {
     cp4(&z, &pt->z);
     cp4(&in.x, &x);
     cp4(&in.z, &z);
-    in.y = (float)(TerrainGetHeight(x, z) + 0.1f);
+    in.y = (float)(TerrainGetHeight(x, z) + (float)0.1f);
     if (!mrProjectPoint(&in, &o)) return 0;
     cp4(&out->x, &o.x);
     cp4(&out->z, &o.y);
@@ -929,7 +929,7 @@ PORT_FN(0x00421c10, "IdealLine::get_actual_bead_position", IdealLine_get_actual_
 // a ground point to the screen for Draw: TerrainGetHeight + 0.1, then mrProjectPoint
 static __forceinline uint8_t draw_project(uint32_t x, uint32_t z, P3* o) {
     P3 in;
-    double hgt = TerrainGetHeight(x, z) + 0.1f;
+    double hgt = TerrainGetHeight(x, z) + (float)0.1f;
     cp4(&in.x, &x);
     in.y = (float)hgt;
     cp4(&in.z, &z);

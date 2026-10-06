@@ -1405,7 +1405,18 @@ int main(int argc, char** argv) {
     *(uint32_t*)0x00455707 = 64;                           // the pools, small (M1's operands: the rewrites read them)
     *(uint32_t*)0x00455742 = 32;
     *(uint32_t*)0x00457217 = 256;
+#if defined(__GNUC__) && !defined(__clang__)
+    // GCC: the arena with 1 MB reserved and never committed below it. A wild vertex index walks the originals' writes
+    // up to ~0xc0000 bytes below the model arrays: MSVC's process has read-only and free pages there (the write faults
+    // in both passes); GCC's had a thread-pool worker's stack, idle -- the writes landed (the first through its guard
+    // page) and the worker returned into them when it woke, 30 s in, taking the process down.
+    {
+        uint8_t* r = (uint8_t*)VirtualAlloc(0, 0x100000 + ARENA_BYTES, MEM_RESERVE, PAGE_NOACCESS);
+        g_arena = r ? (uint8_t*)VirtualAlloc(r + 0x100000, ARENA_BYTES, MEM_COMMIT, PAGE_READWRITE) : 0;
+    }
+#else
     g_arena = (uint8_t*)VirtualAlloc(0, ARENA_BYTES, MEM_COMMIT, PAGE_READWRITE);
+#endif
     g_arena_snap = (uint8_t*)malloc(ARENA_BYTES);
     g_arena_after = (uint8_t*)malloc(ARENA_BYTES);
     g_data_pristine = (uint8_t*)malloc(DATA_BYTES);

@@ -534,7 +534,7 @@ static volatile LONG64 g_pair_tests, g_pair_ticks;
 
 static bool phob_box(void* p, Box& b) {
     b.bounded = true;
-    for (int k = 0; k < 3; k++) { b.mn[k] = 3.0e38f; b.mx[k] = -3.0e38f; }
+    for (int k = 0; k < 3; k++) { b.mn[k] = (float)3.0e38f; b.mx[k] = -(float)3.0e38f; }
     for (int k = 0; k < phob_nvol(p); k++) {
         void* v = phob_vol(p, k);
         if (!v || VSLOT(v, 0x18) == (void*)G.getextents_stub) { b.bounded = false; return false; }

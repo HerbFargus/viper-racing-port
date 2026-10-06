@@ -225,7 +225,7 @@ static void __cdecl camera_look(const P3* eye, const P3* target) {
     const float zz = (float)(D(d.z) * d.z);
     const double m = (D(d.y) * d.y + D(d.x) * d.x) + zz;
     if (!(m >= 1.0)) return;                            // test ah,1: closer than 1 m, or a NaN
-    if (!(fabs(D(d.x)) >= 0.01f) && !(fabs(D(d.z)) >= 0.01f)) return;
+    if (!(fabs(D(d.x)) >= (float)0.01f) && !(fabs(D(d.z)) >= (float)0.01f)) return;
     float* r = cam.rot.m;
     memcpy(&r[6], &d, 12);                              // forward
     cp4(&r[0], &d.z);                                   // right = (fz, 0, -fx)
@@ -586,6 +586,7 @@ static void camera_update(uint8_t* car) {
                 const double sx = (D(V.y) * r[1] + D(V.z) * r[2]) + D(V.x) * r[0];
                 float s = 1.0f;
                 if (!(sx > 0.0f)) s = -1.0f;            // test ah,0x41
+                VP_OPAQUE(s);                           // (fmul s, as the original: a NaN keeps its sign)
                 cam.pos.x = (float)(D(s) * r[0] * FB(0xbe1374bc) + cam.pos.x);   // -0.144
                 cam.pos.y = (float)(D(s) * r[1] * FB(0xbe1374bc) + cam.pos.y);
                 cam.pos.z = (float)(D(s) * r[2] * FB(0xbe1374bc) + cam.pos.z);

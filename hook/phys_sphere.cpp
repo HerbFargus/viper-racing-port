@@ -250,29 +250,29 @@ static void water_float(SphereVolume* self, PhobDyno* owner) {
     P3 u;
     GetPointVelocity(owner, 0, &u, &self->world_center);
     double t = PhysicsGetTime();
-    double a = D(t) * 3.14159274f + self->world_center.x;
-    double hr = wave_sin_plus_one(a) * 0.0254f + h;
+    double a = D(t) * (float)3.14159274f + self->world_center.x;
+    double hr = wave_sin_plus_one(a) * (float)0.0254f + h;
     h = (float)hr;
     if (!(hr > 0.0)) {                                      // fcom 0; test ah,0x41
         in_water(self) = 0;
         return;
     }
     double r2 = D(self->radius) * self->radius;
-    float vol = (float)((D(self->radius) * r2) * 1.67551613f);
+    float vol = (float)((D(self->radius) * r2) * (float)1.67551613f);
     double s = x87_sqrt((D(u.y) * u.y + D(u.z) * u.z) + D(u.x) * u.x);
     double c = s * 10.0f + 500.0f;
-    double nk = -(c * (r2 * 3.14159274f));
+    double nk = -(c * (r2 * (float)3.14159274f));
     P3 drag;
     drag.x = (float)(D(u.x) * nk);
     drag.y = (float)(D(u.y) * nk);
     drag.z = (float)(nk * u.z);
     PhobDynoApplyForce(owner, 0, &drag, &self->world_center);
-    double b = D(h) * 0.1f + 1000.0f;
+    double b = D(h) * (float)0.1f + 1000.0f;
     double two_r = D(self->radius) * 2.0f;
     double m = (D(h) > two_r) ? two_r : D(h);               // fcom; test ah,0x41: a NaN keeps h
     P3 lift;
     lift.x = 0.0f;
-    lift.y = (float)(((m * b) * vol) * 9.81f);
+    lift.y = (float)(((m * b) * vol) * (float)9.81f);
     lift.z = 0.0f;
     PhobDynoApplyForce(owner, 0, &lift, &self->world_center);
 }
@@ -334,7 +334,7 @@ static void __fastcall SphereVolume_CollideGround(SphereVolume* self, Edx) {
                 I.x = (float)(D(N.x) * Jf);
                 I.y = (float)(D(N.y) * Jf);
                 I.z = (float)(D(N.z) * Jf);
-                float w = !(d >= 0.001f) ? 0.001f : d;      // fcom; test ah,1: a NaN depth gives 0.001
+                float w = !(d >= (float)0.001f) ? (float)0.001f : d;      // fcom; test ah,1: a NaN depth gives 0.001
                 QueueExternalImpulse(owner, 0, &I, &P, surf, w);
                 CollideContact(self, 0, &P, &I, &N);
             }
@@ -464,7 +464,7 @@ static void __fastcall CubeVolume_CollideGround(CubeVolume* self, Edx) {
                 I.x = (float)(D(Jf) * N.x);
                 I.y = (float)(D(Jf) * N.y);
                 I.z = (float)(D(Jf) * N.z);
-                float w = !(d >= 0.001f) ? 0.001f : d;
+                float w = !(d >= (float)0.001f) ? (float)0.001f : d;
                 QueueExternalImpulse(owner, 0, &I, &Q, surf, w);
             }
         }

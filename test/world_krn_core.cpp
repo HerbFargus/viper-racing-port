@@ -1729,7 +1729,16 @@ int main(int argc, char** argv) {
     if (s) strcpy(s, "\\out\\race_v10.exe");
 #endif
     if (!load_race_exe(exe)) return 2;
+#if defined(__GNUC__) && !defined(__clang__)
+    // (a guard after the arena: MemAlloc fills the block it was asked for, and st_ioctl's VxD block is at most 0x1000
+    // bytes from the bump heap at the arena's end, so a bigger VxD allocation runs off the arena -- in the MSVC build
+    // into free address space, a fault in both passes; in the GCC build msvcrt's heap grew into the space after the
+    // arena and both passes silently wrote over it. Reserved, never committed: the fault the MSVC build gets.)
+    g_arena = (uint8_t*)VirtualAlloc(0, ARENA_SIZE + 0x40000, MEM_RESERVE, PAGE_NOACCESS);
+    if (g_arena) g_arena = (uint8_t*)VirtualAlloc(g_arena, ARENA_SIZE, MEM_COMMIT, PAGE_READWRITE);
+#else
     g_arena = (uint8_t*)VirtualAlloc(0, ARENA_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#endif
     if (!g_arena || ((uintptr_t)g_arena & 0xffff)) { printf("the arena isn't 64 KB aligned\n"); return 2; }
     install_stubs();
     // return addresses just after an E8 call, in 0x400000..0x480000 (my_handler's stack walk)

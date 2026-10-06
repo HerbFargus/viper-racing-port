@@ -1052,12 +1052,14 @@ template <typename Run, typename Fp> static void check(const char* fname, Run ru
         check(VP_CAT(name_, FN),                                                                        \
               [&](bool orig) {                                                                          \
                   auto f = orig ? (decltype(&FN))(uintptr_t)VP_CAT(addr_, FN) : &FN;                    \
+                  VP_OPAQUE(f); /* GCC: called through the pointer, as the game does (not inlined) */ \
                   return std::apply([&](auto... a) { return invoke(f, a...); }, args_);                 \
               },                                                                                        \
               [&](Footprint& fp) { std::apply([&](auto... a) { VP_CAT(fpof_, FN)(fp, a...); }, args_); });\
     } while (0)
 #define CHECK0(FN)                                                                                      \
-    check(VP_CAT(name_, FN), [&](bool orig) { return invoke(orig ? (decltype(&FN))(uintptr_t)VP_CAT(addr_, FN) : &FN); }, \
+    check(VP_CAT(name_, FN), [&](bool orig) { auto f = orig ? (decltype(&FN))(uintptr_t)VP_CAT(addr_, FN) : &FN; \
+                                              VP_OPAQUE(f); return invoke(f); },                        \
           [&](Footprint& fp) { VP_CAT(fpof_, FN)(fp); })
 #define CB(FN, ...) do { if (g_abort) break; save(g_saved); g_chain = false; CHECK(FN, __VA_ARGS__); if (g_abort) break; load(g_saved); g_chain = true; CHECK(FN, __VA_ARGS__); g_chain = false; } while (0)
 #define CB0(FN) do { if (g_abort) break; save(g_saved); g_chain = false; CHECK0(FN); if (g_abort) break; load(g_saved); g_chain = true; CHECK0(FN); g_chain = false; } while (0)

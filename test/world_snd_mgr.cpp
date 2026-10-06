@@ -1509,7 +1509,17 @@ int main(int argc, char** argv) {
     patch_jmp(0x0041a450, (void*)&stub_resource_forget);
     patch_jmp(0x004728f0, (void*)&stub_engine_ctor);
     patch_jmp(0x00472c10, (void*)&stub_engine_dtor);
+#if defined(__GNUC__) && !defined(__clang__)
+    // (guards around the arena: a sound class outside 0..7 has the table shuffle run the CRT's memmove backward over
+    // 0x240000 dwords from the arena's first bytes, until it faults below the arena. In the MSVC build that's free
+    // address space -- a fault in both passes; in the GCC build a thread's stack could lie there, the original's pass
+    // stopped at its guard page (80000001), the rewrite's ran on through it, and the smashed stack crashed the run.
+    // 64 KB reserved, never committed, on either side: the fault the MSVC build gets.)
+    g_arena = (uint8_t*)VirtualAlloc(0, 0x10000 + ARENA_BYTES + 0x10000, MEM_RESERVE, PAGE_NOACCESS);
+    if (g_arena) g_arena = (uint8_t*)VirtualAlloc(g_arena + 0x10000, ARENA_BYTES, MEM_COMMIT, PAGE_READWRITE);
+#else
     g_arena = (uint8_t*)VirtualAlloc(0, ARENA_BYTES, MEM_COMMIT, PAGE_READWRITE);
+#endif
     g_arena_snap = (uint8_t*)malloc(ARENA_BYTES);
     g_arena_after = (uint8_t*)malloc(ARENA_BYTES);
     g_data_snap = (uint8_t*)malloc(DATA_BYTES);

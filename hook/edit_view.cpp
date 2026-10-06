@@ -410,6 +410,9 @@ static void __fastcall MV_MouseDown_n(ModelViewer* self, Edx, int32_t x, int32_t
         float inv[9];                                    // E-0x78 (mode 2: u at E-0x78)
         float m[9];                                      // E-0x54 (mode 1, 2, 3: a vertex, a triangle)
         float tri[3];                                    // E-0x30 (mode 2: the texture triangle's triangle; mode 4: the triangle)
+#ifdef VP_GCC
+        int32_t tri_flags;                               // E-0x24: mode 4's ModBuilderGetTriangle writes the triangle's 4th
+#endif                                                   // dword here (GCC put the saved ebx there; MSVC's frame has room)
     } L;
     volatile int32_t ta, tb, tc, pvtx;                   // E-0xf0, E-0xcc, E-0xd8; E-0xb4
     int32_t* const tri4 = (int32_t*)L.tri;
@@ -954,8 +957,15 @@ static void __fastcall TV_TranslatePoints_n(TextureViewer* self, Edx, int32_t x,
         UI_GF(S_XFORM + 0x24) = (float)ed_addm(D(du), (const volatile float*)ED_P(S_XFORM + 0x24));
         UI_GF(S_XFORM + 0x28) = (float)ed_addm(D(dv), (const volatile float*)ED_P(S_XFORM + 0x28));
         for (int32_t i = 0; get_tp(UI_G32(S_SURFACE), i, (void*)&vtx, &tu, &tv); i++) {
+#ifdef VP_GCC
+            // fld tv; fadd dv, as the original (GCC would load dv and add tv: a signalling NaN in tv then loses to a
+            // NaN in dv, where the original's quietened tv wins by its larger significand)
+            volatile float nvv = (float)ed_addm(D(tv), &dv);
+            volatile float nuu = (float)ed_addm(D(tu), &du);
+#else
             volatile float nvv = (float)(D(tv) + dv);
             volatile float nuu = (float)(D(tu) + du);
+#endif
             move_tp(UI_G32(S_SURFACE), i, ed_bits(&nuu), ed_bits(&nvv));
         }
     } else {

@@ -451,9 +451,9 @@ static uint8_t __cdecl Write3DS_n(const MrModelInfo* info, const char* name) {
                     if (ADCreateChunk(0x4110)) {                       // the vertices, in inches (x mirrored)
                         ADWriteShort((uint32_t)(uint16_t)(s->v1 - s->v0));
                         for (int32_t k = s->v0; s->v1 > k; k++) {
-                            ADWriteFloat(fbits((float)((double)info->verts[k].x * (double)-39.370079040527344f)));
-                            ADWriteFloat(fbits((float)((double)info->verts[k].y * (double)39.370079040527344f)));
-                            ADWriteFloat(fbits((float)((double)info->verts[k].z * (double)39.370079040527344f)));
+                            ADWriteFloat(fbits((float)((double)info->verts[k].x * (double)-(float)39.370079040527344f)));
+                            ADWriteFloat(fbits((float)((double)info->verts[k].y * (double)(float)39.370079040527344f)));
+                            ADWriteFloat(fbits((float)((double)info->verts[k].z * (double)(float)39.370079040527344f)));
                         }
                         ADCloseChunk();
                     }
@@ -825,9 +825,9 @@ static uint8_t __cdecl parse_vertex_list_n(uint32_t, int32_t, void* data) {
             ADReadFloat(&p[1]);
             ADReadFloat(&p[2]);
             // FIX CANDIDATE: no bound on the vertices (Import3DS's array: 4096)
-            eb_st(&info->verts[EB_G32(S_3DS_NVERTS)].x, (double)p[0] * (double)-0.02539999969303608f);
-            eb_st(&info->verts[EB_G32(S_3DS_NVERTS)].y, (double)p[1] * (double)0.02539999969303608f);
-            eb_st(&info->verts[EB_G32(S_3DS_NVERTS)].z, (double)p[2] * (double)0.02539999969303608f);
+            eb_st(&info->verts[EB_G32(S_3DS_NVERTS)].x, (double)p[0] * (double)-(float)0.02539999969303608f);
+            eb_st(&info->verts[EB_G32(S_3DS_NVERTS)].y, (double)p[1] * (double)(float)0.02539999969303608f);
+            eb_st(&info->verts[EB_G32(S_3DS_NVERTS)].z, (double)p[2] * (double)(float)0.02539999969303608f);
             EB_G32(S_3DS_NVERTS) = EB_G32(S_3DS_NVERTS) + 1;
         } while (i < n);
     }
