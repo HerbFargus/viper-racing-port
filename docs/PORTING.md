@@ -157,6 +157,18 @@ for a check on the main thread, where the physics can tick between the two passe
    with the first difference. It sets and restores viperport.ini, never touches a game it didn't start,
    and keeps each run's log beside its session. Any build change (the relink stages above all) must
    leave the whole corpus PASS. `--list`, `--dry-run`, `--only`, `--routes`, `--selftest`.
+7. **Both compilers:** the port also builds with GCC (mingw-w64 i686, MSYS2 `C:\msys64\mingw32`) --
+   `hook\build_gcc.bat` and `loader\build_loader_gcc.bat` -- on the way to a native Linux build; MSVC stays the
+   shipped build and the harnesses' oracle. `python test\sweep.py` builds every world harness with both and says
+   whether they agree (yes / agree / NO). Rules for code that must stay faithful under GCC (hook/compiler.h):
+   every MSVC `__asm` block has a GNU twin under `#ifdef VP_GCC` (same instructions, `-masm=intel`, `VP_X87_CLOBBERS`,
+   `%=` labels), MSVC code untouched; an inexact floating literal in arithmetic is cast to its own type
+   (`(float)0.4f`) -- GCC reads literals at long-double precision; `VP_KEEP(c)` / `VP_OPAQUE(v)` where GCC would fold
+   at compile time what the original computes under 24-bit precision control, turn `x*-C` into `fchs`, or drop a
+   divide the original faults in; `-fno-strict-aliasing` (the rewrites pun float/int); a function whose asm `call`s
+   out is `VP_ASM_CALLS`. Known GCC differences (no other compiler lays out frames like MSVC): four rewrites that
+   faithfully read uninitialised stack or print a local's address -- world_menu_car, world_menu_options,
+   world_net_core, world_krn_file report them.
 
 ## Fixes
 
