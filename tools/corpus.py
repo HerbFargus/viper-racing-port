@@ -7,6 +7,7 @@
     python tools/corpus.py --dry-run               what would run, without starting the game
     python tools/corpus.py --parse <viperport.log> read a replay's log as the runner does (no game)
     python tools/corpus.py --selftest              the log parser, on synthetic lines
+    python tools/corpus.py --linux                 the standalone route on the native Linux build, in WSL (below)
 
 A route is how the session is replayed (hook/session.cpp, "[session] play="):
     dll         the entry's exe (race.exe beside the port's dinput.dll) with [port] default=new -- the rewrites
@@ -26,6 +27,14 @@ IDENTICAL, every network send matching, the window at the recording's size, and 
 Each run's viperport.log is kept as sessions\\<session>\\<run>.log; the results go to out/corpus/<time>.json.
 
 The corpus lists session NAMES only; the sessions (game data) stay in the install, never in the repo.
+
+--linux (relink stage R2b): every standalone route replayed by the native Linux build -- out-linux/viperport (or
+--linux-exe), run in WSL (--distro, default Ubuntu; WSLg shows its window) as `viperport --race <install>/<exe>` in the
+same install, with the same sessions, viperport.ini settings and verdicts (viperport.ini and viperport.log are beside
+race.exe there too). The run is labelled <label>-linux, its log kept as sessions\\<session>\\<label>-linux.log beside
+the Windows routes'. Where the Windows runner closes the window, this one sends SIGTERM (SDL turns it into the quit that
+closing the window makes); a game that hasn't ended 60 s later is killed (SIGKILL). The dll and original routes are
+Windows' own: --linux runs only the standalone one.
 """
 import argparse
 import ctypes
@@ -44,6 +53,7 @@ REPO = os.path.dirname(HERE)
 MANIFEST = os.path.join(HERE, "corpus.json")
 DEFAULT_INSTALL = os.path.normpath(os.path.join(REPO, "..", "game-files", "installs", "v1.0-RC"))
 ROUTES = ("dll", "original", "standalone")
+LINUX_EXE = os.path.join(REPO, "out-linux", "viperport")
 GAME_EXES = {"race.exe", "race_stock.exe", "viperport.exe", "race.bin"}
 
 
@@ -240,6 +250,61 @@ def close_windows_of(pids):
     return len(found)
 
 
+# ---- the Linux build, in WSL -------------------------------------------------------------------------------------------
+def wsl_path(path):
+    """C:\\x\\y -> /mnt/c/x/y (WSL's automount of a Windows drive)."""
+    p = os.path.abspath(path)
+    drive, rest = os.path.splitdrive(p)
+    if len(drive) != 2 or drive[1] != ":":
+        raise SystemExit("--linux: %s isn't on a drive letter WSL mounts" % p)
+    return "/mnt/" + drive[0].lower() + rest.replace("\\", "/")
+
+
+def sh_quote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def wsl(distro, script):
+    """A bash script in the distribution (a login shell: WSLg's DISPLAY and the rest of its environment)."""
+    return subprocess.run(["wsl.exe", "-d", distro, "--", "bash", "-lc", script], capture_output=True, text=True)
+
+
+def running_linux_game(distro):
+    return wsl(distro, "pgrep -x viperport || true").stdout.split()
+
+
+class LinuxRun:
+    """One viperport process in WSL, started through wsl.exe; its Linux pid (from a pid file) takes the signals."""
+
+    def __init__(self, distro, exe, race, install):
+        self.distro = distro
+        self.pidfile = "/tmp/viperport-corpus-%d-%d.pid" % (os.getpid(), int(time.time() * 1000))
+        script = "cd %s && echo $$ > %s && exec %s --race %s" % (
+            sh_quote(wsl_path(install)), self.pidfile, sh_quote(wsl_path(exe)), sh_quote(wsl_path(race)))
+        self.proc = subprocess.Popen(["wsl.exe", "-d", distro, "--", "bash", "-lc", script], cwd=install)
+        self.pid = None
+
+    def linux_pid(self):
+        for _ in range(10):
+            if self.pid is not None:
+                break
+            out = wsl(self.distro, "cat %s 2>/dev/null" % self.pidfile).stdout.strip()
+            if out.isdigit():
+                self.pid = out
+            else:
+                time.sleep(0.5)
+        return self.pid
+
+    def signal(self, sig):
+        pid = self.linux_pid()
+        if pid:
+            wsl(self.distro, "kill -%s %s 2>/dev/null; true" % (sig, pid))
+        return bool(pid)
+
+    def done(self):
+        wsl(self.distro, "rm -f %s" % self.pidfile)
+
+
 def sha12(path):
     try:
         with open(path, "rb") as f:
@@ -249,7 +314,8 @@ def sha12(path):
 
 
 # ---- one replay ------------------------------------------------------------------------------------------------------
-def run_one(install, entry, route, label, timeout, grace, log_tail):
+def run_one(install, entry, route, label, timeout, grace, log_tail, linux=None):
+    """linux: None (Windows), or {"distro": ..., "exe": the Linux viperport}: the standalone route in WSL."""
     session = entry["session"].replace("/", "\\")
     exe = entry.get("exe", "race.exe")
     if route == "standalone":
@@ -263,7 +329,8 @@ def run_one(install, entry, route, label, timeout, grace, log_tail):
         f.write(ini_for_run(base, session, label, "original" if route == "original" else "new", entry.get("ini")))
     log_path = os.path.join(install, "viperport.log")
     started = time.time()
-    proc = subprocess.Popen(cmd, cwd=install)
+    run = LinuxRun(linux["distro"], linux["exe"], os.path.join(install, exe), install) if linux else None
+    proc = run.proc if run else subprocess.Popen(cmd, cwd=install)
     closed_at = None
     how = "exited"
     while True:
@@ -284,13 +351,21 @@ def run_one(install, entry, route, label, timeout, grace, log_tail):
             ctl = R_ENDED.search(text)
             if (ctl and _seen_since(ctl, grace, now)) or now - started > timeout:
                 how = "closed by the runner (%s)" % ("timeout" if now - started > timeout else "the player had control")
-                close_windows_of(tree_of(proc.pid))
+                if run:
+                    run.signal("TERM")                                # (SDL: the quit closing the window makes)
+                else:
+                    close_windows_of(tree_of(proc.pid))
                 closed_at = now
         elif now - closed_at > 60:
             how = "ended by the runner (didn't close)"
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)   # (its tree only)
+            if run:
+                run.signal("KILL")
+            else:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)   # (its tree only)
             proc.wait()
             break
+    if run:
+        run.done()
     secs = time.time() - started
     try:
         with open(log_path, encoding="latin-1", errors="replace") as f:
@@ -298,8 +373,8 @@ def run_one(install, entry, route, label, timeout, grace, log_tail):
     except OSError:
         lines = []
     res = parse_log(lines)
-    res.update({"entry": entry["name"], "session": session, "route": route, "exe": exe, "exit_code": proc.returncode,
-                "how": how, "seconds": round(secs, 1)})
+    res.update({"entry": entry["name"], "session": session, "route": route + ("-linux" if linux else ""), "exe": exe,
+                "exit_code": proc.returncode, "how": how, "seconds": round(secs, 1)})
     if res["run"] and os.path.exists(log_path):
         keep = os.path.join(session_dir(install, entry), res["run"] + ".log")
         try:
@@ -380,6 +455,8 @@ def selftest():
     assert ini_for_run(t2, "b", "corpus-x", "new").count("play=") == 1
     t3 = ini_for_run(t, "a", "corpus-x", "new", {"test": {"two_copies": 1}})
     assert "two_copies=1" in t3 and "two_copies=0" not in t3, t3
+    assert wsl_path("C:\\Users\\a b\\race.exe") == "/mnt/c/Users/a b/race.exe", wsl_path("C:\\Users\\a b\\race.exe")
+    assert sh_quote("it's") == "'it'\\''s'", sh_quote("it's")
     print("selftest: ok")
 
 
@@ -395,6 +472,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--parse", metavar="LOG")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--linux", action="store_true", help="the standalone route on the native Linux build, in WSL")
+    ap.add_argument("--linux-exe", default=LINUX_EXE, help="the Linux viperport (default out-linux/viperport)")
+    ap.add_argument("--distro", default="Ubuntu", help="the WSL distribution --linux runs in")
     a = ap.parse_args()
 
     if a.selftest:
@@ -412,6 +492,14 @@ def main():
     bad = want_routes - set(ROUTES)
     if bad:
         sys.exit("unknown route(s): %s" % ", ".join(sorted(bad)))
+    linux = None
+    if a.linux:
+        if a.routes and want_routes != {"standalone"}:
+            sys.exit("--linux runs the standalone route only (dll and original are Windows')")
+        want_routes = {"standalone"}
+        if not os.path.isfile(a.linux_exe):
+            sys.exit("--linux: %s isn't there (tools/build_linux.sh, in WSL, builds it)" % a.linux_exe)
+        linux = {"distro": a.distro, "exe": os.path.abspath(a.linux_exe)}
     plan = []
     for e in man["sessions"]:
         if a.only and e["name"] not in a.only:
@@ -429,10 +517,10 @@ def main():
     if not plan:
         sys.exit("nothing to run")
     for e, r in plan:
-        print("%-14s %-11s %s" % (e["name"], r, e["session"]))
+        print("%-14s %-11s %s" % (e["name"], r + ("-linux" if linux else ""), e["session"]))
     if a.dry_run:
         return 0
-    busy = running_game_exes()
+    busy = running_game_exes() + (["viperport (WSL)"] if linux and running_linux_game(a.distro) else [])
     if busy:
         sys.exit("the game is running (%s): close it first -- the runner never closes what it didn't start" % ", ".join(busy))
 
@@ -443,17 +531,19 @@ def main():
     shutil.copyfile(ini_path, backup)
     build = {"dinput.dll": sha12(os.path.join(install, "dinput.dll")),
              "viperport.exe": sha12(os.path.join(install, "viperport.exe"))}
+    if linux:
+        build = {"viperport (Linux)": sha12(linux["exe"])}
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     results = []
     try:
         for i, (e, r) in enumerate(plan, 1):
             print("[%d/%d] %s on %s ..." % (i, len(plan), e["name"], r), flush=True)
-            busy = running_game_exes()
+            busy = running_game_exes() + (["viperport (WSL)"] if linux and running_linux_game(a.distro) else [])
             if busy:
                 print("stopped: the game is still running (%s) -- a replay left it running, or someone started it" %
                       ", ".join(busy))
                 break
-            res = run_one(install, e, r, "%s-%s" % (a.label, r), a.timeout, a.grace, 12)
+            res = run_one(install, e, r, "%s-%s" % (a.label, "linux" if linux else r), a.timeout, a.grace, 12, linux)
             results.append(res)
             print("        %s  %s  (%s s, %s)" % (res["verdict"], "; ".join(res["why"]) or
                                                  "%s frames, %d races" % (res["frames_compared"], len(res["races"])),
@@ -473,8 +563,7 @@ def main():
             res["entry"], res["route"], res["verdict"], res["frames_compared"] if res["frames_compared"] is not None else "-",
             len(res["races"]), res["sends"] if res["sends"] is not None else "-", "; ".join(res["why"])))
     passed = sum(r["verdict"] == "PASS" for r in results)
-    print("\n%d of %d PASS  (dinput.dll %s, viperport.exe %s)  -> %s" % (passed, len(results), build["dinput.dll"],
-                                                                         build["viperport.exe"], out))
+    print("\n%d of %d PASS  (%s)  -> %s" % (passed, len(results), ", ".join("%s %s" % kv for kv in build.items()), out))
     return 0 if passed == len(results) else 1
 
 

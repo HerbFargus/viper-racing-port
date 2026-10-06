@@ -97,3 +97,13 @@ void w32_registry_file(const char* path);
 
 // MapVirtualKeyA(code, MAPVK_VSC_TO_VK) on the US layout -- the Linux branch's table (exposed for the test)
 uint32_t w32_us_scan_to_vk(uint32_t scan);
+
+#ifndef _WIN32
+// R2b (Linux), for platform.cpp: the game's SDL window as a window of the stand-ins -- its HWND (the game's window
+// global); FindWindowA finds it by this class and title, also from another process (a lock file)
+struct SDL_Window;
+struct SDL_Surface;
+uint32_t w32_adopt_window(SDL_Window* window, const char* cls, const char* title);
+// icon group `id` of the image at `instance` (race.exe's .rsrc) as an ARGB surface (the caller frees it), or null
+SDL_Surface* w32_resource_icon(uint32_t instance, uint32_t id);
+#endif

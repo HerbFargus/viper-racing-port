@@ -19,8 +19,15 @@
 #include "SDL_opengl.h"
 
 // the real entry points (or a harness's fakes). GL 1.1 is exported by opengl32; the rest come from the context.
+// Their calling convention: Windows' APIENTRY (__stdcall); on Linux GL's own GLAPIENTRY (cdecl) -- the Linux build's
+// windows.h (win32_compat.h) makes APIENTRY __stdcall, which a Linux libGL's functions are not (R2b)
+#ifdef _WIN32
+#define VP_GLAPIENTRY APIENTRY
+#else
+#define VP_GLAPIENTRY GLAPIENTRY
+#endif
 struct GLApi {
-#define GL_API_FN(ret, name, args) ret(APIENTRY* name) args;
+#define GL_API_FN(ret, name, args) ret(VP_GLAPIENTRY* name) args;
 #include "gl_api.inc"
 #undef GL_API_FN
     // SDL and the platform layer

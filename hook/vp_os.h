@@ -322,8 +322,8 @@ inline DWORD vpos_GetModuleFileNameA(HMODULE m, LPSTR out, DWORD n) { return ::G
 // GetModuleHandleA(0) -- race.exe's base, 0x400000 (the ELF loader maps it there); GetModuleFileNameA -- the
 // executable's path (/proc/self/exe) for both 0 and the port's own module (one ELF), in Windows form (backslashes)
 // through the path layer (w32_path.h).
-// The Linux definitions are agent B's (vp_os.cpp; vpos_AddVectoredExceptionHandler agent C's, w32_seh.cpp); until
-// they exist each is a stub in hook/linux_todo.cpp.
+// The Linux definitions are in hook/vp_os_linux.cpp (vp_os_linux.h: the region table, the modules, the fopen wrapper);
+// vpos_AddVectoredExceptionHandler is w32_seh.cpp's.
 DWORD vpos_GetTickCount();
 BOOL vpos_VirtualProtect(LPVOID p, SIZE_T n, DWORD prot, PDWORD old);
 SIZE_T vpos_VirtualQuery(LPCVOID p, MEMORY_BASIC_INFORMATION* m, SIZE_T n);

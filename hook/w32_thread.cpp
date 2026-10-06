@@ -50,6 +50,7 @@
 #include <sys/file.h>
 #include <time.h>
 #include <unistd.h>
+#include "w32_seh.h"
 #endif
 
 using w32::Handle;
@@ -205,6 +206,7 @@ void* posix_entry(void* p) {
     sigaddset(&m, sig_suspend());
     pthread_sigmask(SIG_UNBLOCK, &m, 0);
     set_x87_default();                           // (a Linux thread inherits its creator's; Windows' start at 0x27f)
+    w32_seh_thread_begin();                      // its TIB behind fs, its signal stack (w32_seh.cpp: SEH on Linux)
     wait_while_suspended(t);                     // CREATE_SUSPENDED
     uint32_t code;
     if (setjmp(t->exit_to)) {

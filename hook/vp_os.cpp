@@ -13,6 +13,9 @@
 #define VP_OS_IMPL                                   // (vp_os.h: these definitions aren't weak)
 #include "vp_os.h"
 #include "w32_handle.h"
+#ifndef _WIN32
+#include "w32_path.h"                                // (R2b: the port's own opens through the path layer)
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -123,10 +126,25 @@ FILE* open_read(const char* path) {
 #ifdef _WIN32
     return fopen(path, "rb");
 #else
-    // R2b: open the Windows path through the path layer (w32_path.h: backslashes, any case, the install as the root)
-    vp_r2b_todo("vp_os.cpp open_read: the path layer (agent B)");
+    // the Windows path through the path layer (w32_path.h: backslashes, any case, the install as the root)
+    w32::path::Resolved r;
+    uint32_t err = 0;
+    if (!path || !w32::path::resolve(path, r, &err)) return 0;
+    return fopen(r.host.c_str(), "rb");
 #endif
 }
+#ifndef _WIN32
+// stat() of a Windows path through the path layer: 0 and whether it is a folder / read-only, or -1
+int stat_win(const std::string& p, bool* dir, bool* ro) {
+    w32::path::Resolved r;
+    uint32_t err = 0;
+    struct stat st;
+    if (!w32::path::resolve(p.c_str(), r, &err) || ::stat(r.host.c_str(), &st) != 0) return -1;
+    *dir = S_ISDIR(st.st_mode);
+    *ro = !(st.st_mode & S_IWUSR);
+    return 0;
+}
+#endif
 
 // ---- the ini reader: Windows' GetPrivateProfileString for a section and a key ------------------------------------------------
 // What Windows does (measured, test/vp_os_test.cpp): the file is read as bytes (no BOM handling: a UTF-8 BOM makes
@@ -440,10 +458,8 @@ DWORD file_attributes(const char* path) {
     const bool dir = r == 0 && (st.st_mode & _S_IFDIR);
     const bool ro = r == 0 && !(st.st_mode & _S_IWRITE);
 #else
-    // R2b: stat() the path resolved through the path layer (w32_path.h)
-    vp_r2b_todo("vp_os.cpp file_attributes: stat() through the path layer (agent B)");
-    const int r = -1;
-    const bool dir = false, ro = false;
+    bool dir = false, ro = false;                    // (the path resolved through the path layer, w32_path.h)
+    const int r = stat_win(p, &dir, &ro);
 #endif
     if (r == 0 && (dir || !want_dir)) {
         return dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE | (ro ? FILE_ATTRIBUTE_READONLY : 0);
@@ -459,7 +475,8 @@ DWORD file_attributes(const char* path) {
         struct _stat ps;
         parent = _stat(p.substr(0, cut).c_str(), &ps) == 0 && (ps.st_mode & _S_IFDIR);
 #else
-        vp_r2b_todo("vp_os.cpp file_attributes: the parent folder through the path layer (agent B)");
+        bool pdir = false, pro = false;
+        parent = stat_win(p.substr(0, cut), &pdir, &pro) == 0 && pdir;
 #endif
     }
     vpos::set_last_error(parent ? w32::ERR_FILE_NOT_FOUND : w32::ERR_PATH_NOT_FOUND);

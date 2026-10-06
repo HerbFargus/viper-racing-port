@@ -17,6 +17,7 @@
 // ---- the flag ----------------------------------------------------------------------------------------------------
 // Read when the DLL's statics are built (before DllMain's install asks), then taken out of the environment so the
 // game's own C runtime (its environ) and anything it starts never see it.
+#ifdef _WIN32
 static bool read_flag() {
     char v[16];
     const DWORD n = GetEnvironmentVariableA(VP_STANDALONE_ENV, v, sizeof v);
@@ -25,6 +26,10 @@ static bool read_flag() {
     return atoi(v) == VP_STANDALONE_VERSION;
 }
 static const bool g_standalone = read_flag();
+#else
+static const bool g_standalone = true;                  // (Linux: one executable, the standalone -- no dinput.dll route)
+extern "C" char __executable_start[], _end[];           // (the linker's: the executable's first byte and its end)
+#endif
 bool vp_standalone() { return g_standalone; }
 
 // ---- the tables (tools/gen_standalone.py, tools/gen_port_tables.py) ------------------------------------------------
@@ -230,11 +235,16 @@ int run(const VpStandaloneArgs* args) {
     const bool check = args->mode == VP_SA_CHECK;
     say("%s, race.exe %s (%s)", check ? "--check" : "starting", args->exe_path,
         args->stock ? "the stock v1.0 file" : "v1.0, but not the stock file: vrmod's patches?");
+#ifdef _WIN32
     MEMORY_BASIC_INFORMATION mbi;
     VirtualQuery((void*)&run, &mbi, sizeof mbi);
     g_dll_lo = (uint32_t)(uintptr_t)mbi.AllocationBase;
     const IMAGE_NT_HEADERS* dnt = (const IMAGE_NT_HEADERS*)(g_dll_lo + ((const IMAGE_DOS_HEADER*)(uintptr_t)g_dll_lo)->e_lfanew);
     g_dll_hi = g_dll_lo + dnt->OptionalHeader.SizeOfImage;
+#else
+    g_dll_lo = (uint32_t)(uintptr_t)__executable_start; // (Linux: "the DLL" is this executable, its ELF header to _end)
+    g_dll_hi = (uint32_t)(uintptr_t)_end;
+#endif
     if (!g_standalone) fail("the DLL wasn't loaded with %s set: it installed as on the dinput.dll route", VP_STANDALONE_ENV);
     if (!build_is_v10()) {
         fail("the DLL didn't install on v1.0 race.exe (viperport.log says why); nothing filled");

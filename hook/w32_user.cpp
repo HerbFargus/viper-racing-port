@@ -22,6 +22,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <map>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #include "SDL.h"
 #endif
 
@@ -47,16 +51,22 @@ struct Bridge {
 #define H(v) ((void*)(uintptr_t)(v))                 // a 32-bit handle as Windows' pointer-sized one
 #define V(p) ((uint32_t)(uintptr_t)(p))
 #else
-// ---- R2b (Linux) ---------------------------------------------------------------------------------------------------------
-// The loading window (RegisterClassA ... EndPaint, LoadBitmapA and GDI32's five, which paint race.exe's SPLASH bitmap
-// for the few seconds the game loads) needs a design: e.g. an SDL window of 300x373 that shows the SPLASH resource
-// (read from race.exe's .rsrc), driven by these stand-ins -- RegisterClassA keeps the class's window procedure,
-// CreateWindowExA makes the window and sends WM_CREATE / WM_PAINT to it, BeginPaint hands out a "DC" that BitBlt
-// from the SPLASH bitmap's DC draws into. Until then they succeed doing nothing (the game shows no loading window).
-// The single-instance check (FindWindowA) on Linux: a lock file in the install, not a window search.
-#ifndef VP_R2B_STUBS
-#error "R2b: w32_user.cpp -- the loading window on SDL (see above); define VP_R2B_STUBS to build the no-op stubs"
-#endif
+// ---- R2b (Linux): the windows, on SDL -------------------------------------------------------------------------------------
+// The game's windows are SDL windows behind fake HWNDs (the window table below, in the #else of USER32):
+//   * the loading window (make_loading_window / splash_proc, krn_file.cpp): RegisterClassA keeps the class's window
+//     procedure; CreateWindowExA makes a hidden borderless SDL window and sends it WM_CREATE (-1: destroyed again, 0
+//     returned, as Windows does), ShowWindow shows it, UpdateWindow sends the pending WM_PAINT; BeginPaint's DC is the
+//     window's SDL surface, EndPaint presents it. LoadBitmapA reads the bitmap resource (SPLASH: 300x373, 24-bit) from
+//     race.exe's .rsrc in the mapped image; CreateCompatibleDC / SelectObject / BitBlt (SRCCOPY) / DeleteDC /
+//     DeleteObject are SDL surfaces and blits. DestroyWindow sends WM_DESTROY and destroys the SDL window.
+//   * the game's window: platform.cpp's SDL window, adopted (w32_adopt_window) -- its HWND is what the game holds; it
+//     has no window procedure (SDL's events go through platform.cpp's handle()), and DestroyWindow (app_end) hides it.
+//   * the single-instance check: start_unique_instance's semaphore is a lock file (w32_thread.cpp); its FindWindowA
+//     finds this process's windows by class and title, and another process's game window through a lock file each
+//     window with a class and a title holds ($XDG_RUNTIME_DIR, else /tmp: viperport-window-<class>-<title>, flock'd for
+//     the window's life) -- a fake HWND that ShowWindow can't restore (one process can't raise another's SDL window).
+//   * GetForegroundWindow / GetActiveWindow: the window of ours with the keyboard focus; SetForegroundWindow raises it.
+// All of it on the thread that made the windows (the game's main thread), as Windows' windows belong to theirs.
 #endif
 
 // ---- the registry: Config\registry.ini ---------------------------------------------------------------------------------
@@ -511,30 +521,445 @@ int __stdcall w32_DeleteObject(uint32_t obj) {
     return f_DeleteObject(H(obj));
 }
 
-#else  // R2b (Linux): SDL where SDL has it; the loading window's calls are no-op stubs (see the top)
+#else  // R2b (Linux): the windows on SDL (see the top); SDL's screen size, message box, cursor and clipboard
+
+namespace {
+
+uint16_t rd16(const uint8_t* p) { uint16_t v; memcpy(&v, p, 2); return v; }
+uint32_t rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
+bool is_int_resource(const char* name) { return (uintptr_t)name < 0x10000; }
+
+// SDL's video, started by the first call that needs it (the loading window comes before platform.cpp's window)
+bool video() {
+    static int state;                                  // 0 not tried, 1 up, -1 failed
+    if (SDL_WasInit(SDL_INIT_VIDEO)) return true;
+    if (!state) state = SDL_InitSubSystem(SDL_INIT_VIDEO) == 0 ? 1 : -1;
+    return state > 0;
+}
+
+// ---- race.exe's resources, read from its mapped image -----------------------------------------------------------------
+// The data of resource (type, name) in the image at `instance` -- race.exe's base, the only module there is (its headers
+// are mapped, as Windows maps them) -- or null. name: an integer resource, "#<n>", or a name (any case, as Windows').
+const uint8_t* find_resource(uint32_t instance, uint32_t type, const char* name, uint32_t* size) {
+    if (!instance || instance != w32_GetModuleHandleA(0)) return 0;
+    const uint8_t* b = (const uint8_t*)(uintptr_t)instance;
+    if (b[0] != 'M' || b[1] != 'Z') return 0;
+    const uint32_t pe = rd32(b + 0x3c);
+    if (pe > 0x800 || memcmp(b + pe, "PE\0\0", 4) != 0) return 0;
+    const uint8_t* opt = b + pe + 24;
+    if (rd16(opt) != 0x10b || rd32(opt + 92) <= 2) return 0;      // PE32, with a resource directory entry
+    const uint32_t image = rd32(opt + 56), root = rd32(opt + 96 + 16), rsize = rd32(opt + 96 + 20);
+    if (!root || rsize < 16 || root > image || rsize > image - root) return 0;
+    const uint8_t* r = b + root;
+    uint32_t want_id = 0;
+    std::string want_name;
+    if (is_int_resource(name)) want_id = (uint32_t)(uintptr_t)name;
+    else if (name[0] == '#') want_id = (uint32_t)strtoul(name + 1, 0, 10);
+    else for (const char* p = name; *p; p++) want_name += (char)toupper((unsigned char)*p);
+    // one level of the tree: the entry with that id (or name; any: the first), its offset in the directory
+    auto pick = [&](uint32_t dir, bool any, uint32_t id, const std::string& nm, uint32_t* out) -> bool {
+        if (dir > rsize - 16) return false;
+        const uint32_t named = rd16(r + dir + 12), ids = rd16(r + dir + 14);
+        if (16 + (uint64_t)(named + ids) * 8 > rsize - dir) return false;
+        for (uint32_t i = 0; i < named + ids; i++) {
+            const uint8_t* e = r + dir + 16 + i * 8;
+            const uint32_t n = rd32(e), off = rd32(e + 4);
+            bool match = any;
+            if (!match && (n & 0x80000000u) && !nm.empty()) {
+                const uint32_t so = n & 0x7fffffffu;
+                if (so <= rsize - 2) {
+                    const uint32_t len = rd16(r + so);
+                    if (len == nm.size() && so + 2 + (uint64_t)len * 2 <= rsize) {
+                        match = true;
+                        for (uint32_t k = 0; k < len && match; k++) {
+                            const uint16_t c = rd16(r + so + 2 + k * 2);
+                            match = c < 0x80 && toupper(c) == (unsigned char)nm[k];
+                        }
+                    }
+                }
+            } else if (!match && !(n & 0x80000000u) && nm.empty()) {
+                match = n == id;
+            }
+            if (match) { *out = off; return true; }
+        }
+        return false;
+    };
+    uint32_t a, c, d;
+    if (!pick(0, false, type, std::string(), &a) || !(a & 0x80000000u)) return 0;
+    if (!pick(a & 0x7fffffffu, false, want_id, want_name, &c) || !(c & 0x80000000u)) return 0;
+    if (!pick(c & 0x7fffffffu, true, 0, std::string(), &d) || (d & 0x80000000u) || d > rsize - 16) return 0;
+    const uint32_t rva = rd32(r + d), n = rd32(r + d + 4);
+    if (rva > image || n > image - rva) return 0;
+    *size = n;
+    return b + rva;
+}
+
+// A device-independent bitmap (BITMAPINFOHEADER, its colour table, its bits) as a 32-bit ARGB SDL surface; an icon's
+// (height doubled: the colour bits, then the 1-bit AND mask) with the mask as its alpha. Null if it isn't one we read.
+SDL_Surface* dib_surface(const uint8_t* p, uint32_t n, bool icon) {
+    if (n < 40) return 0;
+    const uint32_t hs = rd32(p);
+    if (hs < 40 || hs > n) return 0;
+    const int32_t w = (int32_t)rd32(p + 4), h_all = (int32_t)rd32(p + 8);
+    const uint32_t bpp = rd16(p + 14), comp = rd32(p + 16), used = rd32(p + 32);
+    const bool top_down = h_all < 0;
+    const int32_t h = (top_down ? -h_all : h_all) / (icon ? 2 : 1);
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return 0;
+    if (!(bpp == 1 || bpp == 4 || bpp == 8 || bpp == 16 || bpp == 24 || bpp == 32)) return 0;
+    if (!(comp == 0 || (comp == 3 && (bpp == 16 || bpp == 32)))) return 0;      // BI_RGB, BI_BITFIELDS
+    uint32_t masks[3] = {bpp == 16 ? 0x7c00u : 0xff0000u, bpp == 16 ? 0x03e0u : 0xff00u, bpp == 16 ? 0x001fu : 0xffu};
+    uint32_t at = hs;
+    if (comp == 3) {
+        if (hs == 40) {
+            if (at + 12 > n) return 0;
+            at += 12;
+        }
+        for (int i = 0; i < 3; i++) masks[i] = rd32(p + 40 + i * 4);
+    }
+    const uint32_t colours = bpp <= 8 ? (used && used < (1u << bpp) ? used : 1u << bpp) : used;
+    const uint8_t* pal = p + at;
+    if ((uint64_t)at + colours * 4 > n) return 0;
+    at += colours * 4;
+    const uint32_t stride = ((uint32_t)w * bpp + 31) / 32 * 4, mstride = ((uint32_t)w + 31) / 32 * 4;
+    if ((uint64_t)at + (uint64_t)stride * h + (icon ? (uint64_t)mstride * h : 0) > n) return 0;
+    const uint8_t* bits = p + at;
+    const uint8_t* mask = bits + (uint64_t)stride * h;
+    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (!s) return 0;
+    auto field = [](uint32_t v, uint32_t m) -> uint32_t {   // a bitfield scaled to 8 bits
+        if (!m) return 0;
+        int sh = 0, len = 0;
+        while (!((m >> sh) & 1)) sh++;
+        while (sh + len < 32 && ((m >> (sh + len)) & 1)) len++;
+        const uint32_t x = (v & m) >> sh;
+        return len >= 8 ? x >> (len - 8) : (x * 255 + ((1u << len) - 1) / 2) / ((1u << len) - 1);
+    };
+    bool any_alpha = false;
+    for (int32_t y = 0; y < h; y++) {
+        const int32_t sy = top_down ? y : h - 1 - y;          // DIB rows: bottom-up unless the height is negative
+        const uint8_t* row = bits + (uint64_t)stride * sy;
+        uint32_t* out = (uint32_t*)((uint8_t*)s->pixels + (uint64_t)s->pitch * y);
+        for (int32_t x = 0; x < w; x++) {
+            uint32_t argb;
+            if (bpp <= 8) {
+                const uint32_t bit = (uint32_t)x * bpp;
+                const uint32_t ix = (row[bit / 8] >> (8 - bpp - bit % 8)) & ((1u << bpp) - 1);
+                const uint8_t* q = ix < colours ? pal + ix * 4 : pal;
+                argb = colours ? 0xff000000u | (uint32_t)q[2] << 16 | (uint32_t)q[1] << 8 | q[0] : 0xff000000u;
+            } else if (bpp == 24) {
+                const uint8_t* q = row + x * 3;
+                argb = 0xff000000u | (uint32_t)q[2] << 16 | (uint32_t)q[1] << 8 | q[0];
+            } else {
+                const uint32_t v = bpp == 16 ? rd16(row + x * 2) : rd32(row + x * 4);
+                argb = 0xff000000u | field(v, masks[0]) << 16 | field(v, masks[1]) << 8 | field(v, masks[2]);
+                if (bpp == 32 && comp == 0 && icon) {           // a 32-bit icon's own alpha
+                    argb = (argb & 0xffffffu) | (v & 0xff000000u);
+                    any_alpha = any_alpha || (v >> 24);
+                }
+            }
+            out[x] = argb;
+        }
+    }
+    if (icon && !any_alpha)                                     // the AND mask: 1 = transparent
+        for (int32_t y = 0; y < h; y++) {
+            const uint8_t* row = mask + (uint64_t)mstride * (top_down ? y : h - 1 - y);
+            uint32_t* out = (uint32_t*)((uint8_t*)s->pixels + (uint64_t)s->pitch * y);
+            for (int32_t x = 0; x < w; x++)
+                if ((row[x / 8] >> (7 - x % 8)) & 1) out[x] &= 0x00ffffffu;
+        }
+    return s;
+}
+
+// ---- GDI: bitmaps and DCs ---------------------------------------------------------------------------------------------
+enum class Gdi { Bitmap, WindowDC, MemoryDC };
+struct GdiObject {
+    Gdi kind;
+    SDL_Surface* bitmap;                               // Bitmap: its pixels
+    uint32_t hwnd;                                     // WindowDC: the window BeginPaint gave it for
+    uint32_t selected;                                 // MemoryDC: the bitmap selected into it
+};
+std::map<uint32_t, GdiObject> g_gdi;
+uint32_t g_next_gdi = 0x0c010010u;
+const uint32_t STOCK_BITMAP = 0x0185000fu;             // the 1x1 bitmap a new memory DC holds (never drawn)
+
+uint32_t gdi_add(const GdiObject& o) {
+    const uint32_t h = g_next_gdi;
+    g_next_gdi += 0x10;
+    g_gdi[h] = o;
+    return h;
+}
+GdiObject* gdi(uint32_t h, Gdi kind) {
+    auto it = g_gdi.find(h);
+    return it != g_gdi.end() && it->second.kind == kind ? &it->second : 0;
+}
+
+// ---- the windows --------------------------------------------------------------------------------------------------------
+typedef int32_t(__stdcall* WndProc_t)(uint32_t hwnd, uint32_t msg, uint32_t wparam, int32_t lparam);
+struct Class { std::string name; uint32_t atom, proc, instance; };
+struct Win {
+    SDL_Window* sdl = 0;
+    std::string cls, title;
+    uint32_t atom = 0, proc = 0;                       // the class's window procedure (0: platform.cpp's window)
+    bool adopted = false, shown = false, paint = false;
+    int lock = -1;                                     // the lock file another process's FindWindowA sees
+};
+std::vector<Class> g_classes;
+std::map<uint32_t, Win> g_wins;
+uint32_t g_next_hwnd = 0x00020010u, g_next_atom = 0xc000u;
+const uint32_t FOREIGN_HWND = 0x7ffe0010u;             // FindWindowA's answer for another process's window
+
+const Class* find_class(const char* cls) {
+    for (const Class& c : g_classes)
+        if (is_int_resource(cls) ? c.atom == (uint32_t)(uintptr_t)cls : same(c.name, cls)) return &c;
+    return 0;
+}
+Win* win(uint32_t hwnd) {
+    auto it = g_wins.find(hwnd);
+    return it != g_wins.end() ? &it->second : 0;
+}
+int32_t send(uint32_t hwnd, uint32_t msg, uint32_t wparam, int32_t lparam) {
+    Win* w = win(hwnd);
+    const uint32_t proc = w ? w->proc : 0;
+    return proc ? ((WndProc_t)(uintptr_t)proc)(hwnd, msg, wparam, lparam) : 0;
+}
+
+// the lock file of a window with this class and title ($XDG_RUNTIME_DIR, else /tmp; names lower-cased, as FindWindowA
+// compares them, anything but letters and digits escaped)
+std::string window_lock_path(const std::string& cls, const std::string& title) {
+    const char* dir = getenv("XDG_RUNTIME_DIR");
+    std::string path = std::string(dir && *dir ? dir : "/tmp") + "/viperport-window-";
+    static const char hex[] = "0123456789abcdef";
+    auto add = [&](const std::string& s) {
+        for (unsigned char ch : s) {
+            const unsigned char c = (unsigned char)tolower(ch);
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) path += (char)c;
+            else { path += '_'; path += hex[c >> 4]; path += hex[c & 15]; }
+        }
+    };
+    add(cls.substr(0, 100));
+    path += '-';
+    add(title.substr(0, 100));
+    return path;
+}
+int window_lock(const std::string& cls, const std::string& title) {
+    if (cls.empty() || title.empty()) return -1;
+    const int fd = open(window_lock_path(cls, title).c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) { close(fd); return -1; }
+    return fd;
+}
+bool window_held_elsewhere(const char* cls, const char* title) {
+    const int fd = open(window_lock_path(cls, title).c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) return false;
+    const bool held = flock(fd, LOCK_EX | LOCK_NB) != 0;
+    if (!held) flock(fd, LOCK_UN);
+    close(fd);
+    return held;
+}
+
+uint32_t window_add(Win&& w) {
+    const uint32_t h = g_next_hwnd;
+    g_next_hwnd += 0x10;
+    w.lock = window_lock(w.cls, w.title);
+    g_wins[h] = std::move(w);
+    return h;
+}
+void window_remove(uint32_t hwnd) {
+    Win* w = win(hwnd);
+    if (!w) return;
+    if (w->lock >= 0) close(w->lock);
+    if (w->sdl && !w->adopted) SDL_DestroyWindow(w->sdl);
+    g_wins.erase(hwnd);
+}
+
+}  // namespace
 
 int __stdcall w32_GetSystemMetrics(int index) {
     SDL_DisplayMode m;
-    if ((index == 0 || index == 1) && SDL_GetDesktopDisplayMode(0, &m) == 0) return index == 0 ? m.w : m.h;
+    if ((index == 0 || index == 1) && video() && SDL_GetDesktopDisplayMode(0, &m) == 0) return index == 0 ? m.w : m.h;
     return 0;                                          // (SM_CXSCREEN / SM_CYSCREEN are all the game asks)
 }
-uint32_t __stdcall w32_RegisterClassA(const void*) { return 0xc000; }
-uint32_t __stdcall w32_CreateWindowExA(uint32_t, const char*, const char*, uint32_t, int, int, int, int, uint32_t, uint32_t,
-                                       uint32_t, void*) { return 0x10010; }
-int __stdcall w32_DestroyWindow(uint32_t) { return 1; }
-int __stdcall w32_IsWindow(uint32_t) { return 0; }
-int __stdcall w32_ShowWindow(uint32_t, int) { return 0; }
-int __stdcall w32_UpdateWindow(uint32_t) { return 1; }
-uint32_t __stdcall w32_FindWindowA(const char*, const char*) { return 0; }
-uint32_t __stdcall w32_SetFocus(uint32_t) { return 0; }
-uint32_t __stdcall w32_GetForegroundWindow(void) { return 0; }
-int __stdcall w32_SetForegroundWindow(uint32_t) { return 1; }
-uint32_t __stdcall w32_BeginPaint(uint32_t, void* paint) { if (paint) memset(paint, 0, 64); return 0x10020; }
-int __stdcall w32_EndPaint(uint32_t, const void*) { return 1; }
-int32_t __stdcall w32_DefWindowProcA(uint32_t, uint32_t, uint32_t, int32_t) { return 0; }
-uint32_t __stdcall w32_LoadIconA(uint32_t, const char*) { return 0x10030; }
+
+// WNDCLASSA (40 bytes): style, lpfnWndProc, cbClsExtra, cbWndExtra, hInstance, hIcon, hCursor, hbrBackground,
+// lpszMenuName, lpszClassName
+uint32_t __stdcall w32_RegisterClassA(const void* wndclass) {
+    const uint8_t* wc = (const uint8_t*)wndclass;
+    const char* name = wc ? (const char*)(uintptr_t)rd32(wc + 36) : 0;
+    if (!name || is_int_resource(name) || !*name) { w32::set_last_error(w32::ERR_INVALID_PARAMETER); return 0; }
+    if (find_class(name)) { w32::set_last_error(1410); return 0; }   // ERROR_CLASS_ALREADY_EXISTS
+    g_classes.push_back({name, g_next_atom++, rd32(wc + 4), rd32(wc + 16)});
+    return g_classes.back().atom;
+}
+
+uint32_t __stdcall w32_CreateWindowExA(uint32_t ex_style, const char* cls, const char* title, uint32_t style, int x, int y,
+                                       int w, int h, uint32_t parent, uint32_t menu, uint32_t instance, void* param) {
+    const Class* c = cls ? find_class(cls) : 0;
+    if (!c) { w32::set_last_error(1407); return 0; }   // ERROR_CANNOT_FIND_WND_CLASS
+    if (!video()) { w32::set_last_error(w32::ERR_NOT_SUPPORTED); return 0; }
+    const int k_default = (int)0x80000000;             // CW_USEDEFAULT
+    Uint32 flags = SDL_WINDOW_HIDDEN;
+    if ((style & 0x00c00000u) != 0x00c00000u) flags |= SDL_WINDOW_BORDERLESS;   // no WS_CAPTION (WS_POPUP)
+    if (ex_style & 0x80u) flags |= SDL_WINDOW_SKIP_TASKBAR | SDL_WINDOW_UTILITY;  // WS_EX_TOOLWINDOW
+    if (ex_style & 0x08u) flags |= SDL_WINDOW_ALWAYS_ON_TOP;                       // WS_EX_TOPMOST
+    SDL_Window* s = SDL_CreateWindow(title ? title : "", x == k_default ? (int)SDL_WINDOWPOS_UNDEFINED : x,
+                                     y == k_default ? (int)SDL_WINDOWPOS_UNDEFINED : y,
+                                     w == k_default ? 640 : w > 0 ? w : 1, h == k_default ? 480 : h > 0 ? h : 1, flags);
+    if (!s) { w32::set_last_error(w32::ERR_NOT_ENOUGH_MEMORY); return 0; }
+    Win wn;
+    wn.sdl = s;
+    wn.cls = c->name;
+    wn.title = title ? title : "";
+    wn.atom = c->atom;
+    wn.proc = c->proc;
+    const uint32_t hwnd = window_add(std::move(wn));
+    // WM_CREATE with its CREATESTRUCTA (48 bytes): lpCreateParams, hInstance, hMenu, hwndParent, cy, cx, y, x, style,
+    // lpszName, lpszClass, dwExStyle; -1 refuses the window (destroyed again: WM_DESTROY, then 0)
+    const uint32_t cs[12] = {(uint32_t)(uintptr_t)param, instance, menu, parent, (uint32_t)h, (uint32_t)w, (uint32_t)y,
+                             (uint32_t)x, style, (uint32_t)(uintptr_t)title, (uint32_t)(uintptr_t)cls, ex_style};
+    if (send(hwnd, 0x0001, 0, (int32_t)(uintptr_t)cs) == -1) {       // WM_CREATE
+        send(hwnd, 0x0002, 0, 0);                                     // WM_DESTROY
+        window_remove(hwnd);
+        w32::set_last_error(1400);                                    // ERROR_INVALID_WINDOW_HANDLE (as Windows says)
+        return 0;
+    }
+    if (style & 0x10000000u) w32_ShowWindow(hwnd, 5);                 // WS_VISIBLE: SW_SHOW
+    return hwnd;
+}
+
+int __stdcall w32_DestroyWindow(uint32_t hwnd) {
+    Win* w = win(hwnd);
+    if (!w) { w32::set_last_error(1400); return 0; }
+    if (w->adopted) {
+        SDL_HideWindow(w->sdl);                        // (platform.cpp's: SDL and the renderer keep it to the end)
+    } else {
+        send(hwnd, 0x0002, 0, 0);                      // WM_DESTROY
+    }
+    window_remove(hwnd);
+    return 1;
+}
+int __stdcall w32_IsWindow(uint32_t hwnd) { return hwnd == FOREIGN_HWND || win(hwnd) ? 1 : 0; }
+// the previous visibility, as Windows returns it
+int __stdcall w32_ShowWindow(uint32_t hwnd, int cmd) {
+    if (hwnd == FOREIGN_HWND) return 0;                // (another process's window: one process can't show another's)
+    Win* w = win(hwnd);
+    if (!w) { w32::set_last_error(1400); return 0; }
+    const bool was = w->shown;
+    switch (cmd) {
+    case 0: SDL_HideWindow(w->sdl); w->shown = false; break;                      // SW_HIDE
+    case 2: case 6: case 7: case 11:                                               // the minimised ones
+        SDL_ShowWindow(w->sdl); SDL_MinimizeWindow(w->sdl); w->shown = true; break;
+    case 3: SDL_ShowWindow(w->sdl); SDL_MaximizeWindow(w->sdl); w->shown = true; break;   // SW_MAXIMIZE
+    case 9: SDL_ShowWindow(w->sdl); SDL_RestoreWindow(w->sdl); w->shown = true; break;    // SW_RESTORE
+    default: SDL_ShowWindow(w->sdl); w->shown = true; break;
+    }
+    if (!was && w->shown && w->proc) w->paint = true;  // newly visible: its WM_PAINT is pending
+    return was ? 1 : 0;
+}
+int __stdcall w32_UpdateWindow(uint32_t hwnd) {
+    Win* w = win(hwnd);
+    if (!w) { w32::set_last_error(1400); return 0; }
+    if (w->paint) {
+        w->paint = false;
+        send(hwnd, 0x000f, 0, 0);                      // WM_PAINT
+    }
+    return 1;
+}
+uint32_t __stdcall w32_FindWindowA(const char* cls, const char* title) {
+    for (auto& kv : g_wins) {
+        const Win& w = kv.second;
+        if (cls && !(is_int_resource(cls) ? w.atom && w.atom == (uint32_t)(uintptr_t)cls : same(w.cls, cls))) continue;
+        if (title && !same(w.title, title)) continue;
+        return kv.first;
+    }
+    if (cls && title && !is_int_resource(cls) && window_held_elsewhere(cls, title)) return FOREIGN_HWND;
+    return 0;
+}
+uint32_t __stdcall w32_GetForegroundWindow(void) {
+    SDL_Window* f = SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardFocus() : 0;
+    if (f)
+        for (auto& kv : g_wins)
+            if (kv.second.sdl == f) return kv.first;
+    return 0;
+}
+uint32_t __stdcall w32_SetFocus(uint32_t hwnd) {
+    const uint32_t before = w32_GetForegroundWindow();
+    Win* w = win(hwnd);
+    if (hwnd && !w) { w32::set_last_error(1400); return 0; }
+    if (w) SDL_RaiseWindow(w->sdl);
+    return before;
+}
+int __stdcall w32_SetForegroundWindow(uint32_t hwnd) {
+    Win* w = win(hwnd);
+    if (!w) return 0;
+    SDL_RaiseWindow(w->sdl);
+    return 1;
+}
+// PAINTSTRUCT (64 bytes): hdc, fErase, rcPaint, fRestore, fIncUpdate, rgbReserved[32]. The DC draws on the window's SDL
+// surface, erased first with black (the loading window's class brush, COLOR_WINDOWFRAME)
+uint32_t __stdcall w32_BeginPaint(uint32_t hwnd, void* paint) {
+    Win* w = win(hwnd);
+    if (!w || !paint) { w32::set_last_error(1400); return 0; }
+    w->paint = false;
+    SDL_Surface* s = SDL_GetWindowSurface(w->sdl);
+    if (s) SDL_FillRect(s, 0, SDL_MapRGB(s->format, 0, 0, 0));
+    const uint32_t dc = gdi_add({Gdi::WindowDC, 0, hwnd, 0});
+    uint32_t ps[16] = {dc, 0, 0, 0, s ? (uint32_t)s->w : 0, s ? (uint32_t)s->h : 0};
+    memcpy(paint, ps, sizeof ps);
+    return dc;
+}
+int __stdcall w32_EndPaint(uint32_t hwnd, const void* paint) {
+    Win* w = win(hwnd);
+    if (paint) {
+        const uint32_t dc = rd32((const uint8_t*)paint);
+        if (gdi(dc, Gdi::WindowDC)) g_gdi.erase(dc);
+    }
+    if (w) SDL_UpdateWindowSurface(w->sdl);
+    return 1;
+}
+int32_t __stdcall w32_DefWindowProcA(uint32_t, uint32_t msg, uint32_t, int32_t) {
+    return msg == 0x0081 ? 1 : 0;                      // WM_NCCREATE: go on; everything else: done
+}
+uint32_t __stdcall w32_LoadIconA(uint32_t, const char*) { return 0x10030; }   // (unused: platform.cpp's w32_resource_icon)
 uint32_t __stdcall w32_LoadCursorA(uint32_t, const char*) { return 0x10040; }
-uint32_t __stdcall w32_LoadBitmapA(uint32_t, const char*) { return 0x10050; }
+uint32_t __stdcall w32_LoadBitmapA(uint32_t instance, const char* name) {
+    uint32_t n = 0;
+    const uint8_t* p = name ? find_resource(instance, 2, name, &n) : 0;     // RT_BITMAP
+    if (!p) { w32::set_last_error(1814); return 0; }                         // ERROR_RESOURCE_NAME_NOT_FOUND
+    SDL_Surface* s = dib_surface(p, n, false);
+    if (!s) { w32::set_last_error(w32::ERR_NOT_ENOUGH_MEMORY); return 0; }
+    return gdi_add({Gdi::Bitmap, s, 0, 0});
+}
+
+// ---- for platform.cpp (w32_user.h) --------------------------------------------------------------------------------------
+uint32_t w32_adopt_window(SDL_Window* window, const char* cls, const char* title) {
+    for (auto& kv : g_wins)
+        if (kv.second.sdl == window) return kv.first;
+    Win w;
+    w.sdl = window;
+    w.cls = cls ? cls : "";
+    w.title = title ? title : "";
+    w.adopted = true;
+    w.shown = (SDL_GetWindowFlags(window) & SDL_WINDOW_SHOWN) != 0;
+    return window_add(std::move(w));
+}
+
+SDL_Surface* w32_resource_icon(uint32_t instance, uint32_t id) {
+    uint32_t n = 0;
+    const uint8_t* g = find_resource(instance, 14, (const char*)(uintptr_t)id, &n);   // RT_GROUP_ICON
+    if (!g || n < 6 || rd16(g + 2) != 1) return 0;
+    const uint32_t count = rd16(g + 4);
+    int best = -1, best_score = -1;
+    for (uint32_t i = 0; i < count && 6 + (i + 1) * 14 <= n; i++) {          // GRPICONDIRENTRY: 14 bytes
+        const uint8_t* e = g + 6 + i * 14;
+        const int size = e[0] ? e[0] : 256, bits = rd16(e + 6);
+        const int score = (size >= 32 ? 1000 - size : size) * 64 + bits;    // 32x32 first, then the most colours
+        if (score > best_score) best = (int)i, best_score = score;
+    }
+    if (best < 0) return 0;
+    const uint32_t icon_id = rd16(g + 6 + best * 14 + 12);
+    const uint8_t* p = find_resource(instance, 3, (const char*)(uintptr_t)icon_id, &n);   // RT_ICON
+    return p ? dib_surface(p, n, true) : 0;
+}
 uint32_t __stdcall w32_SetCursor(uint32_t) { return 0; }
 int __stdcall w32_ShowCursor(int show) {
     static int count = 0;                              // Windows' display count
@@ -608,14 +1033,61 @@ uint32_t __stdcall w32_GetClipboardData(uint32_t format) {
     return text_global(s);
 }
 
-uint32_t __stdcall w32_GetActiveWindow(void) { return 0; }
+uint32_t __stdcall w32_GetActiveWindow(void) { return w32_GetForegroundWindow(); }
 uint32_t __stdcall w32_GetLastActivePopup(uint32_t hwnd) { return hwnd; }
 
-int __stdcall w32_BitBlt(uint32_t, int, int, int, int, uint32_t, int, int, uint32_t) { return 1; }
-uint32_t __stdcall w32_CreateCompatibleDC(uint32_t) { return 0x10070; }
-int __stdcall w32_DeleteDC(uint32_t) { return 1; }
-uint32_t __stdcall w32_SelectObject(uint32_t, uint32_t) { return 0x10080; }
-int __stdcall w32_DeleteObject(uint32_t) { return 1; }
+// GDI32: a DC is a window's surface (BeginPaint) or a memory DC with a bitmap selected; BitBlt copies (SRCCOPY) or
+// fills (BLACKNESS / WHITENESS) -- the loading window's one blit
+static SDL_Surface* dc_surface(uint32_t dc) {
+    auto it = g_gdi.find(dc);
+    if (it == g_gdi.end()) return 0;
+    if (it->second.kind == Gdi::WindowDC) {
+        Win* w = win(it->second.hwnd);
+        return w ? SDL_GetWindowSurface(w->sdl) : 0;
+    }
+    if (it->second.kind == Gdi::MemoryDC) {
+        GdiObject* b = gdi(it->second.selected, Gdi::Bitmap);
+        return b ? b->bitmap : 0;
+    }
+    return 0;
+}
+int __stdcall w32_BitBlt(uint32_t dc, int x, int y, int w, int h, uint32_t src, int sx, int sy, uint32_t rop) {
+    SDL_Surface* d = dc_surface(dc);
+    if (!d) { w32::set_last_error(w32::ERR_INVALID_HANDLE); return 0; }
+    SDL_Rect dr = {x, y, w, h};
+    if (rop == 0x00000042u || rop == 0x00ff0062u)                  // BLACKNESS, WHITENESS
+        return SDL_FillRect(d, &dr, rop == 0x42u ? SDL_MapRGB(d->format, 0, 0, 0) : SDL_MapRGB(d->format, 255, 255, 255)) == 0;
+    SDL_Surface* s = dc_surface(src);
+    if (rop != 0x00cc0020u || !s) {                                // SRCCOPY only
+        w32::set_last_error(rop != 0x00cc0020u ? w32::ERR_NOT_SUPPORTED : w32::ERR_INVALID_HANDLE);
+        return 0;
+    }
+    SDL_Rect sr = {sx, sy, w, h};
+    SDL_SetSurfaceBlendMode(s, SDL_BLENDMODE_NONE);
+    return SDL_BlitSurface(s, &sr, d, &dr) == 0;
+}
+uint32_t __stdcall w32_CreateCompatibleDC(uint32_t) { return gdi_add({Gdi::MemoryDC, 0, 0, STOCK_BITMAP}); }
+int __stdcall w32_DeleteDC(uint32_t dc) {
+    auto it = g_gdi.find(dc);
+    if (it == g_gdi.end() || it->second.kind == Gdi::Bitmap) { w32::set_last_error(w32::ERR_INVALID_HANDLE); return 0; }
+    g_gdi.erase(it);
+    return 1;
+}
+// a bitmap into a memory DC: the one it held before (a new DC's: the stock 1x1 bitmap)
+uint32_t __stdcall w32_SelectObject(uint32_t dc, uint32_t obj) {
+    GdiObject* d = gdi(dc, Gdi::MemoryDC);
+    if (!d || !(obj == STOCK_BITMAP || gdi(obj, Gdi::Bitmap))) { w32::set_last_error(w32::ERR_INVALID_HANDLE); return 0; }
+    const uint32_t was = d->selected;
+    d->selected = obj;
+    return was;
+}
+int __stdcall w32_DeleteObject(uint32_t obj) {
+    GdiObject* b = gdi(obj, Gdi::Bitmap);
+    if (!b) return obj == STOCK_BITMAP ? 1 : 0;        // (a stock object: "deleted", as Windows answers)
+    SDL_FreeSurface(b->bitmap);
+    g_gdi.erase(obj);
+    return 1;
+}
 
 #endif
 

@@ -28,6 +28,13 @@
 #include "session.h"
 #include "fix_paths.h"
 #include "standalone.h"
+#ifndef _WIN32
+#include <fcntl.h>                                       // (R2b: two_copies' lock files)
+#include <stdlib.h>
+#include <string.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 
 // ---- the one export, forwarded ---------------------------------------------------------------------
 // (Windows only: the dinput.dll route's real DirectInput, for the game's own input code when SDL is off)
@@ -92,8 +99,29 @@ static void decide_copy(const char* ini) {
     }
     g_copy_note = "two_copies: two copies already run; this start is the game's own (its single-instance check decides)";
 #else
-    // R2b: [test] two_copies' two slots -- e.g. flock() on two lock files in the temp folder, held for the process's life
-    vp_r2b_todo("viperport.cpp decide_copy: two_copies' slots as lock files (agent D)");
+    // R2b: the two slots are lock files ($XDG_RUNTIME_DIR, else /tmp: viperport-two_copies-1 / -2), flock'd for the
+    // process's life -- the OS lets go when it ends, as Windows closes a mutex handle
+    static int held = -1;
+    const char* dir = getenv("XDG_RUNTIME_DIR");
+    for (int c = 1; c <= 2; c++) {
+        char path[600];
+        snprintf(path, sizeof path, "%s/viperport-two_copies-%d", dir && *dir && strlen(dir) < 500 ? dir : "/tmp", c);
+        const int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (fd < 0) continue;
+        if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            close(fd);
+            continue;
+        }
+        held = fd;
+        vp_g_two_copies = true;
+        vp_g_copy = c;
+        vp_g_copy_suffix = c == 2 ? "-2" : "";
+        g_copy_note = c == 2 ? "two_copies: this is copy 2 (Config-2\\, log-2\\, the right half of the screen)"
+                             : "two_copies: this is copy 1 (Config\\, log\\, the left half of the screen)";
+        return;
+    }
+    (void)held;
+    g_copy_note = "two_copies: two copies already run; this start is the game's own (its single-instance check decides)";
 #endif
 }
 

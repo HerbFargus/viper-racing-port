@@ -31,6 +31,10 @@
 #include "viperport.h"
 #include "session.h"
 #include "standalone.h"
+#ifndef _WIN32
+#include "w32_user.h"                                            // (R2b: the game's window among the stand-ins')
+#include "w32_net.h"                                             // (R2b: winsock's posted replies)
+#endif
 
 namespace {
 
@@ -197,6 +201,53 @@ void SDLCALL raw_message(void*, void*, unsigned int msg, Uint64 wparam, Sint64 l
         if (hooks[i]) hooks[i](msg, (int)wparam, (int)lparam);
 }
 
+#ifndef _WIN32
+// R2b (Linux): what Windows' window manager did for the game's window, from SDL's events. Activation: game_wndproc's
+// WM_ACTIVATEAPP from the game window's focus (Windows sends it only on a change: so here); a message posted to the
+// game's window (w32_set_message_poster, from any thread): an SDL event of its own, handed to the game's message hooks
+// where SDL's Windows message hook would have. Both also while a session replay feeds the input (as on Windows).
+Uint32 g_posted_event;
+
+void activate(bool active) {
+    static int last = -1;
+    if (last == (int)active) return;
+    last = active;
+    if (active) g_n_activations++;
+    if (!session_playing()) {                                    // a session replay: the recording's switches, not these
+        session_active(active);
+        set_game_active(active);
+    }
+    clip_cursor(active);
+    if (active && g_gl && g_window) SDL_RaiseWindow(g_window);
+}
+
+void post_message(uint32_t hwnd, uint32_t msg, uint32_t wparam, int32_t lparam) {
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = g_posted_event;
+    e.user.code = (Sint32)msg;
+    e.user.data1 = (void*)(uintptr_t)wparam;
+    e.user.data2 = (void*)(intptr_t)lparam;
+    (void)hwnd;                                                  // (the game's window: the only one with a queue)
+    SDL_PushEvent(&e);
+}
+
+// true if it was one of these
+bool system_event(const SDL_Event& e) {
+    if (e.type == SDL_WINDOWEVENT) {
+        if (!g_window || e.window.windowID != SDL_GetWindowID(g_window)) return true;   // (the loading window's)
+        if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) activate(true);
+        else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) activate(false);
+        return true;
+    }
+    if (g_posted_event && e.type == g_posted_event) {
+        raw_message(0, 0, (unsigned)e.user.code, (Uint64)(uintptr_t)e.user.data1, (Sint64)(intptr_t)e.user.data2);
+        return true;
+    }
+    return false;
+}
+#endif
+
 // [test] two_copies (viperport.ini; README, "Testing multiplayer on one PC"): both copies are windows side by side on
 // the primary display's usable area (without the taskbar), copy 1 on the left half and copy 2 on the right, each
 // the largest 4:3 or 16:9 picture that fits its half with the window's frame, centred in it. The OpenGL renderer
@@ -296,11 +347,20 @@ unsigned char __cdecl sdl_create_window(void* instance) {
         SendMessageA(g_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon);
     }
 #else
-    // R2b: the game's HWND -- a handle the window stand-ins (w32_user.h) know as this SDL window; switching away and
-    // back from SDL_WINDOWEVENT_FOCUS_LOST / FOCUS_GAINED in handle() (what game_wndproc does on WM_ACTIVATEAPP);
-    // SDL_SetWindowsMessageHook and SDL_RegisterApp above are Windows-only (the game's message hooks get nothing);
-    // the icon from race.exe's resource 1 through SDL_SetWindowIcon
-    vp_r2b_todo("platform.cpp sdl_create_window: the game's HWND, activation, icon (agent D)");
+    // R2b: the game's HWND -- a fake one the window stand-ins (w32_user.h) know as this SDL window, by the game's class
+    // and the window's title (start_unique_instance's FindWindowA); switching away and back from SDL's focus events
+    // (system_event: what game_wndproc does on WM_ACTIVATEAPP); the icon from race.exe's icon group 1; the replies
+    // winsock's stand-in posts to the game's window (an async host lookup) reach the game's message hooks through
+    // SDL's queue, in order with everything else (system_event), as SDL's Windows message hook hands them on
+    g_hwnd = (HWND)(uintptr_t)w32_adopt_window(g_window, cls ? cls : "Viper Racing Window", SDL_GetWindowTitle(g_window));
+    if (SDL_Surface* icon = w32_resource_icon((uint32_t)(uintptr_t)instance, 1)) {
+        SDL_SetWindowIcon(g_window, icon);
+        SDL_FreeSurface(icon);
+    } else {
+        logf("SDL: race.exe's icon wasn't found");
+    }
+    if (!g_posted_event) g_posted_event = SDL_RegisterEvents(1);
+    if (g_posted_event != (Uint32)-1) w32_set_message_poster(post_message);
 #endif
     *(HWND*)G.hwnd = g_hwnd;
     SDL_ShowCursor(SDL_DISABLE);                                 // the game draws its own
@@ -354,6 +414,9 @@ void mouse(int type, int x, int y) {
 }
 
 void handle(const SDL_Event& e) {
+#ifndef _WIN32
+    if (system_event(e)) return;                                 // (R2b: activation, posted messages)
+#endif
     switch (e.type) {
     case SDL_QUIT:                                               // WM_DESTROY, then WM_QUIT -> ExitProcess
         session_op(SOP_QUIT);
@@ -428,7 +491,12 @@ void __cdecl sdl_idle(void) {                                    // Win32Idle
     SDL_Event e;
     if (session_playing()) {                                     // a session replay: the recording's input
         while (SDL_PollEvent(&e))
+#ifndef _WIN32
             if (e.type == SDL_QUIT) handle(e);                   // (closing the window still quits)
+            else system_event(e);                                // (R2b: activation, posted messages, as on Windows)
+#else
+            if (e.type == SDL_QUIT) handle(e);                   // (closing the window still quits)
+#endif
         if (session_play_idle()) return;
     }                                                            // (the recording ran out: the player's, from here)
     session_idle_begin();

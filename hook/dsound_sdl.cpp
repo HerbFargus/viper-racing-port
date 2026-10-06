@@ -39,6 +39,9 @@
 #include "viperport.h"
 #include "port.h"
 #include "audio_core.h"
+#ifndef _WIN32
+#include "w32_seh.h"                                             // (R2b: the audio thread's fs: block)
+#endif
 
 void com_unsupported(const char* method);
 
@@ -87,6 +90,18 @@ struct SdlBuffer : Base_IDirectSoundBuffer {
     uint32_t align() const { return wfx.nBlockAlign ? wfx.nBlockAlign : 4; }
 
     static void SDLCALL callback(void* self, Uint8* out, int len) {
+#ifndef _WIN32
+        // R2b: SDL's audio thread runs this port code; a Windows thread starts with the x87 control word 0x27F
+        // (53-bit precision, all exceptions masked), a Linux one with 0x37F -- set Windows' once per thread, and give
+        // the thread its own Windows thread block behind fs: (w32_seh.h: SEH chain, signal stack)
+        static __thread bool x87_set;
+        if (!x87_set) {
+            w32_seh_thread_begin();
+            const unsigned short cw = 0x27f;
+            __asm__ volatile("fldcw %0" : : "m"(cw));
+            x87_set = true;
+        }
+#endif
         SdlBuffer* b = (SdlBuffer*)self;
         uint32_t size = (uint32_t)b->ring.size(), p = b->play.load();
         uint8_t fill = b->silence();
