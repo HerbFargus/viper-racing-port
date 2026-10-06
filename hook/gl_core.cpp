@@ -11,6 +11,7 @@
 #include "session.h"
 #include "fix_paths.h"
 #include "gl_dxgi.h"
+#include "perf.h"                               // [debug] perf: where a frame's time goes
 #ifdef VP_GCC
 #include <stdio.h>                                   // _snprintf, FILE (MSVC's own headers bring them in)
 #endif
@@ -696,6 +697,7 @@ namespace {
 
 void read_page() {                               // Lock of the back buffer: the 3D as it stands
     if (!on_gl_thread()) return;
+    perf::Scope perf_scope(perf::READBACK);
     touch_page();
     // the 4:3 middle, shrunk to the game's resolution (the 2D reads it: alpha pastes, XOR)
     int x0 = (int)floorf(st.ox + 0.5f), x1 = (int)floorf(st.ox + st.w * st.scale + 0.5f);
@@ -760,6 +762,7 @@ size_t page_overlay(const uint16_t* page, const uint16_t* under, const uint8_t* 
 
 void draw_page() {                               // Unlock: what the 2D drew, over the full-resolution 3D
     if (!on_gl_thread()) return;
+    perf::Scope perf_scope(perf::PAGE2D);
     if (!page_overlay(pg.page.data(), pg.under.data(), pg.drawn3d.data(), st.w, st.h, pg.overlay.data())) return;
     glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
     int x0 = (int)floorf(st.ox + 0.5f), x1 = (int)floorf(st.ox + st.w * st.scale + 0.5f);
@@ -849,6 +852,8 @@ void capture_frame() {                           // with st.fbo bound for readin
 
 void capture_install(const char* ini) {
     g_capture_ms = (uint32_t)vpos_GetPrivateProfileIntA("debug", "capture", 0, ini) * 1000u;
+    perf::on = vpos_GetPrivateProfileIntA("debug", "perf", 0, ini) != 0;
+    if (perf::on) logf("perf: on ([debug] perf=1): where each frame's time goes, every 5 s and at exit");
 }
 
 // the render target into the window (bound as the draw framebuffer): 1:1 -- the target is the window's size -- or, in a
@@ -865,6 +870,7 @@ void blit_to_window() {
 void present() {
     if (g_session_mode != SESSION_OFF) session_frame();   // a frame ends (the session recorder)
     if (!on_gl_thread()) return;
+    perf::Scope perf_scope(perf::PRESENT);
     glr::BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glr::BindFramebuffer(GL_READ_FRAMEBUFFER, st.fbo);
     capture_frame();
@@ -893,6 +899,7 @@ void present() {
     std::fill(pg.drawn3d.begin(), pg.drawn3d.end(), (uint8_t)0);   // a new frame: no 3D drawn yet
     touch_state();
     st.frames++;
+    perf::frame();
 }
 
 // Switched away: the picture shown once more. A full-screen window's frames bypass the desktop's compositor, so the
@@ -1278,6 +1285,7 @@ void set_material(Material* m, const D3DMATERIAL* p) {
 D3DMATERIALHANDLE material_handle(Material* m) { return (D3DMATERIALHANDLE)(uintptr_t)m; }
 
 void clear(Viewport* v, DWORD n, const D3DRECT* rects, DWORD flags) {
+    perf::Scope perf_scope(perf::DRAW3D);
     if (g_session_frames) {
         D3DCOLORVALUE c = v->background ? v->background->m.diffuse : D3DCOLORVALUE{0, 0, 0, 1};
         const DWORD head[2] = {n, flags};
@@ -1487,6 +1495,7 @@ void mark_drawn3d(bool tl, const void* verts, DWORD nverts) {
 }  // namespace
 
 HRESULT draw(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vtype, const void* verts, DWORD nverts, const WORD* idx, DWORD nidx) {
+    perf::Scope perf_scope(perf::DRAW3D);
     if (g_session_frames) hash_draw(pt, vtype, verts, nverts, idx, nidx);
     if (pt != D3DPT_TRIANGLELIST) {
         ::com_unsupported(idx ? "DrawIndexedPrimitive (not a triangle list)" : "DrawPrimitive (not a triangle list)");
@@ -1584,6 +1593,7 @@ HRESULT draw(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vtype, const void* verts, DWORD 
 
 void report() {
     if (st.frames) logf("exit: renderer: %llu frames, %llu draw calls, %llu triangles", st.frames, st.draws, st.triangles);
+    perf::report_exit();
 }
 
 // ---- for the harnesses ---------------------------------------------------------------------------------------------------

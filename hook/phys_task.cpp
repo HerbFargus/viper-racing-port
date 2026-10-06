@@ -32,6 +32,7 @@
 #include "fix_paths.h"
 #include "x87.h"
 #include "phys_types.h"
+#include "perf.h"                               // [debug] perf: the physics tick's time
 
 #define D(x) ((double)(x))                          // a register value (x87.h)
 typedef int Edx;                                    // the unused edx of a __thiscall received as __fastcall
@@ -457,6 +458,7 @@ PORT_FN(0x00426b20, "PhysTaskRestart", PhysTaskRestart_rw, fp_task_restart)
 // type, +0x40 the overflow flag), every phob's message (from +0x7dc), the deity's, and the event queue (+0x3d8),
 // which is emptied.
 static void __cdecl PhysTaskUpdate_rw() {
+    perf::PhysScope perf_scope;                            // (measures only: [debug] perf)
     SingleEnter(g_task_single, 0, 0);
     int n = TimerConditioner_GetTicks_o(g_timer, 0);
     i_pr_overhead_begin();
