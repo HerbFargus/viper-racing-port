@@ -461,6 +461,7 @@ Surface::~Surface() {
     if (tex && in.ready) {
         glr::Direct d;
         gl_api.DeleteTextures(1, &tex);
+        glr::cache_forget_texture(tex);
     }
     handles.erase(this);
     delete next_mip;                             // a chain's levels belong to its root
@@ -686,6 +687,7 @@ bool start() {
     gl_api.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     gl_api.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     gl_api.ProvokingVertex(GL_FIRST_VERTEX_CONVENTION);        // D3D flat shading takes the first vertex
+    glr::cache_reset();                          // (the state above went to the driver directly)
     in.ready = true;
     set_defaults();
     set_mode(st.w, st.h);
@@ -1574,7 +1576,7 @@ HRESULT draw(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vtype, const void* verts, DWORD 
         glr::Uniform1i(pr.uTexOn, 0);
         glr::Uniform1i(pr.uKeyed, 0);
     }
-    std::vector<uint8_t> buf;
+    static std::vector<uint8_t> buf;             // (kept: its memory is reused draw to draw)
     glr::BindBuffer(GL_ARRAY_BUFFER, in.vbo);
     glr::BufferData(GL_ARRAY_BUFFER, (ptrdiff_t)nverts * 32, for_check(vtype, verts, nverts, textured, buf), GL_STREAM_DRAW);
     touch_state();
