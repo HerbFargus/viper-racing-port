@@ -32,6 +32,8 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <algorithm>
+#include <vector>
 #include <string>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -192,10 +194,18 @@ Thread::~Thread() {
     }
     sem_destroy(&ack);
 }
+// the stand-in threads alive now (ExitProcess stops them first, as Windows does)
+std::mutex g_live_mu;
+std::vector<Thread*> g_live;
+
 void* posix_entry(void* p) {
     std::shared_ptr<Thread>* hold = (std::shared_ptr<Thread>*)p;
     Thread* t = hold->get();
     t_self = t;
+    {
+        std::lock_guard<std::mutex> lk(g_live_mu);
+        g_live.push_back(t);
+    }
     t_hold = hold;
     t_tid = t->tid;
     sigset_t m;
@@ -215,6 +225,10 @@ void* posix_entry(void* p) {
         code = t->start(t->param);
     }
     t->exiting = true;
+    {
+        std::lock_guard<std::mutex> lk(g_live_mu);
+        g_live.erase(std::remove(g_live.begin(), g_live.end(), t), g_live.end());
+    }
     finish(code);
     return 0;
 }
@@ -623,6 +637,27 @@ void W32K_CALL w32_ExitProcess(uint32_t code) {
 #ifdef _WIN32
     ExitProcess(code);
 #else
+    // Windows ends every other thread before the process's own exit work runs; exit() alone would run the port's exit
+    // logs and the static destructors with the game's threads (physics, timer, sound manager) still going -- one of them
+    // then hit a panic after the log had ended and faulted in the last-resort path (seen at quit on a real Linux PC).
+    // So the stand-in threads are stopped first (the SuspendThread handshake, a bounded wait each), then exit().
+    static std::atomic<bool> s_exiting{false};
+    if (!s_exiting.exchange(true)) {
+        std::lock_guard<std::mutex> lk(g_live_mu);
+        for (Thread* tp : g_live) {
+            if (tp == t_self || tp->exiting) continue;
+            std::lock_guard<std::mutex> sl(tp->smu);
+            if (tp->exiting || tp->suspend_count.fetch_add(1) != 0) continue;   // (already suspended: it stays so)
+            if (pthread_kill(tp->pt, sig_suspend()) != 0) continue;
+            for (int i = 0; i < 50; i++) {       // up to 0.5 s for it to say it's stopped
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 10 * 1000000;
+                if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+                if (sem_timedwait(&tp->ack, &ts) == 0 || tp->exiting) break;
+            }
+        }
+    }
     exit((int)code);                             // atexit / static destructors: the port's exit logs (see R2b notes)
 #endif
 }
