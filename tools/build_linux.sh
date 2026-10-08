@@ -6,6 +6,11 @@
 #   tools/build_linux.sh            compile (only what changed) + link out-linux/viperport-link-test and
 #                                   out-linux/viperport (the game: loader/viperport_linux.cpp says how to run it)
 #   tools/build_linux.sh clean      remove out-linux/
+#   tools/build_linux.sh release    the build that's packaged (tools/package_linux.sh) -> out-linux-release/: run in the
+#                                   Ubuntu 22.04 WSL distro (glibc 2.35, so older distros run it too) with g++-15 from the toolchain PPA (the same GCC 15.2 as the main Linux build: GCC 12 has no -fexcess-precision=standard for C++, and GCC 13's x87 code parts from the corpus) and
+#                                   SDL2 built for i386 in /opt/sdl2-i386; libstdc++/libgcc linked in statically (Mesa's
+#                                   drivers load into the process and need the system's own newer libstdc++, so an older
+#                                   copy can't ship beside it), SDL2 found in ./lib beside the binary (RPATH $ORIGIN/lib)
 #   VP_JOBS=n                       compilers at a time (default: nproc)
 #
 # The flags are build_gcc.bat's (the x87 rules of hook/compiler.h: -m32 -O2 -march=i686 -mfpmath=387
@@ -29,11 +34,20 @@ set -u
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$(pwd)
 OUT=$ROOT/out-linux
-if [ "${1:-}" = clean ]; then rm -rf "$OUT"; exit 0; fi
+RELEASE=0
+if [ "${1:-}" = release ]; then RELEASE=1; OUT=$ROOT/out-linux-release; fi
+if [ "${1:-}" = clean ]; then rm -rf "$OUT" "$ROOT/out-linux-release"; exit 0; fi
 mkdir -p "$OUT/obj"
 
-CXX=${CXX:-g++}
-SDL_CFLAGS=$(sdl2-config --cflags) || { echo "build_linux: no sdl2-config (apt install libsdl2-dev:i386)"; exit 1; }
+if [ $RELEASE = 1 ]; then
+    CXX=${CXX:-g++-15}
+    SDL_CONFIG=/opt/sdl2-i386/bin/sdl2-config
+    [ -x "$SDL_CONFIG" ] || { echo "build_linux release: no $SDL_CONFIG (SDL2 2.32 built for i386 -- see out/briefs/linux_pkg_brief.md)"; exit 1; }
+else
+    CXX=${CXX:-g++}
+    SDL_CONFIG=sdl2-config
+fi
+SDL_CFLAGS=$($SDL_CONFIG --cflags) || { echo "build_linux: no sdl2-config (apt install libsdl2-dev:i386)"; exit 1; }
 CFLAGS="-m32 -O2 -march=i686 -mfpmath=387 -fexcess-precision=standard -fno-strict-aliasing -masm=intel -std=c++17 \
 -fms-extensions -Wno-invalid-offsetof -fno-pie -fno-pic -fno-stack-protector -fno-stack-clash-protection \
 -fcf-protection=none -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -mincoming-stack-boundary=2 -D_FILE_OFFSET_BITS=64 $SDL_CFLAGS \
@@ -52,6 +66,9 @@ CFLAGS="-m32 -O2 -march=i686 -mfpmath=387 -fexcess-precision=standard -fno-stric
 # the port opens its own files with fopen and Windows paths: the wrapper (hook/vp_os_linux.cpp) takes them through the path layer
 LDFLAGS="-m32 -no-pie -Wl,--wrap=fopen -Wl,--wrap=fopen64"
 LIBS="-lSDL2 -lGL -lpthread -ldl -lrt"
+if [ $RELEASE = 1 ]; then
+    LDFLAGS="$LDFLAGS -static-libstdc++ -static-libgcc -L/opt/sdl2-i386/lib -Wl,-rpath,\$ORIGIN/lib -Wl,--enable-new-dtags"
+fi
 
 # build_gcc.bat's VP_SOURCES, in its order, plus the Linux-only files
 PATTERNS="viperport.cpp port.cpp replay.cpp session.cpp standalone.cpp net_*.cpp crt_*.cpp edit_*.cpp phys_*.cpp \
@@ -112,11 +129,11 @@ EOF
 $CXX $CFLAGS -I"$ROOT/hook" -c "$OUT/link_test.cpp" -o "$OUT/link_test.o" || exit 1
 $CXX $LDFLAGS -o "$OUT/viperport-link-test" "$OUT/link_test.o" "${OBJS[@]}" -Wl,-Map,"$OUT/viperport-link-test.map" $LIBS \
     || { echo "build_linux: link failed"; exit 1; }
-echo "build_linux: out-linux/viperport-link-test linked"
+echo "build_linux: ${OUT#$ROOT/}/viperport-link-test linked"
 
 # the game: the ELF loader (loader/viperport_linux.cpp) and the whole port, one executable. Non-PIE, linked at ld's
 # default 0x08048000, so race.exe's 0x400000-0x62c000 is free for the loader to map it.
 $CXX $CFLAGS -I"$ROOT/hook" -c "$ROOT/loader/viperport_linux.cpp" -o "$OUT/viperport_linux.o" || exit 1
 $CXX $LDFLAGS -o "$OUT/viperport" "$OUT/viperport_linux.o" "${OBJS[@]}" -Wl,-Map,"$OUT/viperport.map" $LIBS \
     || { echo "build_linux: link of viperport failed"; exit 1; }
-echo "build_linux: out-linux/viperport linked"
+echo "build_linux: ${OUT#$ROOT/}/viperport linked"
