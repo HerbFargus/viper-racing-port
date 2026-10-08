@@ -172,6 +172,7 @@ void session_gfx_state(uint32_t, const void*, size_t) {}
 void session_gfx_page(const uint16_t*, int, int, const uint8_t*) {}
 void session_frame() {}
 uint64_t session_hash(const void*, size_t, uint64_t h) { return h; }
+bool session_graphics(int* a, int* m) { *a = *m = 0; return false; }   // no replay: viperport.ini's (none here)
 bool session_render_size(int*, int*) { return false; }           // no replay: the target follows the window
 
 // port.h's check interface, as port.cpp has it (see the header)

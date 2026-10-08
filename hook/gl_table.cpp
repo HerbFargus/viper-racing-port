@@ -47,7 +47,7 @@ enum Id : uint16_t {
     I_GenFramebuffers, I_GenRenderbuffers, I_GenTextures, I_PixelStorei, I_ReadPixels, I_RenderbufferStorage,
     I_Scissor, I_TexImage2D, I_TexParameterf, I_TexParameteri, I_TexSubImage2D, I_Uniform1f, I_Uniform1i,
     I_Uniform2f, I_Uniform3f, I_Uniform4f, I_UniformMatrix4fv, I_UseProgram, I_Viewport, I_SwapWindow,
-    I_GetDrawableSize, I_SetView,
+    I_GetDrawableSize, I_SetView, I_RenderbufferStorageMultisample,
 };
 
 #ifdef VP_GCC
@@ -236,7 +236,7 @@ const char* gl_record_name(uint16_t m) {
     "glGenRenderbuffers", "glGenTextures", "glPixelStorei", "glReadPixels", "glRenderbufferStorage", "glScissor",
     "glTexImage2D", "glTexParameterf", "glTexParameteri", "glTexSubImage2D", "glUniform1f", "glUniform1i",
     "glUniform2f", "glUniform3f", "glUniform4f", "glUniformMatrix4fv", "glUseProgram", "glViewport",
-    "SDL_GL_SwapWindow", "SDL_GL_GetDrawableSize", "platform_set_view"};
+    "SDL_GL_SwapWindow", "SDL_GL_GetDrawableSize", "platform_set_view", "glRenderbufferStorageMultisample"};
     unsigned i = (unsigned)m - GLREC_BASE - 1;
     return m > GLREC_BASE && i < sizeof n / sizeof n[0] ? n[i] : 0;
 }
@@ -403,6 +403,9 @@ void ReadPixels(GLint x, GLint y, GLsizei wd, GLsizei ht, GLenum f, GLenum t, vo
     if (ph == 2) { take(out, n); return; }
     VP_DRV gl_api.ReadPixels(x, y, wd, ht, f, t, out);
     if (ph == 1) save(out, n);
+}
+void RenderbufferStorageMultisample(GLenum a, GLsizei n, GLenum b, GLsizei c, GLsizei d) {
+    if (LIVE(rec(I_RenderbufferStorageMultisample, 0, 0, a, n, b, c, d))) VP_DRV gl_api.RenderbufferStorageMultisample(a, n, b, c, d);
 }
 void RenderbufferStorage(GLenum a, GLenum b, GLsizei c, GLsizei d) {
     if (LIVE(rec(I_RenderbufferStorage, 0, 0, a, b, c, d))) VP_DRV gl_api.RenderbufferStorage(a, b, c, d);

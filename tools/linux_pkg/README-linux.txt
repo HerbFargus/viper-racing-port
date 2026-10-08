@@ -48,6 +48,9 @@ Good to know
 * Settings: viperport.ini (made on the first run, beside race.exe). The game's own options and
   saves go to Config/.
 * Log: viperport.log beside race.exe -- the first place to look if something goes wrong.
+* Graphics: add a [graphics] section to viperport.ini -- anisotropic=16 sharpens distant
+  textures (switch on "filtering" and "mipmap" in the game's Graphics options too) and msaa=2
+  or 4 smooths edges (next start). Both are 0, the original look, until you change them.
 * Performance: put  perf=1  under  [debug]  in viperport.ini and the log shows where each frame's
   time goes, every 5 seconds.
 * Multiplayer: TCP/IP (UDP) play works with Windows players -- tested on a LAN. IPX, serial and

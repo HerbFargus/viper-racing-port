@@ -12,6 +12,11 @@
 #include "fix_paths.h"
 #include "gl_dxgi.h"
 #include "perf.h"                               // [debug] perf: where a frame's time goes
+#define VP_GL_TEXTURE_MAX_ANISOTROPY 0x84FE      // (GL 4.6 / EXT_texture_filter_anisotropic, which every GL 3.3 driver has)
+#define VP_GL_MAX_TEXTURE_MAX_ANISOTROPY 0x84FF
+#ifndef GL_MAX_SAMPLES
+#define GL_MAX_SAMPLES 0x8D57
+#endif
 #ifdef VP_GCC
 #include <stdio.h>                                   // _snprintf, FILE (MSVC's own headers bring them in)
 #endif
@@ -106,7 +111,34 @@ struct Infra {                                   // made once by start()
     Program smooth, flat;
     GLuint comp = 0, comp_tex_uniform = 0;
     GLuint vao = 0, vbo = 0, ibo = 0, quad_vao = 0, quad_vbo = 0, page_tex = 0;
+    // [graphics] (viperport.ini; a replay: the recording's), decided once the context is up. Kept here, not in the
+    // renderer's state, which the shadow checks save and compare.
+    int msaa = 0;                                // anti-aliasing samples: 0, or 2 / 4 / 8 as the GPU allows
+    float aniso = 0;                             // anisotropic filtering: 0, or 2..16 as the GPU allows
+    // msaa: everything is drawn into ms_fbo (the 3D, its clears, the 2D laid over it) and resolved into st.fbo before
+    // anything reads st.fbo (the 2D's read-back, the present, a capture) -- so the 2D lands on the smoothed 3D as
+    // before, and a frame that mixes 2D and 3D in any order needs no copy back
+    GLuint ms_fbo = 0, ms_color = 0, ms_depth = 0;
+    bool ms_dirty = false;                       // drawn to since the last resolve
 } in;
+int g_ini_aniso, g_ini_msaa;                     // viperport.ini [graphics] anisotropic= / msaa= (capture_install)
+bool g_graphics_in_replays;                      // [debug] graphics_in_replays=1: a replay uses viperport.ini's (to test them)
+
+// where drawing goes: the multisampled target with msaa, else st.fbo (exactly as without the setting)
+GLuint target_fbo() {
+    if (!in.msaa || !in.ms_fbo) return st.fbo;
+    in.ms_dirty = true;
+    return in.ms_fbo;
+}
+// before st.fbo is read: what was drawn into the multisampled target, smoothed into it
+void resolve() {
+    if (!in.msaa || !in.ms_fbo || !in.ms_dirty) return;
+    glr::BindFramebuffer(GL_READ_FRAMEBUFFER, in.ms_fbo);
+    glr::BindFramebuffer(GL_DRAW_FRAMEBUFFER, st.fbo);
+    glr::Disable(GL_SCISSOR_TEST);               // (every draw, clear and blit sets its own)
+    glr::BlitFramebuffer(0, 0, st.rt_w, st.rt_h, 0, 0, st.rt_w, st.rt_h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    in.ms_dirty = false;
+}
 
 GLuint compile(GLenum type, const char* prelude, const char* src) {
     GLuint s = gl_api.CreateShader(type);
@@ -558,6 +590,35 @@ void make_target() {                             // the render target at the win
     glr::ClearDepth(1.0);
     glr::DepthMask(GL_TRUE);
     glr::Clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    if (in.msaa) {                               // [graphics] msaa: the multisampled target at the same size
+        if (in.ms_fbo) {
+            glr::DeleteFramebuffers(1, &in.ms_fbo);
+            glr::DeleteRenderbuffers(1, &in.ms_color);
+            glr::DeleteRenderbuffers(1, &in.ms_depth);
+        }
+        glr::GenRenderbuffers(1, &in.ms_color);
+        glr::BindRenderbuffer(GL_RENDERBUFFER, in.ms_color);
+        glr::RenderbufferStorageMultisample(GL_RENDERBUFFER, in.msaa, GL_RGBA8, ww, wh);
+        glr::GenRenderbuffers(1, &in.ms_depth);
+        glr::BindRenderbuffer(GL_RENDERBUFFER, in.ms_depth);
+        glr::RenderbufferStorageMultisample(GL_RENDERBUFFER, in.msaa, GL_DEPTH_COMPONENT24, ww, wh);
+        glr::GenFramebuffers(1, &in.ms_fbo);
+        glr::BindFramebuffer(GL_FRAMEBUFFER, in.ms_fbo);
+        glr::FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, in.ms_color);
+        glr::FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, in.ms_depth);
+        if (glr::CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            logf("renderer: %dx anti-aliasing isn't available at %dx%d -- off", in.msaa, ww, wh);
+            glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
+            glr::DeleteFramebuffers(1, &in.ms_fbo);
+            glr::DeleteRenderbuffers(1, &in.ms_color);
+            glr::DeleteRenderbuffers(1, &in.ms_depth);
+            in.ms_fbo = in.ms_color = in.ms_depth = 0;
+            in.msaa = 0;
+        } else {
+            glr::Clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        }
+        in.ms_dirty = false;
+    }
 }
 
 }  // namespace
@@ -654,6 +715,21 @@ bool start() {
     SDL_GL_SetSwapInterval(1);
     in.thread = vpos_GetCurrentThreadId();
     logf("renderer: OpenGL %s on %s", (const char*)gl_api.GetString(GL_VERSION), (const char*)gl_api.GetString(GL_RENDERER));
+    {   // [graphics]: viperport.ini's, or a replay's recording's; each as far as this GPU goes
+        int a = g_ini_aniso, m = g_ini_msaa;
+        if (!g_graphics_in_replays) session_graphics(&a, &m);
+        GLint max_samples = 0;
+        GLfloat max_aniso = 0;
+        gl_api.GetIntegerv(GL_MAX_SAMPLES, &max_samples);
+        gl_api.GetFloatv(VP_GL_MAX_TEXTURE_MAX_ANISOTROPY, &max_aniso);   // (no extension: left 0)
+        in.msaa = 0;
+        for (int k = 2; k <= m && k <= max_samples && k <= 8; k *= 2) in.msaa = k;
+        in.aniso = a >= 2 && max_aniso >= 2 ? (float)(a < 16 ? a : 16) : 0.0f;
+        if (in.aniso > max_aniso) in.aniso = max_aniso;
+        if (a || m)
+            logf("renderer: graphics: anisotropic filtering %gx, anti-aliasing %dx (asked %d and %d; this GPU allows %gx and %dx)",
+                 in.aniso, in.msaa, a, m, max_aniso, max_samples);
+    }
     // FIX: present through a DXGI flip-model swap chain where the driver allows (gl_dxgi.h), so screenshots and the
     // taskbar's preview see the game on NVIDIA; anything else presents through SDL_GL_SwapWindow as before
     if (dxgi::start(win)) gl_api.SwapWindow = swap_live;
@@ -705,6 +781,7 @@ void read_page() {                               // Lock of the back buffer: the
     touch_page();
     // the 4:3 middle, shrunk to the game's resolution (the 2D reads it: alpha pastes, XOR)
     int x0 = (int)floorf(st.ox + 0.5f), x1 = (int)floorf(st.ox + st.w * st.scale + 0.5f);
+    resolve();
     glr::BindFramebuffer(GL_READ_FRAMEBUFFER, st.fbo);
     glr::BindFramebuffer(GL_DRAW_FRAMEBUFFER, st.small_fbo);
     glr::Disable(GL_SCISSOR_TEST);
@@ -768,7 +845,7 @@ void draw_page() {                               // Unlock: what the 2D drew, ov
     if (!on_gl_thread()) return;
     perf::Scope perf_scope(perf::PAGE2D);
     if (!page_overlay(pg.page.data(), pg.under.data(), pg.drawn3d.data(), st.w, st.h, pg.overlay.data())) return;
-    glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
+    glr::BindFramebuffer(GL_FRAMEBUFFER, target_fbo());
     int x0 = (int)floorf(st.ox + 0.5f), x1 = (int)floorf(st.ox + st.w * st.scale + 0.5f);
     glr::Viewport(x0, 0, x1 - x0, (int)floorf(st.h * st.scale + 0.5f));
     glr::Disable(GL_SCISSOR_TEST); glr::Disable(GL_DEPTH_TEST); glr::Disable(GL_CULL_FACE);
@@ -856,6 +933,9 @@ void capture_frame() {                           // with st.fbo bound for readin
 
 void capture_install(const char* ini) {
     g_capture_ms = (uint32_t)vpos_GetPrivateProfileIntA("debug", "capture", 0, ini) * 1000u;
+    g_ini_aniso = vpos_GetPrivateProfileIntA("graphics", "anisotropic", 0, ini);
+    g_ini_msaa = vpos_GetPrivateProfileIntA("graphics", "msaa", 0, ini);
+    g_graphics_in_replays = vpos_GetPrivateProfileIntA("debug", "graphics_in_replays", 0, ini) != 0;
     perf::on = vpos_GetPrivateProfileIntA("debug", "perf", 0, ini) != 0;
     if (perf::on) logf("perf: on ([debug] perf=1): where each frame's time goes, every 5 s and at exit");
 }
@@ -875,6 +955,7 @@ void present() {
     if (g_session_mode != SESSION_OFF) session_frame();   // a frame ends (the session recorder)
     if (!on_gl_thread()) return;
     perf::Scope perf_scope(perf::PRESENT);
+    resolve();
     glr::BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glr::BindFramebuffer(GL_READ_FRAMEBUFFER, st.fbo);
     capture_frame();
@@ -892,7 +973,7 @@ void present() {
                      (int)floorf(st.h * st.scale * ky + 0.5f), st.w, st.h);
     }
     // the sides only get drawn by a full-width 3D view; anything else there would be stale
-    glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
+    glr::BindFramebuffer(GL_FRAMEBUFFER, target_fbo());
     glr::Enable(GL_SCISSOR_TEST);
     glr::ClearColor(0, 0, 0, 1);
     glr::Scissor(0, 0, x0, st.rt_h);
@@ -913,12 +994,13 @@ void present() {
 void repaint() {
     if (!in.ready || !st.fbo || !on_gl_thread() || shadow_com_check()) return;
     glr::Direct direct;
+    resolve();
     glr::BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glr::BindFramebuffer(GL_READ_FRAMEBUFFER, st.fbo);
     glr::Disable(GL_SCISSOR_TEST);               // (every draw and clear sets its own scissor)
     blit_to_window();
     glr::SwapWindow(platform_window());
-    glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
+    glr::BindFramebuffer(GL_FRAMEBUFFER, in.msaa && in.ms_fbo ? in.ms_fbo : st.fbo);
 }
 
 // ---- surfaces -----------------------------------------------------------------------------------------------------------
@@ -1298,7 +1380,7 @@ void clear(Viewport* v, DWORD n, const D3DRECT* rects, DWORD flags) {
         session_gfx(SG_CLEAR, head, sizeof head, &c, sizeof c, rects, (size_t)n * sizeof *rects);
     }
     if (!on_gl_thread()) return;
-    glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
+    glr::BindFramebuffer(GL_FRAMEBUFFER, target_fbo());
     glr::Enable(GL_SCISSOR_TEST);
     glr::DepthMask(GL_TRUE);
     GLbitfield bits = 0;
@@ -1517,7 +1599,7 @@ HRESULT draw(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vtype, const void* verts, DWORD 
     if (vtype != D3DVT_LVERTEX && vtype != D3DVT_TLVERTEX) { ::com_unsupported("DrawPrimitive with D3DVT_VERTEX"); return DD_OK; }
     const DWORD* rs = st.rs;
     Program& pr = rs[D3DRENDERSTATE_SHADEMODE] == D3DSHADE_FLAT ? in.flat : in.smooth;
-    glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
+    glr::BindFramebuffer(GL_FRAMEBUFFER, target_fbo());
     glr::UseProgram(pr.id);
     glr::BindVertexArray(in.vao);
     bool tl = vtype == D3DVT_TLVERTEX;
@@ -1578,6 +1660,9 @@ HRESULT draw(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vtype, const void* verts, DWORD 
         float bias;
         memcpy(&bias, &rs[D3DRENDERSTATE_MIPMAPLODBIAS], 4);
         glr::TexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, bias);
+        if (in.aniso > 0)                        // [graphics] anisotropic: where the game filters (its nearest stays)
+            glr::TexParameterf(GL_TEXTURE_2D, VP_GL_TEXTURE_MAX_ANISOTROPY,
+                               min_filter(rs[D3DRENDERSTATE_TEXTUREMIN], mips) == GL_NEAREST ? 1.0f : in.aniso);
         glr::Uniform1i(pr.uTex, 0);
         glr::Uniform1i(pr.uTexOn, 1);
         glr::Uniform1i(pr.uTexAlpha, tex->fmt == F4444 || tex->fmt == F1555);
@@ -1625,3 +1710,4 @@ bool start_headless() {
 
 void gfx_repaint() { gfx::repaint(); }
 void gfx_capture_install(const char* ini) { gfx::capture_install(ini); }
+void gfx_graphics_ini(int* aniso, int* msaa) { *aniso = gfx::g_ini_aniso, *msaa = gfx::g_ini_msaa; }

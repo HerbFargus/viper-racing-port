@@ -44,6 +44,10 @@ Good to know
   mods that load as a DLL beside the game. The release page lists each file's SHA-256 checksum.
 * Settings: viperport.ini. The game's own options and saves go to Config\.
 * Log: viperport.log beside race.exe -- the first place to look if something goes wrong.
+* Graphics: [graphics] in viperport.ini -- anisotropic=16 sharpens distant textures (switch on
+  "filtering" and "mipmap" in the game's Graphics options too) and msaa=2 or 4 smooths edges
+  (next start). Both are 0, the original look, until you change them. The mod manager's
+  Graphics choice sets all of this for you.
 * Performance: put  perf=1  under  [debug]  in viperport.ini and the log shows where each
   frame's time goes, every 5 seconds.
 * Multiplayer: Windows and Linux players can race each other over TCP/IP. Each player sees

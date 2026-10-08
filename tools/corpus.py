@@ -315,8 +315,9 @@ def sha12(path):
 
 
 # ---- one replay ------------------------------------------------------------------------------------------------------
-def run_one(install, entry, route, label, timeout, grace, log_tail, linux=None):
-    """linux: None (Windows), or {"distro": ..., "exe": the Linux viperport}: the standalone route in WSL."""
+def run_one(install, entry, route, label, timeout, grace, log_tail, linux=None, extra=None, cross_gpu=False):
+    """linux: None (Windows), or {"distro": ..., "exe": the Linux viperport}: the standalone route in WSL. extra: more
+    viperport.ini settings ({section: {key: value}}, over the entry's); cross_gpu: compare as --linux does (3D tiles out)."""
     session = entry["session"].replace("/", "\\")
     exe = entry.get("exe", "race.exe")
     if route == "standalone":
@@ -328,8 +329,11 @@ def run_one(install, entry, route, label, timeout, grace, log_tail, linux=None):
         base = f.read()
     with open(ini_path, "w", encoding="latin-1", newline="\r\n") as f:
         # (--linux: another GPU than the recording's -- [session] cross_gpu leaves the page tiles with 3D out)
-        f.write(ini_for_run(base, session, label, "original" if route == "original" else "new", entry.get("ini"),
-                            cross_gpu=bool(linux)))
+        ini = {s: dict(k) for s, k in (entry.get("ini") or {}).items()}
+        for sec, keys in (extra or {}).items():
+            ini.setdefault(sec, {}).update(keys)
+        f.write(ini_for_run(base, session, label, "original" if route == "original" else "new", ini,
+                            cross_gpu=bool(linux) or cross_gpu))
     log_path = os.path.join(install, "viperport.log")
     started = time.time()
     run = LinuxRun(linux["distro"], linux["exe"], os.path.join(install, exe), install) if linux else None
@@ -478,7 +482,17 @@ def main():
     ap.add_argument("--linux", action="store_true", help="the standalone route on the native Linux build, in WSL")
     ap.add_argument("--linux-exe", default=LINUX_EXE, help="the Linux viperport (default out-linux/viperport)")
     ap.add_argument("--distro", default="Ubuntu", help="the WSL distribution --linux runs in")
+    ap.add_argument("--set", nargs="*", default=[], metavar="SECTION.KEY=VALUE",
+                    help="extra viperport.ini settings for every replay (e.g. graphics.msaa=4 debug.graphics_in_replays=1)")
+    ap.add_argument("--cross-gpu", action="store_true",
+                    help="compare as --linux does: page tiles holding GPU-drawn 3D left out (for settings that change the 3D)")
     a = ap.parse_args()
+    extra = {}
+    for item in a.set:                               # SECTION.KEY=VALUE
+        m = re.match(r"([^.=]+)\.([^=]+)=(.*)$", item)
+        if not m:
+            raise SystemExit("--set %s: SECTION.KEY=VALUE" % item)
+        extra.setdefault(m.group(1), {})[m.group(2)] = m.group(3)
 
     if a.selftest:
         return selftest()
@@ -549,7 +563,8 @@ def main():
                 print("stopped: the game is still running (%s) -- a replay left it running, or someone started it" %
                       ", ".join(busy))
                 break
-            res = run_one(install, e, r, "%s-%s" % (a.label, "linux" if linux else r), a.timeout, a.grace, 12, linux)
+            res = run_one(install, e, r, "%s-%s" % (a.label, "linux" if linux else r), a.timeout, a.grace, 12, linux,
+                          extra, a.cross_gpu)
             results.append(res)
             print("        %s  %s  (%s s, %s)" % (res["verdict"], "; ".join(res["why"]) or
                                                  "%s frames, %d races" % (res["frames_compared"], len(res["races"])),

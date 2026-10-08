@@ -74,6 +74,7 @@ void GenRenderbuffers(GLsizei, GLuint*);
 void GenTextures(GLsizei, GLuint*);
 void PixelStorei(GLenum, GLint);
 void ReadPixels(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
+void RenderbufferStorageMultisample(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
 void RenderbufferStorage(GLenum, GLenum, GLsizei, GLsizei);
 void Scissor(GLint, GLint, GLsizei, GLsizei);
 void TexImage2D(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*);

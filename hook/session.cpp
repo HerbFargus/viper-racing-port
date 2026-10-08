@@ -1671,7 +1671,8 @@ void first_present() {
     }
 #endif
     if (g_session_mode == SESSION_RECORD) {
-        int rec[2] = {g_win_w, g_win_h};
+        int rec[4] = {g_win_w, g_win_h, 0, 0};          // (+ the [graphics] settings, which change the 3D's pixels)
+        gfx_graphics_ini(&rec[2], &rec[3]);
         put(K_INFO, rec, sizeof rec);
     }
 }
@@ -1683,9 +1684,22 @@ bool session_render_size(int* w, int* h) {
     if (g_session_mode != SESSION_PLAY && g_session_mode != SESSION_ENDED) return false;
     int rec[2] = {0, 0};
     for (const Rec& r : g_recs)
-        if (r.kind == K_INFO && r.len == sizeof rec) { memcpy(rec, payload(r), sizeof rec); break; }
+        if (r.kind == K_INFO && r.len >= sizeof rec) { memcpy(rec, payload(r), sizeof rec); break; }
     if (rec[0] <= 0 || rec[1] <= 0) return false;
     *w = rec[0], *h = rec[1];
+    return true;
+}
+
+bool session_graphics(int* aniso, int* msaa) {
+    if (g_session_mode != SESSION_PLAY && g_session_mode != SESSION_ENDED) return false;   // (viperport.ini's stand)
+    *aniso = *msaa = 0;
+    for (const Rec& r : g_recs)
+        if (r.kind == K_INFO && r.len >= 16) {
+            int32_t rec[4];
+            memcpy(rec, payload(r), sizeof rec);
+            *aniso = rec[2], *msaa = rec[3];
+            break;
+        }
     return true;
 }
 
