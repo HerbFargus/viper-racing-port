@@ -33,6 +33,9 @@ DNF="glibc.i686 mesa-libGL.i686 mesa-dri-drivers.i686 libX11.i686 libXext.i686 l
 PACMAN="lib32-glibc lib32-mesa lib32-libx11 lib32-libxext lib32-libxcursor lib32-libxi lib32-libxrandr lib32-libxss lib32-libpulse"
 sed -e "s/@VERSION@/$VERSION/" -e "s/@APT_PACKAGES@/$APT/" -e "s/@DNF_PACKAGES@/$DNF/" -e "s/@PACMAN_PACKAGES@/$PACMAN/" \
     tools/linux_pkg/README-linux.txt > "$STAGE/README-linux.txt"
+if grep -q "$(printf '')" "$STAGE/README-linux.txt" "$STAGE/viperport.sh"; then
+    echo "package_linux: CR line ends in the README or viperport.sh (a Windows edit): the install line would break"; exit 1
+fi
 
 SDL_SRC=/opt/src/SDL2-2.32.10
 cp "$SDL_SRC/LICENSE.txt" "$STAGE/LICENSES/SDL2-LICENSE.txt"
