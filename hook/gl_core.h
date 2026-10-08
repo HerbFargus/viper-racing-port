@@ -247,6 +247,9 @@ struct Page {                                    // the back buffer as the game'
                                                  // since neither cleared nor covered by the game's 2D: pixels another GPU
                                                  // rasterises differently (a cross-GPU replay leaves their tiles out;
                                                  // never saved or compared)
+    int done3d[4] = {}, donegpu[4] = {};         // a rect (x0, y0, x1, y1) already all 1s in drawn3d / gpu, so a draw
+                                                 // over it marks nothing new (x1 <= x0: none) -- forgotten wherever
+                                                 // those change otherwise
 };
 extern Page pg;
 extern std::set<Surface*> handles;               // live texture surfaces, to validate texture handles (K_HANDLES)

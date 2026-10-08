@@ -213,10 +213,10 @@ bool stream_upload(GLenum t, ptrdiff_t n, const void* p, GLenum u) {
     bool& alloc = vtx ? S.valloc : S.ialloc;
     const size_t ring = vtx ? VRING : IRING, step = vtx ? 32 : 4;
     if (!alloc || off + (size_t)n > ring) {      // (a fresh store: what the GPU still reads stays with the old one)
-        gl_api.BufferData(t, (ptrdiff_t)ring, 0, GL_STREAM_DRAW);
+        VP_DRV gl_api.BufferData(t, (ptrdiff_t)ring, 0, GL_STREAM_DRAW);
         off = 0, alloc = true;
     }
-    gl_api.BufferSubData(t, (ptrdiff_t)off, n, p);
+    VP_DRV gl_api.BufferSubData(t, (ptrdiff_t)off, n, p);
     if (vtx) S.base = (GLint)(off / 32);
     else S.ibase = off;
     off += ((size_t)n + step - 1) / step * step;
@@ -250,7 +250,7 @@ void ActiveTexture(GLenum a) {
     if (!live(rec(I_ActiveTexture, 0, 0, a))) return;
     if (C.active == a) return skipped();
     C.active = a;
-    gl_api.ActiveTexture(a);
+    VP_DRV gl_api.ActiveTexture(a);
 }
 void BindBuffer(GLenum a, GLuint b) {
     if (!live(rec(I_BindBuffer, 0, 0, a, b))) return;
@@ -258,7 +258,7 @@ void BindBuffer(GLenum a, GLuint b) {
         if (C.array_buf == b) return skipped();
         C.array_buf = b;
     }
-    gl_api.BindBuffer(a, b);
+    VP_DRV gl_api.BindBuffer(a, b);
 }
 void BindFramebuffer(GLenum a, GLuint b) {
     if (!live(rec(I_BindFramebuffer, 0, 0, a, b))) return;
@@ -266,9 +266,9 @@ void BindFramebuffer(GLenum a, GLuint b) {
     if ((!d || C.draw_fb == b) && (!r || C.read_fb == b)) return skipped();
     if (d) C.draw_fb = b;
     if (r) C.read_fb = b;
-    gl_api.BindFramebuffer(a, b);
+    VP_DRV gl_api.BindFramebuffer(a, b);
 }
-void BindRenderbuffer(GLenum a, GLuint b) { if (LIVE(rec(I_BindRenderbuffer, 0, 0, a, b))) gl_api.BindRenderbuffer(a, b); }
+void BindRenderbuffer(GLenum a, GLuint b) { if (LIVE(rec(I_BindRenderbuffer, 0, 0, a, b))) VP_DRV gl_api.BindRenderbuffer(a, b); }
 void BindTexture(GLenum a, GLuint b) {
     if (!live(rec(I_BindTexture, 0, 0, a, b))) return;
     const GLuint unit = C.active == UNKNOWN ? UNKNOWN : C.active - GL_TEXTURE0;
@@ -276,107 +276,107 @@ void BindTexture(GLenum a, GLuint b) {
         if (C.tex[unit] == b) return skipped();
         C.tex[unit] = b;
     }
-    gl_api.BindTexture(a, b);
+    VP_DRV gl_api.BindTexture(a, b);
 }
 void BindVertexArray(GLuint a) {
     if (!live(rec(I_BindVertexArray, 0, 0, a))) return;
     if (C.vao == a) return skipped();
     C.vao = a;
-    gl_api.BindVertexArray(a);
+    VP_DRV gl_api.BindVertexArray(a);
 }
 void BlendFunc(GLenum a, GLenum b) {
     if (!live(rec(I_BlendFunc, 0, 0, a, b))) return;
     if (C.blend_ok && C.blend_s == a && C.blend_d == b) return skipped();
     C.blend_ok = true, C.blend_s = a, C.blend_d = b;
-    gl_api.BlendFunc(a, b);
+    VP_DRV gl_api.BlendFunc(a, b);
 }
 void BlitFramebuffer(GLint a, GLint b, GLint c, GLint d, GLint e, GLint f, GLint g, GLint h, GLbitfield m, GLenum fl) {
-    if (LIVE(rec(I_BlitFramebuffer, 0, 0, a, b, c, d, e, f, g, h, m, fl))) gl_api.BlitFramebuffer(a, b, c, d, e, f, g, h, m, fl);
+    if (LIVE(rec(I_BlitFramebuffer, 0, 0, a, b, c, d, e, f, g, h, m, fl))) VP_DRV gl_api.BlitFramebuffer(a, b, c, d, e, f, g, h, m, fl);
 }
 void BufferData(GLenum t, ptrdiff_t n, const void* p, GLenum u) {
     if (!live(rec(I_BufferData, p, p ? (size_t)n : 0, t, (uint32_t)n, u))) return;
-    if (!stream_upload(t, n, p, u)) gl_api.BufferData(t, n, p, u);
+    if (!stream_upload(t, n, p, u)) VP_DRV gl_api.BufferData(t, n, p, u);
 }
 GLenum CheckFramebufferStatus(GLenum t) {
     int ph = rec(I_CheckFramebufferStatus, 0, 0, t);
     GLenum r = 0;
     if (ph == 2) { take(&r, sizeof r); return r; }
-    r = gl_api.CheckFramebufferStatus(t);
+    VP_DRV r = gl_api.CheckFramebufferStatus(t);
     if (ph == 1) save(&r, sizeof r);
     return r;
 }
-void Clear(GLbitfield m) { if (LIVE(rec(I_Clear, 0, 0, m))) gl_api.Clear(m); }
+void Clear(GLbitfield m) { if (LIVE(rec(I_Clear, 0, 0, m))) VP_DRV gl_api.Clear(m); }
 void ClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
     if (!live(rec(I_ClearColor, 0, 0, r, g, b, a))) return;
     const GLfloat v[4] = {r, g, b, a};
     if (C.cc_ok && !memcmp(C.cc, v, sizeof v)) return skipped();
     C.cc_ok = true, memcpy(C.cc, v, sizeof v);
-    gl_api.ClearColor(r, g, b, a);
+    VP_DRV gl_api.ClearColor(r, g, b, a);
 }
 void ClearDepth(GLdouble d) {
     uint32_t b[2];
     memcpy(b, &d, 8);
-    if (LIVE(rec(I_ClearDepth, 0, 0, b[0], b[1]))) gl_api.ClearDepth(d);
+    if (LIVE(rec(I_ClearDepth, 0, 0, b[0], b[1]))) VP_DRV gl_api.ClearDepth(d);
 }
 void CullFace(GLenum a) {
     if (!live(rec(I_CullFace, 0, 0, a))) return;
     if (C.cull == a) return skipped();
     C.cull = a;
-    gl_api.CullFace(a);
+    VP_DRV gl_api.CullFace(a);
 }
-void DeleteFramebuffers(GLsizei n, const GLuint* p) { if (LIVE(rec(I_DeleteFramebuffers, p, (size_t)n * 4, n))) gl_api.DeleteFramebuffers(n, p); }
-void DeleteRenderbuffers(GLsizei n, const GLuint* p) { if (LIVE(rec(I_DeleteRenderbuffers, p, (size_t)n * 4, n))) gl_api.DeleteRenderbuffers(n, p); }
+void DeleteFramebuffers(GLsizei n, const GLuint* p) { if (LIVE(rec(I_DeleteFramebuffers, p, (size_t)n * 4, n))) VP_DRV gl_api.DeleteFramebuffers(n, p); }
+void DeleteRenderbuffers(GLsizei n, const GLuint* p) { if (LIVE(rec(I_DeleteRenderbuffers, p, (size_t)n * 4, n))) VP_DRV gl_api.DeleteRenderbuffers(n, p); }
 void DeleteTextures(GLsizei n, const GLuint* p) {
     if (!live(rec(I_DeleteTextures, p, (size_t)n * 4, n))) return;
     for (GLsizei i = 0; i < n; i++) cache_forget_texture(p[i]);
-    gl_api.DeleteTextures(n, p);
+    VP_DRV gl_api.DeleteTextures(n, p);
 }
 void DepthFunc(GLenum a) {
     if (!live(rec(I_DepthFunc, 0, 0, a))) return;
     if (C.df_ok && C.depth_func == a) return skipped();
     C.df_ok = true, C.depth_func = a;
-    gl_api.DepthFunc(a);
+    VP_DRV gl_api.DepthFunc(a);
 }
 void DepthMask(GLboolean a) {
     if (!live(rec(I_DepthMask, 0, 0, a))) return;
     if (C.depth_mask == (int)a) return skipped();
     C.depth_mask = a;
-    gl_api.DepthMask(a);
+    VP_DRV gl_api.DepthMask(a);
 }
 void Disable(GLenum a) {
     if (!live(rec(I_Disable, 0, 0, a))) return;
     auto it = C.caps.find(a);
     if (it != C.caps.end() && it->second == 0) return skipped();
     C.caps[a] = 0;
-    gl_api.Disable(a);
+    VP_DRV gl_api.Disable(a);
 }
 void DrawArrays(GLenum m, GLint f, GLsizei n) {
     if (!live(rec(I_DrawArrays, 0, 0, m, f, n))) return;
-    gl_api.DrawArrays(m, streamed_vao() ? f + S.base : f, n);
+    VP_DRV gl_api.DrawArrays(m, streamed_vao() ? f + S.base : f, n);
 }
 void DrawElements(GLenum m, GLsizei n, GLenum t, const void* off) {
     if (!live(rec(I_DrawElements, 0, 0, m, n, t, (uint32_t)(uintptr_t)off))) return;
-    if (streamed_vao()) gl_api.DrawElementsBaseVertex(m, n, t, (const char*)off + S.ibase, S.base);
-    else gl_api.DrawElements(m, n, t, off);
+    if (streamed_vao()) VP_DRV gl_api.DrawElementsBaseVertex(m, n, t, (const char*)off + S.ibase, S.base);
+    else VP_DRV gl_api.DrawElements(m, n, t, off);
 }
 void Enable(GLenum a) {
     if (!live(rec(I_Enable, 0, 0, a))) return;
     auto it = C.caps.find(a);
     if (it != C.caps.end() && it->second == 1) return skipped();
     C.caps[a] = 1;
-    gl_api.Enable(a);
+    VP_DRV gl_api.Enable(a);
 }
 void FramebufferRenderbuffer(GLenum a, GLenum b, GLenum c, GLuint d) {
-    if (LIVE(rec(I_FramebufferRenderbuffer, 0, 0, a, b, c, d))) gl_api.FramebufferRenderbuffer(a, b, c, d);
+    if (LIVE(rec(I_FramebufferRenderbuffer, 0, 0, a, b, c, d))) VP_DRV gl_api.FramebufferRenderbuffer(a, b, c, d);
 }
 void FramebufferTexture2D(GLenum a, GLenum b, GLenum c, GLuint d, GLint e) {
-    if (LIVE(rec(I_FramebufferTexture2D, 0, 0, a, b, c, d, e))) gl_api.FramebufferTexture2D(a, b, c, d, e);
+    if (LIVE(rec(I_FramebufferTexture2D, 0, 0, a, b, c, d, e))) VP_DRV gl_api.FramebufferTexture2D(a, b, c, d, e);
 }
 void FrontFace(GLenum a) {
     if (!live(rec(I_FrontFace, 0, 0, a))) return;
     if (C.front == a) return skipped();
     C.front = a;
-    gl_api.FrontFace(a);
+    VP_DRV gl_api.FrontFace(a);
 }
 
 // the names a Gen hands back: the rewrite's pass gets the original's
@@ -384,7 +384,7 @@ void FrontFace(GLenum a) {
     void NAME(GLsizei n, GLuint* out) {                                                                              \
         int ph = rec(I_##NAME, 0, 0, n);                                                                             \
         if (ph == 2) { take(out, (size_t)n * 4); return; }                                                           \
-        gl_api.NAME(n, out);                                                                                         \
+        VP_DRV gl_api.NAME(n, out);                                                                                  \
         if (ph == 1) save(out, (size_t)n * 4);                                                                       \
     }
 GEN(GenFramebuffers)
@@ -395,95 +395,95 @@ GEN(GenTextures)
 void PixelStorei(GLenum a, GLint v) {
     if (a == GL_PACK_ALIGNMENT) g_pack = v;
     if (a == GL_UNPACK_ALIGNMENT) g_unpack = v;
-    if (LIVE(rec(I_PixelStorei, 0, 0, a, v))) gl_api.PixelStorei(a, v);
+    if (LIVE(rec(I_PixelStorei, 0, 0, a, v))) VP_DRV gl_api.PixelStorei(a, v);
 }
 void ReadPixels(GLint x, GLint y, GLsizei wd, GLsizei ht, GLenum f, GLenum t, void* out) {
     int ph = rec(I_ReadPixels, 0, 0, x, y, wd, ht, f, t);
     size_t n = pixel_bytes(wd, ht, f, t, g_pack);
     if (ph == 2) { take(out, n); return; }
-    gl_api.ReadPixels(x, y, wd, ht, f, t, out);
+    VP_DRV gl_api.ReadPixels(x, y, wd, ht, f, t, out);
     if (ph == 1) save(out, n);
 }
 void RenderbufferStorage(GLenum a, GLenum b, GLsizei c, GLsizei d) {
-    if (LIVE(rec(I_RenderbufferStorage, 0, 0, a, b, c, d))) gl_api.RenderbufferStorage(a, b, c, d);
+    if (LIVE(rec(I_RenderbufferStorage, 0, 0, a, b, c, d))) VP_DRV gl_api.RenderbufferStorage(a, b, c, d);
 }
 void Scissor(GLint a, GLint b, GLsizei c, GLsizei d) {
     if (!live(rec(I_Scissor, 0, 0, a, b, c, d))) return;
     const GLint v[4] = {a, b, c, d};
     if (C.sc_ok && !memcmp(C.sc, v, sizeof v)) return skipped();
     C.sc_ok = true, memcpy(C.sc, v, sizeof v);
-    gl_api.Scissor(a, b, c, d);
+    VP_DRV gl_api.Scissor(a, b, c, d);
 }
 void TexImage2D(GLenum t, GLint l, GLint i, GLsizei wd, GLsizei ht, GLint b, GLenum f, GLenum ty, const void* p) {
     if (LIVE(rec(I_TexImage2D, p, p ? pixel_bytes(wd, ht, f, ty, g_unpack) : 0, t, l, i, wd, ht, b, f, ty)))
-        gl_api.TexImage2D(t, l, i, wd, ht, b, f, ty, p);
+        VP_DRV gl_api.TexImage2D(t, l, i, wd, ht, b, f, ty, p);
 }
 void TexParameterf(GLenum a, GLenum b, GLfloat c) {
     if (!live(rec(I_TexParameterf, 0, 0, a, b, c))) return;
     if (a == GL_TEXTURE_2D && !texparam_changed(b, bits_of(c))) return skipped();
-    gl_api.TexParameterf(a, b, c);
+    VP_DRV gl_api.TexParameterf(a, b, c);
 }
 void TexParameteri(GLenum a, GLenum b, GLint c) {
     if (!live(rec(I_TexParameteri, 0, 0, a, b, c))) return;
     if (a == GL_TEXTURE_2D && !texparam_changed(b, bits_of(c))) return skipped();
-    gl_api.TexParameteri(a, b, c);
+    VP_DRV gl_api.TexParameteri(a, b, c);
 }
 void TexSubImage2D(GLenum t, GLint l, GLint x, GLint y, GLsizei wd, GLsizei ht, GLenum f, GLenum ty, const void* p) {
     if (LIVE(rec(I_TexSubImage2D, p, p ? pixel_bytes(wd, ht, f, ty, g_unpack) : 0, t, l, x, y, wd, ht, f, ty)))
-        gl_api.TexSubImage2D(t, l, x, y, wd, ht, f, ty, p);
+        VP_DRV gl_api.TexSubImage2D(t, l, x, y, wd, ht, f, ty, p);
 }
 void Uniform1f(GLint l, GLfloat a) {
     if (!live(rec(I_Uniform1f, 0, 0, l, a))) return;
     const uint32_t v[1] = {bits_of(a)};
     if (!uniform_changed(l, v, 1)) return skipped();
-    gl_api.Uniform1f(l, a);
+    VP_DRV gl_api.Uniform1f(l, a);
 }
 void Uniform1i(GLint l, GLint a) {
     if (!live(rec(I_Uniform1i, 0, 0, l, a))) return;
     const uint32_t v[1] = {bits_of(a)};
     if (!uniform_changed(l, v, 1)) return skipped();
-    gl_api.Uniform1i(l, a);
+    VP_DRV gl_api.Uniform1i(l, a);
 }
 void Uniform2f(GLint l, GLfloat a, GLfloat b) {
     if (!live(rec(I_Uniform2f, 0, 0, l, a, b))) return;
     const uint32_t v[2] = {bits_of(a), bits_of(b)};
     if (!uniform_changed(l, v, 2)) return skipped();
-    gl_api.Uniform2f(l, a, b);
+    VP_DRV gl_api.Uniform2f(l, a, b);
 }
 void Uniform3f(GLint l, GLfloat a, GLfloat b, GLfloat c) {
     if (!live(rec(I_Uniform3f, 0, 0, l, a, b, c))) return;
     const uint32_t v[3] = {bits_of(a), bits_of(b), bits_of(c)};
     if (!uniform_changed(l, v, 3)) return skipped();
-    gl_api.Uniform3f(l, a, b, c);
+    VP_DRV gl_api.Uniform3f(l, a, b, c);
 }
 void Uniform4f(GLint l, GLfloat a, GLfloat b, GLfloat c, GLfloat d) {
     if (!live(rec(I_Uniform4f, 0, 0, l, a, b, c, d))) return;
     const uint32_t v[4] = {bits_of(a), bits_of(b), bits_of(c), bits_of(d)};
     if (!uniform_changed(l, v, 4)) return skipped();
-    gl_api.Uniform4f(l, a, b, c, d);
+    VP_DRV gl_api.Uniform4f(l, a, b, c, d);
 }
 void UniformMatrix4fv(GLint l, GLsizei n, GLboolean t, const GLfloat* m) {
     if (!live(rec(I_UniformMatrix4fv, m, (size_t)n * 64, l, n, t))) return;
     if (n == 1 && !t && !uniform_changed(l, (const uint32_t*)m, 16)) return skipped();
-    gl_api.UniformMatrix4fv(l, n, t, m);
+    VP_DRV gl_api.UniformMatrix4fv(l, n, t, m);
 }
 void UseProgram(GLuint p) {
     if (!live(rec(I_UseProgram, 0, 0, p))) return;
     if (C.program == p) return skipped();
     C.program = p;
-    gl_api.UseProgram(p);
+    VP_DRV gl_api.UseProgram(p);
 }
 void Viewport(GLint a, GLint b, GLsizei c, GLsizei d) {
     if (!live(rec(I_Viewport, 0, 0, a, b, c, d))) return;
     const GLint v[4] = {a, b, c, d};
     if (C.vp_ok && !memcmp(C.vp, v, sizeof v)) return skipped();
     C.vp_ok = true, memcpy(C.vp, v, sizeof v);
-    gl_api.Viewport(a, b, c, d);
+    VP_DRV gl_api.Viewport(a, b, c, d);
 }
 
 void SwapWindow(SDL_Window* win) {
     if (!live(rec(I_SwapWindow, 0, 0))) return;
-    gl_api.SwapWindow(win);
+    VP_DRV gl_api.SwapWindow(win);
     C.valid = false;                             // (gl_dxgi.cpp's present binds framebuffers directly)
 }
 void cache_reset() { C.valid = false; }
@@ -500,13 +500,13 @@ void GetDrawableSize(SDL_Window* win, int* wd, int* ht) {
     int v[2] = {0, 0};
     if (ph == 2) take(v, sizeof v);
     else {
-        gl_api.GetDrawableSize(win, &v[0], &v[1]);
+        VP_DRV gl_api.GetDrawableSize(win, &v[0], &v[1]);
         if (ph == 1) save(v, sizeof v);
     }
     *wd = v[0], *ht = v[1];
 }
 void SetView(int x0, int y0, int wd, int ht, int gw, int gh) {
-    if (LIVE(rec(I_SetView, 0, 0, x0, y0, wd, ht, gw, gh))) gl_api.SetView(x0, y0, wd, ht, gw, gh);
+    if (LIVE(rec(I_SetView, 0, 0, x0, y0, wd, ht, gw, gh))) VP_DRV gl_api.SetView(x0, y0, wd, ht, gw, gh);
 }
 
 }  // namespace glr

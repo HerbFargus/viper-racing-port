@@ -598,6 +598,7 @@ void set_mode(int w, int h) {
     pg.overlay.assign((size_t)w * h, 0);
     pg.drawn3d.assign((size_t)w * h, 0);
     pg.gpu.assign((size_t)w * h, 0);
+    pg.done3d[2] = pg.donegpu[2] = 0;
     if (!in.ready) return;
     if (st.small_fbo) glr::DeleteFramebuffers(1, &st.small_fbo), glr::DeleteTextures(1, &st.small_color);
     glr::GenTextures(1, &st.small_color);
@@ -900,6 +901,7 @@ void present() {
     glr::Clear(GL_COLOR_BUFFER_BIT);
     make_target();                               // follows the window if it changed size
     std::fill(pg.drawn3d.begin(), pg.drawn3d.end(), (uint8_t)0);   // a new frame: no 3D drawn yet
+    pg.done3d[2] = 0;
     touch_state();
     st.frames++;
     perf::frame();
@@ -1028,6 +1030,7 @@ HRESULT unlock(Surface* s) {
         if (g_session_frames) {
             const size_t n = (size_t)st.w * st.h;
             const bool have = pg.gpu.size() == n && pg.under.size() == n && pg.page.size() == n;
+            if (have) pg.donegpu[2] = 0;
             if (have)                            // what the game's 2D changed is its own (drawn opaque over the 3D)
                 for (size_t i = 0; i < n; i++)
                     if (pg.page[i] != pg.under[i]) pg.gpu[i] = 0;
@@ -1305,6 +1308,7 @@ void clear(Viewport* v, DWORD n, const D3DRECT* rects, DWORD flags) {
         glr::ClearColor(c.r, c.g, c.b, 1.0f);
     }
     if (flags & D3DCLEAR_ZBUFFER) bits |= GL_DEPTH_BUFFER_BIT, glr::ClearDepth(1.0);
+    if (flags & D3DCLEAR_TARGET) pg.donegpu[2] = 0;
     if ((flags & D3DCLEAR_TARGET) && pg.gpu.size() == (size_t)st.w * st.h)   // a cleared colour is exact on any GPU
         for (DWORD i = 0; i < n; i++) {
             const int x0 = rects[i].x1 < 0 ? 0 : (int)rects[i].x1, y0 = rects[i].y1 < 0 ? 0 : (int)rects[i].y1;
@@ -1489,11 +1493,16 @@ void mark_drawn3d(bool tl, const void* verts, DWORD nverts) {
     }
     const int ix0 = x0 < 0 ? 0 : (int)x0, iy0 = y0 < 0 ? 0 : (int)y0;
     const int ix1 = x1 > st.w ? st.w : (int)ceilf(x1), iy1 = y1 > st.h ? st.h : (int)ceilf(y1);
-    for (int y = iy0; y < iy1; y++)
-        if (ix1 > ix0) {
-            memset(&pg.drawn3d[(size_t)y * st.w + ix0], 1, (size_t)(ix1 - ix0));
-            if (pg.gpu.size() == pg.drawn3d.size()) memset(&pg.gpu[(size_t)y * st.w + ix0], 1, (size_t)(ix1 - ix0));
-        }
+    if (ix1 <= ix0 || iy1 <= iy0) return;
+    // (a 3D scene's draws all cover its viewport: once it's marked, ~500 draws a frame would each set the same ~300 KB
+    // again -- most of a frame's time on an older PC's memory -- so a rect inside the last one marked is skipped)
+    auto fill = [&](std::vector<uint8_t>& m, int* done) {
+        if (done[2] > done[0] && ix0 >= done[0] && iy0 >= done[1] && ix1 <= done[2] && iy1 <= done[3]) return;
+        for (int y = iy0; y < iy1; y++) memset(&m[(size_t)y * st.w + ix0], 1, (size_t)(ix1 - ix0));
+        done[0] = ix0, done[1] = iy0, done[2] = ix1, done[3] = iy1;
+    };
+    fill(pg.drawn3d, pg.done3d);
+    if (pg.gpu.size() == pg.drawn3d.size()) fill(pg.gpu, pg.donegpu);
 }
 }  // namespace
 
