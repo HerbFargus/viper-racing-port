@@ -15,7 +15,8 @@ ROOT=$(pwd)
 tools/build_linux.sh release
 OUT=$ROOT/out-linux-release
 VERSION=$(git log -1 --date=format:%Y.%m.%d --format=%cd-%h)
-[ -z "$(git status --porcelain -- hook loader tools)" ] || VERSION=$VERSION-dirty
+# (a Windows checkout seen from WSL: its CRLF files and modes aren't changes)
+[ -z "$(git -c core.autocrlf=true -c core.filemode=false status --porcelain -- hook loader tools)" ] || VERSION=$VERSION-dirty
 NAME=viperport-linux-$VERSION
 STAGE=$OUT/stage/$NAME
 rm -rf "$OUT/stage" && mkdir -p "$STAGE/lib" "$STAGE/LICENSES"
