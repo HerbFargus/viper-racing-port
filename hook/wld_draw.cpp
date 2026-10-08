@@ -43,7 +43,7 @@
 // Layouts (v1.0; the other groups' files have the evidence): CarObject as hook/wld_carobj.cpp; ShadowObject,
 // ReflectionObject, SmokeObject, SkidObject, SparksObject, SplashObject as hook/wld_effects.cpp; ModelObject /
 // WobbleObject (+4 Frame, +0x3c model) as hook/wld_cars.cpp; GrafNode as hook/wld_carobj.cpp; gxCanvas (+4 pixels,
-// +0xc height, +0x10 pitch) from out/agents/r2d/report.md.
+// +0xc height, +0x10 pitch) from the decompilation.
 //
 // Statics:
 //   world.obj  0x5522d8 the graphics objects (M1 moves the list: m1_operand), 0x553368 their count, 0x553328

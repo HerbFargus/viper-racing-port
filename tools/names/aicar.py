@@ -1,5 +1,5 @@
 """AICar (and LocalCar, the AI's helper structs, the skill parameters AICar reads) named from the v1.0
-race.exe decompilation (aicar agent). Offsets are from the start of the object, base part included.
+race.exe decompilation. Offsets are from the start of the object, base part included.
 
 Units: time is PhysicsGetTime() seconds. The physics step is 0.016 s (62.5 Hz: PhobDyno and Wheel,
 and measured in game); the AI's own rates suggest AICar::Update runs at half that, 31.25 Hz

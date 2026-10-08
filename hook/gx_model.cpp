@@ -3180,9 +3180,8 @@ static void fp_add_deferred_surf(Footprint& f, uint8_t*, uint8_t*, uint8_t* si) 
     fp_pool(f, g_def.pool);
     f.add(deferred_buckets() + ((uint32_t)Ip(si, 0x14) + 1u), 4, "the texture's bucket");
 }
-static const uint8_t k_add_deferred_pro[] = {0x56, 0x8B, 0x0D, 0x80, 0x2D, 0x52, 0x00};   // push esi; mov ecx, [pool]
-PORT_FN_BUILDS(0x004573d0, "add_deferred_surf", add_deferred_surf, fp_add_deferred_surf, k_add_deferred_pro,
-               sizeof k_add_deferred_pro)
+// (v1.0's first 7 bytes' hash: push esi; mov ecx, [pool])
+PORT_FN_BUILDS(0x004573d0, "add_deferred_surf", add_deferred_surf, fp_add_deferred_surf, 0xc2c6cfb8, 7)
 
 static void draw_deferred_bucket(uint8_t** slot, int tex) {
     g_def.begin(tex);
@@ -3209,9 +3208,7 @@ static void __cdecl end_deferred_surfs() {
     g_def.draw_alpha();
 }
 static void fp_end_deferred_surfs(Footprint& f) { fp_draws(f); }
-static const uint8_t k_end_deferred_pro[] = {0x53, 0x56, 0x57, 0x33, 0xDB, 0x55, 0x88, 0x1D};
-PORT_FN_BUILDS(0x00457290, "end_deferred_surfs", end_deferred_surfs, fp_end_deferred_surfs, k_end_deferred_pro,
-               sizeof k_end_deferred_pro)
+PORT_FN_BUILDS(0x00457290, "end_deferred_surfs", end_deferred_surfs, fp_end_deferred_surfs, 0xacf3d005, 8)
 
 static void __cdecl draw_alpha_deferred_surfs() {
     deferred_resolve();
@@ -3221,9 +3218,8 @@ static void __cdecl draw_alpha_deferred_surfs() {
     for (int32_t b = 0; b < last; b++)
         if (buckets[b]) draw_deferred_bucket(&buckets[b], b - 1);
 }
-static const uint8_t k_alpha_deferred_pro[] = {0x53, 0x56, 0x57, 0x55, 0x33, 0xFF};
 PORT_FN_BUILDS(0x00457340, "draw_alpha_deferred_surfs", draw_alpha_deferred_surfs, fp_end_deferred_surfs,
-               k_alpha_deferred_pro, sizeof k_alpha_deferred_pro)
+               0x44d71d16, 6)
 
 // ==== model_copy_transform (0x457410) ============================================================================
 // a new model with the same name and triangle count, and a copy of the info in one MemAlloc (header, vertices,

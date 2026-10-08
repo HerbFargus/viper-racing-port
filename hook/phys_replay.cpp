@@ -163,7 +163,7 @@ static const char* const S_FRAMES = (const char*)0x004ed284;         // "Bad rep
 static const char* const S_PACKET_SIZE = (const char*)0x004ed29c;    // "replay: base packet size mismatch"
 static const char* const S_NO_BUFFER = (const char*)0x004ed2c0;      // "Can't read replay buffer"
 static const char* const S_TOO_MANY = (const char*)0x004ed308;       // "Too many events, dropping."
-static const char* const S_LAZY = (const char*)0x004ed324;           // "Broske is too lazy to implement multiple hooks"
+static const char* const S_ONE_HOOK = (const char*)0x004ed324;       // the original assert's: multiple hooks not implemented
 static const char* const S_NO_HANDLER = (const char*)0x004ed354;     // "...couldn't find handler 0x%x!"
 
 // ---- constants (the original's .rdata, by their bits) --------------------------------------------------------------
@@ -902,7 +902,7 @@ PORT_FN(0x0042d8b0, "PhysReplayAddEvent", PhysReplayAddEvent_rw, fp_add_event)
 // ---- PhysReplayInstallEventHandler (0x42d960): one handler a type (no bounds check) -----------------------------------------
 static void __cdecl PhysReplayInstallEventHandler_rw(int32_t type, void* fn) {
     void** slot = &g_handlers[type];
-    ASSERT_MSG(*slot == 0, S_LAZY);
+    ASSERT_MSG(*slot == 0, S_ONE_HOOK);
     *slot = fn;
 }
 static void fp_install(Footprint& f, int32_t type, void*) { f.add(&g_handlers[type], 4, "replay event handler"); }

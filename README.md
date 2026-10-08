@@ -1,9 +1,58 @@
 # viper-racing-port
 
-A hook-based reimplementation of the 1998 racing game **Viper Racing** (MGI / Sierra), in the style of
-OpenRCT2: a DLL loads into the original game and replaces its parts one at a time with new code, so the
-game stays playable at every step. It needs the player's own copy of the game; nothing from the game is
-in this repository (everything derived from its files stays in the git-ignored `out/`).
+A reimplementation of the 1998 racing game **Viper Racing** (MGI / Sierra): every function of the
+v1.0 `race.exe` rewritten in C++, checked bit for bit against the original, on a modern platform
+layer -- OpenGL at your screen's own resolution with widescreen, SDL2 sound and input, the original's
+hard limits lifted. It runs on Windows and natively on Linux (no Wine), and multiplayer works between
+the two.
+
+It needs your own copy of the game. **Nothing from the game is in this repository**: the engine reads
+your `race.exe` and the game's data files from your install, and everything derived from them while
+developing stays in the git-ignored `out/`.
+
+Not affiliated with MGI, Sierra or their successors. Viper Racing is (c) Sierra / MGI.
+
+## Play it
+
+Download the engine from [Releases](https://github.com/HerbFargus/viper-racing-port/releases):
+
+| download | for |
+|---|---|
+| `viperport-windows-<version>.zip` | Windows: `viperport.exe`, `dinput.dll`, `SDL2.dll`, `viperport.ini` and a readme. Copy them beside `race.exe`, then run `viperport.exe` (v1.0), or start a v1.1 / community 1.2.x game as usual (the engine loads as `dinput.dll`). |
+| `viperport-linux-<version>.tar.gz` | Linux (x86, glibc 2.35 or newer): a native build with SDL2 included and `README-linux.txt` (the one-line 32-bit dependency install per distro). Unpack into the game folder and run `./viperport.sh`. |
+
+Or let the [Viper Racing Mod Manager](https://github.com/HerbFargus/viper-racing-modding) install it
+for you on Windows (its **Modern engine** panel and **Play** button).
+
+What you need: Viper Racing v1.0 (`race.exe` from the CD) for the full engine (`viperport.exe` /
+`viperport` on Linux); v1.1 and the community 1.2.4–1.2.6 `race.bin` builds get the platform layer
+and lifted limits through `dinput.dll` on Windows.
+
+## Build it
+
+- **Windows (MSVC, the shipped build):** Visual Studio 2026 Build Tools (C++), and the SDL2 2.32.10
+  Visual C++ development package unpacked beside this repository as `..\sdl2\SDL2-2.32.10`. Then
+  `hook\build.bat` (the engine, `hook\build\dinput.dll`) and `loader\build_loader.bat` (the standalone,
+  `loader\build\viperport.exe`).
+- **Windows (GCC):** MSYS2's mingw32 toolchain (`C:\msys64\mingw32`): `hook\build_gcc.bat`,
+  `loader\build_loader_gcc.bat`.
+- **Linux:** an i386-multilib GCC 15 with `libsdl2-dev:i386`: `tools/build_linux.sh` (out-linux/viperport).
+  The release build (glibc 2.35, SDL2 bundled) is `tools/build_linux.sh release` on Ubuntu 22.04 with
+  GCC 15 from the ubuntu-toolchain-r PPA and SDL2 2.32.10 built for i386 in `/opt/sdl2-i386`;
+  `tools/package_linux.sh` packs it. `tools/package_windows.py` packs the Windows zip.
+- **Testing:** the world harnesses in `test/` (`python test\sweep.py` builds and runs them with both
+  Windows compilers) and the session-replay corpus (`tools/corpus.py`) need your own game files; see
+  `docs/PORTING.md`.
+
+## Licence
+
+GPL-3.0 (`LICENSE`). The packages bundle SDL2 (zlib licence) and, on Linux, link GCC's runtime under
+the GCC Runtime Library Exception.
+
+---
+
+The rest of this README is the developer's view: how the engine hooks the game, how each rewrite is
+checked, and the project's layout.
 
 ## What the DLL does
 

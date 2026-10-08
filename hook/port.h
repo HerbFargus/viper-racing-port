@@ -18,8 +18,9 @@
 //
 // A shadow check needs to call the original after its entry has been replaced, so it goes through a
 // trampoline: the original's first instructions, copied, then a jump back. tools/gen_port_table.py
-// finds every address hooked this way (PORT_FN and detour below) and writes their instructions from the
-// v1.0 race.exe into prologues.inc; the trampoline is built only if the live bytes still match. So the
+// finds every address hooked this way (PORT_FN and detour below) and writes their instructions' length and
+// hash from the v1.0 race.exe into prologues.inc; the trampoline copies the live bytes, and is built only if
+// they still hash as v1.0's. So the
 // harness works on the reference build, v1.0. On the race.bin builds a PORT_FN with a per-build
 // prologue still switches between new and original; shadow and detours need v1.0.
 #pragma once
@@ -98,8 +99,8 @@ struct PortFn {
     const char* name;                 // its name in the map: the ini key
     void* repl;                       // the rewrite
     void* shadow;                     // the shadow wrapper (same signature as the rewrite)
-    const uint8_t* other_prologue;    // first bytes on the race.bin builds (only for PORT_NEW there), or 0
-    uint8_t other_len;
+    uint32_t other_hash;              // vp_code_hash of v1.0's first other_len bytes: a PORT_FN_BUILDS, hooked on the
+    uint8_t other_len;                // race.bin builds too (only for PORT_NEW there; they check their table's), or 0
     void* orig = 0;                   // trampoline to the original, once installed (v1.0)
     PortMode mode = PORT_NEW;
     volatile long calls = 0, checks = 0, mismatches = 0;
@@ -110,7 +111,7 @@ struct PortFn {
     const char* vrmod_patch = 0;                   // it is vrmod's patch the rewrite takes over (port_check_stock)
     bool needs_renderer = false;                   // calls the OpenGL renderer directly (gx_dd.cpp): original without it
     bool needs_audio = false;                      // calls the SDL audio core directly (snd_mix.cpp's wave.obj): likewise
-    PortFn(uint32_t v, const char* nm, void* r, void* s, const uint8_t* op = 0, uint8_t ol = 0);
+    PortFn(uint32_t v, const char* nm, void* r, void* s, uint32_t oh = 0, uint8_t ol = 0);
 };
 
 // shadow machinery, shared by every wrapper (port.cpp). A check runs the ORIGINAL first -- it reads the
@@ -196,7 +197,8 @@ VP_SHADOW_CC(__stdcall)
 // PORT_FN(0x0043d2e0, "Obstacle::Update", Obstacle_Update, fp_obstacle_update)
 //   registers Obstacle_Update as the rewrite of the v1.0 function at 0x43d2e0; fp_obstacle_update has
 //   the rewrite's arguments after a Footprint& and says what the function may change.
-// PORT_FN_BUILDS(..., prologue, len) also names the first bytes to expect on the race.bin builds.
+// PORT_FN_BUILDS(..., hash, len) also hooks it on the race.bin builds (PORT_NEW only), whose tables say what their
+// first bytes should be; hash and len: vp_code_hash (viperport.h) of v1.0's first len bytes.
 #define VP_CAT2(a, b) a##b
 #define VP_CAT(a, b) VP_CAT2(a, b)
 
@@ -205,13 +207,13 @@ VP_SHADOW_CC(__stdcall)
 // test/fuzz.cpp: the same rewrites, compiled into a test program that runs each pure one against the
 // original on random inputs, outside the game (test/fuzz.h)
 #include "../test/fuzz.h"
-#define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
+#define PORT_FN_BUILDS(V10, NAME, NEW, FP, HASH, LEN)                                                     \
     static FuzzReg VP_CAT(fuzz_, NEW)(V10, NAME, &Fuzz<decltype(&NEW)>::template run<&NEW, &FP>);
 #else
-#define PORT_FN_BUILDS(V10, NAME, NEW, FP, PRO, PROLEN)                                                    \
+#define PORT_FN_BUILDS(V10, NAME, NEW, FP, HASH, LEN)                                                     \
     namespace { extern PortFn VP_CAT(port_, NEW); }   /* file-local: rewrites in different files */     \
     namespace { PortFn VP_CAT(port_, NEW)(V10, NAME, (void*)&NEW,                                                \
-        (void*)&Shadow<decltype(&NEW)>::call<&VP_CAT(port_, NEW), &NEW, &FP>, PRO, PROLEN); }
+        (void*)&Shadow<decltype(&NEW)>::call<&VP_CAT(port_, NEW), &NEW, &FP>, HASH, LEN); }
 #endif
 #define PORT_FN(V10, NAME, NEW, FP) PORT_FN_BUILDS(V10, NAME, NEW, FP, 0, 0)
 // PORT_FN_GL: a rewrite that calls the OpenGL renderer directly (gl_core.h); with the game's own DirectDraw it

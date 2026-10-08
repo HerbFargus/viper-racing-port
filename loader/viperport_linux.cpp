@@ -55,7 +55,7 @@ void logf(const char* fmt, ...);
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID);
 extern "C" int __cdecl viperport_standalone(const VpStandaloneArgs* args);
 extern "C" int __cdecl viperport_probe(uint32_t version, char* line, uint32_t n);
-// the main thread's fs: block (agent C's, hook/w32_seh.cpp; weak: the loader links before it is written)
+// the main thread's fs: block (hook/w32_seh.cpp; weak, so the loader also links without it)
 #include "../hook/w32_seh.h"
 void w32_seh_thread_begin() __attribute__((weak));
 

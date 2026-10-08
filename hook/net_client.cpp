@@ -24,7 +24,7 @@
 // hello's name after its NUL (OptionsGet), the car info's 4, 9-12, 15-25, 58-60, 206-221 and its car name after the NUL, the
 // sync reply's 8-51 (echoed from the server's packet), the chat text after smart_strncpy's NUL.
 //
-// The hornball (the brief's known behaviour): transPGS_CAR_CHOICE_PGS_CAR_WAITING puts HackHornBall() -- THIS machine's
+// The hornball (a known behaviour): transPGS_CAR_CHOICE_PGS_CAR_WAITING puts HackHornBall() -- THIS machine's
 // hack setting -- at byte 0xcd of the car info packet; the server relays every car's info, dispatch_NetCarInfoPacket copies
 // it into the car's slot (+0xc8) and GetCarList hands it to the game in each CarList entry (+0xc4). So each car carries its
 // own driver's flag here; where it leaks to another player's car is the car loading's shared ball.mod name, not this code.

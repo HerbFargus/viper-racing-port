@@ -1,6 +1,6 @@
 // w32_kernel.h -- the stand-ins for race.exe's KERNEL32 imports of memory, threads, synchronisation, time, process,
 // environment, modules, locale/strings and exceptions, and WINMM's timeGetTime / timeKillEvent (relink stage R2a;
-// w32_handle.h says what a stand-in is). Agent C's import table (w32_table.cpp) puts these in race.exe's import slots
+// w32_handle.h says what a stand-in is). The import table (w32_table.cpp) puts these in race.exe's import slots
 // in the GCC standalone; nothing else calls them in the MSVC build.
 //
 // Each is the Win32 function of the same name with the same ABI (__stdcall, 32-bit arguments), and returns what
@@ -9,7 +9,7 @@
 //   w32_mem.cpp     Heap*, Global*, GetSystemInfo, GetVersion
 //   w32_thread.cpp  threads, critical sections, events, semaphores, WaitForSingleObject, Sleep, the current
 //                   process/thread, ExitProcess, CreateProcessA (not available), affinity masks
-//                   (GetLastError / SetLastError are agent A's, w32_file.cpp: w32::last_error)
+//                   (GetLastError / SetLastError are w32_file.cpp's: w32::last_error)
 //   w32_time.cpp    QueryPerformanceCounter/Frequency, GetLocalTime, timeGetTime, timeKillEvent
 //   w32_proc.cpp    the command line, the environment, GetStartupInfoA, SetHandleCount, modules, LoadLibraryA,
 //                   GetProcAddress
@@ -101,7 +101,7 @@ int32_t W32K_CALL w32_ResetEvent(uint32_t event);          // (likewise)
 uint32_t W32K_CALL w32_CreateSemaphoreA(void* security, int32_t initial, int32_t maximum, const char* name);
 int32_t W32K_CALL w32_ReleaseSemaphore(uint32_t sem, int32_t count, int32_t* previous);   // (likewise)
 uint32_t W32K_CALL w32_WaitForSingleObject(uint32_t handle, uint32_t ms);
-uint32_t W32K_CALL w32_GetLastError();                     // (defined in w32_file.cpp, agent A's: w32::last_error)
+uint32_t W32K_CALL w32_GetLastError();                     // (defined in w32_file.cpp: w32::last_error)
 void W32K_CALL w32_SetLastError(uint32_t error);           // (likewise)
 // reached through GetProcAddress (the C runtime's FDIV check), not imported
 int32_t W32K_CALL w32_GetProcessAffinityMask(uint32_t process, uint32_t* process_mask, uint32_t* system_mask);
@@ -133,7 +133,7 @@ void* W32K_CALL w32_GetProcAddress(uint32_t module, const char* name);
 // its path (GetModuleFileNameA of NULL or that base) and its command line (GetCommandLineA). Until then (and in the
 // MSVC build, where nothing calls them) these answer for the process.
 void w32_set_process_image(uint32_t base, const char* path, const char* command_line);
-// GetProcAddress's table: lookup(dll, name) -> a stand-in or null (agent C's import table registers its own; dll is
+// GetProcAddress's table: lookup(dll, name) -> a stand-in or null (w32_table.cpp's import table registers its own; dll is
 // the module's file name without folder or ".dll", any case). Without one, or when it says null, the stand-ins below
 // (w32_kernel_proc) answer for KERNEL32 and WINMM; anything else is Windows' (on Linux: not found).
 typedef void* (*W32ProcLookup)(const char* dll, const char* name);

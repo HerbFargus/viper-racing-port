@@ -148,8 +148,8 @@ static FILE* open_dll_log() {
 // Every game address in this file is written as its v1.0 race.exe address. The race.bin builds run the
 // same code elsewhere: tools/port_sites.py carries each address this file uses across (matched functions,
 // then the same instruction inside them) and checks the target's bytes, into one table per build.
-// A(v10) is the address in the running build. A table entry's value is what should be there: a patched
-// field's current value, or a function's first four bytes.
+// A(v10) is the address in the running build. A table entry's value is the hash (vp_code_hash) of the four bytes
+// that should be there: a patched field's current value, or a function's first four bytes (0: an address only).
 struct Xlat { uint32_t v10, here, value; };
 static const Xlat k_v11[] = {
 #include "sites_v11.inc"
@@ -241,22 +241,20 @@ static void __fastcall Obstacle_Update(uint8_t* self, void* /*edx*/) {
 // other way round -- their first bytes come from the build tables.
 static void fp_obstacle_update(Footprint& f, uint8_t* self, void*) { f.object(self); }
 // push ebx; push esi; fld dword [ecx+23Ch]; fmul dword [ecx+23Ch]
-static const uint8_t k_obstacle_update_pro[] = {0x53, 0x56, 0xD9, 0x81, 0x3C, 0x02, 0x00, 0x00, 0xD8, 0x89, 0x3C, 0x02, 0x00, 0x00};
-PORT_FN_BUILDS(0x0043d2e0, "Obstacle::Update", Obstacle_Update, fp_obstacle_update, k_obstacle_update_pro,
-               sizeof k_obstacle_update_pro)
+PORT_FN_BUILDS(0x0043d2e0, "Obstacle::Update", Obstacle_Update, fp_obstacle_update, 0x9d684b85, 14)   // (its 14 bytes' hash)
 
 // ---- hooking -------------------------------------------------------------------------------------------
 // Does the function at v1.0 address v10 start as it should? v1.0: the prologue given; another build: the
-// first four bytes its table recorded.
-bool code_is(uint32_t v10, const uint8_t* expect, size_t n) {
+// first four bytes its table recorded. Both as hashes (vp_code_hash): no original code is carried here.
+bool code_is(uint32_t v10, uint32_t hash, size_t n) {
     uint32_t at = A(v10);
     if (!at) return false;
-    if (!g_build->table) return memcmp((void*)at, expect, n) == 0;
-    return memcmp((void*)at, &xlat(v10)->value, 4) == 0;
+    if (!g_build->table) return vp_code_hash((const void*)at, n) == hash;
+    return vp_code_hash((const void*)at, 4) == xlat(v10)->value;
 }
 
-bool jmp_hook(uint32_t v10, const uint8_t* expect, size_t n, void* to, const char* what) {
-    if (!code_is(v10, expect, n)) {
+bool jmp_hook(uint32_t v10, uint32_t hash, size_t n, void* to, const char* what) {
+    if (!code_is(v10, hash, n)) {
         logf("NOT hooking %s: its first bytes aren't what %s has there", what, g_build->name);
         return false;
     }
@@ -291,7 +289,10 @@ static void* g_gobs[GOB_CAP + 2];
 struct Field { uint32_t at; uint8_t off; uint32_t old; uint32_t neu; bool at_least; };
 
 static uint32_t field_addr(const Field& f) { return g_build->table ? A(f.at) : f.at + f.off; }
-static uint32_t field_old(const Field& f) { return g_build->table ? xlat(f.at)->value : f.old; }
+// does the field hold the value it should before patching? v1.0: Field::old; another build: its table's hash of it
+static bool field_holds_old(const Field& f, uint32_t at) {
+    return g_build->table ? vp_code_hash((const void*)at, 4) == xlat(f.at)->value : *(uint32_t*)at == f.old;
+}
 
 static bool patch_fields(Field* f, int n, const char* what) {
     for (int i = 0; i < n; i++) {                                    // all or nothing
@@ -302,7 +303,7 @@ static bool patch_fields(Field* f, int n, const char* what) {
             uint32_t now = *(uint32_t*)at;
             ok = (op == 0x68 || (op >= 0xB8 && op <= 0xBF)) && now > 0 && now < 0x100000;
         } else if (ok) {
-            ok = *(uint32_t*)at == field_old(f[i]);
+            ok = field_holds_old(f[i], at);
         }
         if (!ok) {
             logf("NOT lifting %s: the field for v1.0 %08x isn't what %s has there", what, f[i].at, g_build->name);
@@ -399,9 +400,6 @@ bool vp_deferred_bucket_ok(int id, int buckets) {
 }
 
 static void lift_texture_limit() {
-    static const uint8_t add_pro[] = {0x56, 0x8B, 0x0D, 0x80, 0x2D, 0x52, 0x00};
-    static const uint8_t end_pro[] = {0x53, 0x56, 0x57, 0x33, 0xDB, 0x55, 0x88, 0x1D};
-    static const uint8_t alpha_pro[] = {0x53, 0x56, 0x57, 0x55, 0x33, 0xFF};
     Field fields[] = {
         {0x45723d, 1, 0x522b40, (uint32_t)&g_buckets[0]},    // begin_deferred: mov edi, buckets
         {0x457244, 1, 0x78, TEX_BUCKETS},                     // begin_deferred: mov ecx, 120 (rep stosd)
@@ -409,8 +407,9 @@ static void lift_texture_limit() {
         {0x45fc25, 1, 0x80, 1024, true},                      // txBegin: 'vid texture pool', 128 x 40
     };
     // verify everything before touching anything
-    if (!code_is(0x4573d0, add_pro, sizeof add_pro) || !code_is(0x457290, end_pro, sizeof end_pro) ||
-        !code_is(0x457340, alpha_pro, sizeof alpha_pro)) {
+    // (vp_code_hash of v1.0's first bytes: add_deferred_surf's 7 -- push esi; mov ecx, [pool] -- end_deferred_surfs' 8,
+    // draw_alpha_deferred_surfs' 6)
+    if (!code_is(0x4573d0, 0xc2c6cfb8, 7) || !code_is(0x457290, 0xacf3d005, 8) || !code_is(0x457340, 0x44d71d16, 6)) {
         logf("NOT lifting the texture limit: the deferred-draw functions aren't the code %s should have", g_build->name);
         return;
     }
@@ -670,9 +669,7 @@ static void __cdecl collide_phobs(void) {
 static void fp_collide_phobs(Footprint& f) { f.replay_only = "it can change every physics object"; }
 // sub esp,14h; push ebx; push esi; push edi; push ebp; xor esi,esi (the race.bin builds have no profiler
 // calls in it, so theirs starts sub esp,10h -- the loops are the same)
-static const uint8_t k_collide_phobs_pro[] = {0x83, 0xEC, 0x14, 0x53, 0x56, 0x57, 0x55, 0x33, 0xF6};
-PORT_FN_BUILDS(0x00427120, "collide_phobs", collide_phobs, fp_collide_phobs, k_collide_phobs_pro,
-               sizeof k_collide_phobs_pro)
+PORT_FN_BUILDS(0x00427120, "collide_phobs", collide_phobs, fp_collide_phobs, 0xc6c97d66, 9)   // (its 9 bytes' hash)
 
 // the most of each seen during the session, for the exit line
 static volatile LONG g_peak_phobs, g_peak_wobs, g_peak_gobs;

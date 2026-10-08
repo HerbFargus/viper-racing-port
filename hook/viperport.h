@@ -31,11 +31,19 @@ bool have(uint32_t v10);
 // the running build's address for a v1.0 race.exe address (0, logged, if its table lacks it)
 uint32_t A(uint32_t v10);
 
-// does the function at v1.0 address v10 start as it should in the running build?
-bool code_is(uint32_t v10, const uint8_t* expect, size_t n);
+// FNV-1a of n bytes: how the tables and checks name original code without carrying it (tools/gen_port_tables.py fnv)
+inline uint32_t vp_code_hash(const void* p, size_t n) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t*)p)[i]) * 16777619u;
+    return h;
+}
 
-// replace the function at v1.0 address v10 with `to`, after checking its first bytes
-bool jmp_hook(uint32_t v10, const uint8_t* expect, size_t n, void* to, const char* what);
+// does the function at v1.0 address v10 start as it should in the running build? v1.0: its first n bytes hash to
+// `hash` (vp_code_hash of v1.0's); another build: its first four bytes hash to what that build's table recorded
+bool code_is(uint32_t v10, uint32_t hash, size_t n);
+
+// replace the function at v1.0 address v10 with `to`, after checking its first bytes (code_is)
+bool jmp_hook(uint32_t v10, uint32_t hash, size_t n, void* to, const char* what);
 
 // M2 (platform.cpp): move the window and input onto SDL2 if viperport.ini says so
 void platform_install(const char* build);

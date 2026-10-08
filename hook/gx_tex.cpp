@@ -3,7 +3,7 @@
 // reference counts, lazy video loading, grabs, de-rezing), tmap.obj (every DirectDraw / Direct3D texture operation,
 // through dd.obj's wrappers) and tex.obj (the .tex resources: mip levels, pasting into a gxCanvas).
 //
-// Layering (out/agents/rtex/report.md):
+// Layering:
 //   game code -> gx*Texture (gx.obj: _SingleEnter(gx_sync) .. _SingleLeave around each call)
 //             -> Texture* / tc_* (texture.obj: an int id = an index into the texture table)
 //             -> tx* (tmap.obj: texture_info*, the pools, dtexture / dsurface calls)

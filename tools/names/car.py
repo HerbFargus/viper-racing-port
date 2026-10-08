@@ -1,5 +1,5 @@
-"""Car + drivetrain field names for tools/type_names.py, from the v1.0 race.exe decompilation (agent copy of the
-Ghidra project, out/agents/car). Offsets are from the start of each class, base part included.
+"""Car + drivetrain field names for tools/type_names.py, from the v1.0 race.exe decompilation (a copy of the
+Ghidra project). Offsets are from the start of each class, base part included.
 
 Units the code settles: physics step dt = 0.016 s (62.5 Hz); shaft speeds are rpm (x 0.10472 -> rad/s);
 temperatures are kelvin (start 290 K; the HUD converts to F); CarData engine/aero inputs arrive in imperial

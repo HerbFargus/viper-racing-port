@@ -1180,7 +1180,7 @@ static void __cdecl destroy_hunted_node_rw(ResourceSetNode* node) {
             c = nx;
         }
     }
-    ASSERT_MSG_res(c != 0, S(0x004eb0f0), c);                        // "Broske is a loser (%x)"
+    ASSERT_MSG_res(c != 0, S(0x004eb0f0), c);                        // the original assert's message (with %x)
     op_delete(((volatile ResourceSetNode*)node)->toc->data);
     op_delete(((volatile ResourceSetNode*)node)->toc);
     op_delete(node);

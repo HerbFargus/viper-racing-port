@@ -43,7 +43,7 @@ struct Overlapped {
 };
 
 // DuplicateHandle of the pseudo-handles GetCurrentThread() / GetCurrentProcess(): a real handle to the calling thread /
-// the process -- objects of the thread stand-ins (agent B's w32_kernel), which set these when they start. Null: such a
+// the process -- objects of the thread stand-ins (w32_kernel.h, w32_thread.cpp), which set these when they start. Null: such a
 // DuplicateHandle fails with ERROR_INVALID_HANDLE.
 extern std::shared_ptr<Object> (*current_thread_object)();
 extern std::shared_ptr<Object> (*current_process_object)();
@@ -107,6 +107,6 @@ uint32_t W32_STDCALL w32_WriteConsoleA(w32_HANDLE h, const void* buf, uint32_t n
 uint32_t W32_STDCALL w32_SetConsoleMode(w32_HANDLE h, uint32_t mode);
 uint32_t W32_STDCALL w32_SetConsoleTitleA(const char* title);
 
-// the last error (no other agent's list has them: the stand-ins' w32::last_error, what the game reads after a failure)
+// the last error (no other stand-in header declares them: the stand-ins' w32::last_error, what the game reads after a failure)
 uint32_t W32_STDCALL w32_GetLastError();
 void W32_STDCALL w32_SetLastError(uint32_t e);

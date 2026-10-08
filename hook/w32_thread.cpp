@@ -631,7 +631,7 @@ uint32_t W32K_CALL w32_GetCurrentThreadId() {
 #endif
 }
 
-// (GetLastError / SetLastError: agent A's, in w32_file.cpp -- w32::last_error)
+// (GetLastError / SetLastError: in w32_file.cpp -- w32::last_error)
 
 void W32K_CALL w32_ExitProcess(uint32_t code) {
 #ifdef _WIN32

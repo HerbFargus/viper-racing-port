@@ -11,8 +11,7 @@
 //     cast where needed. Nothing here uses wchar_t.
 // Handles are Windows' (void*, and STRICT's distinct struct pointers for HWND & co.), with the stand-ins' 32-bit
 // values (w32_handle.h) behind them. The functions declared at the end are the ones the port's Linux build calls
-// directly -- implemented by the port (vp_os.cpp / the stand-ins) or, until agents B/C/D write them, stubbed in
-// hook/linux_todo.cpp.
+// directly -- implemented by the port (vp_os.cpp, vp_os_linux.cpp, the stand-ins).
 //
 // msvc_compat.h (force-included) has the compiler side: __stdcall & co., __declspec, intrinsics, MSVC CRT names.
 #pragma once
@@ -660,7 +659,7 @@ typedef LONG(__stdcall* PVECTORED_EXCEPTION_HANDLER)(struct _EXCEPTION_POINTERS*
 typedef LONG(__stdcall* PTOP_LEVEL_EXCEPTION_FILTER)(struct _EXCEPTION_POINTERS* ExceptionInfo);
 typedef PTOP_LEVEL_EXCEPTION_FILTER LPTOP_LEVEL_EXCEPTION_FILTER;
 
-// the thread information block at fs:[0] (agent C's w32_seh.cpp makes one per thread on Linux)
+// the thread information block at fs:[0] (hook/w32_seh.cpp makes one per thread on Linux)
 typedef struct _NT_TIB {
     struct _EXCEPTION_REGISTRATION_RECORD* ExceptionList;
     PVOID StackBase;
@@ -1119,8 +1118,7 @@ static inline LONG InterlockedCompareExchange(LONG volatile* p, LONG v, LONG cmp
 // ---- the Windows functions the port names ------------------------------------------------------------------------------------------
 // Windows' prototypes (__stdcall, C names). Most are named only for their type -- decltype(&HeapAlloc) is how the
 // port calls race.exe's import slot, which the stand-ins fill on Linux -- and need no definition. One the Linux build
-// really calls is defined by the port (the stand-ins, vp_os.cpp) or, until agents B/C/D replace those calls, stubbed
-// in hook/linux_todo.cpp (vp_r2b_todo).
+// really calls is defined by the port (the stand-ins, vp_os.cpp, vp_os_linux.cpp).
 typedef CHAR* LPCH;
 typedef const CHAR* LPCCH;
 typedef WCHAR* LPWCH;

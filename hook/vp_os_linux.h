@@ -1,4 +1,4 @@
-// vp_os_linux.h -- the native Linux build's OS layer (relink stage R2b, agent B): what vp_os.h's "O" kind is on Linux,
+// vp_os_linux.h -- the native Linux build's OS layer (relink stage R2b): what vp_os.h's "O" kind is on Linux,
 // the Win32 names the port still calls itself (standalone.cpp, viperport.cpp), and what the ELF loader
 // (loader/viperport_linux.cpp) tells it. hook/vp_os_linux.cpp has the code; Linux only.
 //

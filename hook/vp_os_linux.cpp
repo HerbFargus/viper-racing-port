@@ -1,4 +1,4 @@
-// vp_os_linux.cpp -- the native Linux build's OS layer (relink stage R2b, agent B; vp_os_linux.h says what it is).
+// vp_os_linux.cpp -- the native Linux build's OS layer (relink stage R2b; vp_os_linux.h says what it is).
 #ifndef _WIN32
 #include <windows.h>                                           // hook/linux_inc -> win32_compat.h
 #include "vp_os.h"

@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <ctype.h>
 #include <string>
 #include <vector>
 #include <functional>
@@ -210,7 +211,18 @@ static R fullpath_stub(const char* in, DWORD n, bool part) {
 }
 
 static void test_paths() {
-    const char* cwds[] = {"C:\\Users\\player\\AppData", "c:\\users\\PLAYER\\", "C:\\", "\\\\localhost\\c$\\Users"};
+    // the user profile (C:\Users\<name>): a folder that exists, also spelt lower-case with an upper-case last folder
+    char prof[MAX_PATH] = "C:\\Users\\Default";
+    DWORD pn = GetEnvironmentVariableA("USERPROFILE", prof, MAX_PATH);
+    if (!pn || pn >= MAX_PATH) strcpy(prof, "C:\\Users\\Default");
+    std::string home = prof, home_lc = home;
+    for (char& ch : home_lc) ch = (char)tolower((unsigned char)ch);
+    std::string home_mc = home_lc;
+    for (size_t i = home_mc.rfind('\\') + 1; i < home_mc.size(); i++)
+        home_mc[i] = (char)toupper((unsigned char)home_mc[i]);
+    home_mc += "\\";
+    std::string home_appdata = home + "\\AppData", home_temp = home_lc + "\\appdata\\local\\temp";
+    const char* cwds[] = {home_appdata.c_str(), home_mc.c_str(), "C:\\", "\\\\localhost\\c$\\Users"};
     char saved[MAX_PATH];
     GetCurrentDirectoryA(MAX_PATH, saved);
     SetEnvironmentVariableA("=C:", 0);          // (a shell may have set it: "C:x" from a UNC directory would read it)
@@ -251,20 +263,20 @@ static void test_paths() {
     }
 
     // the current directory
-    const char* dirs[] = {"C:\\Users", "c:\\users\\PLAYER\\", "c:/users/./", "C:\\Windows\\..\\Users", "..", ".", "",
+    const char* dirs[] = {"C:\\Users", home_mc.c_str(), "c:/users/./", "C:\\Windows\\..\\Users", "..", ".", "",
                           "C:\\nonexist", "C:\\nonexist\\x", "C:\\Windows\\notepad.exe", "C:\\Windows\\notepad.exe\\x",
-                          "\\", "C:", "Users", "c:\\users\\player\\appdata\\local\\temp", "C:\\USERS\\.\\", "C:\\x*",
+                          "\\", "C:", "Users", home_temp.c_str(), "C:\\USERS\\.\\", "C:\\x*",
                           "\\\\localhost\\c$\\Users", "C:\\Users ", "C:\\Users."};
     for (const char* d : dirs) {
         R a, b;
-        SetCurrentDirectoryA("C:\\Users\\player");
+        SetCurrentDirectoryA(prof);
         mark();
         a.ret = SetCurrentDirectoryA(d);
         a.err = real_err();
         char buf[MAX_PATH] = "";
         GetCurrentDirectoryA(MAX_PATH, buf);
         a.out = buf;
-        SetCurrentDirectoryA("C:\\Users\\player");
+        SetCurrentDirectoryA(prof);
         mark();
         b.ret = w32_SetCurrentDirectoryA(d);
         b.err = stub_err();
@@ -273,20 +285,22 @@ static void test_paths() {
         b.out = buf;
         check(fmt("SetCurrentDirectoryA(\"%s\")", d), a, b);
     }
-    SetCurrentDirectoryA("C:\\Users\\player");
-    for (DWORD n : {0u, 1u, 16u, 17u, 18u, 260u}) {
+    SetCurrentDirectoryA(prof);
+    DWORD hn = (DWORD)home.size();                // the profile path's length: an exact fit (with the NUL) and over it
+    size_t cmp = hn + 5;
+    for (DWORD n : {(DWORD)0, (DWORD)1, hn + 1, hn + 2, hn + 3, (DWORD)260}) {
         R a, b;
         char buf[300];
         memset(buf, 'X', sizeof buf);
         mark();
         a.ret = GetCurrentDirectoryA(n, n ? buf : 0);
         a.err = real_err();
-        a.out = std::string(buf, 20);
+        a.out = std::string(buf, cmp);
         memset(buf, 'X', sizeof buf);
         mark();
         b.ret = w32_GetCurrentDirectoryA(n, n ? buf : 0);
         b.err = stub_err();
-        b.out = std::string(buf, 20);
+        b.out = std::string(buf, cmp);
         check(fmt("GetCurrentDirectoryA(%u)", n), a, b);
     }
     // drive types

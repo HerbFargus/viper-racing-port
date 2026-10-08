@@ -436,7 +436,7 @@ static void rotation(float* m, bool upright) {
     for (int i = 0; i < 9; i++) m[i] = (float)R[i];
 }
 static const char* const k_cars[] = {"viper", "gts", "a", "bmwm3", "vipergt", "p9"};
-static const char* const k_drivers[] = {"Herb", "", "Jonathan Q", "x"};
+static const char* const k_drivers[] = {"Kate", "", "Jonathan Q", "x"};
 
 // the view / world statics a function may read
 static uint8_t* const OPTS = (uint8_t*)0x00554024;        // WorldGameOptions()

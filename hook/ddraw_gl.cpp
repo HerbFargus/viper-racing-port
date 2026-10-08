@@ -1,7 +1,7 @@
 // viperport -- the game's DirectDraw and Direct3D, served from the OpenGL renderer (gl_core.h): the COM facade.
 //
 // race.exe's DirectDrawCreate / DirectDrawEnumerateA imports are pointed here, and the game gets objects that
-// implement exactly the DirectX 5 methods it calls (out/agents/r2d, r3d, rtex report.md list them); everything else
+// implement exactly the DirectX 5 methods it calls (traced from its 2D, 3D and texture code); everything else
 // is a generated "unsupported" method that logs its first call (com_base.h). Each method is the renderer's
 // operation of the same name. This is how every build reaches the renderer (v1.0, v1.1, 1.2.x) in `original` mode,
 // and how a shadow check's original pass does; the rewritten dd.obj wrappers (gx_dd.cpp) call the renderer

@@ -10,7 +10,7 @@
 // Loads out\race_v10.exe at 0x400000 the way test/world_paintkit.cpp does (a child process with the range reserved) and
 // includes the two rewrite files with PORT_FN redefined to list each function (its v1.0 address, the rewrite, its calling
 // convention, stack arguments and return, its footprint). VP_FAITHFUL (group B has no fixes). It checks that every
-// function of the three objects but the $E initialisers (agent A's generated file) is listed exactly once.
+// function of the three objects but the $E initialisers (a generated file's) is listed exactly once.
 //
 // The models. Read-only from the test install (..\game-files\installs\v1.0-RC: its .car, .trk and .res resource sets) the
 // stock models (MINF resources) of at most 2000 vertices / triangles and 60 surfaces; and generated ones (a few surfaces,

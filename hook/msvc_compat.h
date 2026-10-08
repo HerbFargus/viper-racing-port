@@ -6,7 +6,7 @@
 //     Windows' for every argument the port passes), __forceinline, __declspec(naked / noinline / thread / dllexport /
 //     dllimport / align(n) / noreturn / selectany / novtable), __int8..__int64
 //   * MSVC's intrinsics the port calls (mingw's <intrin.h>): __debugbreak, _ReturnAddress, _AddressOfReturnAddress,
-//     __readfsdword / __writefsdword (fs: is the thread's TIB on Linux too -- agent C's w32_seh.cpp sets it up),
+//     __readfsdword / __writefsdword (fs: is the thread's TIB on Linux too -- hook/w32_seh.cpp sets it up),
 //     __stosb / __stosd / __movsb / __movsw / __movsd (rep stos / rep movs, as MSVC emits them), __cpuid, __rdtsc,
 //     _mm_pause,
 //     _InterlockedExchange / _InterlockedCompareExchange / _InterlockedIncrement / _InterlockedDecrement, _alloca
@@ -17,11 +17,11 @@
 //     here (no <unistd.h>: its W_OK / R_OK would collide with the port's own names).
 // Nothing here is a Windows API type: those are win32_compat.h's (hook/linux_inc/windows.h includes it in place of
 // <windows.h>), so a file that doesn't include <windows.h> on Windows doesn't see them on Linux either.
-// (It also declares vp_r2b_todo, linux_todo.h, for R2b's placeholders.)
+// (It also declares vp_r2b_todo, linux_todo.h: the abort for Linux paths that can't be reached.)
 //
 // What isn't Windows': wchar_t is 32-bit here (the port's 16-bit wide strings are WCHAR = uint16_t, never wchar_t);
 // long double is the x87's 80 bits, as mingw's (MSVC's is double); and three i386 System V ABI points differ from
-// Windows' -- checked over the whole port (R2b agent A's report: every class's size and alignment under mingw and
+// Windows' -- checked over the whole port (relink stage R2b: every class's size and alignment under mingw and
 // Linux GCC compared, -Waggregate-return):
 //   - a double or 64-bit integer inside a struct is aligned to 4 here, 8 on Windows: no layout the game shares differs
 //     (VP_WIN_ALIGN8 where win32_compat.h needs Windows' alignment: LARGE_INTEGER);
@@ -156,5 +156,5 @@ static inline int _snprintf(char* buf, size_t count, const char* fmt, ...) {
 #define _stricmp strcasecmp
 #define _strnicmp strncasecmp
 
-// ---- R2b's placeholders (vp_r2b_todo), visible everywhere in the Linux build until agents B/C/D replace them -------------
+// ---- vp_r2b_todo (linux_todo.h): the Linux build's abort for a path that can't be reached --------------------------------
 #include "linux_todo.h"

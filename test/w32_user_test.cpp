@@ -1,4 +1,4 @@
-// w32_user_test.cpp -- agent C's stand-ins (hook/w32_user.*, hook/w32_net.*) against the real Windows API, on the same
+// w32_user_test.cpp -- the stand-ins (hook/w32_user.*, hook/w32_net.*) against the real Windows API, on the same
 // inputs, in one process: USER32 / GDI32 (forwarded: results and the last error carried both ways), MapVirtualKeyA's
 // US table, the registry on registry.ini (against a scratch key under HKEY_CURRENT_USER, removed at the end), TAPI32
 // "not available" (against TAPI32 on a PC with no modem), the serial-port functions, and WSOCK32 (winsock: loopback

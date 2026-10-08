@@ -31,7 +31,7 @@ void logf(const char* fmt, ...);
 
 bool vp_os_on;
 
-// ---- the stand-ins the port's calls use (hook/w32_*.cpp: agents A, B, C) ------------------------------------------------
+// ---- the stand-ins the port's calls use (hook/w32_*.cpp; A w32_file.h, B w32_kernel.h, C w32_user.h) --------------------
 // Their owners' headers, and each one used here declared again weak (the same signature), so the build links while
 // one isn't written yet (see the top).
 #ifdef VP_GCC

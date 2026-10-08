@@ -812,51 +812,39 @@ void platform_install(const char* build) {
         logf("platform: NOT switching to SDL2 -- %s is missing addresses", build);
         return;
     }
-    // first bytes of each replaced function in v1.0 (other builds check their own, from their tables)
-    static const uint8_t create_window_pro[] = {0x83, 0xEC, 0x28, 0x53, 0x56, 0x57, 0x33, 0xF6};
-    static const uint8_t hook_keys_pro[] = {0xFF, 0x15, 0x74, 0x74, 0x5D, 0x00};
-    static const uint8_t idle_pro[] = {0x83, 0xEC, 0x1C, 0x80, 0x3D, 0xC0, 0x5E, 0x4E};
-    static const uint8_t scan_begin_pro[] = {0x57, 0x6A, 0x00, 0x68, 0x88, 0x81, 0x50, 0x00};
-    static const uint8_t scan_update_pro[] = {0x83, 0x3D, 0x8C, 0x81, 0x50, 0x00, 0x00, 0x0F};
-    static const uint8_t mouse_center_pro[] = {0x6A, 0x00, 0xA1, 0x54, 0x86, 0x50, 0x00, 0x6A};
-    static const uint8_t joy_begin_pro[] = {0x53, 0x33, 0xDB, 0x53, 0x88, 0x1D, 0x10, 0x91};
-    static const uint8_t joy_pos_pro[] = {0x83, 0xEC, 0x54, 0x83, 0x3D, 0x08, 0x91, 0x50};
-    static const uint8_t joy_name_pro[] = {0x83, 0x3D, 0x08, 0x91, 0x50, 0x00, 0x00, 0xB8};
-    static const uint8_t joy_hasff_pro[] = {0x83, 0x3D, 0x14, 0x91, 0x50, 0x00, 0x00, 0x75};
-    static const uint8_t joy_enff_pro[] = {0x8A, 0x44, 0x24, 0x04, 0x3A, 0x05, 0x10, 0x91};
-    static const uint8_t joy_force_pro[] = {0x80, 0x3D, 0x10, 0x91, 0x50, 0x00, 0x00, 0x56};
-    static const uint8_t joy_end_pro[] = {0x83, 0x3D, 0x14, 0x91, 0x50, 0x00, 0x00, 0x74};
-    struct H { uint32_t at; const uint8_t* pro; size_t n; void* to; const char* what; };
+    // each replaced function's first n bytes in v1.0, as their hash (vp_code_hash; other builds check their own, from
+    // their tables)
+    struct H { uint32_t at; uint32_t hash; size_t n; void* to; const char* what; };
     const H window[] = {
-        {0x00412690, create_window_pro, sizeof create_window_pro, (void*)sdl_create_window, "create_window (SDL window)"},
-        {0x00412ac0, hook_keys_pro, sizeof hook_keys_pro, (void*)sdl_hook_keys, "hook_keys"},
-        {0x00412bf0, idle_pro, sizeof idle_pro, (void*)sdl_idle, "Win32Idle (SDL events)"},
-        {0x00412f00, scan_begin_pro, sizeof scan_begin_pro, (void*)sdl_scan_begin, "ScanBegin"},
-        {0x00413040, scan_update_pro, sizeof scan_update_pro, (void*)sdl_scan_update, "ScanUpdate (SDL keyboard)"},
-        {0x00414620, mouse_center_pro, sizeof mouse_center_pro, (void*)sdl_mouse_center, "MouseCenter"},
+        {0x00412690, 0x57ac2a49, 8, (void*)sdl_create_window, "create_window (SDL window)"},
+        {0x00412ac0, 0x3064423c, 6, (void*)sdl_hook_keys, "hook_keys"},
+        {0x00412bf0, 0xd3bf1e2b, 8, (void*)sdl_idle, "Win32Idle (SDL events)"},
+        {0x00412f00, 0xf4989b6f, 8, (void*)sdl_scan_begin, "ScanBegin"},
+        {0x00413040, 0x8a4d0267, 8, (void*)sdl_scan_update, "ScanUpdate (SDL keyboard)"},
+        {0x00414620, 0xcf0b3072, 8, (void*)sdl_mouse_center, "MouseCenter"},
     };
     // v1.0 and v1.1 have one joystick; 1.2.x rewrote joy.obj for up to 8 (every call takes an index), so
     // its tables have none of these and its joysticks stay on DirectInput
     const H joystick[] = {
-        {0x00418bb0, joy_begin_pro, sizeof joy_begin_pro, (void*)sdl_joy_begin, "JoyBegin (SDL joystick)"},
-        {0x00418f30, joy_end_pro, sizeof joy_end_pro, (void*)sdl_joy_end, "JoyEnd"},
-        {0x00418ff0, joy_pos_pro, sizeof joy_pos_pro, (void*)sdl_joy_get_pos, "JoyGetPos"},
-        {0x00418fd0, joy_name_pro, sizeof joy_name_pro, (void*)sdl_joy_get_name, "JoyGetName"},
-        {0x00419230, joy_hasff_pro, sizeof joy_hasff_pro, (void*)sdl_joy_has_ff, "JoyHasForceFeedback"},
-        {0x00419250, joy_enff_pro, sizeof joy_enff_pro, (void*)sdl_joy_enable_ff, "JoyEnableForceFeedback"},
-        {0x00419360, joy_force_pro, sizeof joy_force_pro, (void*)sdl_joy_set_force, "JoySetForce"},
+        {0x00418bb0, 0x211387c5, 8, (void*)sdl_joy_begin, "JoyBegin (SDL joystick)"},
+        {0x00418f30, 0x260d971a, 8, (void*)sdl_joy_end, "JoyEnd"},
+        {0x00418ff0, 0xfb213a97, 8, (void*)sdl_joy_get_pos, "JoyGetPos"},
+        {0x00418fd0, 0xbeadf882, 8, (void*)sdl_joy_get_name, "JoyGetName"},
+        {0x00419230, 0x270d98ad, 8, (void*)sdl_joy_has_ff, "JoyHasForceFeedback"},
+        {0x00419250, 0xdfe9c695, 8, (void*)sdl_joy_enable_ff, "JoyEnableForceFeedback"},
+        {0x00419360, 0x54bd0bdf, 8, (void*)sdl_joy_set_force, "JoySetForce"},
     };
     for (const H& h : window)                                    // all or nothing: check every one first
-        if (!code_is(h.at, h.pro, h.n)) {
+        if (!code_is(h.at, h.hash, h.n)) {
             logf("platform: NOT switching to SDL2 -- %s isn't the code %s should have", h.what, build);
             return;
         }
     bool joy = true;
     for (const H& h : joystick)
-        joy = joy && have(h.at) && code_is(h.at, h.pro, h.n);
-    for (const H& h : window) jmp_hook(h.at, h.pro, h.n, h.to, h.what);
+        joy = joy && have(h.at) && code_is(h.at, h.hash, h.n);
+    for (const H& h : window) jmp_hook(h.at, h.hash, h.n, h.to, h.what);
     if (joy)
-        for (const H& h : joystick) jmp_hook(h.at, h.pro, h.n, h.to, h.what);
+        for (const H& h : joystick) jmp_hook(h.at, h.hash, h.n, h.to, h.what);
     else
         logf("platform: joysticks stay on DirectInput in %s (its joystick code isn't v1.0's)", build);
     logf("platform: SDL2 window, keyboard and mouse%s", joy ? ", joystick" : "");

@@ -7,7 +7,7 @@
 //                per axle or per wheel, by the mixer quality; the other wheels get a silent dummy), and its $E
 //                initialisers
 //
-// Faithful (docs/PORTING.md, the S1 brief): written from the v1.0 disassembly. Every call in the original's order with
+// Faithful (docs/PORTING.md): written from the v1.0 disassembly. Every call in the original's order with
 // its arguments: the game's functions by their v1.0 address (this file's own too -- EngineSound::Update calls
 // EngineSoundSample::Update, which calls GetVolume, each at its address, so a hooked rewrite or the original is what
 // runs), the Car's GetPerceivedThrottle / GetPerceivedRPM and the sounds' deleting destructors through their vtables,

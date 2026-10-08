@@ -17,7 +17,7 @@
 // each against the real TAPI32 of a PC without one.
 // Serial (KERNEL32: GetCommState, SetCommState, SetCommTimeouts, GetCommModemStatus, GetCommProperties,
 // ClearCommError): no COM ports. The game reaches them only with a COM port CreateFileA opened ("COM1".."COM4", which
-// fail ERROR_FILE_NOT_FOUND without one -- agent A's CreateFileA) or a TAPI modem's (none), so they fail as Windows
+// fail ERROR_FILE_NOT_FOUND without one -- w32_file.cpp's CreateFileA) or a TAPI modem's (none), so they fail as Windows
 // fails them on any handle that isn't a COM port: a disk file ERROR_INVALID_PARAMETER, a console ERROR_INVALID_FUNCTION,
 // any other object or an unknown handle ERROR_INVALID_HANDLE (checked against Windows; w32_net.cpp).
 #pragma once

@@ -2455,33 +2455,31 @@ struct Island {
     uint32_t at;
     IslandKind kind;
     uint8_t group;            // 0: 87disp, 1: __adj_fpatan, 2: __rdtsc
-    uint8_t orig[5];          // the v1.0 bytes it replaces
+    uint32_t orig;            // FNV-1a of the v1.0 bytes it replaces (5 for JMP5, 2 for SHORT2): viperport.h's vp_code_hash
     void* to;                 // JMP5: the rewrite
     uint32_t short_to;        // SHORT2: the slot
     const char* what;
 };
-#define B5(a, b, c, d, e) {a, b, c, d, e}
 static const Island k_islands[] = {
-    {0x004d2e9c, JMP5, 0, B5(0xc3, 0xe8, 0xb7, 0x00, 0x00), (void*)&crt_rttosnpop, 0, "__rttosnpop"},
-    {0x004d2ea4, SHORT2, 0, B5(0xdd, 0xd8, 0, 0, 0), 0, 0x004d2eab, "__rtzeropop"},
-    {0x004d2eab, JMP5, 0, B5(0xdd, 0xd8, 0xdd, 0xd8, 0xd9), (void*)&crt_rtzeropop, 0, "__rtzeropop's slot"},
-    {0x004d2ea6, JMP5, 0, B5(0xdd, 0xd8, 0xd9, 0xee, 0xc3), (void*)&crt_rtzeronpop, 0, "__rtzeronpop"},
-    {0x004d2eb2, JMP5, 0, B5(0xdb, 0xbd, 0x62, 0xff, 0xff), (void*)&crt_tosnan1, 0, "__tosnan1"},
-    {0x004d2edd, SHORT2, 0, B5(0xd9, 0xc9, 0, 0, 0), 0, 0x004d2ee4, "__nosnan2"},
-    {0x004d2ee4, JMP5, 0, B5(0xff, 0xdb, 0xad, 0x62, 0xff), (void*)&crt_nosnan2, 0, "__nosnan2's slot"},
-    {0x004d2edf, JMP5, 0, B5(0xdb, 0xbd, 0x62, 0xff, 0xff), (void*)&crt_tosnan2, 0, "__tosnan2"},
-    {0x004d2f07, JMP5, 0, B5(0xdb, 0xbd, 0x62, 0xff, 0xff), (void*)&crt_nan2, 0, "__nan2"},
-    {0x004d2f46, SHORT2, 0, B5(0xdd, 0xd8, 0, 0, 0), 0, 0x004d2f4d, "__rtindfpop"},
-    {0x004d2f4d, JMP5, 0, B5(0x28, 0x50, 0x00, 0x80, 0xbd), (void*)&crt_rtindfpop, 0, "__rtindfpop's slot"},
-    {0x004d2f48, JMP5, 0, B5(0xdd, 0xd8, 0xdb, 0x2d, 0x50), (void*)&crt_rtindfnpop, 0, "__rtindfnpop"},
-    {0x004d2f63, JMP5, 0, B5(0x0a, 0xc9, 0x74, 0x02, 0xd9), (void*)&crt_rtchsifneg, 0, "__rtchsifneg"},
-    {0x004cef65, SHORT2, 1, B5(0xd9, 0xf3, 0, 0, 0), 0, 0x004cef6d, "__adj_fpatan"},
-    {0x004cef6d, SHORT2, 1, B5(0xcc, 0xcc, 0, 0, 0), 0, 0x004cefe9, "__adj_fpatan's hop (adj_fptan's padding)"},
-    {0x004cefe9, JMP5, 1, B5(0xcc, 0xcc, 0xcc, 0xcc, 0xcc), (void*)&crt_adj_fpatan, 0, "__adj_fpatan's slot (onexit's padding)"},
-    {0x004188ad, SHORT2, 2, B5(0x0f, 0x31, 0, 0, 0), 0, 0x00418912, "__rdtsc"},
-    {0x00418912, JMP5, 2, B5(0xcc, 0xcc, 0xcc, 0xcc, 0xcc), (void*)&crt_rdtsc, 0, "__rdtsc's slot (KernelEnd's padding)"},
+    {0x004d2e9c, JMP5, 0, 0x2c991093, (void*)&crt_rttosnpop, 0, "__rttosnpop"},
+    {0x004d2ea4, SHORT2, 0, 0xa9c8bd30, 0, 0x004d2eab, "__rtzeropop"},
+    {0x004d2eab, JMP5, 0, 0x9c51014c, (void*)&crt_rtzeropop, 0, "__rtzeropop's slot"},
+    {0x004d2ea6, JMP5, 0, 0x3f5557b4, (void*)&crt_rtzeronpop, 0, "__rtzeronpop"},
+    {0x004d2eb2, JMP5, 0, 0xacd62b83, (void*)&crt_tosnan1, 0, "__tosnan1"},
+    {0x004d2edd, SHORT2, 0, 0xc2d504e7, 0, 0x004d2ee4, "__nosnan2"},
+    {0x004d2ee4, JMP5, 0, 0x452f9ce9, (void*)&crt_nosnan2, 0, "__nosnan2's slot"},
+    {0x004d2edf, JMP5, 0, 0xacd62b83, (void*)&crt_tosnan2, 0, "__tosnan2"},
+    {0x004d2f07, JMP5, 0, 0xacd62b83, (void*)&crt_nan2, 0, "__nan2"},
+    {0x004d2f46, SHORT2, 0, 0xa9c8bd30, 0, 0x004d2f4d, "__rtindfpop"},
+    {0x004d2f4d, JMP5, 0, 0xc8be0ed0, (void*)&crt_rtindfpop, 0, "__rtindfpop's slot"},
+    {0x004d2f48, JMP5, 0, 0x37886c4c, (void*)&crt_rtindfnpop, 0, "__rtindfnpop"},
+    {0x004d2f63, JMP5, 0, 0xf6584315, (void*)&crt_rtchsifneg, 0, "__rtchsifneg"},
+    {0x004cef65, SHORT2, 1, 0xccd514a5, 0, 0x004cef6d, "__adj_fpatan"},
+    {0x004cef6d, SHORT2, 1, 0xe3a5daa5, 0, 0x004cefe9, "__adj_fpatan's hop (adj_fptan's padding)"},
+    {0x004cefe9, JMP5, 1, 0xfe38b9eb, (void*)&crt_adj_fpatan, 0, "__adj_fpatan's slot (onexit's padding)"},
+    {0x004188ad, SHORT2, 2, 0xa082b1dd, 0, 0x00418912, "__rdtsc"},
+    {0x00418912, JMP5, 2, 0xfe38b9eb, (void*)&crt_rdtsc, 0, "__rdtsc's slot (KernelEnd's padding)"},
 };
-#undef B5
 enum { N_ISLANDS = sizeof k_islands / sizeof k_islands[0] };
 
 static void island_bytes(const Island& is, uint8_t* b, int* n) {
@@ -2525,9 +2523,11 @@ bool crt_islands_install() {
             int n;
             island_bytes(is, want, &n);
             const uint8_t* p = (const uint8_t*)(uintptr_t)is.at;
-            bool orig = true, cc = true, mine = true;
+            uint32_t h = 2166136261u;                                 // (viperport.h's vp_code_hash: not included here,
+            for (int k = 0; k < n; k++) h = (h ^ p[k]) * 16777619u;   // its have() would shadow the asm label above)
+            const bool orig = h == is.orig;
+            bool cc = true, mine = true;
             for (int k = 0; k < n; k++) {
-                orig &= p[k] == is.orig[k];
                 cc &= p[k] == 0xcc;
                 mine &= p[k] == want[k];
             }

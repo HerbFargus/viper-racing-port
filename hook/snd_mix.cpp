@@ -5,7 +5,7 @@
 // looping DirectSound buffer the SoftMixer streams into: WaveBegin, the primary and fallback secondary buffers,
 // WaveGrab / WaveRelease, WaveEnd -- the only code in the game that calls DirectSound).
 //
-// How it runs (out/agents/rsnd/report.md). SoundBegin -> MixerBegin(1): the list is [NullMixer, SoftMixer if its probe
+// How it runs. SoundBegin -> MixerBegin(1): the list is [NullMixer, SoftMixer if its probe
 // works] (MixerAddMixer runs a mixer's Begin and End once, on the main thread). The SoundManager then runs the chosen
 // mixer's Begin again and calls its Update from its BGHook, so SoftMixer::Update -- WaveGrab, mix_bytes into the
 // locked memory, WaveRelease -- runs on the BGTask timer thread every 16 ms, the physics thread. SoftMixer::Begin:

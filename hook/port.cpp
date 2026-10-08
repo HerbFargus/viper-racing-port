@@ -15,15 +15,17 @@ static std::vector<PortFn*>& registry() {
     return r;
 }
 
-PortFn::PortFn(uint32_t v, const char* nm, void* r, void* s, const uint8_t* op, uint8_t ol)
-    : v10(v), name(nm), repl(r), shadow(s), other_prologue(op), other_len(ol) {
+PortFn::PortFn(uint32_t v, const char* nm, void* r, void* s, uint32_t oh, uint8_t ol)
+    : v10(v), name(nm), repl(r), shadow(s), other_hash(oh), other_len(ol) {
     registry().push_back(this);
 }
 
 bool port_is_new(const PortFn& f) { return f.mode != PORT_ORIGINAL && f.orig; }
 
 // ---- trampolines ---------------------------------------------------------------------------------------
-struct Prologue { uint32_t v10; uint8_t len; int8_t rel; uint8_t bytes[16]; };
+// {address, length, rel32 offset, FNV-1a of v1.0's bytes, the same with M1's operand as zeros}: no code, only hashes --
+// a trampoline copies the live bytes (tools/gen_port_tables.py, write_prologues)
+struct Prologue { uint32_t v10; uint8_t len; int8_t rel; uint32_t hash, hash_m1; };
 static const Prologue k_prologues[] = {
 #include "prologues.inc"
 };
@@ -44,7 +46,8 @@ static void* make_trampoline(const Prologue& p) {
     g_tramp_used += 32;
     memcpy(t, (const void*)p.v10, p.len);                         // the live bytes: M1's operands included
     if (p.rel >= 0) {                                             // a call/jmp rel32 moved: re-aim it
-        int32_t d = *(int32_t*)(p.bytes + p.rel);
+        int32_t d;
+        memcpy(&d, t + p.rel, 4);                                 // (the live copy's: live_prologue checked it)
         uint32_t target = p.v10 + p.rel + 4 + d;
         *(int32_t*)(t + p.rel) = (int32_t)(target - (uint32_t)(t + p.rel + 4));
     }
@@ -82,15 +85,23 @@ static bool vrmod_patched(uint32_t v10);
 
 // the prologue record for v10, if the live bytes are still v1.0's (apart from bytes M1 patched, and a function the
 // stock check accepted as vrmod's patch: its first bytes are vrmod's, which the trampoline copies -- unsafe_check's
-// `ret` runs and returns, as vrmod's function does; no vrmod patch there moves a rel32)
+// `ret` runs and returns, as vrmod's function does; no vrmod patch there moves a rel32). The table holds hashes, not
+// bytes: the live bytes are hashed with the ones M1 patched as zeros, against v1.0's hash if M1 patched none of them,
+// or v1.0's with M1's operand as zeros if it did (M1 writes an operand's 4 bytes all or nothing, and the generator
+// allows at most one in a prologue -- so this is the byte-by-byte test it replaces)
 static const Prologue* live_prologue(uint32_t v10) {
     if (!is_v10()) return 0;
     for (const Prologue& p : k_prologues)
         if (p.v10 == v10) {
-            for (int i = 0; i < p.len; i++)
-                if (((const uint8_t*)v10)[i] != p.bytes[i] && !m1_patched(v10 + i) && !(vrmod_patched(v10) && p.rel < 0))
-                    return 0;
-            return &p;
+            if (vrmod_patched(v10) && p.rel < 0) return &p;
+            uint32_t h = 2166136261u;
+            bool m1 = false;
+            for (int i = 0; i < p.len; i++) {
+                const bool m = m1_patched(v10 + i);
+                m1 |= m;
+                h = (h ^ (m ? 0 : ((const uint8_t*)v10)[i])) * 16777619u;
+            }
+            return h == (m1 ? p.hash_m1 : p.hash) ? &p : 0;
         }
     return 0;
 }
@@ -847,9 +858,9 @@ void port_install(const char* ini) {
                 continue;
             }
             write_jmp(f->v10, f->mode == PORT_SHADOW ? f->shadow : f->repl);
-        } else if (!is_v10() && f->other_prologue && f->mode == PORT_NEW) {
+        } else if (!is_v10() && f->other_len && f->mode == PORT_NEW) {
             // another build: new only, after the per-build check of its first bytes
-            if (!jmp_hook(f->v10, f->other_prologue, f->other_len, f->repl, f->name)) continue;
+            if (!jmp_hook(f->v10, f->other_hash, f->other_len, f->repl, f->name)) continue;
             f->orig = (void*)1;                                     // marks it in force; never called
         } else {
             logf("port: %s stays original (%s needs v1.0 and its prologue in prologues.inc)", f->name, mode_name(f->mode));

@@ -652,7 +652,7 @@ static const char* k_strs[6][4] = {
     {"Rookie", "Pro", "Expert", "?realism"}, {"Single", "Laps", "Drag", "?type"}, {"Clear", "Rain", "Fog", "?weather"},
     {"Noon", "Dusk", "Night", "?time"}, {"Easy", "Medium", "Hard", "?ai"}, {"Status A", "Status B", "Lost", "?status"},
 };
-static const char* k_user_names[8] = {"Player", "Herb", "a12charname!", "x", "Pajama Sam", "", "Putt-Putt", "Fatty Bear"};
+static const char* k_user_names[8] = {"Player", "Kate", "a12charname!", "x", "Racer Jane", "", "Road-Hawk", "Night Wolf"};
 static int32_t __cdecl stub_HackGetCarIndex() { L('HGCI'); return HS->hack_car; }
 static int32_t __cdecl stub_GetCarFileNumber(const char* s) { L('GCFR'); LS(s); return HS->car_number; }
 static int32_t __cdecl stub_GetTrackCount() { L('GTCN'); return HS->ntracks; }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# package_linux.sh -- the Linux release tarball (out/briefs/linux_pkg_brief.md), in the Ubuntu 22.04 WSL distro:
+# package_linux.sh -- the Linux release tarball, in the Ubuntu 22.04 WSL distro:
 #
 #   wsl -d Ubuntu-22.04 -- tools/package_linux.sh
 #

@@ -12,7 +12,7 @@
 //         import table holds the port's own Win32 functions (hook/w32_*.cpp) -- the port's call goes where the game's
 //         goes: the same thread ids, handles, last error, files, clocks and window as the game sees (session.cpp
 //         compares the game's thread ids and suspends the game's threads, hands the game a find handle and its last
-//         error; platform.cpp hands the game its foreground window). A stand-in another agent hasn't written yet is
+//         error; platform.cpp hands the game its foreground window). A stand-in that isn't linked in is
 //         a weak reference (null): Windows' own is called, as the game's slot then still is (the loader keeps the real
 //         import for any slot without a stand-in). The port's own objects of the kind (its events, its ini reads,
 //         GetFileAttributesA, which the game doesn't import) are implemented here, in vp_os.cpp, portably.

@@ -160,7 +160,7 @@ static void patch_jump(uint32_t at, void* to) {
 }
 
 // ---- the real data: members of the install's archives (0TSR: vrmod/archive.py) ------------------------------------
-static const char* k_install = "C:\\Users\\player\\Desktop\\claude-code\\game-files\\installs\\v1.0-RC\\";
+static std::string k_install;                               // <repo>\..\game-files\installs\v1.0-RC\, set in main
 struct Member { std::string name; uint32_t version; std::vector<uint8_t> data; };
 static std::vector<Member> g_members;
 static std::vector<uint8_t> g_csu;                          // Config\setups\limbo.csu
@@ -177,7 +177,7 @@ static bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }
 static void load_archive(const char* file, const char* const* want) {
     std::vector<uint8_t> d;
-    if (!read_file(std::string(k_install) + file, d) || d.size() < 16 || memcmp(d.data(), "0TSR", 4)) {
+    if (!read_file(k_install + file, d) || d.size() < 16 || memcmp(d.data(), "0TSR", 4)) {
         printf("can't read %s from the install\n", file);
         return;
     }
@@ -1272,7 +1272,10 @@ int main(int argc, char** argv) {
     char exe[MAX_PATH];
     strcpy(exe, __FILE__);
     char* s = strstr(exe, "\\test\\world_wld_cars.cpp");
-    if (s) strcpy(s, "\\out\\race_v10.exe");
+    if (s) {
+        k_install = std::string(exe, s) + "\\..\\game-files\\installs\\v1.0-RC\\";
+        strcpy(s, "\\out\\race_v10.exe");
+    }
     if (!load_race_exe(exe)) return 2;
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(0x400000 + ((IMAGE_DOS_HEADER*)0x400000)->e_lfanew);
     IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
@@ -1285,7 +1288,7 @@ int main(int argc, char** argv) {
     load_archive("common.res", res_parts);
     static const char* const trk_parts[] = {".ccs", "default.ili", 0};
     load_archive("kenyon.trk", trk_parts);
-    if (!read_file(std::string(k_install) + "Config\\setups\\limbo.csu", g_csu) || g_csu.size() != 0xd4) {
+    if (!read_file(k_install + "Config\\setups\\limbo.csu", g_csu) || g_csu.size() != 0xd4) {
         printf("can't read Config\\setups\\limbo.csu from the install\n");
         return 2;
     }

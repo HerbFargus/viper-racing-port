@@ -26,9 +26,8 @@
 # #include: __stdcall & co., __declspec, the intrinsics, the MSVC C runtime names.
 #
 # The link test (out-linux/viperport-link-test): every object of the port plus a main() that references the stand-ins'
-# table, proving everything resolves. What agents B/C/D of R2b will provide is a stub in hook/linux_todo.cpp
-# (vp_r2b_todo: prints its name and aborts) -- running the test stops at the first one (standalone.cpp's static
-# initialiser reads the environment). The real executable is out-linux/viperport: the ELF loader
+# table, proving everything resolves (a Linux path that can't be reached calls vp_r2b_todo, hook/linux_todo.cpp:
+# prints its name and aborts). The real executable is out-linux/viperport: the ELF loader
 # (loader/viperport_linux.cpp) and the same objects, linked with -Wl,--wrap=fopen (hook/vp_os_linux.h).
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -42,7 +41,7 @@ mkdir -p "$OUT/obj"
 if [ $RELEASE = 1 ]; then
     CXX=${CXX:-g++-15}
     SDL_CONFIG=/opt/sdl2-i386/bin/sdl2-config
-    [ -x "$SDL_CONFIG" ] || { echo "build_linux release: no $SDL_CONFIG (SDL2 2.32 built for i386 -- see out/briefs/linux_pkg_brief.md)"; exit 1; }
+    [ -x "$SDL_CONFIG" ] || { echo "build_linux release: no $SDL_CONFIG (SDL2 2.32 built for i386, installed to /opt/sdl2-i386)"; exit 1; }
 else
     CXX=${CXX:-g++}
     SDL_CONFIG=sdl2-config
@@ -54,13 +53,13 @@ CFLAGS="-m32 -O2 -march=i686 -mfpmath=387 -fexcess-precision=standard -fno-stric
 -I$ROOT/hook/linux_inc -include $ROOT/hook/msvc_compat.h"
 # -D_FILE_OFFSET_BITS=64: 32-bit stat()/readdir fail with EOVERFLOW on WSL's /mnt/c (drvfs inode numbers are 64-bit), so
 # an install on a Windows drive would look missing.
-# -mincoming-stack-boundary=2 (R2b agent B: the stack-alignment risk): race.exe's code calls the port with the stack
+# -mincoming-stack-boundary=2 (relink stage R2b's stack-alignment risk): race.exe's code calls the port with the stack
 # aligned to 4 only (Win32's guarantee), and the i386 System V ABI that Linux GCC, glibc, SDL2 and Mesa assume is 16 at
 # every call -- a misaligned movaps in a library the port calls would fault. With this, every port function that calls
 # another (or keeps a 16-aligned local) realigns its own frame on entry (push ebp; mov ebp, esp; and esp, -16), so every
 # call the port makes out of a game frame is 16-aligned again. Arguments stay ebp-relative, the return address where
 # it was (_AddressOfReturnAddress), naked functions untouched, x87 arithmetic the same: frames only. (-mstackrealign,
-# the brief's first idea, realigns only a function with an over-aligned local of its own, not a caller: a call into a
+# the obvious first choice, realigns only a function with an over-aligned local of its own, not a caller: a call into a
 # library from a game frame would stay misaligned.)
 # A change of flags rebuilds everything (out-linux/flags.txt).
 # the port opens its own files with fopen and Windows paths: the wrapper (hook/vp_os_linux.cpp) takes them through the path layer

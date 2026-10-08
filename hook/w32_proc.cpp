@@ -8,7 +8,7 @@
 // What the game loads: the C runtime's FDIV check LoadLibraryA("KERNEL32") and GetProcAddress's
 // GetProcessAffinityMask, GetCurrentProcess, SetThreadAffinityMask, GetCurrentThread (once a run); its message box,
 // only on a fatal C runtime error: LoadLibraryA("user32.dll") and MessageBoxA, GetActiveWindow, GetLastActivePopup.
-// GetProcAddress gives the stand-ins for those (agent C's table through w32_set_proc_lookup, else this file's
+// GetProcAddress gives the stand-ins for those (w32_table.cpp's table through w32_set_proc_lookup, else this file's
 // KERNEL32/WINMM list), so the game reaches no Windows function by that road either.
 //
 // The environment (the C runtime reads it once, at start: GetEnvironmentStringsW, then WideCharToMultiByte twice,
@@ -358,7 +358,7 @@ void* W32K_CALL w32_GetProcAddress(uint32_t module, const char* name) {
 #endif
 }
 
-// ---- this area's stand-ins by name (GetProcAddress's fallback; agent C's table may use it too) -------------------------
+// ---- this area's stand-ins by name (GetProcAddress's fallback; w32_table.cpp's table may use it too) -------------------
 void* w32_kernel_proc(const char* dll, const char* name) {
     struct Entry { const char* name; void* fn; };
 #define E(n) {#n, (void*)&w32_##n}

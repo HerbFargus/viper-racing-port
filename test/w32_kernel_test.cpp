@@ -82,7 +82,7 @@ struct Api {
 };
 static int32_t real_close(uint32_t h) { return CloseHandle((HANDLE)(uintptr_t)h); }
 static int32_t stand_close(uint32_t h) { return w32::close(h); }
-static uint32_t W32K_CALL stand_last_error() { return w32::last_error(); }   // (w32_GetLastError: agent A's, w32_file.cpp)
+static uint32_t W32K_CALL stand_last_error() { return w32::last_error(); }   // (w32_GetLastError: w32_file.cpp's)
 #define R(f) (decltype(Api::f))(void*)&::f
 #define S(f) &w32_##f
 static Api real_api() {

@@ -39,7 +39,7 @@ struct SaSpan { uint32_t start, end; };
 struct SaKeep { uint32_t start, bytes; const char* why; };
 struct SaThunk { uint32_t va, slot; };
 struct SaNamed { uint32_t va; const char* where; };
-struct Prologue { uint32_t v10; uint8_t len; int8_t rel; uint8_t bytes[16]; };
+struct Prologue { uint32_t v10; uint8_t len; int8_t rel; uint32_t hash, hash_m1; };   // (port.cpp)
 
 const SaFunc k_funcs[] = {
 #define VP_SA_FUNCS

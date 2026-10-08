@@ -1,7 +1,7 @@
 // viperport -- milestone M2, stage 3: the game's DirectSound, emulated on SDL2 audio.
 //
 // Only the game's software mixer ever runs (SoftMixer + wave.obj; the hardware DSoundMixer is never
-// constructed -- out/agents/rsnd): it mixes every sound itself, 3D attenuation, panning and Doppler
+// constructed): it mixes every sound itself, 3D attenuation, panning and Doppler
 // included, and streams the result into ONE looping 22050 Hz stereo buffer from its 16 ms background
 // thread. So DirectSound here is a ring buffer the game writes ahead of an SDL audio callback that plays it:
 //
