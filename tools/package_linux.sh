@@ -27,13 +27,14 @@ cp -L /opt/sdl2-i386/lib/libSDL2-2.0.so.0 "$STAGE/lib/"
 strip --strip-unneeded "$STAGE/lib/libSDL2-2.0.so.0"
 install -m 755 tools/linux_pkg/viperport.sh "$STAGE/"
 
-# the dependency lines, one place: what the binary and SDL2 load from the system (32-bit glibc, Mesa GL, X11, audio)
-APT="libc6:i386 libgl1:i386 libgl1-mesa-dri:i386 libx11-6:i386 libxext6:i386 libxcursor1:i386 libxi6:i386 libxrandr2:i386 libxss1:i386 libpulse0:i386"
-DNF="glibc.i686 mesa-libGL.i686 mesa-dri-drivers.i686 libX11.i686 libXext.i686 libXcursor.i686 libXi.i686 libXrandr.i686 libXScrnSaver.i686 pulseaudio-libs.i686"
-PACMAN="lib32-glibc lib32-mesa lib32-libx11 lib32-libxext lib32-libxcursor lib32-libxi lib32-libxrandr lib32-libxss lib32-libpulse"
+# the dependency lines, one place: what the binary and SDL2 load from the system (32-bit glibc, Mesa GL, X11, audio,
+# udev -- without it SDL's joystick driver can't start: the game then runs without controllers)
+APT="libc6:i386 libgl1:i386 libgl1-mesa-dri:i386 libx11-6:i386 libxext6:i386 libxcursor1:i386 libxi6:i386 libxrandr2:i386 libxss1:i386 libpulse0:i386 libudev1:i386"
+DNF="glibc.i686 mesa-libGL.i686 mesa-dri-drivers.i686 libX11.i686 libXext.i686 libXcursor.i686 libXi.i686 libXrandr.i686 libXScrnSaver.i686 pulseaudio-libs.i686 systemd-libs.i686"
+PACMAN="lib32-glibc lib32-mesa lib32-libx11 lib32-libxext lib32-libxcursor lib32-libxi lib32-libxrandr lib32-libxss lib32-libpulse lib32-systemd"
 sed -e "s/@VERSION@/$VERSION/" -e "s/@APT_PACKAGES@/$APT/" -e "s/@DNF_PACKAGES@/$DNF/" -e "s/@PACMAN_PACKAGES@/$PACMAN/" \
     tools/linux_pkg/README-linux.txt > "$STAGE/README-linux.txt"
-if grep -q "$(printf '')" "$STAGE/README-linux.txt" "$STAGE/viperport.sh"; then
+if grep -q $'\r' "$STAGE/README-linux.txt" "$STAGE/viperport.sh"; then
     echo "package_linux: CR line ends in the README or viperport.sh (a Windows edit): the install line would break"; exit 1
 fi
 

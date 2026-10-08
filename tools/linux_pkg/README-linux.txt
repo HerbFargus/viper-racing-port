@@ -62,6 +62,8 @@ Troubleshooting
 * Nothing happens / a library is missing: run  ./viperport.sh --check  in a terminal, and check
   the install line above went through. "ld-linux.so.2: not found" or "No such file" for
   ./viperport means the 32-bit runtime isn't installed.
+* No controller: the 32-bit libudev isn't installed (it's in the install line above); the log
+  says "controllers can't start". The mouse and keyboard still work.
 * The window opens black or the game is slow: check 32-bit Mesa is installed (glxinfo32 or the
   log's "GL" lines show the renderer); a software renderer (llvmpipe) is much slower.
 

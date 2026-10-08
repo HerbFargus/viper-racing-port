@@ -458,8 +458,20 @@ int run(const VpStandaloneArgs* args) {
 #endif
             const Uint32 sub = SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC;
             if (SDL_InitSubSystem(sub) != 0) {
-                fail("SDL doesn't start as the game starts it: %s (GetModuleHandle(NULL) = %p)", SDL_GetError(),
-                     (void*)GetModuleHandleA(0));
+                char why[256];                          // (the game falls back to video and events, as here)
+                snprintf(why, sizeof why, "%s", SDL_GetError());
+                if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
+                    fail("SDL doesn't start as the game starts it: %s (GetModuleHandle(NULL) = %p)", SDL_GetError(),
+                         (void*)GetModuleHandleA(0));
+                else {
+                    say("SDL starts without controllers (%s): the mouse and keyboard only%s", why,
+#ifdef _WIN32
+                        "");
+#else
+                        " -- install the 32-bit libudev for controllers (README-linux.txt)");
+#endif
+                    SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
+                }
             } else {
                 say("SDL starts as the game starts it (video, events, joysticks, haptics: %d joysticks)", SDL_NumJoysticks());
                 SDL_QuitSubSystem(sub);

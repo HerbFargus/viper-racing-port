@@ -311,8 +311,13 @@ unsigned char __cdecl sdl_create_window(void* instance) {
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "unaware");
     int before_w = vpos_GetSystemMetrics(SM_CXSCREEN), before_h = vpos_GetSystemMetrics(SM_CYSCREEN);
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC) != 0) {
-        logf("SDL: can't start: %s", SDL_GetError());
-        return 0;
+        // (Linux without the 32-bit libudev: SDL's joystick driver can't start, and that stopped SDL as a whole; the
+        // game then runs with the mouse and keyboard only)
+        logf("SDL: controllers can't start (%s) -- the mouse and keyboard only", SDL_GetError());
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+            logf("SDL: can't start: %s", SDL_GetError());
+            return 0;
+        }
     }
 #ifdef _WIN32
     SDL_SetWindowsMessageHook(raw_message, 0);
