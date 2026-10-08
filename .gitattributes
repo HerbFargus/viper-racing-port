@@ -1,2 +1,4 @@
 # the Linux build script must keep LF line ends on a Windows checkout (core.autocrlf)
 *.sh text eol=lf
+# the Linux package's files ship as they are: LF
+tools/linux_pkg/* text eol=lf
