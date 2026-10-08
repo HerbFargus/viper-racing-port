@@ -183,6 +183,47 @@ bool texparam_changed(GLenum pname, uint32_t bits) {
 }
 template <class T> uint32_t bits_of(T v) { uint32_t b = 0; memcpy(&b, &v, sizeof v); return b; }
 
+// ---- the draws' vertex stream (draw-performance stage P2) ---------------------------------------------------------------
+// gl_core.cpp's draw uploads each draw's vertices (and indices) with glBufferData into the one buffer, then draws: on
+// some drivers (Intel's Mesa) every upload waits for the draw before it to finish with the buffer, ~440 waits a frame.
+// Live, those uploads go instead into a big buffer one after another (glBufferSubData at a fresh offset -- a range the
+// GPU isn't reading, so nothing waits), the buffer orphaned only when it fills; the draw that follows is offset to its
+// data (DrawArrays' first, DrawElementsBaseVertex). As for the cache, the recorded stream is untouched.
+struct Stream {
+    GLuint vao, vbo, ibo;                        // gl_core.cpp's draw buffers (stream_buffers)
+    size_t voff, ioff;                           // where the next upload goes
+    bool valloc, ialloc;                         // the big buffer is the buffer's store (vs. a plain upload)
+    GLint base;                                  // the last vertex upload's first vertex
+    uintptr_t ibase;                             // the last index upload's byte offset
+} S;
+const size_t VRING = 8u << 20, IRING = 2u << 20;
+
+// a stream upload: true when it went into the big buffer
+bool stream_upload(GLenum t, ptrdiff_t n, const void* p, GLenum u) {
+    const bool vtx = t == GL_ARRAY_BUFFER, ix = t == GL_ELEMENT_ARRAY_BUFFER;
+    // (is the bound buffer one of the draw buffers? the array buffer by the cache; the element buffer is the VAO's)
+    const bool ours = S.vao && ((vtx && C.array_buf == S.vbo) || (ix && C.vao == S.vao));
+    if (!ours || u != GL_STREAM_DRAW || !p || n <= 0 || (size_t)n > (vtx ? VRING : IRING) / 4) {
+        // a plain upload replaces the store of whatever's bound -- which may be a draw buffer
+        if (vtx && (C.array_buf == S.vbo || C.array_buf == UNKNOWN)) S.valloc = false, S.base = 0;
+        if (ix && (C.vao == S.vao || C.vao == UNKNOWN)) S.ialloc = false, S.ibase = 0;
+        return false;
+    }
+    size_t& off = vtx ? S.voff : S.ioff;
+    bool& alloc = vtx ? S.valloc : S.ialloc;
+    const size_t ring = vtx ? VRING : IRING, step = vtx ? 32 : 4;
+    if (!alloc || off + (size_t)n > ring) {      // (a fresh store: what the GPU still reads stays with the old one)
+        gl_api.BufferData(t, (ptrdiff_t)ring, 0, GL_STREAM_DRAW);
+        off = 0, alloc = true;
+    }
+    gl_api.BufferSubData(t, (ptrdiff_t)off, n, p);
+    if (vtx) S.base = (GLint)(off / 32);
+    else S.ibase = off;
+    off += ((size_t)n + step - 1) / step * step;
+    return true;
+}
+inline bool streamed_vao() { return S.vao && C.vao == S.vao; }
+
 }  // namespace
 
 const char* gl_record_name(uint16_t m) {
@@ -253,7 +294,8 @@ void BlitFramebuffer(GLint a, GLint b, GLint c, GLint d, GLint e, GLint f, GLint
     if (LIVE(rec(I_BlitFramebuffer, 0, 0, a, b, c, d, e, f, g, h, m, fl))) gl_api.BlitFramebuffer(a, b, c, d, e, f, g, h, m, fl);
 }
 void BufferData(GLenum t, ptrdiff_t n, const void* p, GLenum u) {
-    if (LIVE(rec(I_BufferData, p, p ? (size_t)n : 0, t, (uint32_t)n, u))) gl_api.BufferData(t, n, p, u);
+    if (!live(rec(I_BufferData, p, p ? (size_t)n : 0, t, (uint32_t)n, u))) return;
+    if (!stream_upload(t, n, p, u)) gl_api.BufferData(t, n, p, u);
 }
 GLenum CheckFramebufferStatus(GLenum t) {
     int ph = rec(I_CheckFramebufferStatus, 0, 0, t);
@@ -308,9 +350,14 @@ void Disable(GLenum a) {
     C.caps[a] = 0;
     gl_api.Disable(a);
 }
-void DrawArrays(GLenum m, GLint f, GLsizei n) { if (LIVE(rec(I_DrawArrays, 0, 0, m, f, n))) gl_api.DrawArrays(m, f, n); }
+void DrawArrays(GLenum m, GLint f, GLsizei n) {
+    if (!live(rec(I_DrawArrays, 0, 0, m, f, n))) return;
+    gl_api.DrawArrays(m, streamed_vao() ? f + S.base : f, n);
+}
 void DrawElements(GLenum m, GLsizei n, GLenum t, const void* off) {
-    if (LIVE(rec(I_DrawElements, 0, 0, m, n, t, (uint32_t)(uintptr_t)off))) gl_api.DrawElements(m, n, t, off);
+    if (!live(rec(I_DrawElements, 0, 0, m, n, t, (uint32_t)(uintptr_t)off))) return;
+    if (streamed_vao()) gl_api.DrawElementsBaseVertex(m, n, t, (const char*)off + S.ibase, S.base);
+    else gl_api.DrawElements(m, n, t, off);
 }
 void Enable(GLenum a) {
     if (!live(rec(I_Enable, 0, 0, a))) return;
@@ -440,6 +487,7 @@ void SwapWindow(SDL_Window* win) {
     C.valid = false;                             // (gl_dxgi.cpp's present binds framebuffers directly)
 }
 void cache_reset() { C.valid = false; }
+void stream_buffers(GLuint vao, GLuint vbo, GLuint ibo) { S = Stream{vao, vbo, ibo}; }
 // a deleted texture: it unbinds from every unit, and its parameters go with it (its name can come back from GenTextures)
 void cache_forget_texture(GLuint t) {
     for (GLuint& u : C.tex)

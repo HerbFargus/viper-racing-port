@@ -91,6 +91,7 @@ void Viewport(GLint, GLint, GLsizei, GLsizei);
 void SwapWindow(SDL_Window*);
 void cache_reset();                              // after GL state set outside glr (gl_api directly)
 void cache_forget_texture(GLuint);               // after a texture deleted outside glr
+void stream_buffers(GLuint vao, GLuint vbo, GLuint ibo);   // the draws' buffers: their uploads stream (live side)
 void GetDrawableSize(SDL_Window*, int*, int*);
 void SetView(int x0, int y0, int w, int h, int game_w, int game_h);
 }  // namespace glr

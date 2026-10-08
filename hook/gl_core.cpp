@@ -688,6 +688,7 @@ bool start() {
     gl_api.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     gl_api.ProvokingVertex(GL_FIRST_VERTEX_CONVENTION);        // D3D flat shading takes the first vertex
     glr::cache_reset();                          // (the state above went to the driver directly)
+    glr::stream_buffers(in.vao, in.vbo, in.ibo);
     in.ready = true;
     set_defaults();
     set_mode(st.w, st.h);
