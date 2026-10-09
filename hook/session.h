@@ -16,10 +16,10 @@ void session_install(const char* ini);         // after port_install: reads [ses
 // the recording has one -- the renderer draws at that size, whatever the window is, so the 2D page's 3D read-back is
 // the recording's (gl_core.cpp make_target)
 bool session_render_size(int* w, int* h);
-// a replay: the [graphics] settings (anisotropic, msaa) it was recorded with -- 0, 0 for a recording made before they
-// existed; false when not replaying (the renderer then uses viperport.ini's)
-bool session_graphics(int* aniso, int* msaa);
-void gfx_graphics_ini(int* aniso, int* msaa);   // viperport.ini's [graphics] (gl_core.cpp): what a recording keeps
+// a replay: the [graphics] settings it was recorded with, v[3] = {anisotropic, msaa, fxaa} -- 0 for
+// any a recording predates; false when not replaying (the renderer then uses viperport.ini's)
+bool session_graphics(int* v);
+void gfx_graphics_ini(int* v);                   // viperport.ini's [graphics], v[3] (gl_core.cpp): what a recording keeps
 void session_report();                         // the exit log (and a recording's end)
 
 inline bool session_recording() { return g_session_mode == SESSION_RECORD; }

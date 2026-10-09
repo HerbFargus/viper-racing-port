@@ -99,6 +99,34 @@ void main() {
 }
 )";
 
+// [graphics] fxaa: edge smoothing over the finished 3D, after the published FXAA technique (luma edges; a blur along the
+// edge's direction, kept only where it stays inside the neighbourhood's range). Written for the port.
+const char* FX_VS = R"(
+in vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+)";
+const char* FX_FS = R"(
+uniform sampler2D uTex; uniform vec2 uInv; out vec4 frag;
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+vec3 at(vec2 p) { return texture(uTex, p).rgb; }
+void main() {
+    vec2 p = gl_FragCoord.xy * uInv;
+    vec3 m = at(p);
+    float lm = luma(m);
+    float nw = luma(at(p + vec2(-1.0, -1.0) * uInv)), ne = luma(at(p + vec2(1.0, -1.0) * uInv));
+    float sw = luma(at(p + vec2(-1.0, 1.0) * uInv)), se = luma(at(p + vec2(1.0, 1.0) * uInv));
+    float lo = min(lm, min(min(nw, ne), min(sw, se))), hi = max(lm, max(max(nw, ne), max(sw, se)));
+    if (hi - lo < max(0.0312, hi * 0.125)) { frag = vec4(m, 1.0); return; }      // no edge here
+    vec2 dir = vec2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));
+    float reduce = max((nw + ne + sw + se) * (0.25 / 8.0), 1.0 / 128.0);
+    dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), vec2(-8.0), vec2(8.0)) * uInv;
+    vec3 a = 0.5 * (at(p + dir * (1.0 / 3.0 - 0.5)) + at(p + dir * (2.0 / 3.0 - 0.5)));
+    vec3 b = 0.5 * a + 0.25 * (at(p - dir * 0.5) + at(p + dir * 0.5));
+    float lb = luma(b);
+    frag = vec4(lb < lo || lb > hi ? a : b, 1.0);
+}
+)";
+
 struct Program {
     GLuint id = 0;
     GLint uM, uClip, uTL, uRT, uMap, uTex, uTexOn, uBlend, uTexAlpha, uKeyed, uSpec, uFog, uAlphaFunc, uAlphaRef, uFogCol;
@@ -120,8 +148,15 @@ struct Infra {                                   // made once by start()
     // before, and a frame that mixes 2D and 3D in any order needs no copy back
     GLuint ms_fbo = 0, ms_color = 0, ms_depth = 0;
     bool ms_dirty = false;                       // drawn to since the last resolve
+    // fxaa: one pass over the 3D into fx_fbo, copied back -- when the game asks for its page (before the 2D goes on),
+    // or at the present for a frame whose 3D no 2D followed. Off with msaa (which smooths the same edges).
+    int fxaa = 0;
+    GLuint fx_prog = 0, fx_fbo = 0, fx_tex = 0;
+    GLint fx_tex_u = -1, fx_inv_u = -1;
+    bool fx_pending = false;                     // 3D drawn since the last pass
+    bool fx_over = false;                        // and the 2D laid over it since (this frame)
 } in;
-int g_ini_aniso, g_ini_msaa;                     // viperport.ini [graphics] anisotropic= / msaa= (capture_install)
+int g_ini_aniso, g_ini_msaa, g_ini_fxaa;          // viperport.ini [graphics] (capture_install)
 bool g_graphics_in_replays;                      // [debug] graphics_in_replays=1: a replay uses viperport.ini's (to test them)
 
 // where drawing goes: the multisampled target with msaa, else st.fbo (exactly as without the setting)
@@ -138,6 +173,24 @@ void resolve() {
     glr::Disable(GL_SCISSOR_TEST);               // (every draw, clear and blit sets its own)
     glr::BlitFramebuffer(0, 0, st.rt_w, st.rt_h, 0, 0, st.rt_w, st.rt_h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     in.ms_dirty = false;
+}
+// [graphics] fxaa: the 3D in st.fbo smoothed (through fx_fbo, then copied back)
+void fxaa() {
+    in.fx_pending = false;
+    if (!in.fx_fbo || !in.fx_prog) return;
+    glr::BindFramebuffer(GL_FRAMEBUFFER, in.fx_fbo);
+    glr::Viewport(0, 0, st.rt_w, st.rt_h);
+    glr::Disable(GL_SCISSOR_TEST); glr::Disable(GL_DEPTH_TEST); glr::Disable(GL_CULL_FACE); glr::Disable(GL_BLEND);
+    glr::ActiveTexture(GL_TEXTURE0);
+    glr::BindTexture(GL_TEXTURE_2D, st.fbo_color);
+    glr::UseProgram(in.fx_prog);
+    glr::Uniform1i(in.fx_tex_u, 0);
+    glr::Uniform2f(in.fx_inv_u, 1.0f / (float)st.rt_w, 1.0f / (float)st.rt_h);
+    glr::BindVertexArray(in.quad_vao);
+    glr::DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glr::BindFramebuffer(GL_READ_FRAMEBUFFER, in.fx_fbo);
+    glr::BindFramebuffer(GL_DRAW_FRAMEBUFFER, st.fbo);
+    glr::BlitFramebuffer(0, 0, st.rt_w, st.rt_h, 0, 0, st.rt_w, st.rt_h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 }
 
 GLuint compile(GLenum type, const char* prelude, const char* src) {
@@ -619,6 +672,22 @@ void make_target() {                             // the render target at the win
         }
         in.ms_dirty = false;
     }
+    if (in.fxaa) {                               // [graphics] fxaa: where the pass draws
+        if (in.fx_fbo) glr::DeleteFramebuffers(1, &in.fx_fbo), glr::DeleteTextures(1, &in.fx_tex);
+        glr::GenTextures(1, &in.fx_tex);
+        glr::BindTexture(GL_TEXTURE_2D, in.fx_tex);
+        glr::TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ww, wh, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+        glr::GenFramebuffers(1, &in.fx_fbo);
+        glr::BindFramebuffer(GL_FRAMEBUFFER, in.fx_fbo);
+        glr::FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, in.fx_tex, 0);
+        if (glr::CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            logf("renderer: FXAA isn't available at %dx%d -- off", ww, wh);
+            glr::DeleteFramebuffers(1, &in.fx_fbo), glr::DeleteTextures(1, &in.fx_tex);
+            in.fx_fbo = in.fx_tex = 0;
+            in.fxaa = 0;
+        }
+        glr::BindFramebuffer(GL_FRAMEBUFFER, st.fbo);
+    }
 }
 
 }  // namespace
@@ -716,8 +785,9 @@ bool start() {
     in.thread = vpos_GetCurrentThreadId();
     logf("renderer: OpenGL %s on %s", (const char*)gl_api.GetString(GL_VERSION), (const char*)gl_api.GetString(GL_RENDERER));
     {   // [graphics]: viperport.ini's, or a replay's recording's; each as far as this GPU goes
-        int a = g_ini_aniso, m = g_ini_msaa;
-        if (!g_graphics_in_replays) session_graphics(&a, &m);
+        int v[3] = {g_ini_aniso, g_ini_msaa, g_ini_fxaa};
+        if (!g_graphics_in_replays) session_graphics(v);
+        const int a = v[0], m = v[1];
         GLint max_samples = 0;
         GLfloat max_aniso = 0;
         gl_api.GetIntegerv(GL_MAX_SAMPLES, &max_samples);
@@ -726,9 +796,16 @@ bool start() {
         for (int k = 2; k <= m && k <= max_samples && k <= 8; k *= 2) in.msaa = k;
         in.aniso = a >= 2 && max_aniso >= 2 ? (float)(a < 16 ? a : 16) : 0.0f;
         if (in.aniso > max_aniso) in.aniso = max_aniso;
-        if (a || m)
-            logf("renderer: graphics: anisotropic filtering %gx, anti-aliasing %dx (asked %d and %d; this GPU allows %gx and %dx)",
-                 in.aniso, in.msaa, a, m, max_aniso, max_samples);
+        in.fxaa = v[2] && !in.msaa ? 1 : 0;           // (with msaa: off -- the same edges, already smooth)
+        if (in.fxaa) {
+            in.fx_prog = link("#version 330 core\n", FX_VS, FX_FS, false);
+            in.fx_tex_u = gl_api.GetUniformLocation(in.fx_prog, "uTex");
+            in.fx_inv_u = gl_api.GetUniformLocation(in.fx_prog, "uInv");
+            if (!in.fx_prog) in.fxaa = 0;
+        }
+        if (a || m || v[2])
+            logf("renderer: graphics: anisotropic filtering %gx, anti-aliasing %dx, FXAA %s (asked %d, %d, %d; this GPU"
+                 " allows %gx and %dx)", in.aniso, in.msaa, in.fxaa ? "on" : "off", a, m, v[2], max_aniso, max_samples);
     }
     // FIX: present through a DXGI flip-model swap chain where the driver allows (gl_dxgi.h), so screenshots and the
     // taskbar's preview see the game on NVIDIA; anything else presents through SDL_GL_SwapWindow as before
@@ -782,6 +859,7 @@ void read_page() {                               // Lock of the back buffer: the
     // the 4:3 middle, shrunk to the game's resolution (the 2D reads it: alpha pastes, XOR)
     int x0 = (int)floorf(st.ox + 0.5f), x1 = (int)floorf(st.ox + st.w * st.scale + 0.5f);
     resolve();
+    if (in.fxaa && in.fx_pending) fxaa();
     glr::BindFramebuffer(GL_READ_FRAMEBUFFER, st.fbo);
     glr::BindFramebuffer(GL_DRAW_FRAMEBUFFER, st.small_fbo);
     glr::Disable(GL_SCISSOR_TEST);
@@ -845,6 +923,7 @@ void draw_page() {                               // Unlock: what the 2D drew, ov
     if (!on_gl_thread()) return;
     perf::Scope perf_scope(perf::PAGE2D);
     if (!page_overlay(pg.page.data(), pg.under.data(), pg.drawn3d.data(), st.w, st.h, pg.overlay.data())) return;
+    in.fx_over = true;
     glr::BindFramebuffer(GL_FRAMEBUFFER, target_fbo());
     int x0 = (int)floorf(st.ox + 0.5f), x1 = (int)floorf(st.ox + st.w * st.scale + 0.5f);
     glr::Viewport(x0, 0, x1 - x0, (int)floorf(st.h * st.scale + 0.5f));
@@ -935,6 +1014,7 @@ void capture_install(const char* ini) {
     g_capture_ms = (uint32_t)vpos_GetPrivateProfileIntA("debug", "capture", 0, ini) * 1000u;
     g_ini_aniso = vpos_GetPrivateProfileIntA("graphics", "anisotropic", 0, ini);
     g_ini_msaa = vpos_GetPrivateProfileIntA("graphics", "msaa", 0, ini);
+    g_ini_fxaa = vpos_GetPrivateProfileIntA("graphics", "fxaa", 0, ini);
     g_graphics_in_replays = vpos_GetPrivateProfileIntA("debug", "graphics_in_replays", 0, ini) != 0;
     perf::on = vpos_GetPrivateProfileIntA("debug", "perf", 0, ini) != 0;
     if (perf::on) logf("perf: on ([debug] perf=1): where each frame's time goes, every 5 s and at exit");
@@ -956,6 +1036,8 @@ void present() {
     if (!on_gl_thread()) return;
     perf::Scope perf_scope(perf::PRESENT);
     resolve();
+    if (in.fxaa && in.fx_pending && !in.fx_over) fxaa();
+    in.fx_pending = in.fx_over = false;
     glr::BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glr::BindFramebuffer(GL_READ_FRAMEBUFFER, st.fbo);
     capture_frame();
@@ -1600,6 +1682,7 @@ HRESULT draw(D3DPRIMITIVETYPE pt, D3DVERTEXTYPE vtype, const void* verts, DWORD 
     const DWORD* rs = st.rs;
     Program& pr = rs[D3DRENDERSTATE_SHADEMODE] == D3DSHADE_FLAT ? in.flat : in.smooth;
     glr::BindFramebuffer(GL_FRAMEBUFFER, target_fbo());
+    in.fx_pending = true, in.fx_over = false;
     glr::UseProgram(pr.id);
     glr::BindVertexArray(in.vao);
     bool tl = vtype == D3DVT_TLVERTEX;
@@ -1710,4 +1793,4 @@ bool start_headless() {
 
 void gfx_repaint() { gfx::repaint(); }
 void gfx_capture_install(const char* ini) { gfx::capture_install(ini); }
-void gfx_graphics_ini(int* aniso, int* msaa) { *aniso = gfx::g_ini_aniso, *msaa = gfx::g_ini_msaa; }
+void gfx_graphics_ini(int* v) { v[0] = gfx::g_ini_aniso, v[1] = gfx::g_ini_msaa, v[2] = gfx::g_ini_fxaa; }

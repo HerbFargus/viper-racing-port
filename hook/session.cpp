@@ -1671,8 +1671,8 @@ void first_present() {
     }
 #endif
     if (g_session_mode == SESSION_RECORD) {
-        int rec[4] = {g_win_w, g_win_h, 0, 0};          // (+ the [graphics] settings, which change the 3D's pixels)
-        gfx_graphics_ini(&rec[2], &rec[3]);
+        int rec[5] = {g_win_w, g_win_h, 0, 0, 0};       // (+ the [graphics] settings, which change the 3D's pixels)
+        gfx_graphics_ini(&rec[2]);
         put(K_INFO, rec, sizeof rec);
     }
 }
@@ -1690,14 +1690,14 @@ bool session_render_size(int* w, int* h) {
     return true;
 }
 
-bool session_graphics(int* aniso, int* msaa) {
+bool session_graphics(int* v) {
     if (g_session_mode != SESSION_PLAY && g_session_mode != SESSION_ENDED) return false;   // (viperport.ini's stand)
-    *aniso = *msaa = 0;
+    for (int i = 0; i < 3; i++) v[i] = 0;
     for (const Rec& r : g_recs)
-        if (r.kind == K_INFO && r.len >= 16) {
-            int32_t rec[4];
-            memcpy(rec, payload(r), sizeof rec);
-            *aniso = rec[2], *msaa = rec[3];
+        if (r.kind == K_INFO && r.len >= 8) {     // {w, h, then as many settings as the recording knew}
+            int32_t rec[5] = {0, 0, 0, 0, 0};
+            memcpy(rec, payload(r), r.len < sizeof rec ? r.len : sizeof rec);
+            for (int i = 0; i < 3; i++) v[i] = rec[2 + i];
             break;
         }
     return true;
