@@ -46,14 +46,22 @@ Good to know
 * Log: viperport.log beside race.exe -- the first place to look if something goes wrong.
 * Graphics: [graphics] in viperport.ini -- anisotropic=16 sharpens distant textures (switch on
   "filtering" and "mipmap" in the game's Graphics options too) and msaa=2 or 4 smooths edges
-  (next start). Both are 0, the original look, until you change them. The mod manager's
+  (next start); fxaa=1 is a cheaper smoothing that softens the picture a little. All are 0,
+  the original look, until you change them. The mod manager's
   Graphics choice sets all of this for you.
 * Performance: put  perf=1  under  [debug]  in viperport.ini and the log shows where each
   frame's time goes, every 5 seconds.
 * Multiplayer: Windows and Linux players can race each other over TCP/IP. Each player sees
   every car with their OWN copy of shared files -- your paint job and hornball look on everyone's
   car, as in the original game.
-* Controllers work in races; the menus use the mouse and keyboard, as in the original.
+* Controllers: a game controller (Xbox, PlayStation and the like) works without setting it up,
+  and can be plugged in or out at any time. In a race it drives alongside the keyboard: left
+  stick steer, RT throttle, LT brake, A handbrake, B reverse, X horn, Y next camera, LB / RB
+  shift down / up, right stick look left / right (click: look back), Start the pause menu (in
+  it: D-pad, A choose, B back). In the menus the left stick moves the mouse pointer, A clicks,
+  X right-clicks and B is Esc. If you map any control to the joystick in Options > Controls,
+  races use your mapping instead, exactly as the original did. A wheel or plain joystick works
+  through Options > Controls, as in the original.
 
 
 Licences

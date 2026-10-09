@@ -206,6 +206,50 @@ dozen places and the game dies.
   unchanged. Elsewhere (AMD, Intel, Wine), or if any step fails, the log says so in one line and the game
   presents as before. (Cosmetic; `gl_dxgi.cpp`.)
 
+## Controllers
+
+Not fixes of the original's code but the platform layer's (`platform.cpp`); always on, and nothing changes
+unless a game controller is used.
+
+- A controller can be plugged in or out while the game runs: the one connected last is used, and when it
+  goes another still connected takes over. The original opened the first joystick at start-up and never
+  looked again. With none, `JoyGetPos` now hands the game a joystick at rest -- the original left the last
+  reading in place, so a button held as the pad was unplugged stayed held. (A recording made before only
+  ever reports no joystick from its start, when the reading is all zeros anyway, so it replays the same.)
+- A game controller (anything SDL knows the layout of: Xbox, PlayStation, Switch Pro...) works without
+  setting it up. Wheels and plain joysticks are left to Options > Controls, as before.
+
+  | Where | Input | Does |
+  |---|---|---|
+  | race | left stick | steer (dead zone 15%, then the game's steering sensitivity and range, as its analog path) |
+  | race | RT / LT | throttle / brake (the game's pedal sensitivity and range; the larger of trigger and key wins) |
+  | race | A / B / X | handbrake / reverse (held) / horn |
+  | race | LB / RB | shift down / up, one gear a press (down to reverse, up to the top gear) |
+  | race | right stick across / its click | look left or right / look back |
+  | race | Y | the next camera, F1..F11 in turn (the blimp, F12, is left out) |
+  | race | Start | the pause menu (Esc); in it D-pad up / down, A choose, B or Start back |
+  | menus | left stick | the mouse pointer (faster the further it's pushed and the longer it moves) |
+  | menus | A / X / B | left click / right click / Esc |
+
+  Back, the left stick's click and the D-pad outside the pause menu do nothing. The keyboard keeps working
+  alongside: the controller's steering takes over while the stick is off centre, and the keyboard's ramps go
+  on from their own values, not the controller's. Anyone who has mapped any control to the joystick in
+  Options > Controls keeps exactly the original's behaviour in a race (no merge; Y and Start left alone).
+  The control-detect dialog reads the controller itself, so the controller makes no clicks or keys while
+  it's open.
+- Replays stay exact. The driving is merged in a wrapper round `DriverUpdate` from nothing but the joystick
+  reading the game polled (`JoyGetPos`, which a session records) and the driver's own state, so the
+  `DriverGet*` values the race recorder stores are the merged ones; the triggers, which the original's
+  layout folds into one axis (LT - RT), ride in the reading's spare button bytes 16 and 17, with a mark in
+  byte 18 that says the layout is a game controller's (the game reads buttons 0..7 only, so the record's
+  size is unchanged). The buttons that act as keys, and the pointer, are made inside `Win32Idle` as the
+  keys and mouse events a real keyboard and mouse give, so a session records them as its ops (the
+  pointer's resulting position included). v1.0 only, like the SDL joystick itself.
+- Testing without a controller: `VIPERPORT_TEST_PAD=<script>` in the environment attaches SDL's virtual
+  controller and drives it from the script (`<ms> attach | detach | quit | axis <lx|ly|rx|ry|lt|rt> <v> |
+  button <a|b|x|y|back|start|ls|rs|lb|rb|up|down|left|right> <0|1>`), and the log shows every merge, key
+  and click.
+
 ## Sound
 
 - Doppler: a sound source and the listener closing at exactly the speed of sound divided by zero. The

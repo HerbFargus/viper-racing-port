@@ -12,7 +12,11 @@
 //   ScanBegin/Update the 256-byte DirectInput keyboard state the driving controls read, from SDL's
 //                    keyboard state
 //   Joy*             SDL game controllers and joysticks for DirectInput's, and SDL haptics for its
-//                    constant-force effect, with the game's own force maths
+//                    constant-force effect, with the game's own force maths; plugged in and out while the
+//                    game runs (the last one connected is the one used)
+//   the controller   a game controller works without setting anything up (always on; "the controller",
+//                    below): in a race it drives alongside the keyboard (DriverUpdate's merge) and its
+//                    buttons are the camera / pause-menu keys; in the menus its left stick is a mouse
 //
 // Off unless viperport.ini (next to the DLL) has `[platform] sdl=1`. SDL2.dll is delay-loaded, so the DLL
 // still loads without it when the switch is off.
@@ -24,6 +28,8 @@
 #include <windows.h>
 #include "vp_os.h"
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include "SDL.h"
@@ -394,10 +400,13 @@ void key_meta(unsigned vk, unsigned char scan) { uint8_t b[2] = {(uint8_t)vk, sc
 #pragma pack(push, 1)
 struct MouseOp { uint8_t type; int16_t x, y; uint8_t buttons; };
 #pragma pack(pop)
+int g_mouse_x = -1, g_mouse_y = -1;                              // the last position handed to the game (its pixels)
+bool g_mouse_real;                                               // the real mouse moved since the pad's pointer did
 void mouse_event(int type, int x, int y, int buttons) {
     MouseOp m = {(uint8_t)type, (int16_t)x, (int16_t)y, (uint8_t)buttons};
     session_op(SOP_MOUSE, &m, sizeof m);
     MouseQueueEvent(type, x, y, buttons);
+    g_mouse_x = x, g_mouse_y = y;
 }
 
 void queue_text(const char* utf8) {                              // typed text: the game's character set is ANSI
@@ -416,7 +425,22 @@ void mouse(int type, int x, int y) {
         y = y < 0 ? 0 : y >= g_view.game_h ? g_view.game_h - 1 : y;
     }
     mouse_event(type, x, y, (int)g_mouse_buttons);
+    g_mouse_real = true;
 }
+
+// a key pressed, as the game gets it from a real one (SDL_KEYDOWN below): KeyDown, the meta character, and the
+// characters WM_CHAR delivered that SDL's text input doesn't (control keys and ctrl+letters)
+void key_press(const Key* k, Uint16 mod) {
+    unsigned char scan = k->dik & 0x7f;
+    key_down(k->vk);
+    key_meta(k->vk, scan);
+    if (k->vk == 0x08 || k->vk == 0x09 || k->vk == 0x0d || k->vk == 0x1b)
+        key_char(k->vk, scan);
+    else if ((mod & KMOD_CTRL) && !(mod & KMOD_ALT) && k->vk >= 'A' && k->vk <= 'Z')
+        key_char(k->vk - 0x40, scan);
+}
+
+void joy_device_event(const SDL_Event& e);
 
 void handle(const SDL_Event& e) {
 #ifndef _WIN32
@@ -431,17 +455,13 @@ void handle(const SDL_Event& e) {
     case SDL_KEYDOWN: {                                          // WM_KEYDOWN / WM_SYSKEYDOWN
         g_n_keys++;
         const Key* k = key_for(e.key.keysym.scancode);
-        if (!k) break;
-        unsigned char scan = k->dik & 0x7f;
-        key_down(k->vk);
-        key_meta(k->vk, scan);
-        // the characters WM_CHAR delivered that SDL's text input doesn't: control keys and ctrl+letters
-        if (k->vk == 0x08 || k->vk == 0x09 || k->vk == 0x0d || k->vk == 0x1b)
-            key_char(k->vk, scan);
-        else if ((e.key.keysym.mod & KMOD_CTRL) && !(e.key.keysym.mod & KMOD_ALT) && k->vk >= 'A' && k->vk <= 'Z')
-            key_char(k->vk - 0x40, scan);
+        if (k) key_press(k, e.key.keysym.mod);
         break;
     }
+    case SDL_JOYDEVICEADDED:                                     // a controller plugged in or out
+    case SDL_JOYDEVICEREMOVED:
+        joy_device_event(e);
+        break;
     case SDL_KEYUP: {
         const Key* k = key_for(e.key.keysym.scancode);
         if (k) key_up(k->vk);
@@ -492,16 +512,22 @@ void record_scan() {
     session_op(SOP_SCAN, list, (uint8_t)(n + 1 > 255 ? 255 : n + 1));
 }
 
+void pad_test_tick();
+void pad_idle();
+
 void __cdecl sdl_idle(void) {                                    // Win32Idle
     SDL_Event e;
+    pad_test_tick();                                             // (VIPERPORT_TEST_PAD only)
     if (session_playing()) {                                     // a session replay: the recording's input
-        while (SDL_PollEvent(&e))
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) handle(e);                   // (closing the window still quits)
+            // controllers plugged in or out: opened and closed (the game reads the recording's JoyPos meanwhile), so
+            // the right one is there if the recording runs out
+            else if (e.type == SDL_JOYDEVICEADDED || e.type == SDL_JOYDEVICEREMOVED) joy_device_event(e);
 #ifndef _WIN32
-            if (e.type == SDL_QUIT) handle(e);                   // (closing the window still quits)
             else system_event(e);                                // (R2b: activation, posted messages, as on Windows)
-#else
-            if (e.type == SDL_QUIT) handle(e);                   // (closing the window still quits)
 #endif
+        }
         if (session_play_idle()) return;
     }                                                            // (the recording ran out: the player's, from here)
     session_idle_begin();
@@ -528,6 +554,7 @@ void __cdecl sdl_idle(void) {                                    // Win32Idle
         gxRestore();
     }
     while (SDL_PollEvent(&e)) handle(e);
+    pad_idle();                                                  // the controller's keys and pointer: ops like the rest
     scan_update();
     record_scan();
     session_idle_end();
@@ -549,20 +576,61 @@ struct JoyPos { float axis[6]; uint8_t button[32]; int32_t pov; };   // pov: an 
 
 float unit(Sint16 v) { float f = v / 32768.0f; return f < -1 ? -1 : f > 1 ? 1 : f; }
 
-void __cdecl sdl_joy_begin(void) {
+// JoyPos.button[16..18]: the port's own, for a game controller -- the game reads buttons 0..7 only, so the recorded
+// JoyPos keeps its size: the triggers apart, 0..255 (axis 2 folds them into LT - RT, so both held read as neither),
+// and a mark saying the layout is a game controller's (a plain joystick's buttons are 0 or 1). The controller's merge
+// (DriverUpdate, below) reads them from the JoyPos the game polled, which a session records.
+enum { JB_LT = 16, JB_RT = 17, JB_MARK = 18, PAD_MARK = 0xc0 };
+
+// Plugged in and out while the game runs (SDL_JOYDEVICEADDED / REMOVED): the device connected last is the one in use;
+// when it goes, another still connected takes over, else there is none (JoyGetPos: 0, and a JoyPos at rest). Only the
+// main thread opens, closes and reads them (Win32Idle, DriverUpdate's poll, DriverRefresh's force feedback).
+bool g_joy_begun;                                                // between JoyBegin and JoyEnd
+SDL_JoystickID g_joy_id = -1;                                    // the open one's instance id
+SDL_JoystickID g_known[16];                                      // connected ones already announced (or there at JoyBegin)
+int g_nknown;
+bool known(SDL_JoystickID id) {
+    for (int i = 0; i < g_nknown; i++)
+        if (g_known[i] == id) return true;
+    return false;
+}
+void know(SDL_JoystickID id) {
+    if (id >= 0 && !known(id) && g_nknown < (int)(sizeof g_known / sizeof g_known[0])) g_known[g_nknown++] = id;
+}
+void forget(SDL_JoystickID id) {
+    for (int i = 0; i < g_nknown; i++)
+        if (g_known[i] == id) g_known[i--] = g_known[--g_nknown];
+}
+
+void joy_close() {
+    if (g_haptic) SDL_HapticClose(g_haptic);
+    if (g_pad) SDL_GameControllerClose(g_pad);
+    else if (g_joy) SDL_JoystickClose(g_joy);
+    g_haptic = 0, g_pad = 0, g_joy = 0, g_effect = -1, g_joy_id = -1;
     g_joy_name[0] = 0;
-    for (int i = 0; i < SDL_NumJoysticks() && !g_joy; i++) {
-        if (SDL_IsGameController(i) && (g_pad = SDL_GameControllerOpen(i)))
-            g_joy = SDL_GameControllerGetJoystick(g_pad);
-        else
-            g_joy = SDL_JoystickOpen(i);
-    }
-    if (!g_joy) {
-        logf("SDL: no joystick");
-        return;
-    }
+}
+
+// the force feedback as JoyEnableForceFeedback last asked (a device opened later gets it too)
+void ff_apply() {
+    if (g_effect < 0) return;
+    if (SDL_HapticQuery(g_haptic) & SDL_HAPTIC_AUTOCENTER) SDL_HapticSetAutocenter(g_haptic, g_ff_on ? 0 : 100);
+    if (g_ff_on) SDL_HapticRunEffect(g_haptic, g_effect, 1);
+    else SDL_HapticStopEffect(g_haptic, g_effect);
+}
+
+// device `index` as the one in use (the one open before is closed): a game controller if SDL knows its layout
+bool joy_open(int index) {
+    SDL_GameController* pad = 0;
+    SDL_Joystick* joy = 0;
+    if (SDL_IsGameController(index) && (pad = SDL_GameControllerOpen(index))) joy = SDL_GameControllerGetJoystick(pad);
+    else joy = SDL_JoystickOpen(index);
+    if (!joy) return false;
+    joy_close();
+    g_pad = pad, g_joy = joy, g_joy_id = SDL_JoystickInstanceID(joy);
+    know(g_joy_id);
     const char* n = g_pad ? SDL_GameControllerName(g_pad) : SDL_JoystickName(g_joy);
     strncpy(g_joy_name, n ? n : "Joystick", sizeof g_joy_name - 1);
+    g_joy_name[sizeof g_joy_name - 1] = 0;
     if (SDL_JoystickIsHaptic(g_joy) == 1 && (g_haptic = SDL_HapticOpenFromJoystick(g_joy))) {
         if (SDL_HapticQuery(g_haptic) & SDL_HAPTIC_CONSTANT) {
             SDL_HapticEffect fx;
@@ -574,28 +642,71 @@ void __cdecl sdl_joy_begin(void) {
             g_effect = SDL_HapticNewEffect(g_haptic, &fx);
         }
     }
+    if (g_ff_on) ff_apply();                                     // (a reconnect: as it was)
     logf("SDL: joystick '%s' (%s, %d axes, %d buttons%s)", g_joy_name, g_pad ? "game controller" : "joystick",
          SDL_JoystickNumAxes(g_joy), SDL_JoystickNumButtons(g_joy), g_effect >= 0 ? ", force feedback" : "");
+    return true;
+}
+
+void pad_test_begin();
+
+void __cdecl sdl_joy_begin(void) {
+    g_joy_name[0] = 0;
+    g_joy_begun = true;
+    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {                 // (SDL's joystick driver couldn't start)
+        logf("SDL: no joystick (controllers didn't start)");
+        return;
+    }
+    pad_test_begin();                                            // (VIPERPORT_TEST_PAD only)
+    const int n = SDL_NumJoysticks();
+    for (int i = 0; i < n; i++) know(SDL_JoystickGetDeviceInstanceID(i));   // (SDL announces these as added too)
+    for (int i = 0; i < n && !g_joy; i++) joy_open(i);
+    if (!g_joy) logf("SDL: no joystick (one plugged in later is picked up)");
 }
 
 void __cdecl sdl_joy_end(void) {
-    if (g_haptic) SDL_HapticClose(g_haptic);
-    if (g_pad) SDL_GameControllerClose(g_pad);
-    else if (g_joy) SDL_JoystickClose(g_joy);
-    g_haptic = 0, g_pad = 0, g_joy = 0, g_effect = -1;
+    joy_close();
+    g_joy_begun = false;
+    g_nknown = 0;
+}
+
+void joy_device_event(const SDL_Event& e) {
+    if (!g_joy_begun || !SDL_WasInit(SDL_INIT_GAMECONTROLLER)) return;
+    if (e.type == SDL_JOYDEVICEADDED) {
+        const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(e.jdevice.which);
+        if (id < 0 || id == g_joy_id) return;
+        if (known(id) && g_joy) return;                          // there at JoyBegin, or announced twice
+        know(id);
+        logf("SDL: a controller was plugged in");
+        joy_open(e.jdevice.which);
+    } else if (e.type == SDL_JOYDEVICEREMOVED) {
+        const SDL_JoystickID id = e.jdevice.which;               // (an instance id here)
+        forget(id);
+        if (id != g_joy_id) return;
+        logf("SDL: joystick '%s' unplugged", g_joy_name);
+        joy_close();
+        for (int i = SDL_NumJoysticks() - 1; i >= 0 && !g_joy; i--)   // the latest other one still there
+            if (SDL_JoystickGetDeviceInstanceID(i) != id) joy_open(i);
+        if (!g_joy) logf("SDL: no joystick now");
+    }
 }
 
 unsigned char joy_get_pos(JoyPos* p);
 struct JoyRec { uint8_t ok; JoyPos pos; };
+// FIX: with no joystick the original left the JoyPos as it was. Now that one can be unplugged, the game is handed a
+// JoyPos at rest then, so nothing stays held. (A recording's ok is 0 only where its JoyPos never changed from rest --
+// there was no unplugging before -- so it replays the same.)
 unsigned char __cdecl sdl_joy_get_pos(JoyPos* p) {               // in a session: recorded, and fed back
     JoyRec r;
     if (session_feed(SK_JOYPOS, &r, sizeof r)) {
         if (r.ok) *p = r.pos;
+        else memset(p, 0, sizeof *p);
         return r.ok;
     }
     memset(&r, 0, sizeof r);
     r.ok = joy_get_pos(&r.pos);
     if (r.ok) *p = r.pos;
+    else memset(p, 0, sizeof *p);
     session_saw(SK_JOYPOS, &r, sizeof r);
     return r.ok;
 }
@@ -612,6 +723,9 @@ unsigned char joy_get_pos(JoyPos* p) {
         float lt = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERLEFT) / 32767.0f;
         float rt = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) / 32767.0f;
         p->axis[2] = lt - rt;
+        p->button[JB_LT] = (uint8_t)(lt <= 0 ? 0 : lt >= 1 ? 255 : (int)(lt * 255.0f + 0.5f));
+        p->button[JB_RT] = (uint8_t)(rt <= 0 ? 0 : rt >= 1 ? 255 : (int)(rt * 255.0f + 0.5f));
+        p->button[JB_MARK] = PAD_MARK;
         p->axis[4] = unit(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX));
         p->axis[5] = unit(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
         static const SDL_GameControllerButton order[] = {
@@ -659,10 +773,7 @@ unsigned char __cdecl sdl_joy_has_ff(void) {
 void __cdecl sdl_joy_enable_ff(unsigned char on) {
     if ((on != 0) == g_ff_on) return;
     g_ff_on = on != 0;
-    if (g_effect < 0) return;
-    if (SDL_HapticQuery(g_haptic) & SDL_HAPTIC_AUTOCENTER) SDL_HapticSetAutocenter(g_haptic, g_ff_on ? 0 : 100);
-    if (g_ff_on) SDL_HapticRunEffect(g_haptic, g_effect, 1);
-    else SDL_HapticStopEffect(g_haptic, g_effect);
+    ff_apply();
 }
 
 void __cdecl sdl_joy_set_force(float a, float b, float c) {
@@ -681,6 +792,338 @@ void __cdecl sdl_joy_set_force(float a, float b, float c) {
     fx.constant.length = SDL_HAPTIC_INFINITY;
     fx.constant.level = (Sint16)(m * 32767.0f / 10000.0f);
     SDL_HapticUpdateEffect(g_haptic, g_effect, &fx);
+}
+
+// ---- the controller ------------------------------------------------------------------------------------------------
+// A game controller (an XInput pad, a DualShock... -- whatever SDL knows the layout of; a plain joystick or a wheel is
+// left to the game's own control setup) works with nothing set up. Always on; nothing changes unless one is used.
+//
+//   in a race      left stick steer             RT throttle     LT brake
+//                  A  handbrake (e-brake)       B  reverse      X  horn        Y  next camera (F1..F11)
+//                  LB / RB  shift down / up     right stick: look left / right, its click: look back
+//                  Start  the pause menu (Esc); in it the D-pad up / down, A choose, B or Start back
+//   in the menus   left stick: the mouse pointer   A  left click   X  right click   B  Esc
+//
+// In a race it drives alongside the keyboard (the larger pedal wins; the stick, when off centre, steers). Anyone who
+// has mapped any control to the joystick in Options keeps exactly the game's own behaviour in a race: no merge, and Y
+// and Start are left alone (the pause menu's buttons still work: nothing drives while it's open). The control-detect
+// dialog (Options, Controls) reads the controller itself, so nothing is synthesised while it's open. Back, the left
+// stick's click and the D-pad outside the pause menu do nothing.
+//
+// Replays stay exact because everything goes through what a session records: the driving comes ONLY from the JoyPos the
+// game polled (JoyGetPos, recorded) and the driver's own state, in a wrapper round DriverUpdate (main thread, so the
+// DriverGet* readings the race recorder stores are the merged ones); the buttons that are keys and the pointer are made
+// inside Win32Idle as the keys and mouse events a real keyboard and mouse would give (recorded as its ops, with the
+// pointer's resulting position).
+//
+// v1.0 only (the game's addresses below; the other builds keep the game's own joystick handling).
+enum : uint32_t {
+    // driver.obj (hook/phys_player.cpp has the full list)
+    DS_BRAKING = 0x005221c8, DS_BRAKE_RANGE = 0x005221d8, DS_LOOK_SIDE = 0x005221ec, DS_THROTTLE_RANGE = 0x005221f4,
+    DS_STEERING = 0x00522200, DS_NUM_GEARS = 0x00522204, DS_THROTTLE_SENS = 0x00522218, DS_BRAKE_SENS = 0x00522228,
+    DS_STEER_RANGE = 0x00522238, DS_EBRAKE = 0x00522260, DS_GEAR = 0x00522264, DS_REVERSE = 0x00522298,
+    DS_THROTTLE = 0x0052229c, DS_HORN = 0x005222a0, DS_LOOK_BACK = 0x005222c8, DS_STEER_SENS = 0x005222d0,
+    DS_JOY = 0x00522730,                                         // control.obj: the JoyPos ControlUpdate polls into
+    MS_CAMERA = 0x004e3764,                                      // main.obj: the race's camera (0..10, 0xb blimp, 0xc over)
+};
+// the 15 controls DriverRefresh loads (driver.obj's Control statics: {type, value}; types 2..4 are the joystick's)
+const uint32_t k_controls[15] = {0x005221d0, 0x005221e0, 0x00522210, 0x00522220, 0x00522240, 0x00522258, 0x00522268,
+                                 0x00522278, 0x00522280, 0x00522288, 0x00522290, 0x005222a8, 0x005222b0, 0x005222c0,
+                                 0x005222d8};
+const float STICK_DEAD = 0.15f;                                  // the sticks' dead zone
+const int TRIGGER_DEAD = 13;                                     // the triggers' (of 255)
+
+typedef void(__cdecl* DriverUpdate_t)(float);
+typedef unsigned char(__cdecl* CDetectIdle_t)(int32_t*);
+Void_t o_game_loop;
+DriverUpdate_t o_driver_update;
+CDetectIdle_t o_cdetect_idle;
+U8_t EscapeMenuActive;
+bool g_ctl_on;                                                   // the three hooks are in
+int g_in_race;                                                   // inside game_loop (the main thread's)
+bool g_pad_log;                                                  // VIPERPORT_TEST_PAD: every merge and key logged
+
+void __cdecl game_loop_front(void) {
+    g_in_race++;
+    o_game_loop();
+    g_in_race--;
+}
+
+unsigned g_idles, g_detect_at;                                   // Win32Idle calls; the last one cdetect_idle ran in
+bool g_detect_seen;
+unsigned char __cdecl cdetect_idle_front(int32_t* code) {
+    g_detect_seen = true, g_detect_at = g_idles;
+    return o_cdetect_idle(code);
+}
+
+// -- in a race: the controller merged into the driver's outputs ------------------------------------------------------
+struct Merge {
+    bool steer, throttle, brake;                                 // last time's merge replaced the keyboard's value
+    float kb_steer, kb_throttle, kb_brake;                       // ...which was this (its ramps go on from it)
+    uint8_t lb, rb;                                              // the shoulder buttons as last polled (a press: one gear)
+    float logged[10];
+} g_mg;
+
+bool joystick_mapped() {
+    for (uint32_t a : k_controls) {
+        const int32_t t = *(const volatile int32_t*)(uintptr_t)a;
+        if (t >= 2 && t <= 4) return true;
+    }
+    return false;
+}
+
+// a stick past its dead zone, as -1..1 from the zone's edge; 0 inside it
+double stick(float a) {
+    const double m = fabs((double)a);
+    if (!(m > STICK_DEAD)) return 0.0;
+    const double v = m >= 1.0 ? 1.0 : (m - STICK_DEAD) / (1.0 - STICK_DEAD);
+    return a < 0 ? -v : v;
+}
+
+// an analog pedal as DriverUpdate takes one: reading x range + sensitivity - 1, in 0..1
+float pedal(int raw, uint32_t range, uint32_t sens) {
+    const double v = (raw / 255.0) * *(const float*)(uintptr_t)range + *(const float*)(uintptr_t)sens - 1.0;
+    return (float)(v > 1.0 ? 1.0 : v > 0.0 ? v : 0.0);
+}
+
+template <typename T> T& ds(uint32_t a) { return *(T*)(uintptr_t)a; }
+
+void __cdecl driver_update_front(float dt) {
+    // the keyboard's ramps (digital steering, throttle, brake) go on from their own values, not the controller's
+    if (g_mg.steer) ds<float>(DS_STEERING) = g_mg.kb_steer;
+    if (g_mg.throttle) ds<float>(DS_THROTTLE) = g_mg.kb_throttle;
+    if (g_mg.brake) ds<float>(DS_BRAKING) = g_mg.kb_brake;
+    g_mg.steer = g_mg.throttle = g_mg.brake = false;
+    o_driver_update(dt);
+    if (!g_ctl_on) return;
+    const JoyPos& j = *(const JoyPos*)(uintptr_t)DS_JOY;
+    const bool pad = j.button[JB_MARK] == PAD_MARK && !joystick_mapped();
+    const uint8_t lb = pad && j.button[4], rb = pad && j.button[5];
+    const bool up = rb && !g_mg.rb, down = lb && !g_mg.lb;
+    g_mg.lb = lb, g_mg.rb = rb;
+    if (!pad) return;
+    g_mg.kb_steer = ds<float>(DS_STEERING);
+    g_mg.kb_throttle = ds<float>(DS_THROTTLE);
+    g_mg.kb_brake = ds<float>(DS_BRAKING);
+    // steering: the stick through DriverUpdate's analog path -- the dead band 1 - steer_sensitivity, times steer_range
+    const double s = stick(j.axis[0]);
+    if (s != 0.0) {
+        const float st = (float)s;
+        const float dead = (float)(1.0 - *(const float*)(uintptr_t)DS_STEER_SENS);
+        double v = ((double)dead + 1.0) * st;
+        v = st > 0 ? (v - dead > 0.0 ? v - dead : 0.0) : (v + dead < 0.0 ? v + dead : 0.0);
+        v = (double)ds<float>(DS_STEER_RANGE) * (float)v;
+        ds<float>(DS_STEERING) = (float)(v < -1.0 ? -1.0 : v > 1.0 ? 1.0 : v);
+        g_mg.steer = true;
+    }
+    // the pedals: the larger of the keyboard's and the trigger's (as an analog pedal, with the pedal's options)
+    if (j.button[JB_RT] > TRIGGER_DEAD) {
+        const float t = pedal(j.button[JB_RT], DS_THROTTLE_RANGE, DS_THROTTLE_SENS);
+        if (t > g_mg.kb_throttle) ds<float>(DS_THROTTLE) = t, g_mg.throttle = true;
+    }
+    if (j.button[JB_LT] > TRIGGER_DEAD) {
+        const float b = pedal(j.button[JB_LT], DS_BRAKE_RANGE, DS_BRAKE_SENS);
+        if (b > g_mg.kb_brake) ds<float>(DS_BRAKING) = b, g_mg.brake = true;
+    }
+    if (j.button[0]) ds<float>(DS_EBRAKE) = 1.0f;               // A: the handbrake
+    if (j.button[1]) ds<uint8_t>(DS_REVERSE) = 1;               // B: reverse (held)
+    if (j.button[2]) ds<uint8_t>(DS_HORN) = 1;                  // X: the horn
+    if (j.button[9]) ds<uint8_t>(DS_LOOK_BACK) = 1;             // the right stick's click: look back
+    const double look = stick(j.axis[4]);                       // the right stick across: look left / right
+    if (look != 0.0) ds<float>(DS_LOOK_SIDE) = (float)look;
+    // LB / RB: one gear per press, as DriverUpdate steps it for the shift keys (up to the top gear, down to reverse)
+    int32_t& gear = ds<int32_t>(DS_GEAR);
+    if (up && ds<int32_t>(DS_NUM_GEARS) > gear) gear = gear + 1;
+    else if (down && gear > -1) gear = gear - 1;
+    if (g_pad_log) {
+        const float now[10] = {ds<float>(DS_STEERING), ds<float>(DS_THROTTLE), ds<float>(DS_BRAKING), ds<float>(DS_EBRAKE),
+                               (float)gear, (float)ds<uint8_t>(DS_REVERSE), (float)ds<uint8_t>(DS_HORN),
+                               (float)ds<uint8_t>(DS_LOOK_BACK), ds<float>(DS_LOOK_SIDE),
+                               (float)((int)g_mg.steer | (int)g_mg.throttle << 1 | (int)g_mg.brake << 2)};
+        if (memcmp(now, g_mg.logged, sizeof now)) {
+            memcpy(g_mg.logged, now, sizeof now);
+            logf("pad: driver steer %.3f throttle %.3f brake %.3f ebrake %.0f gear %d reverse %d horn %d look_back %d "
+                 "look_side %.2f (merged: %s%s%s)", now[0], now[1], now[2], now[3], (int)now[4], (int)now[5], (int)now[6],
+                 (int)now[7], now[8], g_mg.steer ? "steer " : "", g_mg.throttle ? "throttle " : "", g_mg.brake ? "brake" : "");
+        }
+    }
+}
+
+// -- in Win32Idle: the buttons that are keys, and the menus' pointer -----------------------------------------------------
+bool g_prev[SDL_CONTROLLER_BUTTON_MAX];                          // the buttons last time (presses only)
+bool g_vm_left, g_vm_right;                                      // the pointer's buttons, held down by A / X
+double g_px = -1, g_py = -1, g_held;                             // the pointer (the game's pixels); how long it's moved
+Uint64 g_pad_t;
+
+// a key pressed and let go, as a real one gives it to the game
+void tap_key(SDL_Scancode sc) {
+    const Key* k = key_for(sc);
+    if (!k) return;
+    if (g_pad_log) logf("pad: key %s", SDL_GetScancodeName(sc));
+    key_press(k, 0);
+    key_up(k->vk);
+}
+
+void pointer_button(int bit, bool down) {
+    g_mouse_buttons = down ? (g_mouse_buttons | bit) : (g_mouse_buttons & ~bit);
+    const int type = (bit == 1 ? 0 : 2) + (down ? 0 : 1);
+    const int x = g_mouse_x < 0 ? 0 : g_mouse_x, y = g_mouse_y < 0 ? 0 : g_mouse_y;
+    if (g_pad_log) logf("pad: mouse %s %s at %d,%d", bit == 1 ? "left" : "right", down ? "down" : "up", x, y);
+    mouse_event(type, x, y, (int)g_mouse_buttons);
+}
+
+void pad_idle() {
+    const Uint64 now = SDL_GetPerformanceCounter();
+    double dt = g_pad_t ? (double)(now - g_pad_t) / (double)SDL_GetPerformanceFrequency() : 0.0;
+    g_pad_t = now;
+    dt = dt < 0 ? 0 : dt > 0.1 ? 0.1 : dt;                         // (a long load between two calls: no leap)
+    g_idles++;
+    bool cur[SDL_CONTROLLER_BUTTON_MAX] = {};
+    if (g_pad)
+        for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++)
+            cur[i] = SDL_GameControllerGetButton(g_pad, (SDL_GameControllerButton)i) != 0;
+    bool hit[SDL_CONTROLLER_BUTTON_MAX];
+    for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++) hit[i] = cur[i] && !g_prev[i];
+    memcpy(g_prev, cur, sizeof g_prev);
+    // the pointer's buttons come up with A / X whatever else happened meanwhile (or with the controller gone)
+    if (g_vm_left && !cur[SDL_CONTROLLER_BUTTON_A]) g_vm_left = false, pointer_button(1, false);
+    if (g_vm_right && !cur[SDL_CONTROLLER_BUTTON_X]) g_vm_right = false, pointer_button(2, false);
+    const bool detecting = g_detect_seen && g_idles - g_detect_at <= 8;   // the control-detect dialog is open
+    if (!g_ctl_on || !g_pad || *(uint8_t*)G.inactive || detecting) {
+        g_held = 0;
+        return;
+    }
+    if (g_in_race) {
+        if (EscapeMenuActive()) {                                // the pause menu (every key is on while it's open)
+            if (hit[SDL_CONTROLLER_BUTTON_DPAD_UP]) tap_key(SDL_SCANCODE_UP);
+            if (hit[SDL_CONTROLLER_BUTTON_DPAD_DOWN]) tap_key(SDL_SCANCODE_DOWN);
+            if (hit[SDL_CONTROLLER_BUTTON_A]) tap_key(SDL_SCANCODE_RETURN);
+            if (hit[SDL_CONTROLLER_BUTTON_B] || hit[SDL_CONTROLLER_BUTTON_START]) tap_key(SDL_SCANCODE_ESCAPE);
+        } else if (!joystick_mapped()) {                         // (a pad set up in Options: its buttons are its own)
+            if (hit[SDL_CONTROLLER_BUTTON_START]) tap_key(SDL_SCANCODE_ESCAPE);
+            if (hit[SDL_CONTROLLER_BUTTON_Y]) {                  // the next camera, F1..F11 (the blimp, F12, left out)
+                const int32_t cam = *(const volatile int32_t*)(uintptr_t)MS_CAMERA;
+                if (cam != 0xc) tap_key((SDL_Scancode)(SDL_SCANCODE_F1 + (cam >= 0 && cam < 10 ? cam + 1 : 0)));
+            }
+        }
+        g_held = 0;
+        return;
+    }
+    // the menus: the left stick moves the pointer, faster the further it's pushed and the longer it moves
+    const int gw = g_view.set ? g_view.game_w : 640, gh = g_view.set ? g_view.game_h : 480;
+    if (g_mouse_real || g_px < 0) {                              // from where the real mouse left it
+        g_mouse_real = false;
+        g_px = g_mouse_x >= 0 ? g_mouse_x + 0.5 : gw / 2.0;
+        g_py = g_mouse_y >= 0 ? g_mouse_y + 0.5 : gh / 2.0;
+    }
+    const double lx = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTX) / 32768.0;
+    const double ly = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTY) / 32768.0;
+    const double mag = sqrt(lx * lx + ly * ly);
+    if (mag > STICK_DEAD) {
+        const double m = ((mag > 1 ? 1 : mag) - STICK_DEAD) / (1 - STICK_DEAD);
+        g_held += dt;
+        const double speed = gw * 1.2 * m * m * (0.35 + 0.65 * (g_held > 0.6 ? 1.0 : g_held / 0.6));   // pixels a second
+        g_px += lx / mag * speed * dt;
+        g_py += ly / mag * speed * dt;
+        g_px = g_px < 0 ? 0 : g_px > gw - 0.001 ? gw - 0.001 : g_px;
+        g_py = g_py < 0 ? 0 : g_py > gh - 0.001 ? gh - 0.001 : g_py;
+        const int x = (int)g_px, y = (int)g_py;
+        if (x != g_mouse_x || y != g_mouse_y) mouse_event(6, x, y, (int)g_mouse_buttons);
+    } else {
+        g_held = 0;
+    }
+    if (hit[SDL_CONTROLLER_BUTTON_A] && !g_vm_left) g_vm_left = true, pointer_button(1, true);
+    if (hit[SDL_CONTROLLER_BUTTON_X] && !g_vm_right) g_vm_right = true, pointer_button(2, true);
+    if (hit[SDL_CONTROLLER_BUTTON_B]) tap_key(SDL_SCANCODE_ESCAPE);
+}
+
+// -- VIPERPORT_TEST_PAD=<script>: a virtual controller (SDL's virtual joystick), for testing without one --------------------
+// One command a line, at <ms> after JoyBegin:  <ms> attach | detach | quit | axis <lx|ly|rx|ry|lt|rt> <value> |
+// button <a|b|x|y|back|guide|start|ls|rs|lb|rb|up|down|left|right> <0|1>   (sticks -1..1, triggers 0..1). Logs the merge
+// and every key and click the controller makes.
+struct TestCmd { Uint32 ms; char op[8]; int which; float v; };
+TestCmd g_test[1024];
+int g_ntest, g_itest;
+Uint32 g_test_t0;
+SDL_Joystick* g_vjoy;
+
+void pad_test_run(const TestCmd& c) {
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+    logf("pad test: %u ms: %s %d %.2f", c.ms, c.op, c.which, c.v);
+    if (!strcmp(c.op, "attach") && !g_vjoy) {
+        SDL_VirtualJoystickDesc d;
+        SDL_zero(d);
+        d.version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
+        d.type = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
+        d.naxes = SDL_CONTROLLER_AXIS_MAX;
+        d.nbuttons = SDL_CONTROLLER_BUTTON_MAX;
+        d.name = "viperport test pad";
+        const int index = SDL_JoystickAttachVirtualEx(&d);
+        if (index >= 0) g_vjoy = SDL_JoystickOpen(index);
+        if (!g_vjoy) logf("pad test: no virtual controller: %s", SDL_GetError());
+        else
+            for (int a = SDL_CONTROLLER_AXIS_TRIGGERLEFT; a <= SDL_CONTROLLER_AXIS_TRIGGERRIGHT; a++)
+                SDL_JoystickSetVirtualAxis(g_vjoy, a, -32768);   // (a trigger's full range: -32768 is let go)
+    } else if (!strcmp(c.op, "detach") && g_vjoy) {
+        SDL_JoystickClose(g_vjoy);
+        g_vjoy = 0;
+        for (int i = SDL_NumJoysticks() - 1; i >= 0; i--)
+            if (SDL_JoystickIsVirtual(i)) SDL_JoystickDetachVirtual(i);
+    } else if (!strcmp(c.op, "axis") && g_vjoy) {
+        const bool trigger = c.which >= SDL_CONTROLLER_AXIS_TRIGGERLEFT;
+        const double v = trigger ? -32768.0 + c.v * 65535.0 : c.v * 32767.0;
+        SDL_JoystickSetVirtualAxis(g_vjoy, c.which, (Sint16)(v < -32768 ? -32768 : v > 32767 ? 32767 : v));
+    } else if (!strcmp(c.op, "button") && g_vjoy) {
+        SDL_JoystickSetVirtualButton(g_vjoy, c.which, c.v != 0 ? 1 : 0);
+    } else if (!strcmp(c.op, "quit")) {
+        SDL_Event q;
+        SDL_zero(q);
+        q.type = SDL_QUIT;
+        SDL_PushEvent(&q);
+    }
+#else
+    logf("pad test: SDL %d.%d.%d has no virtual joysticks (2.24 does)", SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_PATCHLEVEL);
+    (void)c;
+#endif
+}
+
+void pad_test_begin() {
+    static bool once;
+    const char* path = getenv("VIPERPORT_TEST_PAD");
+    if (once || !path || !*path) return;
+    once = true;
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        logf("pad test: can't open %s", path);
+        return;
+    }
+    static const char* axes[] = {"lx", "ly", "rx", "ry", "lt", "rt"};
+    static const char* buttons[] = {"a", "b", "x", "y", "back", "guide", "start", "ls", "rs", "lb", "rb", "up", "down",
+                                    "left", "right"};
+    char line[128];
+    while (fgets(line, sizeof line, f) && g_ntest < (int)(sizeof g_test / sizeof g_test[0])) {
+        TestCmd c = {0, "", 0, 0};
+        char name[16] = "";
+        if (line[0] == '#' || sscanf(line, "%u %7s %15s %f", &c.ms, c.op, name, &c.v) < 2) continue;
+        const char* const* list = !strcmp(c.op, "axis") ? axes : !strcmp(c.op, "button") ? buttons : 0;
+        const int count = list == axes ? 6 : list == buttons ? 15 : 0;
+        c.which = -1;
+        for (int i = 0; i < count; i++)
+            if (!strcmp(name, list[i])) c.which = i;
+        if (list && c.which < 0) continue;
+        g_test[g_ntest++] = c;
+    }
+    fclose(f);
+    g_pad_log = true;
+    g_test_t0 = SDL_GetTicks();
+    logf("pad test: %d commands from %s", g_ntest, path);
+    while (g_itest < g_ntest && g_test[g_itest].ms == 0) pad_test_run(g_test[g_itest++]);   // (attach: there at JoyBegin)
+}
+
+void pad_test_tick() {
+    if (g_itest >= g_ntest) return;
+    const Uint32 t = SDL_GetTicks() - g_test_t0;
+    while (g_itest < g_ntest && g_test[g_itest].ms <= t) pad_test_run(g_test[g_itest++]);
 }
 
 }  // namespace
@@ -741,6 +1184,24 @@ static int platform_ini_sdl(const char* ini) { return vp_standalone() ? 1 : vpos
 static void platform_ini_str(const char* key, const char* dflt, const char* standalone, char* out, DWORD n, const char* ini) {
     if (vp_standalone()) vpos_lstrcpynA(out, standalone, (int)n);
     else vpos_GetPrivateProfileStringA("platform", key, dflt, out, n, ini);
+}
+
+// the controller (above): the race loop, the driver and the control-detect dialog, each hooked in front of what runs there
+// (the rewrite or the original); v1.0 only
+void* detour_front(uint32_t v10, void* to, const char* what);   // (port.h)
+static void controller_install() {
+    if (!build_is_v10()) {
+        logf("controller: not in this build (v1.0's race.exe only) -- joysticks as the game's control setup has them");
+        return;
+    }
+    EscapeMenuActive = (U8_t)A(0x0040c560);
+    // detour(0x00402050) detour(0x004417c0) detour(0x0047dcc0) -- listed for gen_port_tables.py
+    o_game_loop = (Void_t)detour_front(0x00402050, (void*)game_loop_front, "game_loop (controller)");
+    o_driver_update = (DriverUpdate_t)detour_front(0x004417c0, (void*)driver_update_front, "DriverUpdate (controller)");
+    o_cdetect_idle = (CDetectIdle_t)detour_front(0x0047dcc0, (void*)cdetect_idle_front, "cdetect_idle (controller)");
+    g_ctl_on = o_game_loop && o_driver_update && o_cdetect_idle && EscapeMenuActive;
+    logf(g_ctl_on ? "controller: a game controller drives with the keyboard in races and points in the menus"
+                  : "controller: NOT on -- its hooks didn't all go in");
 }
 
 bool platform_switched_away() { return G.inactive && *(volatile uint8_t*)G.inactive; }
@@ -848,6 +1309,7 @@ void platform_install(const char* build) {
     else
         logf("platform: joysticks stay on DirectInput in %s (its joystick code isn't v1.0's)", build);
     logf("platform: SDL2 window, keyboard and mouse%s", joy ? ", joystick" : "");
+    if (joy) controller_install();
     if (g_gl && !renderer_install()) g_gl = false;               // M2 stage 2: OpenGL in place of DirectDraw
     if (vp_two_copies() && !g_gl)
         logf("two_copies: the windows need [platform] renderer=gl -- DirectDraw takes the whole screen for itself");
