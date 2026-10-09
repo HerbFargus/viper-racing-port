@@ -733,6 +733,24 @@ leaves it original.
 - writepaths: the `.data` path strings it rewrites are read by rewrites that put the files under the game's own
   folder anyway (`Config\`, `log\`), under "Where the game writes".
 
+## Performance
+
+Not fixes: the same results, faster. Nothing observable changes but the time, so there is no switch, and a recorded
+race replays bit for bit.
+
+- The car's LOD vertex maps (`Car::Car`). Every vertex of the body's LODs 1-4 is mapped to its nearest LOD-0 vertex
+  (the dents are copied out through it). The original compares every pair: 0.3M steps for the stock Viper, but
+  ~270M a car for a detailed mod car (the Willys jeep's 11,040-vertex body: ~0.75 s a car, ~6 s for a grid of
+  eight, a hang at race load). The rewrite looks only at the LOD-0 vertices near each one, through a grid over
+  LOD 0, and runs the original's own rule over them -- the float-rounded running best, ties to the first -- so
+  every map entry is the original's (the proof is in `hook/phys_car.cpp`; `test/world_lodmap.cpp` checks it
+  against the original loop, `test/world_car2.cpp` against the original constructor). The jeep's maps take ~0.02 s
+  a car. Below 2M steps a LOD (stock cars always), with a NaN, infinite or out-of-range (> 1e15) coordinate, it
+  runs the original loop itself. `viperport.log` says how long the grid's cars took to build: "race load: cars
+  built in X.XXX s (N cars)".
+- The OpenGL renderer's state cache and vertex stream (`hook/gl_table.cpp`, stages P1 and P2): fewer calls to the
+  driver for the same state and the same pixels.
+
 ## Not fixed
 
 - Multiplayer: anything said in chat during a race on the dedicated server restarts the race (it may be intended);

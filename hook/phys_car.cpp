@@ -13,7 +13,9 @@
 // values as float, float constants of the same bits, float copies the original makes with integer moves as bit
 // copies, and every call made in the original's order with the same arguments -- by address, or through the
 // vtable where the original makes a virtual call.
+#include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "viperport.h"
 #include "port.h"
@@ -482,10 +484,259 @@ static void fp_car_all(Footprint& f, Car* c) {
 }
 
 // =============================================================================================================
+// The LOD vertex maps (Car::Car), found fast -- a performance change, not a FIX: the maps come out identical
+// =============================================================================================================
+// Car::Car maps every vertex j of LODs 1-4 to "its nearest" LOD-0 vertex, which ActuallyApplyDamage copies the
+// dents through. The original finds it by brute force (lodmap_original, below, kept verbatim): every LOD-0 vertex
+// for every LOD vertex, n0 x (n1+n2+n3+n4) steps per car, for every car on the grid. Stock that's 325 x 828; for a
+// detailed mod car (the Willys jeep: 11,040 LOD-0 vertices, LODs of 7,174 / 5,762 x 3) it's ~270M a car, ~2.2
+// billion for eight: a long hang at race load. lodmap_search finds the SAME entry for every vertex from a uniform grid
+// over LOD 0's positions, looking only at the few vertices near each query. No VP_FIX switch (like the
+// draw-performance stages, gl_table.cpp P1/P2): nothing observable changes but the time.
+//
+// The original's rule, reproduced, not replaced by "the true nearest": best starts at the float 1e8, near_ at 0; for
+// k = 0, 1, ... in order, e_k = the double (d1*d1 + d2*d2) + d0*d0 of the float differences, and when !(e_k >= best)
+// it takes k and best = (float)e_k. So a candidate wins against the float-ROUNDED previous best; ties go to the
+// first k; a NaN would make every later candidate win; a query more than 1e4 from all of LOD 0 keeps 0.
+//
+// Why running that same rule over only the near candidates gives the same answer. Write m for the least e_k over
+// all k (as computed: the same expression, so the same double), k_m for the first k having it, rnd for the round to
+// float, and R for the candidates with e_k < 1e8f and e_k <= m (1 + 2^-23). Run the rule over ANY subsequence S of
+// the k (in order) that contains R; it ends at the same near_ as over all of them:
+//   - If m >= 1e8f, best (<= 1e8f always) never exceeds an e_k: nothing wins in either run, near_ stays 0.
+//   - Else, before k_m: a k whose rnd(e_k) <= m (the class Q, empty unless rnd(m) <= m: e_k in [m, m + half an
+//     ulp], all in R) can win only against a best > m, i.e. against 1e8f or rnd(e) > m for a non-Q winner; any
+//     float above m is >= the next float after rnd(m), which is above every e in Q, so the FIRST Q member before
+//     k_m wins, and after it best is rnd(m) <= m and nothing before k_m can win again (every e >= m). With no Q
+//     member before k_m, best is still > m at k_m and k_m wins. Either way, just after k_m, best == rnd(m) and the
+//     winner is determined by Q and k_m alone -- the same in both runs. Far candidates (outside R) may win and lose
+//     in between; they don't change this, since what happens at the first Q member and at k_m depends only on best
+//     being > m.
+//   - After k_m, best == rnd(m) and stays so (a winner e < rnd(m) is >= m, so rnd(e) == rnd(m)): exactly the
+//     candidates with e < rnd(m) win -- all in R, in both runs -- and the last of them, if any, is the answer.
+// The grid search below puts every k with e_k <= T in S, for T = min(m' (1 + 1e-5) + 1e-30, 1e8f (1 + 1e-5)) where
+// m' (>= m) is the least e it has seen (k_m is never skipped, so finally m' == m): far more than R needs. A cell is
+// skipped only when a lower bound on the TRUE squared distance to anything in it, shrunk by 1e-5, minus 1e-30, still
+// exceeds T. The computed e_k is the true distance with at most ~3.1e-7 relative error (each float difference
+// rounded once, three products, two sums; under the physics thread's 24-bit precision or in double), plus a
+// negligible absolute error for denormal differences -- so a skipped vertex has e_k > T. The cell bounds allow for
+// the rounding of the cell index too (slack below). The search computes e_k with the same expression as the rule
+// (lodmap_d2), and the rule itself runs over S verbatim, in k order.
+//
+// Faithful by construction where the bounds don't hold: lodmap_original runs instead when any coordinate of LOD 0 or
+// of the LOD is NaN, infinite or beyond 1e15 (the squares then can't overflow anything), when n0 x n is under 2M (the
+// brute force is instant there; stock cars always), or when the grid's memory can't be had. The u16 truncation of
+// k is kept as is: past 65,535 LOD-0 vertices k wraps, in both versions alike (not fixed here).
+enum { LODMAP_FAST_MIN = 2000000 };                 // n0 x n below this: the original's loop
+
+// the original's search for one LOD (1-4), verbatim from Car::Car
+static void lodmap_original(const mrVertex* v0, int32_t n0, const mrVertex* v, int32_t n, uint16_t* map) {
+    for (int j = 0; j < n; j++) {
+        float best = FB(0x4cbebc20);                             // 1e8
+        uint16_t near_ = 0;
+        for (int k = 0; k < n0; k++) {
+            float d[3];
+            d[0] = (float)(D(v0[k].pos.x) - v[j].pos.x);
+            d[1] = (float)(D(v0[k].pos.y) - v[j].pos.y);
+            d[2] = (float)(D(v0[k].pos.z) - v[j].pos.z);
+            double d2 = (D(d[1]) * d[1] + D(d[2]) * d[2]) + D(d[0]) * d[0];
+            const float d2s = (float)d2;
+            if (!(d2 >= best)) {                                  // fcom; test ah,1
+                near_ = (uint16_t)k;
+                best = d2s;
+            }
+        }
+        map[j] = near_;
+    }
+}
+
+// e_k exactly as the original computes it (the same expression, rounded to double where it assigns d2)
+static inline double lodmap_d2(const mrVertex& a, const mrVertex& b) {
+    float d[3];
+    d[0] = (float)(D(a.pos.x) - b.pos.x);
+    d[1] = (float)(D(a.pos.y) - b.pos.y);
+    d[2] = (float)(D(a.pos.z) - b.pos.z);
+    double d2 = (D(d[1]) * d[1] + D(d[2]) * d[2]) + D(d[0]) * d[0];
+    return d2;
+}
+static bool lodmap_bounded(const mrVertex* p, int32_t n) {          // every coordinate finite and within 1e15
+    const double lim = (double)1e15;
+    for (int32_t i = 0; i < n; i++)
+        if (!(fabs(D(p[i].pos.x)) <= lim) || !(fabs(D(p[i].pos.y)) <= lim) || !(fabs(D(p[i].pos.z)) <= lim)) return false;
+    return true;
+}
+static int lodmap_cmp_k(const void* a, const void* b) {
+    const int32_t x = *(const int32_t*)a, y = *(const int32_t*)b;
+    return x < y ? -1 : x > y;
+}
+
+// The grid search for one LOD (no work threshold: the harness calls it directly). false: not applicable (a
+// coordinate out of bounds, no memory) -- map untouched, the caller runs lodmap_original.
+static bool lodmap_search(const mrVertex* v0, int32_t n0, const mrVertex* v, int32_t n, uint16_t* map) {
+    if (n0 < 1 || n < 1) return false;
+    if (!lodmap_bounded(v0, n0) || !lodmap_bounded(v, n)) return false;
+    // the grid: origin lo (LOD 0's least corner), cubic cells of side `cell`, about 8 n0 of them (a car's vertices
+    // lie on its surface, so most cells are empty; on the jeeps 8 n0 was quickest, from n0 / 8 to 128 n0)
+    double lo[3] = {D(v0[0].pos.x), D(v0[0].pos.y), D(v0[0].pos.z)}, hi[3] = {lo[0], lo[1], lo[2]};
+    for (int32_t k = 1; k < n0; k++) {
+        const double p[3] = {D(v0[k].pos.x), D(v0[k].pos.y), D(v0[k].pos.z)};
+        for (int a = 0; a < 3; a++) {
+            if (p[a] < lo[a]) lo[a] = p[a];
+            if (p[a] > hi[a]) hi[a] = p[a];
+        }
+    }
+    double ext[3], mx = 0;
+    for (int a = 0; a < 3; a++) {
+        ext[a] = hi[a] - lo[a];
+        if (ext[a] > mx) mx = ext[a];
+    }
+    double cell = 1;
+    if (mx > 0) {
+        double e[3];
+        for (int a = 0; a < 3; a++) e[a] = ext[a] > mx / 64 ? ext[a] : mx / 64;   // flat meshes: a floor per axis
+        cell = cbrt(e[0] * e[1] * e[2] / n0) / 2;
+        if (!(cell >= mx / 1000)) cell = mx / 1000;               // at most ~1000 cells an axis
+        if (!(cell >= (double)1e-20)) cell = (double)1e-20;
+    }
+    const double inv = 1 / cell;
+    cell = 1 / inv;                                               // the side the indices below are in
+    // each LOD-0 vertex's cell, per axis: floor((x - lo) * inv). Monotonic in x and >= 0; the grid is sized from
+    // the indices themselves, so no vertex is clamped
+    int32_t* ax = (int32_t*)malloc((size_t)n0 * 3 * sizeof(int32_t));
+    if (!ax) return false;
+    int g[3] = {1, 1, 1};
+    for (int32_t k = 0; k < n0; k++) {
+        const double p[3] = {D(v0[k].pos.x), D(v0[k].pos.y), D(v0[k].pos.z)};
+        for (int a = 0; a < 3; a++) {
+            const int c = (int)floor((p[a] - lo[a]) * inv);
+            ax[k * 3 + a] = c;
+            if (c + 1 > g[a]) g[a] = c + 1;
+        }
+    }
+    const int64_t ncells = (int64_t)g[0] * g[1] * g[2];
+    int32_t* start = ncells <= (1 << 24) ? (int32_t*)calloc((size_t)ncells + 1, sizeof(int32_t)) : 0;
+    int32_t* pts = (int32_t*)malloc((size_t)n0 * sizeof(int32_t));
+    int32_t* cand_k = (int32_t*)malloc((size_t)n0 * sizeof(int32_t));
+    double* cand_e = (double*)malloc((size_t)n0 * sizeof(double));
+    if (!start || !pts || !cand_k || !cand_e) {
+        free(ax); free(start); free(pts); free(cand_k); free(cand_e);
+        return false;
+    }
+    // counting sort by cell, k ascending within a cell
+    for (int32_t k = 0; k < n0; k++) {
+        ax[k * 3] = (ax[k * 3] * g[1] + ax[k * 3 + 1]) * g[2] + ax[k * 3 + 2];
+        start[ax[k * 3] + 1]++;
+    }
+    for (int64_t c = 0; c < ncells; c++) start[c + 1] += start[c];
+    for (int32_t k = 0; k < n0; k++) pts[start[ax[k * 3]]++] = k;
+    for (int64_t c = ncells; c > 0; c--) start[c] = start[c - 1];
+    start[0] = 0;
+    free(ax);
+
+    const double shrink = 1 - (double)1e-5, tiny = (double)1e-30, grow = 1 + (double)1e-5;
+    const double cap = (double)FB(0x4cbebc20) * grow;             // 1e8f: no e_k >= it ever wins
+    for (int32_t j = 0; j < n; j++) {
+        const double q[3] = {D(v[j].pos.x), D(v[j].pos.y), D(v[j].pos.z)};
+        double cq[3], sl[3], slmax = 0, box = 0;
+        int cc[3], rmax = 0;
+        for (int a = 0; a < 3; a++) {
+            const double off = q[a] - lo[a];
+            cq[a] = floor(off * inv);                             // the query's own cell index (may be outside)
+            cc[a] = cq[a] < 0 ? 0 : cq[a] > g[a] - 1 ? g[a] - 1 : (int)cq[a];   // the ring centre, in the grid
+            // the cell indices' rounding: (x - lo) * inv is off by a few 1e-8 of |x - lo| at 24-bit precision
+            sl[a] = (ext[a] + fabs(off) + cell) * (double)4e-6;
+            if (sl[a] > slmax) slmax = sl[a];
+            const int far_ = cc[a] > g[a] - 1 - cc[a] ? cc[a] : g[a] - 1 - cc[a];
+            if (far_ > rmax) rmax = far_;
+            double out = off < 0 ? -off : q[a] - hi[a];           // outside LOD 0's box along this axis
+            out -= sl[a];
+            if (out > 0) box += out * out;
+        }
+        int32_t nc = 0;
+        double T = cap, mbest = cap;
+        if (!(box * shrink - tiny > T)) {                         // else all of LOD 0 is beyond 1e4: no candidate
+            for (int r = 0; r <= rmax; r++) {
+                if (r >= 2) {                                     // every cell left is >= r - 1 cells away on an axis
+                    const double a = (r - 1) * cell - slmax;
+                    if (a > 0 && a * a * shrink - tiny > T) break;
+                }
+                const int x0 = cc[0] - r < 0 ? 0 : cc[0] - r, x1 = cc[0] + r > g[0] - 1 ? g[0] - 1 : cc[0] + r;
+                const int y0 = cc[1] - r < 0 ? 0 : cc[1] - r, y1 = cc[1] + r > g[1] - 1 ? g[1] - 1 : cc[1] + r;
+                const int z0 = cc[2] - r < 0 ? 0 : cc[2] - r, z1 = cc[2] + r > g[2] - 1 ? g[2] - 1 : cc[2] + r;
+                for (int x = x0; x <= x1; x++)
+                    for (int y = y0; y <= y1; y++) {
+                        const bool shell = x == cc[0] - r || x == cc[0] + r || y == cc[1] - r || y == cc[1] + r;
+                        for (int z = z0; z <= z1; z++) {
+                            if (!shell && z != cc[2] - r && z != cc[2] + r) {   // the ring's inside: done already
+                                z = cc[2] + r - 1;
+                                continue;
+                            }
+                            // a lower bound on the true squared distance to anything in cell (x, y, z)
+                            const int c[3] = {x, y, z};
+                            double lb = 0;
+                            for (int a = 0; a < 3; a++) {
+                                const double gap = fabs(c[a] - cq[a]) - 1;
+                                if (gap > 0) {
+                                    const double d = gap * cell - sl[a];
+                                    if (d > 0) lb += d * d;
+                                }
+                            }
+                            if (lb * shrink - tiny > T) continue;
+                            const int64_t id = ((int64_t)x * g[1] + y) * g[2] + z;
+                            for (int32_t p = start[id]; p < start[id + 1]; p++) {
+                                const int32_t k = pts[p];
+                                const double e = lodmap_d2(v0[k], v[j]);
+                                if (!(e <= T)) continue;
+                                cand_k[nc] = k;
+                                cand_e[nc++] = e;
+                                if (e < mbest) {
+                                    mbest = e;
+                                    const double t = mbest * grow + tiny;
+                                    T = t < cap ? t : cap;
+                                }
+                            }
+                        }
+                    }
+            }
+        }
+        // S: the candidates within the final T, in k order; then the original's rule over them, verbatim
+        int32_t ns = 0;
+        for (int32_t i = 0; i < nc; i++)
+            if (cand_e[i] <= T) cand_k[ns++] = cand_k[i];
+        if (ns > 1) qsort(cand_k, (size_t)ns, sizeof(int32_t), lodmap_cmp_k);
+        float best = FB(0x4cbebc20);                              // 1e8
+        uint16_t near_ = 0;
+        for (int32_t i = 0; i < ns; i++) {
+            const int k = cand_k[i];
+            float d[3];
+            d[0] = (float)(D(v0[k].pos.x) - v[j].pos.x);
+            d[1] = (float)(D(v0[k].pos.y) - v[j].pos.y);
+            d[2] = (float)(D(v0[k].pos.z) - v[j].pos.z);
+            double d2 = (D(d[1]) * d[1] + D(d[2]) * d[2]) + D(d[0]) * d[0];
+            const float d2s = (float)d2;
+            if (!(d2 >= best)) {
+                near_ = (uint16_t)k;
+                best = d2s;
+            }
+        }
+        map[j] = near_;
+    }
+    free(start); free(pts); free(cand_k); free(cand_e);
+    return true;
+}
+
+// one LOD's map, as Car::Car builds it: the grid search where the brute force would be slow, else the original
+static void lodmap_build(const mrVertex* v0, int32_t n0, const mrVertex* v, int32_t n, uint16_t* map) {
+    if ((int64_t)n0 * n >= LODMAP_FAST_MIN && lodmap_search(v0, n0, v, n, map)) return;
+    lodmap_original(v0, n0, v, n, map);
+}
+
+// =============================================================================================================
 // Car::Car (0x4364c0)
 // =============================================================================================================
 // The parts' constructors, Car's vtable; each LOD's vertex map (LOD 0 to itself, the others to their nearest LOD-0
-// vertex, the first of equals); the defaults; Setup and reset; register with the physics task; the sounds.
+// vertex, the first of equals: lodmap_build, above); the defaults; Setup and reset; register with the physics task;
+// the sounds.
 static Car* __fastcall Car_ctor(Car* self, Edx, CarData* pd, void* p2) {
     char buf[256];
     PhobDyno_ctor(self, 0, pd, p2);
@@ -506,27 +757,11 @@ static Car* __fastcall Car_ctor(Car* self, Edx, CarData* pd, void* p2) {
         int32_t n = 0;
         mrVertex* v;
         mrModelGetVerts(self->lod_models[lod], &v, &n);
-        self->lod_vertex_maps[lod] = (uint16_t*)MemAlloc(n + n);
-        for (int j = 0; j < n; j++) {
-            float best = FB(0x4cbebc20);                         // 1e8
-            uint16_t near_ = 0;
-            if (lod == 0) near_ = (uint16_t)j;
-            else {
-                for (int k = 0; k < n0; k++) {
-                    float d[3];
-                    d[0] = (float)(D(v0[k].pos.x) - v[j].pos.x);
-                    d[1] = (float)(D(v0[k].pos.y) - v[j].pos.y);
-                    d[2] = (float)(D(v0[k].pos.z) - v[j].pos.z);
-                    double d2 = (D(d[1]) * d[1] + D(d[2]) * d[2]) + D(d[0]) * d[0];
-                    const float d2s = (float)d2;
-                    if (!(d2 >= best)) {                          // fcom; test ah,1
-                        near_ = (uint16_t)k;
-                        best = d2s;
-                    }
-                }
-            }
-            self->lod_vertex_maps[lod][j] = near_;
-        }
+        uint16_t* const map = self->lod_vertex_maps[lod] = (uint16_t*)MemAlloc(n + n);
+        if (lod == 0)
+            for (int j = 0; j < n; j++) map[j] = (uint16_t)j;
+        else
+            lodmap_build(v0, n0, v, n, map);                      // the original's search, or the same maps fast
     }
     self->name[0] = 0;
     self->realism = 2;

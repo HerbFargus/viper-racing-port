@@ -5,6 +5,8 @@
 //     cl /nologo /O2 /arch:IA32 /fp:precise /MT /W3 /EHsc /std:c++17 /FC /DVP_FUZZ test\world_car2.cpp
 //        /Fo<outdir>\ /Fe<outdir>\world_car2.exe /link /BASE:0x10000000 /DYNAMICBASE:NO /FIXED /MACHINE:X86
 //   run:   world_car2.exe [iterations] [name-filter, or -] [seed]
+//   (Car::Car's branches: is_plane, SoundDash made, and the vertex maps by the grid search -- phys_car.cpp's lodmap;
+//   test/world_lodmap.cpp checks that search on its own, against the original loop)
 //   the fixes (docs/PORTING.md, "Fixes"): the same with /DFIX_TESTS (or /DVP_TEST_FIXES) -- the rewrites as the game
 //   builds them; Car::Setup then also gets CarData names of 32 characters and more (unterminated), which must come out
 //   as the original's result for the name cut to 31.
@@ -362,18 +364,25 @@ static void random_cardata(CarData* cd) {
     cd->name[len] = 0;
 }
 
-// the world, up to (not including) the Car's construction
+// the world, up to (not including) the Car's construction. g_big_lods (Car::Car's own check): now and then a body
+// big enough that Car::Car's vertex maps take the grid search (n0 x n >= LODMAP_FAST_MIN for some LOD), with welded
+// LOD-0 vertices (the same position twice) and LODs up to LOD 0's size
+static bool g_big_lods;
 static void build_world_data() {
     memset(g_arena, 0, g_bump);
     g_bump = 0;
     W.cd = (CarData*)arena_alloc(0x200);
     random_cardata(W.cd);
     // the body model: LOD 0 and four smaller ones (some vertices shared exactly with LOD 0)
-    int n0 = 20 + (int)(fuzz_rand() % 100);
+    const bool big = g_big_lods && chance(15);
+    int n0 = big ? 1400 + (int)(fuzz_rand() % 1200) : 20 + (int)(fuzz_rand() % 100);
     mrVertex* v0 = (mrVertex*)malloc(n0 * 32);
-    for (int i = 0; i < n0; i++) random_vertex(&v0[i]);
+    for (int i = 0; i < n0; i++) {
+        random_vertex(&v0[i]);
+        if (big && i && chance(10)) v0[i].pos = v0[fuzz_rand() % i].pos;
+    }
     for (int lod = 0; lod < 5; lod++) {
-        int n = lod == 0 ? n0 : 5 + (int)(fuzz_rand() % (n0 / 2 + 1));
+        int n = lod == 0 ? n0 : big ? 300 + (int)(fuzz_rand() % (n0 - 299)) : 5 + (int)(fuzz_rand() % (n0 / 2 + 1));
         if (lod && chance(3)) n = 0;
         mrVertex* v = (mrVertex*)malloc((n + 1) * 32);
         for (int i = 0; i < n; i++) {
@@ -621,7 +630,16 @@ static void cover(int which) {
     Car* a = car ? (Car*)after_of(car) : 0;                     // the original's result
     if (car) car = (Car*)(g_arena_snap + ((uint8_t*)car - g_arena));   // and the state it started from
     switch (which) {
-    case 0: c.branch[0] += a->is_plane != 0; c.branch[1] += log_has('SDSH'); break;
+    case 0: {
+        c.branch[0] += a->is_plane != 0; c.branch[1] += log_has('SDSH');
+        // the vertex maps by the grid search: a LOD with n0 x n past Car::Car's threshold
+        int32_t nv[5];
+        for (int lod = 0; lod < 5; lod++) nv[lod] = (*(mrModelInfo**)((uint8_t*)(uintptr_t)W.cd->lod_models[lod] + 0x10))->num_verts;
+        bool grid = false;
+        for (int lod = 1; lod < 5; lod++) grid |= (int64_t)nv[0] * nv[lod] >= LODMAP_FAST_MIN;
+        c.branch[2] += grid;
+        break;
+    }
     case 3: case 4: case 5:
         c.branch[0] += mc; c.branch[1] += memcmp(a->damage_grid, car->damage_grid, 32) != 0;
         c.branch[2] += log_has('REVT'); c.branch[3] += a->damaged != car->damaged; break;
@@ -642,7 +660,9 @@ static int run_one(int which, int it) {
     Car* c;
     switch (which) {
     case 0: {                                                   // Car::Car on random bytes
+        g_big_lods = true;
         build_world_data();
+        g_big_lods = false;
         W.car = c = (Car*)arena_alloc(4224);
         for (int i = 0; i < 4224; i++) ((uint8_t*)c)[i] = (uint8_t)fuzz_rand();
         void* p2 = (void*)(uintptr_t)(fuzz_rand() % 0x400);

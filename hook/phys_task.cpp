@@ -386,11 +386,15 @@ static void __cdecl PhysTaskBegin_rw(void* stream) {
     void* ptr = MemStreamCreatePtr(stream);
     MemStreamSeekStart(ptr);
     g_nphobs = 0;
+    const uint64_t t0 = perf::now();                     // the race's load timer (a log line; changes nothing)
     if (create_phob_o(ptr, g_phobs)) {
         do {
             g_nphobs++;
         } while (create_phob_o(ptr, g_phobs + g_nphobs));
     }
+    int ncars = 0;
+    for (int i = 0; i < 16; i++) ncars += g_cars[i] != 0;
+    if (ncars) logf("race load: cars built in %.3f s (%d cars)", (double)(perf::now() - t0) / 1e9, ncars);
     MemStreamDestroyPtr(ptr);
     PhysReplayDoneCreating();
     g_shm_w = ShmemAlloc(k_str_shmem, g_msg_tail + 0x7dc);
