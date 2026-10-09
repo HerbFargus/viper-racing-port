@@ -59,9 +59,10 @@ Good to know
   shared files -- your paint job and hornball look on everyone's car, as in the original game.
 * Controllers: a game controller (Xbox, PlayStation and the like) works without setting it up,
   and can be plugged in or out at any time. In a race it drives alongside the keyboard: left
-  stick steer, RT throttle, LT brake, A handbrake, B reverse, X horn, Y next camera, LB / RB
+  stick or D-pad steer, RT throttle, LT brake, A handbrake, B reverse, X horn, Y next camera,
+  Back puts the car back on the track, LB / RB
   shift down / up, right stick look left / right (click: look back), Start the pause menu (in
-  it: D-pad, A choose, B back). In the menus the left stick moves the mouse pointer, A clicks,
+  it: D-pad, A choose, B back). In the menus the left stick or D-pad moves the pointer, A clicks,
   X right-clicks and B is Esc. If you map any control to the joystick in Options > Controls,
   races use your mapping instead, exactly as the original did. A wheel or plain joystick works
   through Options > Controls, as in the original.

@@ -222,16 +222,18 @@ unless a game controller is used.
   | Where | Input | Does |
   |---|---|---|
   | race | left stick | steer (dead zone 15%, then the game's steering sensitivity and range, as its analog path) |
+  | race | D-pad left / right | steer too, as the player's own steer-left / steer-right keys held (the keyboard's ramp) |
   | race | RT / LT | throttle / brake (the game's pedal sensitivity and range; the larger of trigger and key wins) |
   | race | A / B / X | handbrake / reverse (held) / horn |
   | race | LB / RB | shift down / up, one gear a press (down to reverse, up to the top gear) |
   | race | right stick across / its click | look left or right / look back |
   | race | Y | the next camera, F1..F11 in turn (the blimp, F12, is left out) |
+  | race | Back | the car put back on the track ('help', the keyboard's Space) |
   | race | Start | the pause menu (Esc); in it D-pad up / down, A choose, B or Start back |
-  | menus | left stick | the mouse pointer (faster the further it's pushed and the longer it moves) |
+  | menus | left stick or D-pad | the mouse pointer (faster the further it's pushed and the longer it moves) |
   | menus | A / X / B | left click / right click / Esc |
 
-  Back, the left stick's click and the D-pad outside the pause menu do nothing. The keyboard keeps working
+  The left stick's click does nothing. The keyboard keeps working
   alongside: the controller's steering takes over while the stick is off centre, and the keyboard's ramps go
   on from their own values, not the controller's. Anyone who has mapped any control to the joystick in
   Options > Controls keeps exactly the original's behaviour in a race (no merge; Y and Start left alone).

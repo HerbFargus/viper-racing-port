@@ -489,12 +489,18 @@ void handle(const SDL_Event& e) {
     }
 }
 
+// the D-pad steering in a race (pad_idle, just before): the scan codes of the player's steer-left / steer-right keys to
+// hold, 0 for none -- so the game steers with its own keyboard ramp, exactly as the arrow keys feel
+uint8_t g_dpad_left, g_dpad_right;
+
 void scan_update() {                                             // ScanUpdate: the DirectInput keyboard state
     uint8_t* state = (uint8_t*)G.dik;
     memset(state, 0, 256);
     const Uint8* ks = SDL_GetKeyboardState(0);
     for (const Key& k : KEYS)
         if (ks[k.sc]) state[k.dik] = 0x80;
+    if (g_dpad_left) state[g_dpad_left] = 0x80;
+    if (g_dpad_right) state[g_dpad_right] = 0x80;
     *(uint8_t*)G.shift = state[0x2a] | state[0x36];
     *(uint8_t*)G.ctrl = state[0x1d] | state[0x9d];
     *(uint8_t*)G.alt = state[0x38] | state[0xb8];
@@ -823,6 +829,8 @@ enum : uint32_t {
     DS_STEERING = 0x00522200, DS_NUM_GEARS = 0x00522204, DS_THROTTLE_SENS = 0x00522218, DS_BRAKE_SENS = 0x00522228,
     DS_STEER_RANGE = 0x00522238, DS_EBRAKE = 0x00522260, DS_GEAR = 0x00522264, DS_REVERSE = 0x00522298,
     DS_THROTTLE = 0x0052229c, DS_HORN = 0x005222a0, DS_LOOK_BACK = 0x005222c8, DS_STEER_SENS = 0x005222d0,
+    DS_HELP = 0x00522274,                                        // u8: 'help' -- the car put back on the track
+    CTL_STEER_LEFT = 0x005221e0, CTL_STEER_RIGHT = 0x00522268,   // the steer_left / steer_right Controls
     DS_JOY = 0x00522730,                                         // control.obj: the JoyPos ControlUpdate polls into
     MS_CAMERA = 0x004e3764,                                      // main.obj: the race's camera (0..10, 0xb blimp, 0xc over)
 };
@@ -830,6 +838,7 @@ enum : uint32_t {
 const uint32_t k_controls[15] = {0x005221d0, 0x005221e0, 0x00522210, 0x00522220, 0x00522240, 0x00522258, 0x00522268,
                                  0x00522278, 0x00522280, 0x00522288, 0x00522290, 0x005222a8, 0x005222b0, 0x005222c0,
                                  0x005222d8};
+struct Binding { int32_t type; uint8_t key; };                   // driver.obj's Control: type 1 = a key, its scan code
 const float STICK_DEAD = 0.15f;                                  // the sticks' dead zone
 const int TRIGGER_DEAD = 13;                                     // the triggers' (of 255)
 
@@ -929,6 +938,7 @@ void __cdecl driver_update_front(float dt) {
     if (j.button[1]) ds<uint8_t>(DS_REVERSE) = 1;               // B: reverse (held)
     if (j.button[2]) ds<uint8_t>(DS_HORN) = 1;                  // X: the horn
     if (j.button[9]) ds<uint8_t>(DS_LOOK_BACK) = 1;             // the right stick's click: look back
+    if (j.button[6]) ds<uint8_t>(DS_HELP) = 1;                  // Back: the car back on the track (the keyboard's Space)
     const double look = stick(j.axis[4]);                       // the right stick across: look left / right
     if (look != 0.0) ds<float>(DS_LOOK_SIDE) = (float)look;
     // LB / RB: one gear per press, as DriverUpdate steps it for the shift keys (up to the top gear, down to reverse)
@@ -978,6 +988,7 @@ void pad_idle() {
     g_pad_t = now;
     dt = dt < 0 ? 0 : dt > 0.1 ? 0.1 : dt;                         // (a long load between two calls: no leap)
     g_idles++;
+    g_dpad_left = g_dpad_right = 0;
     bool cur[SDL_CONTROLLER_BUTTON_MAX] = {};
     if (g_pad)
         for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++)
@@ -1001,6 +1012,11 @@ void pad_idle() {
             if (hit[SDL_CONTROLLER_BUTTON_B] || hit[SDL_CONTROLLER_BUTTON_START]) tap_key(SDL_SCANCODE_ESCAPE);
         } else if (!joystick_mapped()) {                         // (a pad set up in Options: its buttons are its own)
             if (hit[SDL_CONTROLLER_BUTTON_START]) tap_key(SDL_SCANCODE_ESCAPE);
+            // the D-pad steers too, beside the stick: the player's own steering keys held (when they are keys)
+            const Binding* sl = (const Binding*)(uintptr_t)CTL_STEER_LEFT;
+            const Binding* sr = (const Binding*)(uintptr_t)CTL_STEER_RIGHT;
+            if (cur[SDL_CONTROLLER_BUTTON_DPAD_LEFT] && sl->type == 1) g_dpad_left = sl->key;
+            if (cur[SDL_CONTROLLER_BUTTON_DPAD_RIGHT] && sr->type == 1) g_dpad_right = sr->key;
             if (hit[SDL_CONTROLLER_BUTTON_Y]) {                  // the next camera, F1..F11 (the blimp, F12, left out)
                 const int32_t cam = *(const volatile int32_t*)(uintptr_t)MS_CAMERA;
                 if (cam != 0xc) tap_key((SDL_Scancode)(SDL_SCANCODE_F1 + (cam >= 0 && cam < 10 ? cam + 1 : 0)));
@@ -1016,8 +1032,14 @@ void pad_idle() {
         g_px = g_mouse_x >= 0 ? g_mouse_x + 0.5 : gw / 2.0;
         g_py = g_mouse_y >= 0 ? g_mouse_y + 0.5 : gh / 2.0;
     }
-    const double lx = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTX) / 32768.0;
-    const double ly = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTY) / 32768.0;
+    double lx = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTX) / 32768.0;
+    double ly = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTY) / 32768.0;
+    // the D-pad moves it too (full speed in its direction), whichever of the two is used
+    if (cur[SDL_CONTROLLER_BUTTON_DPAD_LEFT] || cur[SDL_CONTROLLER_BUTTON_DPAD_RIGHT] ||
+        cur[SDL_CONTROLLER_BUTTON_DPAD_UP] || cur[SDL_CONTROLLER_BUTTON_DPAD_DOWN]) {
+        lx = (double)cur[SDL_CONTROLLER_BUTTON_DPAD_RIGHT] - (double)cur[SDL_CONTROLLER_BUTTON_DPAD_LEFT];
+        ly = (double)cur[SDL_CONTROLLER_BUTTON_DPAD_DOWN] - (double)cur[SDL_CONTROLLER_BUTTON_DPAD_UP];
+    }
     const double mag = sqrt(lx * lx + ly * ly);
     if (mag > STICK_DEAD) {
         const double m = ((mag > 1 ? 1 : mag) - STICK_DEAD) / (1 - STICK_DEAD);
