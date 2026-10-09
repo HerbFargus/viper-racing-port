@@ -829,7 +829,7 @@ enum : uint32_t {
     DS_STEERING = 0x00522200, DS_NUM_GEARS = 0x00522204, DS_THROTTLE_SENS = 0x00522218, DS_BRAKE_SENS = 0x00522228,
     DS_STEER_RANGE = 0x00522238, DS_EBRAKE = 0x00522260, DS_GEAR = 0x00522264, DS_REVERSE = 0x00522298,
     DS_THROTTLE = 0x0052229c, DS_HORN = 0x005222a0, DS_LOOK_BACK = 0x005222c8, DS_STEER_SENS = 0x005222d0,
-    DS_HELP = 0x00522274,                                        // u8: 'help' -- the car put back on the track
+    DS_AIRLIFT = 0x00522208,                                     // u8: 'airlift' -- the car lifted back onto the track
     CTL_STEER_LEFT = 0x005221e0, CTL_STEER_RIGHT = 0x00522268,   // the steer_left / steer_right Controls
     DS_JOY = 0x00522730,                                         // control.obj: the JoyPos ControlUpdate polls into
     MS_CAMERA = 0x004e3764,                                      // main.obj: the race's camera (0..10, 0xb blimp, 0xc over)
@@ -938,7 +938,10 @@ void __cdecl driver_update_front(float dt) {
     if (j.button[1]) ds<uint8_t>(DS_REVERSE) = 1;               // B: reverse (held)
     if (j.button[2]) ds<uint8_t>(DS_HORN) = 1;                  // X: the horn
     if (j.button[9]) ds<uint8_t>(DS_LOOK_BACK) = 1;             // the right stick's click: look back
-    if (j.button[6]) ds<uint8_t>(DS_HELP) = 1;                  // Back: the car back on the track (the keyboard's Space)
+    if (j.button[6]) {                                          // Back: the car lifted back onto the track (Space)
+        if (g_pad_log && !ds<uint8_t>(DS_AIRLIFT)) logf("pad: airlift (Back)");
+        ds<uint8_t>(DS_AIRLIFT) = 1;
+    }
     const double look = stick(j.axis[4]);                       // the right stick across: look left / right
     if (look != 0.0) ds<float>(DS_LOOK_SIDE) = (float)look;
     // LB / RB: one gear per press, as DriverUpdate steps it for the shift keys (up to the top gear, down to reverse)

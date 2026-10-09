@@ -228,7 +228,7 @@ unless a game controller is used.
   | race | LB / RB | shift down / up, one gear a press (down to reverse, up to the top gear) |
   | race | right stick across / its click | look left or right / look back |
   | race | Y | the next camera, F1..F11 in turn (the blimp, F12, is left out) |
-  | race | Back | the car put back on the track ('help', the keyboard's Space) |
+  | race | Back | the car lifted back onto the track ('airlift', the keyboard's Space) |
   | race | Start | the pause menu (Esc); in it D-pad up / down, A choose, B or Start back |
   | menus | left stick or D-pad | the mouse pointer (faster the further it's pushed and the longer it moves) |
   | menus | A / X / B | left click / right click / Esc |
