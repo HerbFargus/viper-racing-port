@@ -27,7 +27,8 @@
 // The hornball (a known behaviour): transPGS_CAR_CHOICE_PGS_CAR_WAITING puts HackHornBall() -- THIS machine's
 // hack setting -- at byte 0xcd of the car info packet; the server relays every car's info, dispatch_NetCarInfoPacket copies
 // it into the car's slot (+0xc8) and GetCarList hands it to the game in each CarList entry (+0xc4). So each car carries its
-// own driver's flag here; where it leaks to another player's car is the car loading's shared ball.mod name, not this code.
+// own driver's flag here; where it leaked to another player's car was the car loading's shared ball.mod name, not this
+// code (fixed there: car_parts.h).
 //
 // Footprints: whatever sends (SendReliable / Send / Disconnect / the server search), logs, allocates or frees (the chat pool),
 // builds or translates the function-local Xlators the first time, runs a callee through a vtable that may send, or touches the

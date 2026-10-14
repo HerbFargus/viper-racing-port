@@ -117,6 +117,21 @@ dozen places and the game dies.
   original; the rows of a canvas taller than 2048 below that aren't drawn. `gxTriangle`'s rewrite calls
   `fill_line`'s directly, so the two halves always agree on the tables. A canvas up to 1024 rows (the
   OpenGL renderer's 640x480 page) draws exactly as before.
+- A car's plain-named parts came from the wrong car. The game loads every racing car's `<car>.car` set at the
+  start of a race and asks for some of each car's models by a plain name -- `ball.mod`, `wheel_1-3.mod`,
+  `fwheel_1-3.mod`, `needle.mod`, `spin_l/r.mod`, the `arm_*.mod`s, `diskglow.mod` and the `brakelt.mod`
+  fallback -- which the resource layer finds in the newest set that has it. So every car got the newest car set's
+  parts: every player threw one car's horn ball, and a kart's wheels were drawn on the stock Vipers racing it (the
+  stock parts are in `race.res`, which loads before the cars). Each is now asked for in the car's own set first
+  (`<car>.car/<part>`), then `race.res`'s, then by the plain name as before (`hook/car_parts.h`; `create_ball`,
+  `load_wheels`, `load_car_models`). The models are only drawn -- the horn ball's collision sphere and mass are fixed
+  numbers, a wheel model is scaled to the car file's tyre -- so the physics, replays and network races are the
+  original's. A car's files don't change: it keeps its plain-named parts, which the original game still shares.
+  Seen fixed in game (2026-10-13): a stock Viper racing a kart has its own wheels again. A session recorded on the
+  build before (a kart against Viper AI, horn balls thrown) replays on the fixed build with its race IDENTICAL over
+  all 1,500 ticks and in lockstep; only the drawing differs from the race's start (the Vipers' own wheel models and
+  texture), as intended -- the build before replays it IDENTICAL throughout.
+  In a two-copy LAN race (Bowser Kart against Mario Kart) each player throws their own item, the same in both copies.
 - `find_mem`: the start-up's video-memory check adds 600 KB (a 640x480 front buffer) to the total
   DirectDraw reports, and a card reporting within 600 KB of 4 GB wrapped it to almost nothing: "unsupported:
   0 megs of vram" and the game quit (with the game's own DirectDraw on a modern card; the OpenGL renderer
@@ -760,9 +775,9 @@ race replays bit for bit.
   the cars). `kill_thread`'s 12-second wait and panic: nothing in v1.0 sets the task it waits for. The line device
   reads its overlapped port without an OVERLAPPED: kernel32 waits on the handle itself, and the game's return-at-
   once timeouts mean a read never pends. `set_autodial` still tries to turn Windows' autodial off in
-  HKEY_USERS\.Default (without administrator rights nothing happens). A hornball carries from one player's car to
-  another's (the cars share `ball.mod`), and an AI car hit by a hornball snaps back to its line in a network race:
-  behaviour, for a later look.
+  HKEY_USERS\.Default (without administrator rights nothing happens). An AI car hit by a hornball snaps back to its line
+  in a network race: behaviour, for a later look. (The hornball that carried from one player's car to another's is
+  fixed: "Drawing", a car's plain-named parts.)
 - A track with no AI racing line still crashes in a career race or a multiplayer race; those are fixed
   with their own stages (the menus and career, multiplayer).
 - The AI's quirks that shape how it drives (its per-segment speed notes are computed and then

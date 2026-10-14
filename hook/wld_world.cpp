@@ -48,6 +48,7 @@
 #include "port.h"
 #include "x87.h"
 #include "phys_types.h"
+#include "car_parts.h"
 
 #define D(x) ((double)(x))                          // a register value (x87.h)
 typedef int Edx;                                    // the unused edx of a __thiscall received as __fastcall
@@ -971,6 +972,11 @@ static void __cdecl create_remaining_cars_rw(const CarList* cl) {
 static void fp_remaining_cars(Footprint& f, const CarList*) { f.replay_only = "it loads car files and makes the cars"; }
 PORT_FN(0x00462f90, "create_remaining_cars", create_remaining_cars_rw, fp_remaining_cars)
 
+// FIX: the ball's model is the car's own ball.mod (car_parts.h), not the newest car set's: every player threw one
+// car's horn ball. parse_car names the car here (create_ball takes only its index; the car manager doesn't know the car
+// yet); 0 -- any other caller, or VP_FAITHFUL -- is the plain "ball.mod" as before.
+static const char* g_ball_car;
+
 // ==== parse_car (0x462fc0) ================================================================================================
 // "obj car X, Z" makes the next car of the list (none once the list is used up): its <car>.cf loaded into a CarData
 // (the career's upgrades for the player), the type by subtype (the player also becomes the focus and player car;
@@ -1053,7 +1059,11 @@ static void __cdecl parse_car_rw(const char* line, const CarList* cl) {
         uint32_t* r = (uint32_t*)L.cd.frame.rot.m;
         for (int k = 0; k < 9; k++) r[k] = (k == 0 || k == 4 || k == 8) ? k_one : 0;
     }
-    if (e->ball) create_ball_o(L.cd.car);
+    if (e->ball) {
+        g_ball_car = e->car;                                     // FIX: create_ball finds this car's own ball.mod
+        create_ball_o(L.cd.car);
+        g_ball_car = 0;
+    }
     void* obj;
     if (e->subtype == 3) {
         void* p = MemAlloc(0x844);
@@ -1190,7 +1200,9 @@ static void __cdecl create_ball_rw(int car) {
     memcpy(&b._30, &k5, 4);
     b.car = car;
     void* p = MemAlloc(0x40);
-    void* obj = p ? ModelObject_ctor(p, 0, &b, k_str_ball_mod) : 0;
+    char part[0x60];
+    // FIX: (g_ball_car, above parse_car)
+    void* obj = p ? ModelObject_ctor(p, 0, &b, car_part(part, sizeof part, g_ball_car, k_str_ball_mod)) : 0;
     WorldAddWob_o(obj);
 }
 static void fp_create_ball(Footprint& f, int) { f.replay_only = "it allocates a ModelObject (which loads ball.mod)"; }
