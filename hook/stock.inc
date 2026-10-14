@@ -11593,7 +11593,7 @@
 #endif
 #ifdef VP_STOCK_VARIANTS
 // {address, fingerprint, what}: vrmod's patched functions the rewrites replace too (VRMOD_PATCHES, VRMOD_MASKS)
-    {0x0040d540, 0x7a6c682a, "enginefix: horn ball in career"},
+    {0x0040d540, 0x7a6c682a, "careerhorn"},
     {0x00415020, 0xb96b25f9, "modassert"},
     {0x00421840, 0x5bdee0a7, "enginefix: the AI bead guard"},
     {0x004311d0, 0xcaa43297, "headon"},
