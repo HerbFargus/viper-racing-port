@@ -26,6 +26,7 @@
 #include "port.h"
 #include "x87.h"
 #include "phys_types.h"
+#include "hornball_sync.h"
 
 #define D(x) ((double)(x))                          // a register value (x87.h)
 
@@ -457,15 +458,64 @@ static void __fastcall Car_SetGearAutoAI(Car* self, Edx) {          // the same 
 static void fp_set_gear_auto_ai(Footprint& f, Car* self, Edx) { f.object(self, "car"); }
 PORT_FN(0x00439760, "Car::SetGearAutoAI", Car_SetGearAutoAI, fp_set_gear_auto_ai)
 
+// ---- the horn balls between port players (hornball_sync.h) ---------------------------------------------------------------
+// A ball's state as the sync sends it: its rotation and position (PhobRoot +0x38, 12 floats), its velocity (PhobDyno +0x234)
+static const Flag_t hb_MultiEnabled = (Flag_t)0x004a23c0;
+static bool hb_on() { return hbs::S().active.load(std::memory_order_acquire) && hb_MultiEnabled(); }
+static void hb_publish(int i, void* ball) {
+    float s[15];
+    memcpy(s, (const uint8_t*)ball + 0x38, 48);
+    memcpy(s + 12, (const uint8_t*)ball + 0x234, 12);
+    hbs::publish(hbs::S().out[i], s, 0.0f, 0.0f);
+}
+// a throw another port player made, put in place: the thrower's ball, moved on by the delay under gravity (contacts in the
+// delay aren't simulated); its spin stopped and its throw time now, as Ball::Throw leaves them
+static void hb_apply(int i) {
+    hbs::State& st = hbs::S();
+    const uint32_t seq = st.in[i].seq.load(std::memory_order_acquire);
+    if (seq == st.applied[i]) return;
+    st.applied[i] = seq;
+    uint8_t* const ball = (uint8_t*)GetBall(i);
+    if (!ball) return;
+    const float now = (float)PhysicsGetTime();
+    float dt = now - st.in[i].recv_time + st.in[i].latency;
+    if (!(dt >= 0.0f)) dt = 0.0f;
+    if (dt > 1.0f) dt = 1.0f;
+    float s[15];
+    memcpy(s, st.in[i].s, sizeof s);
+    const float g = 9.8100004196167f;                        // PhobDyno::Update's
+    s[9] += s[12] * dt;
+    s[10] += s[13] * dt - 0.5f * g * dt * dt;
+    s[11] += s[14] * dt;
+    s[13] -= g * dt;
+    memcpy(ball + 0x38, s, 48);
+    memcpy(ball + 0x234, s + 12, 12);
+    memset(ball + 0x240, 0, 12);                             // angular velocity
+    memcpy(ball + 0x478, &now, 4);                           // Ball::last_throw_time
+}
+
 // SetHorn (0x43afb0): with the horn-ball hack on, a rising edge throws the car's ball -- from the car (its
-// frame and velocity), or from the blimp's frame at rest when the camera is the blimp's (type 11)
+// frame and velocity), or from the blimp's frame at rest when the camera is the blimp's (type 11).
+// The port's horn balls: another port player's car throws by message only (hb_apply); a car driven here sends its throws.
 static void __fastcall Car_SetHorn(Car* self, Edx, uint8_t on) {
+    const int hi = self->car_index;
+    if (VP_FIX && (uint32_t)hi < 8u && hb_on() && hbs::S().remote[hi].load()) {
+        hb_apply(hi);
+        self->horn = on;
+        return;
+    }
     const uint8_t hack = HackHornBall();
     if (hack && self->horn != on && on) {
         if (void* ball = GetBall(self->car_index)) {
             if (g_camera_type != 0xb) {
                 const float t = (float)PhysicsGetTime();
+                uint32_t before;
+                memcpy(&before, (const uint8_t*)ball + 0x478, 4);
                 Ball_Throw(ball, 0, &self->frame, &self->velocity, t);
+                uint32_t after;
+                memcpy(&after, (const uint8_t*)ball + 0x478, 4);
+                if (VP_FIX && after != before && (uint32_t)hi < 8u && hb_on() && hbs::S().local[hi].load())
+                    hb_publish(hi, ball);
             } else {
                 P3 zero;                                // [+0xc]
                 zero.x = 0.0f; zero.y = 0.0f; zero.z = 0.0f;

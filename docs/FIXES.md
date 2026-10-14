@@ -585,6 +585,17 @@ A normal LAN game is unchanged: recorded on the fixed code, it replays identical
 
 ### In play
 
+- Horn balls between port players (`hook/hornball_sync.h`). A network car's throw wasn't sent: the horn is a bit in
+  its car packet, and each machine threw that car's ball itself, from its own estimate of the car -- on the network
+  thread when the bit arrived (dropped when the packet was over 0.1 s old, so with lag the other player's balls never
+  appeared) and on the physics thread when the car was updated (only if that player had the hack on). Each copy used
+  its own player's ball size and mass. Between port players a throw is now a message of its own, on a packet class an
+  original client or server drops unread (3): a HELLO to the host, the host's WELCOME (its ball size and mass, which
+  every ball in the game then has, and who is on the port), and each THROW (the car, its ball's orientation, position
+  and velocity as thrown) relayed to the other port players, who put their copy there moved on by the delay and ignore
+  that car's horn bit. A game with an original-exe player, or hosted on one, plays as before. Seen in a two-copy LAN race
+  (2026-10-13): every throw shows on both screens, from the same place. Copies still part after a contact (each machine
+  bounces its own copy off its own view of the cars).
 - More than 8 cars: the AI-cars slider goes to 6, so with 3 or more players the host's server added cars past its
   8 slots. That overwrote its own car count and the race on offer and overran the car-list packet, usually
   crashing the host or garbling the race. The server now adds only as many AI cars as there is room for, up to 8
@@ -775,9 +786,10 @@ race replays bit for bit.
   the cars). `kill_thread`'s 12-second wait and panic: nothing in v1.0 sets the task it waits for. The line device
   reads its overlapped port without an OVERLAPPED: kernel32 waits on the handle itself, and the game's return-at-
   once timeouts mean a read never pends. `set_autodial` still tries to turn Windows' autodial off in
-  HKEY_USERS\.Default (without administrator rights nothing happens). An AI car hit by a hornball snaps back to its line
-  in a network race: behaviour, for a later look. (The hornball that carried from one player's car to another's is
-  fixed: "Drawing", a car's plain-named parts.)
+  HKEY_USERS\.Default (without administrator rights nothing happens). A horn ball's copies on different machines part
+  after it touches something, and an AI car hit by one snaps back to its line in a network race (each machine bounces
+  its own copy; the throws themselves are synced between port players: "Multiplayer", "In play"). (The hornball that
+  carried from one player's car to another's is fixed: "Drawing", a car's plain-named parts.)
 - A track with no AI racing line still crashes in a career race or a multiplayer race; those are fixed
   with their own stages (the menus and career, multiplayer).
 - The AI's quirks that shape how it drives (its per-segment speed notes are computed and then

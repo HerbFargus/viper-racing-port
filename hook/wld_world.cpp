@@ -49,6 +49,7 @@
 #include "x87.h"
 #include "phys_types.h"
 #include "car_parts.h"
+#include "hornball_sync.h"
 
 #define D(x) ((double)(x))                          // a register value (x87.h)
 typedef int Edx;                                    // the unused edx of a __thiscall received as __fastcall
@@ -1191,8 +1192,14 @@ static void __cdecl create_ball_rw(int car) {
     b.pos.y = (float)h;
     memcpy(&b.inertia[2], &k5000, 4);
     memcpy(&b._28, &k5000, 4);
-    const uint32_t k3000 = vrmod_operand(0x004636f2);            // mov [esp+8], 3000.0 (the mass)
-    const uint32_t k18 = vrmod_operand(0x00463700);              // mov [esp+0x28], 18.0 (the radius, inches)
+    uint32_t k3000 = vrmod_operand(0x004636f2);                  // mov [esp+8], 3000.0 (the mass)
+    uint32_t k18 = vrmod_operand(0x00463700);                    // mov [esp+0x28], 18.0 (the radius, inches)
+    // the port's horn balls: in a network game with port players, every ball has the host's size and mass (hornball_sync.h)
+    typedef uint8_t(__cdecl * Flag_t)();
+    if (VP_FIX && hbs::S().active.load() && ((Flag_t)0x004a23c0)()) {   // MultiEnabled
+        k3000 = hbs::S().mass.load();
+        k18 = hbs::S().radius.load();
+    }
     const uint32_t k06 = 0x3f19999a, k5 = 0x40a00000;
     memcpy(&b.mass, &k3000, 4);
     memcpy(&b.radius, &k18, 4);

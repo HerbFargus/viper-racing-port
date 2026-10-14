@@ -53,6 +53,7 @@
 #include "net_types.h"
 #include "net_race.h"
 #include "net_wsock.h"
+#include "hornball_sync.h"
 
 namespace {
 namespace net_client {
@@ -789,6 +790,89 @@ static void fp_unregister(Footprint& f, RaceClient* self, Edx, void*) { fp_clien
 PORT_FN(0x004a94f0, "RaceClient::UnRegister", RC_UnRegister, fp_unregister)
 
 // =========================================================================================================================
+// the horn balls between port players (hornball_sync.h): not the original's -- class 3, which it drops unread
+// =========================================================================================================================
+typedef double(__cdecl* PhysTime_t)();
+static const PhysTime_t hb_physics_time = (PhysTime_t)(uintptr_t)0x0042bc80;   // PhysicsGetTime
+static void hb_send(RaceClient* self, const uint8_t* pkt, int len) {
+    tcall<void>(F_SM_SendReliable, self->sm, self->chan, pkt, len, 0u, (uint32_t)hbs::CLASS);
+}
+static bool hb_is_port(int32_t user) {
+    if (!user) return false;
+    for (int j = 0; j < 8; j++)
+        if (hbs::S().port_ids[j] == user) return true;
+    return false;
+}
+// RaceClient::Tick, once the client is in the game: the HELLO; then which cars are whose, and this machine's throws out
+static void hb_client_tick(RaceClient* self) {
+    hbs::State& st = hbs::S();
+    if (st.client != self) hbs::reset_client(self);
+    if (self->state < 9) {
+        st.active.store(0);
+        return;
+    }
+    if (!st.hello_sent) {
+        uint8_t pkt[hbs::HDR];
+        memset(pkt, 0, sizeof pkt);
+        hbs::put_header(pkt, hbs::T_HELLO);
+        hb_send(self, pkt, sizeof pkt);
+        st.hello_sent = 1;
+    }
+    if (!st.active.load()) return;
+    for (int i = 0; i < 8; i++) {
+        CarSlot* const c = car_at(self, i);
+        st.local[i].store(c->localcar ? 1 : 0);
+        st.remote[i].store(c->netcar && hb_is_port(c->user) ? 1 : 0);
+        const uint32_t seq = st.out[i].seq.load(std::memory_order_acquire);
+        if (seq == st.sent[i]) continue;
+        st.sent[i] = seq;
+        if (!c->localcar) continue;
+        uint8_t pkt[hbs::HDR + sizeof(hbs::Throw)];
+        memset(pkt, 0, sizeof pkt);
+        hbs::put_header(pkt, hbs::T_THROW);
+        hbs::Throw t;
+        memset(&t, 0, sizeof t);
+        t.car = (int8_t)i;
+        memcpy(t.s, st.out[i].s, sizeof t.s);
+        memcpy(pkt + hbs::HDR, &t, sizeof t);
+        hb_send(self, pkt, sizeof pkt);
+    }
+}
+// a class-3 packet from the host
+static void hb_client_recv(RaceClient* self, const uint8_t* pkt, int len) {
+    hbs::State& st = hbs::S();
+    uint8_t type;
+    if (!hbs::read_header(pkt, len, &type)) return;
+    if (st.client != self) hbs::reset_client(self);
+    if (type == hbs::T_WELCOME && len >= hbs::HDR + (int)sizeof(hbs::Welcome)) {
+        hbs::Welcome w;
+        memcpy(&w, pkt + hbs::HDR, sizeof w);
+        st.mass.store(w.mass);
+        st.radius.store(w.radius);
+        memcpy(st.port_ids, w.port_ids, sizeof st.port_ids);
+        if (!st.active.exchange(1)) NT_LogReport("horn balls: kept in sync with the other port players (the host's ball)");
+    } else if (type == hbs::T_THROW && st.active.load() && len >= hbs::HDR + (int)sizeof(hbs::Throw)) {
+        hbs::Throw t;
+        memcpy(&t, pkt + hbs::HDR, sizeof t);
+        if (t.car < 0 || t.car >= 8) return;
+        const uint8_t* const nc = (const uint8_t*)car_at(self, t.car)->netcar;
+        if (!nc) return;
+        // the car's packet lag: its newest packet's arrival less its send time, both on this machine's physics clock
+        float lat = 0.0f;
+        const uint8_t* const packets = *(const uint8_t* const*)(nc + 0xec4);
+        if (packets && *(const int32_t*)(nc + 0xec8) > 0) {
+            float recv, sent;
+            memcpy(&recv, packets + 0, 4);
+            memcpy(&sent, packets + 4, 4);
+            lat = recv - sent;
+            if (!(lat >= 0.0f)) lat = 0.0f;
+            if (lat > 1.0f) lat = 1.0f;
+        }
+        hbs::publish(st.in[(int)t.car], t.s, (float)hb_physics_time(), lat);
+    }
+}
+
+// =========================================================================================================================
 // the packets
 // =========================================================================================================================
 static void __fastcall RC_dispatch_packets(RaceClient* self, Edx) {
@@ -820,6 +904,8 @@ static void __fastcall RC_dispatch_packets(RaceClient* self, Edx) {
             else NT_LogPanic(S(0x004fd2fc), (uint32_t)buf[0]);           // (byte 0, not the type)
         } else if (cls == 2) {
             tcall<void>(A_race_packet, self, buf, len);
+        } else if (VP_FIX && cls == hbs::CLASS) {
+            hb_client_recv(self, buf, len);                              // the port's horn balls (above)
         }
         len = 0xe2;
     } while (tcall<uint8_t>(F_SM_Recv, self->sm, self->chan, buf, &len));
@@ -838,6 +924,7 @@ static void __fastcall RC_Tick(RaceClient* self, Edx) {
         if (self->state < 7) return;
         tcall<void>(A_keep_alive, self);
         tcall<void>(A_dispatch_packets, self);
+        if (VP_FIX) hb_client_tick(self);                               // the port's horn balls (above)
         return;
     }
     if (st == 5) tcall<void>(A_checkPGS_SEARCHING, self);
