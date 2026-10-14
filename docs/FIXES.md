@@ -730,7 +730,7 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
 
 ## vrmod's patches
 
-vrmod (viper-mod-manager) patches sixteen of the functions the port rewrites (one only when the player asks), and
+vrmod (viper-mod-manager) patches seventeen of the functions the port rewrites (one only when the player asks), and
 a few constants they read. The rewrites take every one of them over, so on a vrmod `race.exe` every function runs as a rewrite -- on the
 `dinput.dll` route and in `viperport.exe`, whose `--check` accepts such a `race.exe` -- with the same behaviour
 as the patch. The stock check (`tools/gen_port_tables.py`: `VRMOD_PATCHES`, `VRMOD_MASKS`, `LIVE_CONSTS`)
@@ -760,6 +760,11 @@ leaves it original.
   full lock. A behaviour, not a fix: the stock check records that it found vrmod's byte (`port_vrmod_has`, taken
   before the hook's jmp covers it) and the rewrite then returns at once, as the patched function does; without it,
   the stock panic bit for bit. `test/world_aicar2.cpp` with `VP_VRMOD=1` puts the `ret` in half the worlds.
+- enginefix's horn ball in career (always on; `HackHornBall`): vrmod NOPs the function's first `je` (the hacks-on
+  test at 0x40d547, 2 bytes), because career mode turns the hacks off for as long as it runs (`CareerDo` calls
+  `HackDisable`) and the horn ball is one of them. The ball then follows its own option everywhere, career too; the
+  other hacks stay off in career. A behaviour, not a fix: the rewrite skips the hacks-on test when the stock check
+  found vrmod's bytes (`port_vrmod_has`), so the standalone and Linux builds do what the patched function does.
 - writepaths: the `.data` path strings it rewrites are read by rewrites that put the files under the game's own
   folder anyway (`Config\`, `log\`), under "Where the game writes".
 
