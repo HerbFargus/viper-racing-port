@@ -594,8 +594,12 @@ A normal LAN game is unchanged: recorded on the fixed code, it replays identical
   every ball in the game then has, and who is on the port), and each THROW (the car, its ball's orientation, position
   and velocity as thrown) relayed to the other port players, who put their copy there moved on by the delay and ignore
   that car's horn bit. A game with an original-exe player, or hosted on one, plays as before. Seen in a two-copy LAN race
-  (2026-10-13): every throw shows on both screens, from the same place. Copies still part after a contact (each machine
-  bounces its own copy off its own view of the cars).
+  (2026-10-13): every throw shows on both screens, from the same place.
+  After the throw, the thrower streams its ball (BALL: position, velocity, spin; unreliable, with its car packets, for
+  15 s) and the host relays it to the other port players. Each receiver pulls its copy towards where the stream says the
+  ball is now (`Ball::Update`: a quarter of the way a tick, outright past 4 m), so the copies stay together after
+  contacts; each copy still collides on its own machine, so a hit on that machine's own car is real there, and the
+  host's copy knocks its AI cars. Seen in a two-copy LAN race (2026-10-13): working.
 - More than 8 cars: the AI-cars slider goes to 6, so with 3 or more players the host's server added cars past its
   8 slots. That overwrote its own car count and the race on offer and overran the car-list packet, usually
   crashing the host or garbling the race. The server now adds only as many AI cars as there is room for, up to 8
@@ -786,9 +790,9 @@ race replays bit for bit.
   the cars). `kill_thread`'s 12-second wait and panic: nothing in v1.0 sets the task it waits for. The line device
   reads its overlapped port without an OVERLAPPED: kernel32 waits on the handle itself, and the game's return-at-
   once timeouts mean a read never pends. `set_autodial` still tries to turn Windows' autodial off in
-  HKEY_USERS\.Default (without administrator rights nothing happens). A horn ball's copies on different machines part
-  after it touches something, and an AI car hit by one snaps back to its line in a network race (each machine bounces
-  its own copy; the throws themselves are synced between port players: "Multiplayer", "In play"). (The hornball that
+  HKEY_USERS\.Default (without administrator rights nothing happens). With an original-exe player in the game, horn balls
+  behave as the original's: each machine throws and bounces its own copy, and an AI car hit by one can snap back to its
+  line (between port players they're synced: "Multiplayer", "In play"). (The hornball that
   carried from one player's car to another's is fixed: "Drawing", a car's plain-named parts.)
 - A track with no AI racing line still crashes in a career race or a multiplayer race; those are fixed
   with their own stages (the menus and career, multiplayer).

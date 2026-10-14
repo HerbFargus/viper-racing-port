@@ -22,6 +22,7 @@
 #include "port.h"
 #include "x87.h"
 #include "phys_types.h"
+#include "hornball_sync.h"
 
 #define D(x) ((double)(x))                          // a register value (x87.h)
 
@@ -1821,9 +1822,42 @@ static void __cdecl unregister_ball_rw(Ball* b) {
 static void fp_unregister_ball(Footprint& f, Ball*) { f.add(g_balls, 64, "ball table"); }
 PORT_FN(0x00441210, "unregister_ball", unregister_ball_rw, fp_unregister_ball)
 
+// The port's horn balls (hornball_sync.h): another port player's ball, pulled towards where its stream says it is now --
+// the streamed state moved on by its age (the car's packet lag plus the time since it came; gravity only), a quarter
+// of the way a tick, or put there outright when it's over 4 m off. Only while the stream is fresh (under 0.5 s since
+// the last state came); otherwise the copy flies on its own.
+static void hb_pull(Ball* self) {
+    typedef uint8_t(__cdecl * Flag_t)();
+    typedef double(__cdecl * Time_t)();
+    const int i = self->index;
+    hbs::State& st = hbs::S();
+    if ((uint32_t)i >= 8u || !st.active.load(std::memory_order_acquire) || !st.remote[i].load()) return;
+    if (!((Flag_t)0x004a23c0)()) return;                    // MultiEnabled
+    float s[9], recv, lat;
+    if (!hbs::stream_read(st.stream[i], s, &recv, &lat)) return;
+    const float now = (float)((Time_t)0x0042bc80)();         // PhysicsGetTime
+    const float since = now - recv;
+    if (!(since >= 0.0f) || since > 0.5f) return;
+    float age = since + lat;
+    if (age > 0.6f) age = 0.6f;
+    const float g = 9.8100004196167f;                        // PhobDyno::Update's
+    const float tp[3] = {s[0] + s[3] * age, s[1] + s[4] * age - 0.5f * g * age * age, s[2] + s[5] * age};
+    const float tv[3] = {s[3], s[4] - g * age, s[5]};
+    float* const pos = &self->frame.pos.x;
+    float* const vel = &self->velocity.x;
+    const float ex = tp[0] - pos[0], ey = tp[1] - pos[1], ez = tp[2] - pos[2];
+    const float k = (ex * ex + ey * ey + ez * ez) > 16.0f ? 1.0f : 0.25f;
+    for (int a = 0; a < 3; a++) {
+        pos[a] += (tp[a] - pos[a]) * k;
+        vel[a] += (tv[a] - vel[a]) * k;
+    }
+    memcpy(&self->angular_velocity, s + 6, 12);
+}
+
 // Ball::Update (0x441240, virtual): fallen below y = -2000 (the height's bits compared unsigned, so a -NaN
 // too): held there, still; then PhobDyno's Update
 static void __fastcall Ball_Update(Ball* self, Edx) {
+    if (VP_FIX) hb_pull(self);
     if (get_bits(&self->frame.pos.y) > 0xc4fa0000u) {
         set_bits(&self->frame.pos.y, 0xc4fa0000);           // -2000
         set_bits(&self->velocity.x, 0);

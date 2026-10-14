@@ -17,8 +17,14 @@
 //            thrown (orientation, position, velocity). Each receiver puts its copy there and moves it on by the delay
 //            (the car's own packet lag plus the time since the message came: gravity, no contacts), and ignores that
 //            car's horn bit -- so a throw is never missed, never late by a packet, and starts where the thrower's did.
-// The network thread (RaceClient / RaceServer) and the physics thread (Car::SetHorn) hand throws over through per-car
-// slots, a sequence number published after the data (a car throws at most every 2 s).
+//   BALL     the thrower -> host -> the other port players, unreliable, with its car packets (15 a second) for 15 s
+//            after each throw: the ball's position, velocity and spin, and the thrower's physics time. Each receiver
+//            pulls its copy towards where that says the ball is now (Ball::Update), and puts it there outright when
+//            it's over 4 m off -- so the copies stay together after contacts, each still colliding on its own machine
+//            (a hit on this machine's own car is real here; the host's copy knocks its AI cars).
+// The network thread (RaceClient / RaceServer) and the physics thread (Car::SetHorn, Ball::Update) hand throws over
+// through per-car slots, a sequence number published after the data (a car throws at most every 2 s); the ball stream,
+// written 15 times a second, goes through a seqlock (odd while it's being written).
 #pragma once
 #include <atomic>
 #include <stdint.h>
@@ -27,7 +33,7 @@
 namespace hbs {
 
 enum : uint32_t { CLASS = 3, MAGIC = 0x42485056u /* "VPHB" */, VERSION = 1 };
-enum : uint8_t { T_HELLO = 1, T_WELCOME = 2, T_THROW = 3 };
+enum : uint8_t { T_HELLO = 1, T_WELCOME = 2, T_THROW = 3, T_BALL = 4 };
 enum : int { HDR = 9 };                    // [0..2] the session layer's, [3] the type, [4..7] MAGIC, [8] VERSION
 
 struct Welcome {                           // after the header
@@ -39,7 +45,14 @@ struct Throw {                             // after the header
     uint8_t _pad[3];
     float s[15];                           // the ball just thrown: rotation (9), position (3), velocity (3)
 };
-static_assert(sizeof(Welcome) == 40 && sizeof(Throw) == 64, "hornball sync packets");
+struct BallState {                         // after the header
+    int8_t car;
+    uint8_t _pad[3];
+    float time;                            // the thrower's physics time (orders the stream; its clock, not ours)
+    float s[9];                            // position (3), velocity (3), spin (3)
+};
+static_assert(sizeof(Welcome) == 40 && sizeof(Throw) == 64 && sizeof(BallState) == 44, "hornball sync packets");
+enum { STREAM_SECONDS = 15 };              // a ball is streamed this long after its throw
 
 struct Slot {
     std::atomic<uint32_t> seq;             // bumped after the data is written
@@ -47,6 +60,12 @@ struct Slot {
     float recv_time, latency;              // a received throw: when it came (physics time), the car's packet lag
 };
 
+struct Stream {                            // a ball streamed to us: the network thread writes, Ball::Update reads
+    std::atomic<uint32_t> seq;             // odd while being written
+    float s[9];
+    float recv_time, latency;              // when it came (our physics time), the car's packet lag
+    float sender_time;                     // the newest taken (older ones dropped: the stream is unreliable)
+};
 struct State {
     // client (the network thread writes, the physics thread reads)
     std::atomic<int> active;               // a port host welcomed this client
@@ -57,6 +76,7 @@ struct State {
     uint32_t sent[8];
     Slot in[8];                            // throws received (network -> physics)
     uint32_t applied[8];
+    Stream stream[8];                      // balls streamed by other port players
     const void* client;                    // the RaceClient the state belongs to
     uint8_t hello_sent;
     int32_t port_ids[8];
@@ -83,6 +103,24 @@ inline bool read_header(const uint8_t* p, int len, uint8_t* type) {
     *type = p[3];
     return true;
 }
+inline void stream_write(Stream& st, const float* s, float recv_time, float latency, float sender_time) {
+    st.seq.fetch_add(1, std::memory_order_acq_rel);          // odd: being written
+    memcpy(st.s, s, sizeof st.s);
+    st.recv_time = recv_time;
+    st.latency = latency;
+    st.sender_time = sender_time;
+    st.seq.fetch_add(1, std::memory_order_release);          // even: done
+}
+// a consistent copy, or false (being written, or torn: try again next tick)
+inline bool stream_read(const Stream& st, float* s, float* recv_time, float* latency) {
+    const uint32_t a = st.seq.load(std::memory_order_acquire);
+    if (a == 0 || (a & 1)) return false;
+    memcpy(s, st.s, sizeof st.s);
+    *recv_time = st.recv_time;
+    *latency = st.latency;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return st.seq.load(std::memory_order_relaxed) == a;
+}
 inline void publish(Slot& sl, const float* s, float recv_time, float latency) {
     memcpy(sl.s, s, sizeof sl.s);
     sl.recv_time = recv_time;
@@ -99,6 +137,7 @@ inline void reset_client(const void* client) {
         st.sent[i] = st.out[i].seq.load(std::memory_order_acquire);
         st.applied[i] = st.in[i].seq.load(std::memory_order_acquire);
         st.port_ids[i] = 0;
+        st.stream[i].sender_time = -1e30f;
     }
     st.client = client;
     st.hello_sent = 0;
