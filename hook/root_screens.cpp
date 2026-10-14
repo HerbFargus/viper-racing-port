@@ -424,7 +424,11 @@ PORT_FN(0x0040d500, "HackGripBoost", HackGripBoost_n, fp_none)
 static float __cdecl HackGravityFactor_n() { return hack_factor(S_HACK_GRAVITY); }
 PORT_FN(0x0040d520, "HackGravityFactor", HackGravityFactor_n, fp_none)
 
-static uint8_t __cdecl HackHornBall_n() { return RH_G8(S_HACK_ON) && RH_G8(S_HACK_HORN) ? 1 : 0; }
+// vrmod's careerhorn (opt-in "Horn ball in career") NOPs the hacks-on test -- career mode turns the hacks off, so the
+// ball follows its own option instead; the rewrite skips the test when the stock check found that patch
+static uint8_t __cdecl HackHornBall_n() {
+    return (RH_G8(S_HACK_ON) || port_vrmod_has(0x0040d540)) && RH_G8(S_HACK_HORN) ? 1 : 0;
+}
 PORT_FN(0x0040d540, "HackHornBall", HackHornBall_n, fp_none)
 static uint8_t __cdecl HackNoWalls_n() { return RH_G8(S_HACK_ON) && RH_G8(S_HACK_NO_WALLS) ? 1 : 0; }
 PORT_FN(0x0040d560, "HackNoWalls", HackNoWalls_n, fp_none)

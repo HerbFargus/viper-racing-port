@@ -149,6 +149,9 @@ void Footprint::add(void* p, uint32_t bytes, const char* what) { if (n < MAX) r[
 void Footprint::object(void* obj, const char* what) { printf("footprint: object() not expected (%s)\n", what); add(obj, 4, what); }
 void Footprint::stack_ptr(void* p, const char* what) { add(p, 4, what); }
 
+// vrmod's opt-in upgradeunlock (docs/FIXES.md, "vrmod's patches"): the rewrite asks port_vrmod_has, which in the DLL is
+// the stock check's verdict; the worlds here run the stock shop, so never
+bool port_vrmod_has(uint32_t) { return false; }
 #include "../hook/career_shop.cpp"
 #include "../hook/career_credits.cpp"
 

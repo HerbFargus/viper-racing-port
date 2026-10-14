@@ -663,7 +663,9 @@ static void __fastcall UpgradeCatalog_MouseUp_n(UpgradeCatalog* self, Edx, int32
         const uint32_t k4 = (uint32_t)k << 2;
         const CshUpgrade* u = *(CshUpgrade* const volatile*)((const uint8_t*)cs_set() + k4 + 4);
         if (*(const volatile uint8_t*)(cs_info() + k + 0x1c) != 0) return;
-        const uint8_t allowed = *(const volatile int32_t*)(cs_info() + 0x124) + 1 >= u->req_class ? 1 : 0;
+        // vrmod's upgradeunlock (opt-in, "All upgrades on sale") sets this to 1 (mov cl, 1): every upgrade in every class
+        const uint8_t allowed = port_vrmod_has(0x004c4640) ||
+                                *(const volatile int32_t*)(cs_info() + 0x124) + 1 >= u->req_class ? 1 : 0;
         const char* req = u->requires;
         int32_t missing = -1;
         if (*(const volatile char*)req != 0) {
@@ -768,7 +770,8 @@ static void __fastcall UpgradeCatalog_Draw_n(UpgradeCatalog* self, Edx, gxCanvas
             const int32_t k = *(const volatile int32_t*)((const volatile uint8_t*)sp + 0x100);
             const uint8_t* item = *(const uint8_t* const volatile*)((const uint8_t*)cs_set() + (uint32_t)k * 4u + 4);
             const int32_t rc = (*(CshUpgrade* const volatile*)((const uint8_t*)cs_set() + (uint32_t)k * 4u + 4))->req_class;
-            const uint8_t allowed = rc <= *(const volatile int32_t*)(cs_info() + 0x124) + 1 ? 1 : 0;
+            const uint8_t allowed = port_vrmod_has(0x004c4990) ||                 // vrmod's upgradeunlock (above)
+                                    rc <= *(const volatile int32_t*)(cs_info() + 0x124) + 1 ? 1 : 0;
             const uint8_t bought = *(const volatile uint8_t*)(cs_info() + k + 0x1c);
             uint32_t st = allowed ? 0u : 1u;
             if (self->hot == i && allowed) {
