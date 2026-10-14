@@ -149,6 +149,10 @@ VRMOD_PATCHES = {
     # behaviour, not a fix: the rewrite returns at once when the stock check found it (port_vrmod_has, phys_aicar2.cpp)
     # and does the stock panic otherwise; as with modassert, the trampoline's copy of the first byte is vrmod's ret
     0x004311D0: [("headon", [(0x00, "c3")])],
+    # enginefix.py, always on (a behaviour, not a fix): HackHornBall's first je (the hacks-on test) NOP'd, so the horn
+    # ball follows its own option in career mode too, where CareerDo turns the hacks off. The rewrite skips the same
+    # test when the stock check found it (port_vrmod_has, root_screens.cpp)
+    0x0040D540: [("enginefix: horn ball in career", [(0x07, "9090")])],
     # aspectfix.py, always on: Hor+ at widescreen DirectDraw modes; the rewrite does the same (gx_dd.cpp), reading R0 and
     # -0.5 through the code's own two addresses (VRMOD_MASKS: any addresses)
     0x0045EC20: [("aspectfix", [(0x3F,
