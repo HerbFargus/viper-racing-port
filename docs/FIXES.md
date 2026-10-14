@@ -730,7 +730,7 @@ nothing changes below the old limit (`viperport.log` says "lifted ...").
 
 ## vrmod's patches
 
-vrmod (viper-mod-manager) patches seventeen of the functions the port rewrites (one only when the player asks), and
+vrmod (viper-mod-manager) patches nineteen of the functions the port rewrites (three only when the player asks), and
 a few constants they read. The rewrites take every one of them over, so on a vrmod `race.exe` every function runs as a rewrite -- on the
 `dinput.dll` route and in `viperport.exe`, whose `--check` accepts such a `race.exe` -- with the same behaviour
 as the patch. The stock check (`tools/gen_port_tables.py`: `VRMOD_PATCHES`, `VRMOD_MASKS`, `LIVE_CONSTS`)
@@ -765,6 +765,11 @@ leaves it original.
   `HackDisable`) and the horn ball is one of them. The ball then follows its own option everywhere, career too; the
   other hacks stay off in career. A behaviour, not a fix: the rewrite skips the hacks-on test when the stock check
   found vrmod's bytes (`port_vrmod_has`), so the standalone and Linux builds do what the patched function does.
+- upgradeunlock (opt-in, "All upgrades on sale"; `UpgradeCatalog::MouseUp` and `::Draw`): the upgrade shop allows an
+  upgrade when `career class + 1 >= its class`, computed into `cl` by a `setge` (the buy, 0x4c46f3) and a `setle` (the
+  "Available" label, 0x4c4ad8); vrmod writes `mov cl, 1; nop` over each, so every upgrade is on sale from the first week
+  (prices and prerequisites stay). The rewrites allow every upgrade when the stock check found vrmod's bytes
+  (`port_vrmod_has`).
 - writepaths: the `.data` path strings it rewrites are read by rewrites that put the files under the game's own
   folder anyway (`Config\`, `log\`), under "Where the game writes".
 

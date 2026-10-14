@@ -153,6 +153,11 @@ VRMOD_PATCHES = {
     # ball follows its own option in career mode too, where CareerDo turns the hacks off. The rewrite skips the same
     # test when the stock check found it (port_vrmod_has, root_screens.cpp)
     0x0040D540: [("enginefix: horn ball in career", [(0x07, "9090")])],
+    # upgradeunlock.py (opt-in "All upgrades on sale"): the upgrade shop's class test -- setge / setle cl -- made
+    # `mov cl, 1; nop` in UpgradeCatalog::MouseUp (the buy) and ::Draw (the "Available" label). The rewrites allow
+    # every upgrade when the stock check found it (port_vrmod_has, career_shop.cpp)
+    0x004C4640: [("upgradeunlock", [(0xB3, "b10190")])],
+    0x004C4990: [("upgradeunlock", [(0x148, "b10190")])],
     # aspectfix.py, always on: Hor+ at widescreen DirectDraw modes; the rewrite does the same (gx_dd.cpp), reading R0 and
     # -0.5 through the code's own two addresses (VRMOD_MASKS: any addresses)
     0x0045EC20: [("aspectfix", [(0x3F,

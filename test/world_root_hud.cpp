@@ -142,6 +142,9 @@ void Footprint::object(void* obj, const char* what) { printf("footprint: object(
 void Footprint::stack_ptr(void* p, const char* what) { add(p, 4, what); }
 
 #include "../hook/root_dash.cpp"
+// vrmod's enginefix horn ball in career (docs/FIXES.md, "vrmod's patches"): the rewrite asks port_vrmod_has, which in
+// the DLL is the stock check's verdict; the worlds here run the stock HackHornBall, so never
+bool port_vrmod_has(uint32_t) { return false; }
 #include "../hook/root_screens.cpp"
 #include "../hook/root_leftover.cpp"
 

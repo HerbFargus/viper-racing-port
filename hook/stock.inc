@@ -11609,4 +11609,6 @@
     {0x0045ec20, 0xba6577e7, "aspectfix"},
     {0x004636a0, 0x9d80b5b9, "hornball"},
     {0x00486230, 0xb1ada288, "carlist"},
+    {0x004c4640, 0x4887bda3, "upgradeunlock"},
+    {0x004c4990, 0xddfb95ed, "upgradeunlock"},
 #endif
