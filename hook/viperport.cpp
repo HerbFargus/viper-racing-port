@@ -779,6 +779,7 @@ static void install() {
     char* slash = strrchr(ini, '\\');
     vpos_lstrcpyA(slash ? slash + 1 : ini, "viperport.ini");
     port_install(ini);                          // M3: rewritten functions (Obstacle::Update, collide_phobs, ...)
+    tune_install(ini);                          // [tune] car=...: the tune race (root_tune.cpp); before replay_install (its seed)
     session_install(ini);                       // M3: the session recorder (before the race recorder, which it drives)
     replay_install(ini);                        // M3: the race recorder and replayer
     gfx_capture_install(ini);                   // [debug] capture=<seconds>: frames for the hi-res 2D work

@@ -54,6 +54,14 @@ bool renderer_install();
 bool platform_plans_gl(const char* ini);     // will platform_install switch to the OpenGL renderer?
 bool platform_switched_away();                // the game's inactive flag (win32.obj): DirectSound goes quiet while it's set
 void gfx_capture_install(const char* ini);   // [debug] capture: frames written to log\capture (gl_core.cpp)
+void tune_install(const char* ini);          // [tune] car=...: one unattended tune race instead of the menus (root_tune.cpp)
+bool tune_active();
+void tune_run();
+void tune_learn_done();                       // the learn screen's race is over: the tune race reads its laps
+void tune_tick();                             // every physics tick in tune mode: the incident counts / the tests
+struct TuneControls { volatile bool on; volatile float steer, throttle, brake; };
+extern TuneControls g_tune_ctl;               // [tune] test=handling: the scripted controls DriverGet* return
+const uint32_t TUNE_SEED = (1802u << 16) | 9373u;   // the tune race's random seed (rmarin's ij, kl: Marsaglia's own)
 void gfx_repaint();                           // the OpenGL renderer shows its picture again (gl_core.cpp)
 void renderer_report();
 

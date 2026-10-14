@@ -468,6 +468,8 @@ static int __fastcall h_GetTicks(void* self, void* edx) {
 // Randomize (start-up, from RandomBegin): the original seeds rmarin with the clock mod 30000; here the
 // recorder picks the seed the same way and keeps it, and a replay reuses the recording's.
 static void __cdecl h_Randomize(void) {
+    if (g_seed == UINT32_MAX && tune_active())        // [tune]: a fixed seed, so every tune race rolls the same drivers
+        g_seed = TUNE_SEED;
     if (g_seed == UINT32_MAX) {
         uint32_t t = vpos_GetTickCount();
         g_seed = ((t % 30000) << 16) | ((t / 7) % 30000);
@@ -572,7 +574,7 @@ void replay_install(const char* ini) {
     // session (session_install, before this) needs the race hooks whatever [replay] says
     const bool session = g_session_mode != SESSION_OFF;
     const bool race = g_record || g_play[0] || session;
-    if (!race && !shadow_on()) return;
+    if (!race && !shadow_on() && !tune_active()) return;
     if (race && !g_label[0]) {
         SYSTEMTIME t;
         vpos_GetLocalTime(&t);
@@ -618,7 +620,7 @@ void replay_install(const char* ini) {
     };
     int ok = 0, wanted = 0;
     for (H& h : hooks) {
-        if (h.race_only && !race) continue;
+        if (h.race_only && !race && !(h.to == (void*)h_Randomize && tune_active())) continue;
         wanted++;
         // detour() is the only way these are hooked; listed here so gen_port_tables.py finds them:
         // detour(0x00426850) detour(0x00426a80) detour(0x00426b20) detour(0x00426b90) detour(0x004274d0)

@@ -44,6 +44,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "port.h"
+#include "viperport.h"
 #include "ui_types.h"
 #include "x87.h"
 #include "root_main.h"
@@ -207,8 +208,11 @@ static void __cdecl AppMain_c() {
     switch ((uint32_t)UI_G32(S_APP_MODE)) {
     case 0:
         ccall<void>(F_app_begin);
-        while (ccall<uint8_t>(F_race)) {}
-        ccall<void>(F_CreditsDo);
+        if (tune_active()) tune_run();                  // [tune]: one tune race, no menus, no credits (root_tune.cpp)
+        else {
+            while (ccall<uint8_t>(F_race)) {}
+            ccall<void>(F_CreditsDo);
+        }
         ccall<void>(F_app_end);
         break;
     case 1: ccall<void>(F_dave_b); break;

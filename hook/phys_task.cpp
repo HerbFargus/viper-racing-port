@@ -478,6 +478,7 @@ static void __cdecl PhysTaskUpdate_rw() {
         for (; n > 0; n--) {
             if (!play) collide_phobs_o();
             update_phobs_o();
+            if (tune_active()) tune_tick();          // [tune]: the tune race's incident counts (reads only; root_tune.cpp)
             if (!g_paused) g_tick++;
         }
     }
@@ -824,7 +825,8 @@ static int __fastcall TimerConditioner_GetTicks_rw(TimerConditioner* self, Edx) 
     uint8_t fixed = !(!PhysReplayPlayMode() && !g_paused && speed == 1);
     if (speed == 0) {
         n = 24 / CarMgrCount();
-        if ((uint8_t)g_tick < 0x80 && (uint8_t)((uint8_t)g_tick - (uint8_t)n) > 0x80) TaskSleep(20);
+        // [tune] (root_tune.cpp): no 20 ms yield -- the tune race runs as fast as the CPU takes it
+        if ((uint8_t)g_tick < 0x80 && (uint8_t)((uint8_t)g_tick - (uint8_t)n) > 0x80 && !tune_active()) TaskSleep(20);
     } else if (speed == 2) {
         uint8_t t = self->half_toggle;
         n = t;
@@ -1296,6 +1298,7 @@ static __forceinline float steer_squared_signed() {
 // The steering: squared (keeping its sign) for the "square" option; above 15.6 m/s (35 mph, as the argument's
 // bits) scaled down linearly towards 100 mph: x (1.269 - 0.0173 v), v capped at 44.44 (a NaN gives 44.44).
 static float __cdecl DriverGetSteering_rw(float speed) {
+    if (g_tune_ctl.on) return g_tune_ctl.steer;   // [tune] test=handling: the script's, past the steering filter
     float s;
     memcpy(&s, g_steer, 4);
     if (g_steer_square) s = steer_squared_signed();
@@ -1312,10 +1315,10 @@ static float __cdecl DriverGetSteering_rw(float speed) {
 static void fp_driver_steering(Footprint&, float) {}
 PORT_FN(0x00441df0, "DriverGetSteering", DriverGetSteering_rw, fp_driver_steering)
 
-static float __cdecl DriverGetThrottle_rw() { return *(const float*)0x0052229c; }
+static float __cdecl DriverGetThrottle_rw() { return g_tune_ctl.on ? g_tune_ctl.throttle : *(const float*)0x0052229c; }
 PORT_FN(0x00441e60, "DriverGetThrottle", DriverGetThrottle_rw, fp_none)
 
-static float __cdecl DriverGetBraking_rw() { return *(const float*)0x005221c8; }
+static float __cdecl DriverGetBraking_rw() { return g_tune_ctl.on ? g_tune_ctl.brake : *(const float*)0x005221c8; }
 PORT_FN(0x00441e70, "DriverGetBraking", DriverGetBraking_rw, fp_none)
 
 // the pedal's travel mapped to engagement: 1.1 - 1.2 x, clamped to [0, 1] in the register (a NaN gives 1)

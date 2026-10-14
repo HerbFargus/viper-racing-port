@@ -3057,10 +3057,11 @@ static void __cdecl AIDisplayLearnMode_n(const uint8_t* world) {
         if ((uint8_t)deity_call(0x40, 0)) PhysicsAbortRace();
         if (done) break;
     }
+    if (tune_active()) tune_learn_done();                       // [tune]: the laps, while the race still holds them
     uint8_t* const flag = (uint8_t*)&L.screen;
     *flag = 0;
     OptionsGetBool(GP(const char, 0x004db500), (const char*)0x004eb7f0, flag);
-    if (*flag) {
+    if (*flag && !tune_active()) {                             // [tune]: no "press a key" at the end (root_tune.cpp)
         gxCanvas second;
         KeyClear();
         if (!gxGrabScreen(&second)) {

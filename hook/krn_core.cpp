@@ -1181,12 +1181,17 @@ static DWORD __stdcall timer_vector_rw(void* fn) {
     TaskSetPriority(15);                                 // THREAD_PRIORITY_TIME_CRITICAL
     int overruns = 0, yielded = 0;
     int32_t period = get_task_info(current_taskid())->period;
+    // [tune] (root_tune.cpp): the BG task runs back to back -- the physics, whose ticks a call runs don't depend on the
+    // clock at speed 0, as fast as the CPU takes it; the same calls in the same order, just no waiting between them
+    const bool spin = tune_active() && (uint32_t)(uintptr_t)fn == k_bg_vector;
     if (!TaskShouldIDie()) {
         do {
             int t0 = PTimeNow();
             FN(Void_t, fn)();
             int dt = PTimeNow() - t0;
-            if (dt < period) {
+            if (spin) {
+                TaskSleep(0);
+            } else if (dt < period) {
                 TaskSleep(period - dt);
             } else if (++overruns >= 60) {
                 overruns = 0;
