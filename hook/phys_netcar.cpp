@@ -29,6 +29,7 @@
 #include "port.h"
 #include "x87.h"
 #include "phys_types.h"
+#include "hornball_sync.h"
 
 #define D(x) ((double)(x))                          // a register value (x87.h)
 #define FB(b) __builtin_bit_cast(float, (uint32_t)(b))   // a float constant from its bits
@@ -506,6 +507,10 @@ PORT_FN(0x0043f5f0, "NetCar::we_are_abandoned", NetCar_we_are_abandoned, fp_net_
 
 // NetCar::do_horn (0x43f640): the horn went on in the newest packet: throw the horn ball from the car
 static void __fastcall NetCar_do_horn(NetCar* self, Edx) {
+    // the port's horn balls: another port player's car throws by message only (hornball_sync.h, Car::SetHorn)
+    if (VP_FIX && (uint32_t)self->car_index < 8u && hbs::S().active.load() && MultiEnabled() &&
+        hbs::S().remote[self->car_index].load())
+        return;
     if (self->num_packets < 2) return;
     uint8_t h = self->packets[0].horn;
     if (self->packets[1].horn == h || !h) return;

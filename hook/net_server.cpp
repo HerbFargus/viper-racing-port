@@ -49,6 +49,7 @@
 #include "net_core.h"
 #include "net_server.h"
 #include "net_wsock.h"
+#include "hornball_sync.h"
 
 namespace {
 namespace net_server {
@@ -1167,6 +1168,49 @@ static void fp_sic(Footprint& f, RaceServer*, Edx, int, const char*) { f.replay_
 PORT_FN(0x004acc30, "RaceServer::SetIrocCar", SetIrocCar, fp_sic)
 
 // the main loop's step: the lag warning, the sessions gone down, the state's check, every packet in, the dead users,
+// ---- the horn balls between port players (hornball_sync.h): class 3, which an original server drops unread ----------
+// HELLO: that user is the port; every port user then gets a WELCOME (the host's ball, the port users). THROW from a car's
+// owner: relayed to the other port users. A user's HELLO counts while its slot keeps the id it had.
+static void hb_send(RaceServer* self, int user, const void* p, int len) {
+    tcall<void>(F_SM_SendReliable, self->sm, self->base + user, p, len, (const void*)0, (uint8_t)hbs::CLASS);
+}
+static bool hb_port_user(RaceServer* self, int j) {
+    return self->users[j].id != 0 && hbs::S().srv_ids[j] == self->users[j].id;
+}
+static void hb_server_recv(RaceServer* self, const uint8_t* pkt, int sess, int len) {
+    hbs::State& st = hbs::S();
+    if (st.server != self) {
+        memset(st.srv_ids, 0, sizeof st.srv_ids);
+        st.server = self;
+    }
+    uint8_t type;
+    if (!hbs::read_header(pkt, len, &type)) return;
+    const uint32_t u = (uint32_t)(sess - self->base);
+    if (u >= 8 || !self->users[u].id) return;
+    if (type == hbs::T_HELLO) {
+        st.srv_ids[u] = self->users[u].id;
+        uint8_t out[hbs::HDR + sizeof(hbs::Welcome)];
+        memset(out, 0, sizeof out);
+        hbs::put_header(out, hbs::T_WELCOME);
+        hbs::Welcome w;
+        memset(&w, 0, sizeof w);
+        w.mass = vrmod_operand(0x004636f2);                  // create_ball's mov [esp+8], 3000.0 (vrmod's hornball patch)
+        w.radius = vrmod_operand(0x00463700);                // its mov [esp+0x28], 18.0
+        for (int j = 0; j < 8; j++) w.port_ids[j] = hb_port_user(self, j) ? self->users[j].id : 0;
+        memcpy(out + hbs::HDR, &w, sizeof w);
+        for (int j = 0; j < 8; j++)
+            if (hb_port_user(self, j)) hb_send(self, j, out, sizeof out);
+    } else if (type == hbs::T_THROW && len >= hbs::HDR + (int)sizeof(hbs::Throw)) {
+        const int8_t car = (int8_t)pkt[hbs::HDR];
+        if (car < 0 || car >= 8 || !hb_port_user(self, (int)u)) return;
+        if (self->cars[car].info.user != self->users[u].id) return;     // only the car's owner throws its ball
+        uint8_t out[hbs::HDR + sizeof(hbs::Throw)];
+        memcpy(out, pkt, sizeof out);
+        for (int j = 0; j < 8; j++)
+            if (j != (int)u && hb_port_user(self, j)) hb_send(self, j, out, sizeof out);
+    }
+}
+
 // a lone player
 static void __fastcall Tick(RaceServer* self, Edx) {
     owner_check(self, 0x722, 0x004fe038, 0x004fe044);
@@ -1199,6 +1243,10 @@ static void __fastcall Tick(RaceServer* self, Edx) {
         const uint32_t kind = (uint8_t)(U8(G_SEND_CLASS_MASK) & pkt[0]);
         if (kind == 2) {
             tcall<void>(S_race_packet, self, (void*)pkt, sess, len);
+            continue;
+        }
+        if (VP_FIX && kind == hbs::CLASS) {                  // the port's horn balls (above)
+            hb_server_recv(self, pkt, sess, len);
             continue;
         }
         if (kind != 1) continue;
