@@ -1169,8 +1169,8 @@ PORT_FN(0x004acc30, "RaceServer::SetIrocCar", SetIrocCar, fp_sic)
 
 // the main loop's step: the lag warning, the sessions gone down, the state's check, every packet in, the dead users,
 // ---- the horn balls between port players (hornball_sync.h): class 3, which an original server drops unread ----------
-// HELLO: that user is the port; every port user then gets a WELCOME (the host's ball, the port users). THROW from a car's
-// owner: relayed to the other port users. A user's HELLO counts while its slot keeps the id it had.
+// HELLO: that user is the port; every port user then gets a WELCOME (the host's ball, the port users). THROW (reliable)
+// and BALL (unreliable) from a car's owner: relayed to the other port users. A user's HELLO counts while its slot keeps the id it had.
 static void hb_send(RaceServer* self, int user, const void* p, int len) {
     tcall<void>(F_SM_SendReliable, self->sm, self->base + user, p, len, (const void*)0, (uint8_t)hbs::CLASS);
 }
@@ -1200,6 +1200,16 @@ static void hb_server_recv(RaceServer* self, const uint8_t* pkt, int sess, int l
         memcpy(out + hbs::HDR, &w, sizeof w);
         for (int j = 0; j < 8; j++)
             if (hb_port_user(self, j)) hb_send(self, j, out, sizeof out);
+    } else if (type == hbs::T_BALL && len >= hbs::HDR + (int)sizeof(hbs::BallState)) {
+        // a ball's state: relayed as it came, unreliable (as the car packets are)
+        const int8_t car = (int8_t)pkt[hbs::HDR];
+        if (car < 0 || car >= 8 || !hb_port_user(self, (int)u)) return;
+        if (self->cars[car].info.user != self->users[u].id) return;
+        uint8_t out[hbs::HDR + sizeof(hbs::BallState)];
+        memcpy(out, pkt, sizeof out);
+        for (int j = 0; j < 8; j++)
+            if (j != (int)u && hb_port_user(self, j))
+                tcall<void>(F_SM_Send, self->sm, self->base + j, (const void*)out, (int)sizeof out, (uint32_t)hbs::CLASS);
     } else if (type == hbs::T_THROW && len >= hbs::HDR + (int)sizeof(hbs::Throw)) {
         const int8_t car = (int8_t)pkt[hbs::HDR];
         if (car < 0 || car >= 8 || !hb_port_user(self, (int)u)) return;

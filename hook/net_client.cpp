@@ -678,6 +678,7 @@ static void __fastcall RC_check_status(RaceClient* self, Edx) {
 static void fp_check_status(Footprint& f, RaceClient*, Edx) { f.replay_only = R_LOG; }
 PORT_FN(0x004a9020, "RaceClient::check_status", RC_check_status, fp_check_status)
 
+static void hb_send_balls(RaceClient* self);                      // the port's horn balls (below)
 typedef double(__cdecl* Deviation_t)();                                 // a float in ST0, taken as the register has it
 static void __fastcall RC_SendAll(RaceClient* self, Edx) {
     task_check(self, 0x445, 0x004fd0cc, 0x004fd0c0);
@@ -699,6 +700,8 @@ static void __fastcall RC_SendAll(RaceClient* self, Edx) {
         count++;
     }
     tcall<void>(F_SM_Send, self->sm, self->chan, pkt, count * 24 + 2, 2u);
+    // the port's horn balls: this machine's balls in flight, to the other port players (hb_send_balls)
+    if (VP_FIX && hbs::S().active.load()) hb_send_balls(self);
     self->last_send = net_PTimeNow();                                   // site 0x4a917e
 }
 PORT_FN(0x004a9090, "RaceClient::SendAll", RC_SendAll, fp_io)
@@ -803,6 +806,22 @@ static bool hb_is_port(int32_t user) {
         if (hbs::S().port_ids[j] == user) return true;
     return false;
 }
+// a network car's packet lag: its newest packet's arrival less its send time, both on this machine's physics clock
+// (0..1 s); -1 for no car
+static float hb_car_lag(const uint8_t* nc) {
+    if (!nc) return -1.0f;
+    float lat = 0.0f;
+    const uint8_t* const packets = *(const uint8_t* const*)(nc + 0xec4);
+    if (packets && *(const int32_t*)(nc + 0xec8) > 0) {
+        float recv, sent;
+        memcpy(&recv, packets + 0, 4);
+        memcpy(&sent, packets + 4, 4);
+        lat = recv - sent;
+        if (!(lat >= 0.0f)) lat = 0.0f;
+        if (lat > 1.0f) lat = 1.0f;
+    }
+    return lat;
+}
 // RaceClient::Tick, once the client is in the game: the HELLO; then which cars are whose, and this machine's throws out
 static void hb_client_tick(RaceClient* self) {
     hbs::State& st = hbs::S();
@@ -855,20 +874,44 @@ static void hb_client_recv(RaceClient* self, const uint8_t* pkt, int len) {
         hbs::Throw t;
         memcpy(&t, pkt + hbs::HDR, sizeof t);
         if (t.car < 0 || t.car >= 8) return;
-        const uint8_t* const nc = (const uint8_t*)car_at(self, t.car)->netcar;
-        if (!nc) return;
-        // the car's packet lag: its newest packet's arrival less its send time, both on this machine's physics clock
-        float lat = 0.0f;
-        const uint8_t* const packets = *(const uint8_t* const*)(nc + 0xec4);
-        if (packets && *(const int32_t*)(nc + 0xec8) > 0) {
-            float recv, sent;
-            memcpy(&recv, packets + 0, 4);
-            memcpy(&sent, packets + 4, 4);
-            lat = recv - sent;
-            if (!(lat >= 0.0f)) lat = 0.0f;
-            if (lat > 1.0f) lat = 1.0f;
-        }
+        const float lat = hb_car_lag((const uint8_t*)car_at(self, t.car)->netcar);
+        if (lat < 0.0f) return;
         hbs::publish(st.in[(int)t.car], t.s, (float)hb_physics_time(), lat);
+    } else if (type == hbs::T_BALL && st.active.load() && len >= hbs::HDR + (int)sizeof(hbs::BallState)) {
+        hbs::BallState b;
+        memcpy(&b, pkt + hbs::HDR, sizeof b);
+        if (b.car < 0 || b.car >= 8) return;
+        hbs::Stream& sm = st.stream[(int)b.car];
+        if (!(b.time > sm.sender_time)) return;                          // unreliable: an older one, or a repeat
+        const float lat = hb_car_lag((const uint8_t*)car_at(self, b.car)->netcar);
+        if (lat < 0.0f) return;                                          // not a car we follow
+        hbs::stream_write(sm, b.s, (float)hb_physics_time(), lat, b.time);
+    }
+}
+// RaceClient::SendAll (the physics thread), after the car packets: each ball of a car driven here, for 15 s after its
+// throw -- unreliable, as the car packets go
+static void hb_send_balls(RaceClient* self) {
+    typedef void*(__cdecl* GetBall_t)(int);
+    const GetBall_t get_ball = (GetBall_t)(uintptr_t)0x004410e0;
+    const float now = (float)hb_physics_time();
+    for (int i = 0; i < 8; i++) {
+        if (!car_at(self, i)->localcar) continue;
+        const uint8_t* const ball = (const uint8_t*)get_ball(i);
+        if (!ball) continue;
+        float thrown;
+        memcpy(&thrown, ball + 0x478, 4);                               // Ball::last_throw_time (0: never)
+        if (thrown == 0.0f || !(now >= thrown) || now - thrown > (float)hbs::STREAM_SECONDS) continue;
+        uint8_t pkt[hbs::HDR + sizeof(hbs::BallState)];
+        memset(pkt, 0, sizeof pkt);
+        hbs::put_header(pkt, hbs::T_BALL);
+        hbs::BallState b;
+        memset(&b, 0, sizeof b);
+        b.car = (int8_t)i;
+        b.time = now;
+        memcpy(b.s, ball + 0x5c, 12);                                   // the frame's position (PhobRoot +0x38 + 36)
+        memcpy(b.s + 3, ball + 0x234, 24);                              // velocity, spin (PhobDyno +0x234, +0x240)
+        memcpy(pkt + hbs::HDR, &b, sizeof b);
+        tcall<void>(F_SM_Send, self->sm, self->chan, pkt, (int)sizeof pkt, (uint32_t)hbs::CLASS);
     }
 }
 
