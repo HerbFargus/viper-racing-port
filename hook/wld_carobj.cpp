@@ -51,6 +51,7 @@
 #include "port.h"
 #include "x87.h"
 #include "phys_types.h"
+#include "car_parts.h"
 
 #define D(x) ((double)(x))                          // a register value (x87.h)
 #define FB(b) __builtin_bit_cast(float, (uint32_t)(b))   // a float constant from its bits
@@ -1143,8 +1144,11 @@ static void __fastcall CarObject_load_car_models(CarObject* self, Edx, const cha
         self->cockpit_w = mrModelLoad(path);
         game_sprintf(path, (const char*)0x004f4fb0, name);                               // "%sc.mod"
         self->cockpit_c = mrModelLoad(path);
-        self->needle[0] = mrModelLoad((const char*)0x004f4fb8);                         // "needle.mod"
-        self->needle[1] = mrModelLoad((const char*)0x004f4fc4);                         // "needle.mod"
+        // FIX: this car's own needle, wheels, spinners, arms, disk glow and brake-light stand-in, not the newest
+        // car set's (car_parts.h); with VP_FAITHFUL each is the plain name, as the original
+        char part[0x60];
+        self->needle[0] = mrModelLoad(car_part(part, sizeof part, name, (const char*)0x004f4fb8));   // "needle.mod"
+        self->needle[1] = mrModelLoad(car_part(part, sizeof part, name, (const char*)0x004f4fc4));   // "needle.mod"
         self->cockpit_row1[0] = (float)game_atof(StringTableGetEntry(st, 1, 1));
         self->cockpit_row1[1] = (float)game_atof(StringTableGetEntry(st, 1, 2));
         self->cockpit_row1[2] = (float)game_atof(StringTableGetEntry(st, 1, 3));
@@ -1166,9 +1170,14 @@ static void __fastcall CarObject_load_car_models(CarObject* self, Edx, const cha
         StringTableForget(st);
     } else self->has_cockpit = 0;
     game_sprintf(path, (const char*)0x004f4fd0, name);                                   // "%sb.mod"
-    if (!ResourceExists(path)) game_sprintf(path, (const char*)0x004f4fd8);              // "brakelt.mod"
-    self->brakelight = mrModelLoad(path);
-    self->diskglow = mrModelLoad((const char*)0x004f4fe4);                              // "diskglow.mod"
+    char part[0x60];
+    const char* brake = path;
+    if (!ResourceExists(path)) {
+        game_sprintf(path, (const char*)0x004f4fd8);                                     // "brakelt.mod"
+        brake = car_part(part, sizeof part, name, path);                                 // FIX: (above)
+    }
+    self->brakelight = mrModelLoad(brake);
+    self->diskglow = mrModelLoad(car_part(part, sizeof part, name, (const char*)0x004f4fe4));   // "diskglow.mod"
     // FIX: with an 11-character car name (the longest whose models' names fit 16), "<car>1.tex" and
     // "~<car>.tex" are 16 characters, and their terminator landed past the 16-byte skin field (and past
     // remap_skin's, by the strcpy below). The next field then overwrote it, and the skin's name ran on into
@@ -1212,14 +1221,14 @@ static void __fastcall CarObject_load_car_models(CarObject* self, Edx, const cha
         self->lod_copy[i] = mrModelCopyRemap(model, self->remap_name, 1);
     }
     self->xray_tex = gxGetTexture((const char*)0x004f5018, 0);                          // "xray.tex"
-    self->spin[0] = mrModelLoad((const char*)0x004f5024);                               // "spin_l.mod"
-    self->spin[1] = mrModelLoad((const char*)0x004f5030);                               // "spin_r.mod"
-    self->arm[0] = mrModelLoad((const char*)0x004f503c);                                // "arm_ul.mod"
-    self->arm[1] = mrModelLoad((const char*)0x004f5048);                                // "arm_ur.mod"
-    self->arm[2] = mrModelLoad((const char*)0x004f5054);                                // "arm_ll.mod"
-    self->arm[3] = mrModelLoad((const char*)0x004f5060);                                // "arm_lr.mod"
-    self->arm[4] = mrModelLoad((const char*)0x004f506c);                                // "arm_sl.mod"
-    self->arm[5] = mrModelLoad((const char*)0x004f5078);                                // "arm_sr.mod"
+    self->spin[0] = mrModelLoad(car_part(part, sizeof part, name, (const char*)0x004f5024));  // "spin_l.mod"
+    self->spin[1] = mrModelLoad(car_part(part, sizeof part, name, (const char*)0x004f5030));  // "spin_r.mod"
+    self->arm[0] = mrModelLoad(car_part(part, sizeof part, name, (const char*)0x004f503c));  // "arm_ul.mod"
+    self->arm[1] = mrModelLoad(car_part(part, sizeof part, name, (const char*)0x004f5048));  // "arm_ur.mod"
+    self->arm[2] = mrModelLoad(car_part(part, sizeof part, name, (const char*)0x004f5054));  // "arm_ll.mod"
+    self->arm[3] = mrModelLoad(car_part(part, sizeof part, name, (const char*)0x004f5060));  // "arm_lr.mod"
+    self->arm[4] = mrModelLoad(car_part(part, sizeof part, name, (const char*)0x004f506c));  // "arm_sl.mod"
+    self->arm[5] = mrModelLoad(car_part(part, sizeof part, name, (const char*)0x004f5078));  // "arm_sr.mod"
     self->arm_copy[0] = mrModelCopy(self->arm[4]);
     self->arm_copy[1] = mrModelCopy(self->arm[5]);
 }
@@ -1257,13 +1266,17 @@ static void __fastcall CarObject_load_wheels(CarObject* self, Edx, const uint8_t
     const float width_r = (float)(D(cf(0x13c)) * FB(0x3a83126f));
     const float diam_r = (float)(D(self->radius_rear) * 2.0f);
     char name[0x40];
+    char part[0x60];
+    // FIX: this car's own wheel models, not the newest car set's (car_parts.h): a kart's wheels were drawn on every
+    // stock Viper in the race
+    const char* car = VP_FIX ? (const char*)CarMgrGetInfo(self->index) + 0x12 : 0;
     int k = 0;
     do {
         k++;
         game_sprintf(name, (const char*)0x004f5098, k);                                 // "wheel_%d.mod"
-        const int wheel = mrModelLoad(name);
+        const int wheel = mrModelLoad(car_part(part, sizeof part, car, name));
         game_sprintf(name, (const char*)0x004f50a8, k);                                 // "fwheel_%d.mod"
-        const int fwheel = mrModelLoad(name);
+        const int fwheel = mrModelLoad(car_part(part, sizeof part, car, name));
         float e[6];
         mrModelGetExtents(wheel, &e[0], &e[1], &e[2], &e[3], &e[4], &e[5]);
         float scale[9];
