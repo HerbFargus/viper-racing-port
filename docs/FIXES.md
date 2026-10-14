@@ -131,6 +131,7 @@ dozen places and the game dies.
   build before (a kart against Viper AI, horn balls thrown) replays on the fixed build with its race IDENTICAL over
   all 1,500 ticks and in lockstep; only the drawing differs from the race's start (the Vipers' own wheel models and
   texture), as intended -- the build before replays it IDENTICAL throughout.
+  In a two-copy LAN race (Bowser Kart against Mario Kart) each player throws their own item, the same in both copies.
 - `find_mem`: the start-up's video-memory check adds 600 KB (a 640x480 front buffer) to the total
   DirectDraw reports, and a card reporting within 600 KB of 4 GB wrapped it to almost nothing: "unsupported:
   0 megs of vram" and the game quit (with the game's own DirectDraw on a modern card; the OpenGL renderer
